@@ -31,10 +31,17 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
             c.Timeout = TimeSpan.FromSeconds(15);
         });
 
-        // Phantom DB (singleton, lazily ensures schema on first use)
-        var paths = applicationHost.Resolve<IApplicationPaths>();
-        var dbPath = Path.Combine(paths.PluginConfigurationsPath, "PhantomLibrary", "phantom.db");
-        serviceCollection.AddSingleton(_ => new PhantomDb(dbPath));
+        // Phantom DB (singleton, lazily ensures schema on first use).
+        // We resolve IApplicationPaths from the DI container at first
+        // request rather than from applicationHost during registration,
+        // because IServerApplicationHost.ServiceProvider is not wired up
+        // yet at this point and Resolve<T>() would throw / return null.
+        serviceCollection.AddSingleton(sp =>
+        {
+            var paths = sp.GetRequiredService<IApplicationPaths>();
+            var dbPath = Path.Combine(paths.PluginConfigurationsPath, "PhantomLibrary", "phantom.db");
+            return new PhantomDb(dbPath);
+        });
 
         // Gostream
         serviceCollection.AddHttpClient<IGostreamClient, GostreamClient>(c =>
