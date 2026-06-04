@@ -1,0 +1,21 @@
+# gostream upstream checkout — patched separately, PR'd upstream, never vendored
+/gostream/
+
+# editor backups
+*~
+*.swp
+
+# build output
+bin/
+obj/
+*.nupkg
+artifacts/
+
+# IDE
+.vs/
+.idea/
+.vscode/
+
+# local secrets / config
+*.local.json
+appsettings.Development.json

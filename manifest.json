@@ -1,0 +1,12 @@
+[
+  {
+    "guid": "9e7a1f4c-2b5d-4e8f-9a3b-7c1d2e5f6a8b",
+    "name": "Phantom Library",
+    "description": "Makes the entire TMDB catalogue appear inside Jellyfin. Lazy-materialises titles via gostream's FUSE-backed virtual MKVs.",
+    "overview": "Phantom Library: TMDB catalogue as a Jellyfin library, materialised on demand.",
+    "owner": "spencerharmon",
+    "category": "Metadata",
+    "imageUrl": "https://raw.githubusercontent.com/spencerharmon/phantom-library/main/assets/phantom-library.png",
+    "versions": []
+  }
+]
