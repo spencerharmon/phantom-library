@@ -21,6 +21,12 @@ public class MaterialisationQueueTests
 
         public RecorderMat(bool wait = false) { _wait = wait; }
 
+        public event EventHandler<MaterialisationLifecycleEvent>? LifecycleChanged
+        {
+            add { _ = value; }
+            remove { _ = value; }
+        }
+
         public async Task<MaterialisationOutcome> MaterialiseAsync(Guid id, MaterialiseTrigger trigger, CancellationToken ct)
         {
             lock (Calls) Calls.Add((id, trigger));
