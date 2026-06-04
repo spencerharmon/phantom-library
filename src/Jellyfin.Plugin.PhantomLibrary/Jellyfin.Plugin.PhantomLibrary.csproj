@@ -50,7 +50,26 @@
   </ItemGroup>
 
   <ItemGroup>
-    <EmbeddedResource Include="Configuration\configPage.html" />
+    <InternalsVisibleTo Include="Jellyfin.Plugin.PhantomLibrary.Tests" />
   </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Configuration\configPage.html" />
+    <EmbeddedResource Include="Assets\splash.mp4" />
+  </ItemGroup>
+
+  <!--
+    Generate Assets/splash.mp4 at build time if missing. The generated
+    file is checked into git, so CI hosts without ffmpeg still build
+    fine — this target only runs on developer machines after a clean
+    or when the file is intentionally deleted. See PLAN.md §0b / §M5.
+  -->
+  <Target Name="GenerateSplashMp4" BeforeTargets="BeforeBuild" Condition="!Exists('Assets/splash.mp4')">
+    <Message Importance="high" Text="Phantom Library: Assets/splash.mp4 missing; invoking ffmpeg to generate it." />
+    <Exec Command="ffmpeg -y -f lavfi -i color=c=0x0a0e27:s=1280x720:r=30:d=10 -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 -vf &quot;drawtext=text='Phantom Library':fontcolor=0xa78bfa:fontsize=72:x=(w-text_w)/2:y=(h-text_h)/2-60,drawtext=text='materialising…':fontcolor=0x6b7280:fontsize=36:x=(w-text_w)/2:y=(h-text_h)/2+40&quot; -c:v libx264 -pix_fmt yuv420p -profile:v high -level 4.0 -preset slow -crf 22 -g 30 -keyint_min 30 -c:a aac -b:a 64k -shortest -movflags +faststart Assets/splash.mp4" IgnoreExitCode="true" ConsoleToMSBuild="true">
+      <Output TaskParameter="ExitCode" PropertyName="FfmpegExitCode" />
+    </Exec>
+    <Error Condition="'$(FfmpegExitCode)' != '0' Or !Exists('Assets/splash.mp4')" Text="ffmpeg failed to generate Assets/splash.mp4 (exit $(FfmpegExitCode)). Install ffmpeg or restore the file from git." />
+  </Target>
 
 </Project>

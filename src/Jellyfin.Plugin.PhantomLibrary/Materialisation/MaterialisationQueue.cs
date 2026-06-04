@@ -12,6 +12,7 @@ namespace Jellyfin.Plugin.PhantomLibrary.Materialisation;
 
 public interface IMaterialisationQueue
 {
+    event EventHandler<MaterialisationLifecycleEvent>? LifecycleChanged;
     void EnqueueUser(Guid jellyfinItemId, MaterialiseTrigger trigger);
     void EnqueueEager(Guid jellyfinItemId);
     int PendingUserCount { get; }
@@ -71,8 +72,23 @@ public sealed class MaterialisationQueue : IMaterialisationQueue, IHostedService
         });
     }
 
+    public event EventHandler<MaterialisationLifecycleEvent>? LifecycleChanged;
+
     public int PendingUserCount => _userLane.Reader.Count;
     public int PendingEagerCount => _eagerLane.Reader.Count;
+
+    private void FireQueued(Guid id)
+    {
+        try
+        {
+            LifecycleChanged?.Invoke(this, new MaterialisationLifecycleEvent(
+                id, MaterialisationLifecyclePhase.Queued, null));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "LifecycleChanged handler threw for {Id} (Queued)", id);
+        }
+    }
 
     public void EnqueueUser(Guid id, MaterialiseTrigger trigger)
     {
@@ -87,7 +103,10 @@ public sealed class MaterialisationQueue : IMaterialisationQueue, IHostedService
         {
             _logger.LogWarning("User lane full; dropping enqueue for {Id}", id);
             _inFlight.TryRemove(id, out _);
+            return;
         }
+
+        FireQueued(id);
     }
 
     public void EnqueueEager(Guid id)
@@ -102,7 +121,10 @@ public sealed class MaterialisationQueue : IMaterialisationQueue, IHostedService
         {
             _logger.LogDebug("Eager lane full; dropping enqueue for {Id}", id);
             _inFlight.TryRemove(id, out _);
+            return;
         }
+
+        FireQueued(id);
     }
 
     public Task StartAsync(CancellationToken cancellationToken)

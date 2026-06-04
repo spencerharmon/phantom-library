@@ -51,6 +51,7 @@ public sealed record PhantomItemRow
     public required DateTimeOffset FirstSeen { get; init; }
     public required DateTimeOffset LastTouched { get; init; }
     public bool EvictionProtected { get; init; }
+    public string? OriginalOverview { get; init; }
 }
 
 /// <summary>
@@ -114,6 +115,8 @@ public sealed class PhantomDb : IDisposable
         return conn;
     }
 
+    private const int CurrentSchemaVersion = 2;
+
     private static void EnsureSchema(SqliteConnection conn)
     {
         using (var pragma = conn.CreateCommand())
@@ -129,23 +132,35 @@ public sealed class PhantomDb : IDisposable
             version = Convert.ToInt32(v.ExecuteScalar() ?? 0, System.Globalization.CultureInfo.InvariantCulture);
         }
 
-        if (version >= 1)
+        if (version >= CurrentSchemaVersion)
         {
             return;
         }
 
         using var tx = conn.BeginTransaction();
-        using (var cmd = conn.CreateCommand())
+
+        if (version < 1)
         {
+            using var cmd = conn.CreateCommand();
             cmd.Transaction = tx;
             cmd.CommandText = SchemaV1Sql;
+            cmd.ExecuteNonQuery();
+        }
+
+        if (version < 2)
+        {
+            // v2: add original_overview to phantom_items so PhantomStatusDecorator
+            // can round-trip the user-visible Overview after stamping its prefix.
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = "ALTER TABLE phantom_items ADD COLUMN original_overview TEXT;";
             cmd.ExecuteNonQuery();
         }
 
         using (var sv = conn.CreateCommand())
         {
             sv.Transaction = tx;
-            sv.CommandText = "PRAGMA user_version = 1;";
+            sv.CommandText = $"PRAGMA user_version = {CurrentSchemaVersion};";
             sv.ExecuteNonQuery();
         }
 
@@ -383,15 +398,16 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
             await using var conn = await OpenAsync(ct).ConfigureAwait(false);
             await using var cmd = conn.CreateCommand();
             cmd.CommandText = @"INSERT INTO phantom_items
-                (item_guid, tmdb_id, imdb_id, type, state, first_seen, last_touched, eviction_protected)
-                VALUES ($guid,$tmdb,$imdb,$type,$state,$first,$last,$prot)
+                (item_guid, tmdb_id, imdb_id, type, state, first_seen, last_touched, eviction_protected, original_overview)
+                VALUES ($guid,$tmdb,$imdb,$type,$state,$first,$last,$prot,$orig)
                 ON CONFLICT(item_guid) DO UPDATE SET
                     tmdb_id=excluded.tmdb_id,
                     imdb_id=excluded.imdb_id,
                     type=excluded.type,
                     state=excluded.state,
                     last_touched=excluded.last_touched,
-                    eviction_protected=excluded.eviction_protected;";
+                    eviction_protected=excluded.eviction_protected,
+                    original_overview=excluded.original_overview;";
             cmd.Parameters.AddWithValue("$guid", jellyfinItemId.ToString("N"));
             cmd.Parameters.AddWithValue("$tmdb", (object?)row.TmdbId ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$imdb", (object?)row.ImdbId ?? DBNull.Value);
@@ -400,6 +416,7 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
             cmd.Parameters.AddWithValue("$first", row.FirstSeen.ToUnixTimeSeconds());
             cmd.Parameters.AddWithValue("$last", row.LastTouched.ToUnixTimeSeconds());
             cmd.Parameters.AddWithValue("$prot", row.EvictionProtected ? 1 : 0);
+            cmd.Parameters.AddWithValue("$orig", (object?)row.OriginalOverview ?? DBNull.Value);
             await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
         finally
@@ -412,7 +429,7 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
     {
         await using var conn = await OpenAsync(ct).ConfigureAwait(false);
         await using var cmd = conn.CreateCommand();
-        cmd.CommandText = @"SELECT tmdb_id, imdb_id, type, state, first_seen, last_touched, eviction_protected
+        cmd.CommandText = @"SELECT tmdb_id, imdb_id, type, state, first_seen, last_touched, eviction_protected, original_overview
             FROM phantom_items WHERE item_guid=$guid LIMIT 1;";
         cmd.Parameters.AddWithValue("$guid", jellyfinItemId.ToString("N"));
         await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
@@ -430,7 +447,91 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
             FirstSeen = DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(4)),
             LastTouched = DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(5)),
             EvictionProtected = r.GetInt32(6) != 0,
+            OriginalOverview = r.IsDBNull(7) ? null : r.GetString(7),
         };
+    }
+
+    /// <summary>
+    /// Stores the unmodified Overview text for the item, leaving every
+    /// other column alone. Only writes on first call (when the existing
+    /// stored value is NULL) so that repeated invocations during the
+    /// materialising → ready transitions never overwrite the
+    /// genuinely-original copy with a previously-decorated one.
+    /// </summary>
+    public async Task<string?> RememberOriginalOverviewAsync(
+        Guid jellyfinItemId, string? overview, CancellationToken ct)
+    {
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using (var read = conn.CreateCommand())
+            {
+                read.CommandText = "SELECT original_overview FROM phantom_items WHERE item_guid=$guid LIMIT 1;";
+                read.Parameters.AddWithValue("$guid", jellyfinItemId.ToString("N"));
+                var existing = await read.ExecuteScalarAsync(ct).ConfigureAwait(false);
+                if (existing is not null && existing is not DBNull)
+                {
+                    return (string)existing;
+                }
+            }
+
+            // Either no row, or row with NULL original_overview. Upsert.
+            await using (var write = conn.CreateCommand())
+            {
+                write.CommandText = @"INSERT INTO phantom_items
+                    (item_guid, tmdb_id, imdb_id, type, state, first_seen, last_touched, eviction_protected, original_overview)
+                    VALUES ($guid, NULL, NULL, 'unknown', 'Virtual', $now, $now, 0, $orig)
+                    ON CONFLICT(item_guid) DO UPDATE SET
+                        original_overview = COALESCE(phantom_items.original_overview, excluded.original_overview);";
+                write.Parameters.AddWithValue("$guid", jellyfinItemId.ToString("N"));
+                write.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+                write.Parameters.AddWithValue("$orig", (object?)overview ?? DBNull.Value);
+                await write.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            }
+
+            return overview;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Returns the stored original overview (if any) and clears it from
+    /// the row in the same transaction — used when the decorator restores
+    /// the user-visible Overview after a Finished phase.
+    /// </summary>
+    public async Task<string?> TakeOriginalOverviewAsync(Guid jellyfinItemId, CancellationToken ct)
+    {
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            string? value;
+            await using (var read = conn.CreateCommand())
+            {
+                read.CommandText = "SELECT original_overview FROM phantom_items WHERE item_guid=$guid LIMIT 1;";
+                read.Parameters.AddWithValue("$guid", jellyfinItemId.ToString("N"));
+                var existing = await read.ExecuteScalarAsync(ct).ConfigureAwait(false);
+                value = existing is null or DBNull ? null : (string)existing;
+            }
+
+            if (value is not null)
+            {
+                await using var clear = conn.CreateCommand();
+                clear.CommandText = "UPDATE phantom_items SET original_overview = NULL WHERE item_guid=$guid;";
+                clear.Parameters.AddWithValue("$guid", jellyfinItemId.ToString("N"));
+                await clear.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            }
+
+            return value;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     // ---- user_prefs / autopilot_state: M7/M8 ----

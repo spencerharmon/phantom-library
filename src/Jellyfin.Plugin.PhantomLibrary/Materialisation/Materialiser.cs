@@ -72,7 +72,37 @@ public sealed class Materialiser : IMaterialiser
         _configProvider = configProvider;
     }
 
+    public event EventHandler<MaterialisationLifecycleEvent>? LifecycleChanged;
+
+    private void Fire(Guid id, MaterialisationLifecyclePhase phase, MaterialisationOutcome? outcome = null)
+    {
+        try
+        {
+            LifecycleChanged?.Invoke(this, new MaterialisationLifecycleEvent(id, phase, outcome));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "LifecycleChanged handler threw for {Id} phase {Phase}", id, phase);
+        }
+    }
+
     public async Task<MaterialisationOutcome> MaterialiseAsync(
+        Guid jellyfinItemId, MaterialiseTrigger trigger, CancellationToken ct)
+    {
+        Fire(jellyfinItemId, MaterialisationLifecyclePhase.Started);
+        MaterialisationOutcome? outcome = null;
+        try
+        {
+            outcome = await MaterialiseCoreAsync(jellyfinItemId, trigger, ct).ConfigureAwait(false);
+            return outcome;
+        }
+        finally
+        {
+            Fire(jellyfinItemId, MaterialisationLifecyclePhase.Finished, outcome);
+        }
+    }
+
+    private async Task<MaterialisationOutcome> MaterialiseCoreAsync(
         Guid jellyfinItemId, MaterialiseTrigger trigger, CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();

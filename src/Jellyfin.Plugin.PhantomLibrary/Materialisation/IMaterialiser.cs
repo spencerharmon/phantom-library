@@ -25,8 +25,22 @@ public sealed record MaterialisationOutcome
     public string? Error { get; init; }
 }
 
+public enum MaterialisationLifecyclePhase
+{
+    Queued,
+    Started,
+    Finished,
+}
+
+public sealed record MaterialisationLifecycleEvent(
+    System.Guid ItemId,
+    MaterialisationLifecyclePhase Phase,
+    MaterialisationOutcome? Outcome);
+
 public interface IMaterialiser
 {
+    event System.EventHandler<MaterialisationLifecycleEvent>? LifecycleChanged;
+
     System.Threading.Tasks.Task<MaterialisationOutcome> MaterialiseAsync(
         System.Guid jellyfinItemId,
         MaterialiseTrigger trigger,

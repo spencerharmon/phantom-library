@@ -95,4 +95,128 @@ public class PhantomDbTests : IDisposable
         Assert.Equal(PhantomItemState.Virtual, r!.State);
         Assert.Equal("tt1", r.ImdbId);
     }
+
+    [Fact]
+    public async Task OriginalOverview_RememberThenTake_RoundTrips()
+    {
+        var id = Guid.NewGuid();
+        var remembered = await _db.RememberOriginalOverviewAsync(id, "original text", default);
+        Assert.Equal("original text", remembered);
+
+        // Re-remember must NOT clobber the first stored value.
+        var second = await _db.RememberOriginalOverviewAsync(id, "[materialising…] original text", default);
+        Assert.Equal("original text", second);
+
+        var taken = await _db.TakeOriginalOverviewAsync(id, default);
+        Assert.Equal("original text", taken);
+
+        // After Take, the column is cleared.
+        var takenAgain = await _db.TakeOriginalOverviewAsync(id, default);
+        Assert.Null(takenAgain);
+    }
+
+    [Fact]
+    public async Task V1_To_V2_Migration_Preserves_Data_And_Adds_Column()
+    {
+        var p = Path.Combine(Path.GetTempPath(), "phantommig_" + Guid.NewGuid().ToString("N") + ".db");
+        try
+        {
+            // Build a v1 database by hand: schema matches the original
+            // SchemaV1Sql; user_version = 1; no original_overview column.
+            using (var conn = new Microsoft.Data.Sqlite.SqliteConnection(
+                       new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder
+                       {
+                           DataSource = p,
+                           Mode = Microsoft.Data.Sqlite.SqliteOpenMode.ReadWriteCreate,
+                       }.ToString()))
+            {
+                conn.Open();
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = @"CREATE TABLE phantom_items (
+                        item_guid TEXT PRIMARY KEY,
+                        tmdb_id INTEGER,
+                        imdb_id TEXT,
+                        type TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        first_seen INTEGER NOT NULL,
+                        last_touched INTEGER NOT NULL,
+                        eviction_protected INTEGER NOT NULL DEFAULT 0
+                    );";
+                    cmd.ExecuteNonQuery();
+                }
+
+                var id = Guid.NewGuid();
+                using (var ins = conn.CreateCommand())
+                {
+                    ins.CommandText = @"INSERT INTO phantom_items
+                        (item_guid, tmdb_id, imdb_id, type, state, first_seen, last_touched, eviction_protected)
+                        VALUES ($g, 42, 'tt42', 'movie', 'Virtual', 1000, 2000, 0);";
+                    ins.Parameters.AddWithValue("$g", id.ToString("N"));
+                    ins.ExecuteNonQuery();
+                }
+
+                using (var sv = conn.CreateCommand())
+                {
+                    sv.CommandText = "PRAGMA user_version = 1;";
+                    sv.ExecuteNonQuery();
+                }
+
+                Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            }
+
+            // Open through PhantomDb — should auto-migrate to v2.
+            using var db = new PhantomDb(p);
+            // Touch the DB so EnsureSchema runs.
+            var entry = await db.GetPhantomItemAsync(Guid.NewGuid(), default);
+            Assert.Null(entry); // missing row, but migration must not have thrown
+
+            // Verify migration: user_version=2 and column exists.
+            using var verify = new Microsoft.Data.Sqlite.SqliteConnection(
+                new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder
+                {
+                    DataSource = p,
+                    Mode = Microsoft.Data.Sqlite.SqliteOpenMode.ReadWrite,
+                }.ToString());
+            verify.Open();
+            using (var vc = verify.CreateCommand())
+            {
+                vc.CommandText = "PRAGMA user_version;";
+                Assert.Equal(2L, Convert.ToInt64(vc.ExecuteScalar(),
+                    System.Globalization.CultureInfo.InvariantCulture));
+            }
+
+            using (var cols = verify.CreateCommand())
+            {
+                cols.CommandText = "PRAGMA table_info(phantom_items);";
+                using var r = cols.ExecuteReader();
+                var found = false;
+                while (r.Read())
+                {
+                    if (string.Equals(r.GetString(1), "original_overview", StringComparison.Ordinal))
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+
+                Assert.True(found, "original_overview column not added by migration");
+            }
+
+            // Existing row preserved with imdb='tt42'.
+            using (var sel = verify.CreateCommand())
+            {
+                sel.CommandText = "SELECT imdb_id, original_overview FROM phantom_items LIMIT 1;";
+                using var r = sel.ExecuteReader();
+                Assert.True(r.Read());
+                Assert.Equal("tt42", r.GetString(0));
+                Assert.True(r.IsDBNull(1));
+            }
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            try { File.Delete(p); File.Delete(p + "-wal"); File.Delete(p + "-shm"); } catch { }
+        }
+    }
 }

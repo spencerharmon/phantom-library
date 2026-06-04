@@ -2,9 +2,11 @@ using System;
 using System.IO;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
 using Jellyfin.Plugin.PhantomLibrary.Materialisation;
+using Jellyfin.Plugin.PhantomLibrary.Playback;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller;
+using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Plugins;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -71,5 +73,12 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         serviceCollection.AddHostedService(sp => sp.GetRequiredService<MaterialisationQueue>());
         serviceCollection.AddHostedService<EagerResolver>();
         serviceCollection.AddHostedService<UserDataSavedListener>();
+
+        // Playback / splash
+        serviceCollection.AddSingleton<PhantomMediaSourceProvider>();
+        serviceCollection.AddSingleton<IMediaSourceProvider>(
+            sp => sp.GetRequiredService<PhantomMediaSourceProvider>());
+        serviceCollection.AddSingleton<PhantomStatusDecorator>();
+        serviceCollection.AddHostedService(sp => sp.GetRequiredService<PhantomStatusDecorator>());
     }
 }
