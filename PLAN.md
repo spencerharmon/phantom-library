@@ -16,8 +16,11 @@ Mascot: *Stygiomedusa gigantea*, the giant phantom jelly.
 Previous open questions have been answered. Recorded here so future
 contributors can see the rationale.
 
-0. **Target Jellyfin version.** 10.10.x. Plugin compiles against the
-   10.10 plugin ABI; older servers are not supported.
+0. **Target Jellyfin version.** 10.11.x (initially planned for
+   10.10.x; bumped during M4 verification when the operator's running
+   instance turned out to be 10.11.9, which moved the plugin ABI to
+   net9.0). Plugin compiles against the 10.11 plugin ABI; older
+   servers are not supported.
 0a. **gostream tree handling.** Not vendored. The upstream fork is
     checked out alongside this repo for development convenience and
     `.gitignore`d. Patches are committed to the fork and PR'd upstream;

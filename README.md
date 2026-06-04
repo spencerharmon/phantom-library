@@ -41,7 +41,7 @@ holds bytes for content somebody actually interacts with.
 
 ## Requirements
 
-- Jellyfin **10.10.x**
+- Jellyfin **10.11.x** (current target — built against 10.11.9)
 - gostream with the `POST /api/library/add` patch applied (see
   [primary patch](https://github.com/spencerharmon/gostream/tree/phantom-library/api-add))
 - TMDB v3 API key
@@ -72,7 +72,7 @@ cd phantom-library
 dotnet build src/Jellyfin.Plugin.PhantomLibrary -c Release
 ```
 
-Output: `src/Jellyfin.Plugin.PhantomLibrary/bin/Release/net8.0/Jellyfin.Plugin.PhantomLibrary.dll`.
+Output: `src/Jellyfin.Plugin.PhantomLibrary/bin/Release/net9.0/Jellyfin.Plugin.PhantomLibrary.dll`.
 
 Drop the DLL into `<jellyfin-data>/plugins/Jellyfin.Plugin.PhantomLibrary_<ver>/`
 and restart Jellyfin to side-load.

@@ -19,3 +19,4 @@ artifacts/
 # local secrets / config
 *.local.json
 appsettings.Development.json
+/.cave/
