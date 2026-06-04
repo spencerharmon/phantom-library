@@ -65,9 +65,9 @@
                         <div class="selectContainer">
                             <label class="selectLabel" for="QualityPreset">Preset</label>
                             <select id="QualityPreset" name="QualityPreset" is="emby-select">
-                                <option value="0">gostream default (4K DV &gt; HDR10+ &gt; HDR &gt; 4K &gt; 1080p REMUX &gt; 1080p)</option>
-                                <option value="1">Biggest .mkv, most seeders</option>
-                                <option value="2">Custom</option>
+                                <option value="GostreamDefault">gostream default (4K DV &gt; HDR10+ &gt; HDR &gt; 4K &gt; 1080p REMUX &gt; 1080p)</option>
+                                <option value="BiggestMostSeeded">Biggest .mkv, most seeders</option>
+                                <option value="Custom">Custom</option>
                             </select>
                         </div>
                         <div class="inputContainer">
@@ -147,9 +147,9 @@
                         <div class="selectContainer">
                             <label class="selectLabel" for="PhantomBadgeVisibility">Phantom badge visibility</label>
                             <select id="PhantomBadgeVisibility" name="PhantomBadgeVisibility" is="emby-select">
-                                <option value="0">Always show</option>
-                                <option value="1">Hide for non-admins</option>
-                                <option value="2">Off</option>
+                                <option value="AlwaysShow">Always show</option>
+                                <option value="HideForNonAdmins">Hide for non-admins</option>
+                                <option value="Off">Off</option>
                             </select>
                         </div>
                         <div class="inputContainer">
@@ -182,7 +182,7 @@
                             document.querySelector('#ProwlarrBaseUrl').value = cfg.ProwlarrBaseUrl || '';
                             document.querySelector('#ProwlarrApiKey').value = cfg.ProwlarrApiKey || '';
                             document.querySelector('#TorrentioBaseUrl').value = cfg.TorrentioBaseUrl || '';
-                            document.querySelector('#QualityPreset').value = String(cfg.QualityPreset || 0);
+                            document.querySelector('#QualityPreset').value = cfg.QualityPreset || 'GostreamDefault';
                             document.querySelector('#MinSeeders').value = cfg.MinSeeders;
                             document.querySelector('#MinSizeGb1080p').value = cfg.MinSizeGb1080p;
                             document.querySelector('#MinSizeGb4K').value = cfg.MinSizeGb4K;
@@ -196,7 +196,7 @@
                             document.querySelector('#EagerResolveMaxConcurrent').value = cfg.EagerResolveMaxConcurrent;
                             document.querySelector('#SeriesAutopilotEnabled').checked = !!cfg.SeriesAutopilotEnabled;
                             document.querySelector('#SeriesAutopilotPrefetchEpisodes').value = cfg.SeriesAutopilotPrefetchEpisodes;
-                            document.querySelector('#PhantomBadgeVisibility').value = String(cfg.PhantomBadgeVisibility || 0);
+                            document.querySelector('#PhantomBadgeVisibility').value = cfg.PhantomBadgeVisibility || 'AlwaysShow';
                             document.querySelector('#SplashLoopAssetPath').value = cfg.SplashLoopAssetPath || '';
                             Dashboard.hideLoadingMsg();
                         });
@@ -213,7 +213,7 @@
                             cfg.ProwlarrBaseUrl = document.querySelector('#ProwlarrBaseUrl').value;
                             cfg.ProwlarrApiKey = document.querySelector('#ProwlarrApiKey').value;
                             cfg.TorrentioBaseUrl = document.querySelector('#TorrentioBaseUrl').value;
-                            cfg.QualityPreset = parseInt(document.querySelector('#QualityPreset').value, 10);
+                            cfg.QualityPreset = document.querySelector('#QualityPreset').value;
                             cfg.MinSeeders = parseInt(document.querySelector('#MinSeeders').value, 10);
                             cfg.MinSizeGb1080p = parseInt(document.querySelector('#MinSizeGb1080p').value, 10);
                             cfg.MinSizeGb4K = parseInt(document.querySelector('#MinSizeGb4K').value, 10);
@@ -227,7 +227,7 @@
                             cfg.EagerResolveMaxConcurrent = parseInt(document.querySelector('#EagerResolveMaxConcurrent').value, 10);
                             cfg.SeriesAutopilotEnabled = document.querySelector('#SeriesAutopilotEnabled').checked;
                             cfg.SeriesAutopilotPrefetchEpisodes = parseInt(document.querySelector('#SeriesAutopilotPrefetchEpisodes').value, 10);
-                            cfg.PhantomBadgeVisibility = parseInt(document.querySelector('#PhantomBadgeVisibility').value, 10);
+                            cfg.PhantomBadgeVisibility = document.querySelector('#PhantomBadgeVisibility').value;
                             cfg.SplashLoopAssetPath = document.querySelector('#SplashLoopAssetPath').value;
                             ApiClient.updatePluginConfiguration(PluginId, cfg).then(function (r) {
                                 Dashboard.processPluginConfigurationUpdateResult(r);
