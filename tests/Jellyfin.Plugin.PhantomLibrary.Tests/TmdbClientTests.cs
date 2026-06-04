@@ -1,0 +1,158 @@
+using System;
+using System.Net;
+using System.Net.Http;
+using System.Threading;
+using System.Threading.Tasks;
+using Jellyfin.Plugin.PhantomLibrary.Clients;
+using Xunit;
+
+namespace Jellyfin.Plugin.PhantomLibrary.Tests;
+
+public class TmdbClientTests
+{
+    private const string SearchMoviesPayload = """
+    {
+      "page": 1,
+      "results": [
+        {
+          "id": 603,
+          "title": "The Matrix",
+          "original_title": "The Matrix",
+          "overview": "A computer hacker learns...",
+          "poster_path": "/p96dm7sCMn4VYAStA6siNz30G1r.jpg",
+          "backdrop_path": "/fNG7i7RqMErkcqhohV2a6cV1Ehy.jpg",
+          "release_date": "1999-03-30",
+          "vote_average": 8.2,
+          "vote_count": 24000
+        },
+        {
+          "id": 605,
+          "title": "The Matrix Revolutions",
+          "release_date": "2003-11-05",
+          "vote_average": 6.7,
+          "vote_count": 8000
+        }
+      ],
+      "total_pages": 1,
+      "total_results": 2
+    }
+    """;
+
+    private const string MovieDetailsPayload = """
+    {
+      "id": 603,
+      "title": "The Matrix",
+      "original_title": "The Matrix",
+      "overview": "Hacker fights machines.",
+      "poster_path": "/x.jpg",
+      "release_date": "1999-03-30",
+      "vote_average": 8.2,
+      "vote_count": 24000,
+      "runtime": 136,
+      "genres": [{"id":28,"name":"Action"},{"id":878,"name":"Science Fiction"}],
+      "status": "Released",
+      "tagline": "Welcome to the Real World.",
+      "imdb_id": "tt0133093",
+      "budget": 63000000,
+      "revenue": 463517383,
+      "external_ids": { "imdb_id": "tt0133093" }
+    }
+    """;
+
+    private static TmdbClient Build(QueuedHandler handler, string apiKey = "test-key")
+    {
+        var http = new HttpClient(handler) { BaseAddress = null };
+        return new TmdbClient(http, new StubKeyProvider(apiKey));
+    }
+
+    [Fact]
+    public async Task SearchMovies_ParsesResults()
+    {
+        var handler = new QueuedHandler().Enqueue(HttpStatusCode.OK, SearchMoviesPayload);
+        var client = Build(handler);
+
+        var hits = await client.SearchMoviesAsync("matrix", null, "en-US", CancellationToken.None);
+
+        Assert.Equal(2, hits.Count);
+        Assert.Equal(603, hits[0].Id);
+        Assert.Equal("The Matrix", hits[0].Title);
+        Assert.Equal("1999-03-30", hits[0].ReleaseDate);
+        Assert.Equal(8.2, hits[0].VoteAverage);
+        Assert.Single(handler.Requests);
+        var url = handler.Requests[0].RequestUri!.ToString();
+        Assert.Contains("search/movie", url, StringComparison.Ordinal);
+        Assert.Contains("api_key=test-key", url, StringComparison.Ordinal);
+        Assert.Contains("query=matrix", url, StringComparison.Ordinal);
+        Assert.Contains("language=en-US", url, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetMovie_ParsesDetailsAndExternalIds()
+    {
+        var handler = new QueuedHandler().Enqueue(HttpStatusCode.OK, MovieDetailsPayload);
+        var client = Build(handler);
+
+        var movie = await client.GetMovieAsync(603, "en-US", CancellationToken.None);
+
+        Assert.NotNull(movie);
+        Assert.Equal(603, movie!.Id);
+        Assert.Equal("tt0133093", movie.ImdbId);
+        Assert.Equal(136, movie.Runtime);
+        Assert.Contains("Action", movie.Genres);
+        Assert.Contains("Science Fiction", movie.Genres);
+        Assert.Equal("Released", movie.Status);
+        Assert.Equal("Welcome to the Real World.", movie.Tagline);
+        var url = handler.Requests[0].RequestUri!.ToString();
+        Assert.Contains("append_to_response=external_ids", url, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task MissingApiKey_Throws()
+    {
+        var handler = new QueuedHandler();
+        var client = Build(handler, apiKey: "");
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => client.SearchMoviesAsync("matrix", null, null, CancellationToken.None));
+        Assert.Contains("TMDB API key", ex.Message, StringComparison.Ordinal);
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public async Task RateLimit_RetriesOnce()
+    {
+        var handler = new QueuedHandler()
+            .Enqueue(HttpStatusCode.TooManyRequests, null, msg =>
+            {
+                msg.Headers.TryAddWithoutValidation("Retry-After", "1");
+            })
+            .Enqueue(HttpStatusCode.OK, SearchMoviesPayload);
+        var client = Build(handler);
+
+        var hits = await client.SearchMoviesAsync("matrix", null, null, CancellationToken.None);
+
+        Assert.Equal(2, hits.Count);
+        Assert.Equal(2, handler.Requests.Count);
+    }
+
+    [Fact]
+    public async Task GetMovie_404_ReturnsNull()
+    {
+        var handler = new QueuedHandler().Enqueue(HttpStatusCode.NotFound, """{"status_message":"not found"}""");
+        var client = Build(handler);
+
+        var movie = await client.GetMovieAsync(99999999, null, CancellationToken.None);
+
+        Assert.Null(movie);
+    }
+
+    [Fact]
+    public async Task UnexpectedError_ThrowsTmdbApiException()
+    {
+        var handler = new QueuedHandler().Enqueue(HttpStatusCode.InternalServerError, """{"err":"boom"}""");
+        var client = Build(handler);
+
+        await Assert.ThrowsAsync<TmdbApiException>(
+            () => client.SearchMoviesAsync("x", null, null, CancellationToken.None));
+    }
+}
