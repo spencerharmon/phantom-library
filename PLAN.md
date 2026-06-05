@@ -25,6 +25,7 @@ Mascot: *Stygiomedusa gigantea*, the giant phantom jelly.
 | M7 — Eviction + favourite-driven persistence | ✅ | `3377add` |
 | M8 — TV series + autopilot                   | ✅ | `60de538` |
 | M9 — Packaging + release polish              | ✅ | M9 release commit (this change) |
+| M10 — Phantom symlink library + visibility fix | 🚧 in progress | — |
 
 ### Documented partials
 
@@ -822,6 +823,450 @@ meaningful, but the API patch (M1) does not depend on it.
 - `manifest.json` repo published via GitHub Pages.
 - README, install instructions, troubleshooting, mascot artwork.
 - Initial release tagged `v0.1.0`.
+
+### M10 — Phantom symlink library + visibility fix (≤ 3 days)
+
+v0.1 shipped with phantom / virtual items that have `Path = null`
+and `IsVirtualItem = true`. **Jellyfin's library scanner culls
+such items from user-facing browse**, so the Suggestions feature
+created `BaseItem` rows that never appeared in the UI. The plan
+below restores visibility without changing the architectural
+contract with gostream.
+
+Full diagnostic transcript is preserved in the testing session
+logs; the short version of what we proved in the rig:
+
+1. `Path = null` (Virtual) → row exists, browse omits it.
+2. `Path = <file that doesn't exist>` → scanner culls the row on
+   next pass.
+3. `Path = <real shared file>` (N items, same Path) → scanner
+   keeps **one** winner, culls the rest. Jellyfin's library
+   scanner reconciles `<root>/<file>` ↔ `BaseItems.Path` 1:1.
+4. `Path = <unique-per-item file>` → row appears in browse,
+   survives rescans, plays via existing `PhantomMediaSourceProvider`.
+5. gostream's FUSE mount (`/var/gostream/gostream-mkv-virtual/...`)
+   is **read-only** to non-root processes (verified `EROFS` on
+   `touch` as `spencer`; the plugin running as `jellyfin` has the
+   same problem). The plugin cannot drop stubs into the FUSE dir.
+6. gostream's underlying source dir
+   (`/var/gostream/gostream-mkv-real/movies/`) is owned by `root`.
+   Not writable by the `jellyfin` user. Same outcome.
+7. **Symlinks satisfy the scanner** when each symlink path is
+   unique, even if every symlink points at the same inode.
+   Verified end-to-end: 5 symlinks → 5 BaseItem rows → all 5
+   visible in browse → materialise of one item leaves the other 4
+   intact.
+
+Design choice: **one plugin-owned writable directory of
+unique-named symlinks, all pointing at one shared splash file**.
+Filenames carry a `__phantom_tmdb<id>` sentinel so cleanup,
+gostream-collision-prevention, and human inspection are
+first-class operations.
+
+The operator additionally requires that phantoms appear **inside
+the existing `gostream-movies` / `gostream-shows` libraries**
+(not as separate `Phantom Movies` siblings). Side-by-side
+browsing of phantom and materialised items is part of the v0.1
+UX. This forces multi-path support on the existing
+`CollectionFolder`, which exposes a Jellyfin bug — see
+[§ Jellyfin upstream issue](#jellyfin-upstream-issue-deferred)
+below.
+
+#### Filesystem layout
+
+Plugin-owned writable root, configurable via
+`PluginConfiguration.PhantomStubRoot`, default
+`/var/lib/jellyfin/phantom-library/`:
+
+```
+/var/lib/jellyfin/phantom-library/
+├── movies/
+│   ├── Backrooms__phantom_tmdb1100782.mp4        -> <splash>
+│   ├── Toy_Story_5__phantom_tmdb748783.mp4       -> <splash>
+│   └── ...
+└── shows/
+    ├── Severance__phantom_tmdb95396.mp4          -> <splash>
+    └── ...
+```
+
+Each symlink targets the same `splash.mp4` extracted by
+`SplashStream.GetLocalPathAsync` into
+`<cache>/PhantomLibrary/splash.mp4`. Disk cost is one splash
+file (~100 KB today; can be replaced with a 1-frame MKV stub of
+~10 KB without UX change because `PhantomMediaSourceProvider`
+overrides playback at the MediaSource layer).
+
+The phantom directory is registered as an **additional path on
+the existing `gostream-movies` / `gostream-shows`
+CollectionFolders**, not as a separate library. Single browse
+view shows phantoms intermixed with materialised items.
+
+**Operator install step** (one-time, documented in README):
+
+```bash
+sudo mkdir -p /var/lib/jellyfin/phantom-library/{movies,shows}
+sudo chown -R jellyfin:jellyfin /var/lib/jellyfin/phantom-library
+```
+
+Plugin verifies writability on startup; refuses to bootstrap
+phantoms if missing/unwritable, with a clear error pointing at
+these exact paths.
+
+#### Filename scheme
+
+```
+<safe_title>__phantom_tmdb<id>.<ext>
+```
+
+- `safe_title` = title with `[^A-Za-z0-9_]` → `_`, collapsed
+  runs, trimmed.
+- `__phantom_tmdb<id>` is the sentinel. Double underscore is
+  deliberate — gostream's slugger uses single underscores, and
+  the literal `phantom_tmdb<digits>` triple-marker is impossible
+  to collide with a real release name.
+- `<ext>` matches the splash file's extension (`.mp4` today).
+  Must be a Jellyfin-recognised video extension or the scanner
+  ignores the file.
+- TV series use the same scheme at the Series level; episodes
+  inherit the series directory and are episode-level symlinks
+  with `__phantom_tmdb<series_id>_s<NN>e<NN>` naming.
+
+Cleanup is a one-liner: `find /var/lib/jellyfin/phantom-library
+-name '*__phantom_tmdb*' -delete`.
+
+#### Plugin components (new and changed)
+
+- **New: `Library/PhantomStubManager.cs`** — owns the
+  filesystem side.
+  - `Task<string> CreateAsync(BaseItem item, MediaKind kind, CancellationToken ct)`
+    derives the filename, creates the symlink via
+    `File.CreateSymbolicLink`, returns the absolute path.
+    Idempotent: if symlink exists pointing at the splash, returns
+    its path without creating a new one.
+  - `Task DeleteAsync(string path, CancellationToken ct)` —
+    swallows `FileNotFound`, throws on other I/O.
+  - `Task BootstrapAsync(CancellationToken ct)` — verifies the
+    root + per-kind subdirs exist and are writable, ensures the
+    splash file is extracted, returns when ready or throws with a
+    clear actionable message if the operator forgot the
+    `mkdir`/`chown`.
+  - `string DeriveFilename(string title, int tmdbId, MediaKind kind)` —
+    deterministic, pure, unit-testable. Same inputs always
+    produce the same name so re-runs of Suggestions don't
+    duplicate symlinks.
+
+- **New: `Library/PhantomCollectionFolderBinder.cs`** — owns the
+  CollectionFolder side. Runs once at plugin startup (and again
+  on config change):
+  1. Look up the operator-configured target libraries
+     (`PluginConfiguration.PhantomMoviesLibraryName` /
+     `PhantomShowsLibraryName`, default `gostream-movies` /
+     `gostream-shows`).
+  2. For each, call `ILibraryManager.AddMediaPath(libraryName,
+     new MediaPathInfo(phantomDir))` if our phantom dir is not
+     already in the library's `PathInfos`. Wrap in `try/catch`;
+     duplicate-add is a no-op.
+  3. Trigger a top-level validation
+     (`((LibraryManager)libraryManager).ValidateTopLibraryFolders(ct, removeRoot: false)`)
+     so the new physical folder gets a `BaseItems` row.
+  4. Apply the **upstream-bug workaround** documented below.
+  5. Log the resulting `cf.PhysicalLocationsList` and
+     `cf.PhysicalFolderIds` for operator visibility.
+
+  The binder is idempotent. On every plugin startup it checks the
+  current binding and only acts if our phantom dir is missing
+  from `PhysicalLocationsList`. Once the upstream Jellyfin fix
+  lands (see deferral note), this binder becomes a near-no-op:
+  `AddMediaPath` will set the fields correctly and our check will
+  match on the first restart.
+
+- **Changed: `Library/SuggestionsContributor.cs`** — after
+  `VirtualItemFactory.CreateVirtualMovie`/`Series`:
+  ```csharp
+  var stubPath = await _stubs.CreateAsync(item, MediaKind.Movie, ct);
+  item.Path = stubPath;
+  item.IsVirtualItem = true;          // visual badge only; scanner ignores when locked
+  item.IsLocked = true;               // ← REQUIRED: prevents scanner-driven rename/refetch
+  parent.AddChild(item);
+  ```
+  `IsLocked = true` is mandatory. Without it the scanner reads
+  the filename stem, fuzzy-matches against TMDB, and renames the
+  item — verified in the rig: `Backrooms__phantom_tmdb1100782`
+  got renamed to `Backrooms.Enderman`. Locked items skip the
+  metadata-provider pipeline.
+
+- **Changed: `Library/SeriesIngestor.cs`** — same pattern for
+  Series-level rows. Episode-level rows are emitted lazily by the
+  autopilot on materialise, so episodes don't get phantom
+  symlinks; only series do.
+
+- **Changed: `Materialisation/Materialiser.cs`**
+  (`PromoteItemAsync`) — after the existing `item.Path = fusePath`
+  + `UpdateItemAsync`, call `_stubs.DeleteAsync(oldStubPath, ct)`.
+  Order matters: update item first (UserData stays attached to
+  the same BaseItem.Id), then delete the symlink. If we delete
+  first and the in-process update fails mid-flight, a subsequent
+  scan would re-resurrect the BaseItem from the now-missing
+  symlink and create a duplicate. The `oldStubPath` is
+  re-derivable from `(tmdbId, title, kind)` via
+  `PhantomStubManager.DeriveFilename`, but for safety we also
+  persist it in `phantom_items.stub_path` (already exists) so
+  there is no ambiguity if title changed between create and
+  promote.
+
+- **Changed: `Materialisation/EvictionSweeper.cs`** — the
+  reverse direction. On eviction:
+  ```csharp
+  var newStub = await _stubs.CreateAsync(item, kind, ct);
+  item.Path = newStub;
+  item.IsVirtualItem = true;
+  item.IsLocked = true;
+  await _libraryManager.UpdateItemAsync(
+      item, item.GetParent(), ItemUpdateType.MetadataEdit, ct);
+  // gostream Remove/Unprestage as today
+  ```
+  No reparent — same library throughout the lifecycle.
+
+- **Changed: `Configuration/PluginConfiguration.cs`** — new
+  settings:
+  - `string PhantomStubRoot` (default
+    `/var/lib/jellyfin/phantom-library`).
+  - `string PhantomMoviesLibraryName` (default `gostream-movies`).
+  - `string PhantomShowsLibraryName` (default `gostream-shows`).
+  - All three exposed in `configPage.html`. Changing
+    `PhantomStubRoot` after first use does not automatically
+    migrate existing symlinks; documented as an admin-only knob
+    set once at install.
+
+- **Deleted: nothing.** `PhantomMediaSourceProvider` and the
+  splash extraction stay as-is. The phantom items now have a
+  `Path` set, but the provider still wins because items with
+  `IsVirtualItem = true` route through the
+  `IMediaSourceProvider` chain before the file path is opened
+  directly. Verified in M5 and unchanged.
+
+#### Jellyfin upstream issue (deferred)
+
+`POST /Library/VirtualFolders/Paths` (controller method
+`LibraryStructureController.AddMediaPath`,
+`Jellyfin.Api/Controllers/LibraryStructureController.cs` lines
+230-263) calls `_libraryManager.AddMediaPath(name, info)` and
+then queues a `ValidateMediaLibrary` scan. **It does not call
+`RefreshMetadata` on the affected `CollectionFolder`.** That is
+asymmetric with the sibling `RenameVirtualFolder` endpoint (same
+file, lines 195-198) which explicitly does
+`await child.RefreshMetadata(...)` after the mutation.
+
+Consequence: `CollectionFolder.PhysicalLocationsList` and
+`PhysicalFolderIds` (defined in
+`MediaBrowser.Controller/Entities/CollectionFolder.cs` lines
+63-67) are not refreshed. Browse queries resolve via
+`LibraryManager.GetTopParentIdsForQuery`
+(`Emby.Server.Implementations/Library/LibraryManager.cs` line
+~2068) which returns `collectionFolder.PhysicalFolderIds`
+directly. Items whose `TopParentId` is not in that list are
+invisible regardless of `ParentId`, mblinks, options.xml
+PathInfos, scan completion, or restart count.
+
+Reproducible on `master` (Jellyfin 12.0.0 in the in-tree clone
+at `./jellyfin/`, HEAD `1a2db53710`) and on `10.11.9`. Cold-start
++ full `ValidateMediaLibrary` + 142s scan duration +
+`/Items/{cf}/Refresh` with `MetadataRefreshMode=FullRefresh` all
+fail to update the persisted state. Direct patch of
+`BaseItems.Data` (the JSON blob of the CF's serialised state)
+followed by restart **does** restore browse, proving the code
+path works once the bytes are right — only the refresh-trigger
+is missing from `AddMediaPath`.
+
+**Plan: defer the upstream PR; ship the workaround now.**
+
+Rationale:
+
+- Even if upstream accepts in days, the fix lands in the next
+  Jellyfin minor release. Operators on current 10.11.x do not
+  benefit until they upgrade, which is 6–18 months typical lag.
+  Phantom Library v0.1 targets 10.11.x and forward.
+- The plugin workaround is small (~20 lines in
+  `PhantomCollectionFolderBinder`) and *idempotent*. It reads the
+  CollectionFolder's `PhysicalLocationsList`, appends our
+  phantom dir + the new physical folder Id if missing, and calls
+  `libraryManager.UpdateItemAsync(cf, cf.GetParent(),
+  ItemUpdateType.MetadataEdit, ct)`. When upstream fixes
+  `AddMediaPath`, our check sees the list already correct and
+  no-ops. No removal required when the fix lands.
+- Removing the workaround on a later Jellyfin version is its own
+  risk. The cost of leaving it in place is the cost of one
+  startup-time idempotent check.
+
+**Upstream PR (deferred work item — track separately, do not
+block v0.1.1)**:
+
+- Repository: `jellyfin/jellyfin`.
+- Branch base: `master` (12.0.0 in the in-tree clone).
+- Minimal diff (sketch — to be verified against current master):
+
+  ```csharp
+  // LibraryStructureController.AddMediaPath, replace the existing
+  // Task.Run finally block. Pattern is the same as the sibling
+  // RenameVirtualFolder method 35 lines above:
+  Task.Run(async () =>
+  {
+      if (refreshLibrary)
+      {
+          await _libraryManager.ValidateTopLibraryFolders(
+              CancellationToken.None, removeRoot: false)
+              .ConfigureAwait(false);
+          var lib = _libraryManager.GetUserRootFolder()
+              .Children.OfType<CollectionFolder>()
+              .FirstOrDefault(f => string.Equals(
+                  f.Name, mediaPathDto.Name,
+                  StringComparison.OrdinalIgnoreCase));
+          if (lib is not null)
+          {
+              _libraryManager.ClearIgnoreRuleCache();
+              foreach (var child in lib.GetPhysicalFolders())
+              {
+                  await child.RefreshMetadata(CancellationToken.None)
+                      .ConfigureAwait(false);
+                  await child.ValidateChildren(
+                      new Progress<double>(), CancellationToken.None)
+                      .ConfigureAwait(false);
+              }
+              await lib.RefreshMetadata(CancellationToken.None)
+                  .ConfigureAwait(false);   // ← the missing call
+          }
+          else
+          {
+              await _libraryManager.ValidateMediaLibrary(
+                  new Progress<double>(), CancellationToken.None)
+                  .ConfigureAwait(false);
+          }
+          _libraryManager.ClearIgnoreRuleCache();
+      }
+      else
+      {
+          await Task.Delay(1000).ConfigureAwait(false);
+          _libraryMonitor.Start();
+      }
+  });
+  ```
+
+- Bug report content (to be filed at
+  `github.com/jellyfin/jellyfin/issues`):
+  - Title: *AddMediaPath does not refresh CollectionFolder
+    binding; items in added path are invisible to browse*.
+  - Repro: cold-start Jellyfin → existing library with one path
+    → `POST /Library/VirtualFolders/Paths` adding a second path
+    → drop files in second path → `POST /Library/Refresh` and
+    wait → `GET /Users/{userId}/Items?ParentId=<libraryId>`
+    returns only items from path #1.
+  - Inspection: `SELECT Data FROM BaseItems WHERE Id =
+    '<libraryId>';` shows `PhysicalLocationsList` and
+    `PhysicalFolderIds` still reflect single-path state.
+  - Expected: `AddMediaPath` should refresh the CollectionFolder
+    the same way `RenameVirtualFolder` does (same controller, 35
+    lines above the bug).
+  - Workaround: described in this milestone.
+
+  File the issue. Do not block on its triage. Track the upstream
+  PR as a separate deferred item; revisit when the fix is in a
+  released Jellyfin version, then evaluate whether the plugin
+  workaround can be simplified or removed.
+
+#### Materialise loop, scan-free
+
+The materialise loop is **fully in-process**; no scan, no
+progress polling, no scheduled-task wait. Pattern (already in
+`Materialiser.PromoteItemAsync`, lines 416-432; M10 adds the
+stub-delete tail):
+
+```csharp
+item.Path = fusePath;
+isVirtualProp!.SetValue(item, false);
+await _libraryManager.UpdateItemAsync(
+    item, item.GetParent(), ItemUpdateType.MetadataImport, ct);
+await _stubs.DeleteAsync(oldStubPath, ct);
+```
+
+`UpdateItemAsync` invalidates the in-memory `BaseItem` cache
+and persists to SQLite in one transaction. Browse API reflects
+the change in milliseconds. BaseItem.Id is unchanged so UserData
+(favourites, watch progress) survives the transition
+automatically.
+
+Verified in the rig: SQL-update + immediate browse showed the
+cached old value (because raw SQL bypasses the in-memory layer);
+a single `/Items/{id}/Refresh` forced invalidation and browse
+returned the new path. The real plugin path through
+`UpdateItemAsync` does both atomically.
+
+#### Tests (new and updated)
+
+- **`PhantomStubManagerTests.cs`** (new) —
+  `DeriveFilename` purity and collision-resistance properties
+  (different tmdb_id → different filename; same inputs → same
+  filename; sentinel always present), symlink create/delete with
+  a tempdir, idempotency.
+- **`PhantomCollectionFolderBinderTests.cs`** (new) — binder
+  is idempotent (second call no-ops when binding already
+  correct), patches missing paths into
+  `cf.PhysicalLocationsList` / `PhysicalFolderIds`, throws a
+  clear error if the configured library name does not exist.
+  Uses a fake `ILibraryManager` and a fake `CollectionFolder`.
+- **`MaterialiserTests.cs`** (updated) — promotion deletes the
+  stub symlink after `UpdateItemAsync` succeeds, does not delete
+  if `UpdateItemAsync` throws, deletes even if the symlink
+  target file is missing.
+- **`EvictionSweeperTests.cs`** (updated) — eviction creates a
+  new stub and rebinds Path before any gostream removal call;
+  Path mutation precedes filesystem changes.
+- **Live integration**: full virtual-→-materialised-→-evicted-→-
+  virtual round-trip in the rig using the `/tmp/jf-test/m2.sh`
+  pattern (see `docs/agents/testing.md`). Confirms (a) phantom
+  shows up in `gostream-movies` browse, (b) materialise swaps
+  Path with no reparent, (c) UserData (favourite flag) survives,
+  (d) eviction restores the symlink, (e) re-materialise works.
+
+#### Operator-visible changes
+
+- Phantoms are now visible in `gostream-movies` and
+  `gostream-shows` libraries, intermixed with materialised
+  items. No new top-level library.
+- One new install step: create + chown the phantom-library dir.
+  Documented in README and surfaced as a clear startup error if
+  forgotten.
+- Three new admin config knobs (root path, two library names).
+  All have sane defaults; an operator running the standard
+  install never touches them.
+- Disk usage: ~few MB at most (one splash file + N symlink
+  entries at ~few-hundred bytes of inode each). Negligible.
+
+#### Done criteria
+
+1. Cold-start plugin against a clean rig with the standard
+   install steps → phantom-library dir exists, splash extracted,
+   `gostream-movies` library lists the phantom dir in its
+   `PhysicalLocationsList` after one startup cycle.
+2. Suggestions refresh creates N phantom rows → all N visible in
+   browse of `gostream-movies` within the same poll cycle (no
+   user-initiated scan needed).
+3. Phantom items survive a full library scan without renaming,
+   metadata mutation, or culling.
+4. Materialise one phantom → that item's row stays the same Id,
+   gets the new fuse path + IsVirtualItem=false, the old symlink
+   is gone from disk, browse reflects the change within ~1s, no
+   scan triggered.
+5. Evict one materialised item → row's Id unchanged, new stub
+   symlink created, Path points at it, IsVirtualItem=true,
+   gostream Remove/Unprestage called; browse reflects the
+   demotion within ~1s.
+6. Round-trip: virtual → materialise → favourite → evict-then-
+   restore (per favourite protection) ends with the row in the
+   correct state and UserData (favourite flag) intact.
+7. Unit tests green; live integration tests pass via the rig.
+8. Upstream bug report filed (referenced in CHANGELOG and PR
+   description). Upstream PR is **not** a blocker for tagging
+   v0.1.1.
 
 ---
 
