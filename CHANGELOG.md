@@ -24,10 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `LibraryStructureController.AddMediaPath` (does not refresh the
   `CollectionFolder`'s `PhysicalLocationsList` /
   `PhysicalFolderIds`); upstream PR tracked separately. The
-  workaround is best-effort: a metadata-saver race can revert the
-  patch on cold start (see PLAN §Documented partials), but a
-  background re-bind every 5 minutes recovers within one cycle
-  without operator intervention.
+  workaround is hardened against the Jellyfin metadata-saver
+  race via three layers (verify-from-repository loop,
+  `ItemUpdated` event watchdog, periodic re-bind every 5 min);
+  end-to-end verified that both `gostream-movies` and
+  `gostream-shows` bindings persist across multiple
+  metadata-refresh cycles.
 
 ## [0.1.0] - 2026-06-04
 
