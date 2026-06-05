@@ -59,7 +59,10 @@ public sealed class EagerResolver : IHostedService
         if (!_configProvider().EagerResolveEnabled) return;
         var item = e?.Item;
         if (item is null) return;
-        if (item is not Movie && item is not Series) return;
+        // Only Movies are eager-resolvable. Series are containers; the autopilot
+        // drives episode-level pre-resolution per playback context (M8). Enqueueing
+        // a Series here just spams 'Series-level materialisation not supported' logs.
+        if (item is not Movie) return;
         // Virtual items carry a null/empty Path; that is the case we want
         // to eager-resolve. Skip materialised items (Path set).
         if (!string.IsNullOrWhiteSpace(item.Path)) return;

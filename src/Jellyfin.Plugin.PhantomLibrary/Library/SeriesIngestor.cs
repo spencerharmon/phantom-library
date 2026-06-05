@@ -70,6 +70,8 @@ public sealed class SeriesIngestor : ISeriesIngestor
             $"phantom_series_{seriesTmdbId.ToString(CultureInfo.InvariantCulture)}", series.GetType());
 
         var parent = _root.ResolveSeriesParent() ?? _libraryManager.GetUserRootFolder();
+        // See SuggestionsContributor: SetParent before CreateItem so ParentId is wired.
+        if (parent is Folder pf) series.SetParent(pf);
         _libraryManager.CreateItem(series, parent);
 
         await _db.UpsertPhantomItemAsync(series.Id, new PhantomItemRow
@@ -173,6 +175,7 @@ public sealed class SeriesIngestor : ISeriesIngestor
             $"phantom_episode_{seriesDetails.Id.ToString(CultureInfo.InvariantCulture)}_{seasonDetails.SeasonNumber.ToString(CultureInfo.InvariantCulture)}_{episode.EpisodeNumber.ToString(CultureInfo.InvariantCulture)}",
             ep.GetType());
 
+        if (seasonItem is Folder sif) ep.SetParent(sif);
         _libraryManager.CreateItem(ep, seasonItem);
 
         await _db.UpsertPhantomItemAsync(ep.Id, new PhantomItemRow
@@ -209,6 +212,7 @@ public sealed class SeriesIngestor : ISeriesIngestor
             $"phantom_season_{seriesItem.Id:N}_{seasonNumber.ToString(CultureInfo.InvariantCulture)}",
             season.GetType());
 
+        if (seriesItem is Folder srf) season.SetParent(srf);
         _libraryManager.CreateItem(season, seriesItem);
         return season;
     }

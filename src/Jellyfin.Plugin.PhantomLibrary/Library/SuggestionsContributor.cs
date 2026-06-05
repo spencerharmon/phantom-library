@@ -307,6 +307,13 @@ public sealed class SuggestionsContributor : ISuggestionsContributor
 
             try
             {
+                // 10.11: ILibraryManager.CreateItem(item, parent) does NOT wire ParentId for
+                // Path-less Virtual items. SetParent + CreateItem ensures the in-memory parent
+                // pointer is set BEFORE persistence; CreateItem then writes the ParentId column.
+                if (parent is Folder parentFolder)
+                {
+                    newItem.SetParent(parentFolder);
+                }
                 _libraryManager.CreateItem(newItem, parent);
             }
             catch (Exception ex)
