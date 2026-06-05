@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Phantom Library mascot: Stygiomedusa gigantea, the giant phantom jelly.
+     Deep purple jelly with translucent bell on dark navy background.
+     Hand-written paths, ~256x256 viewBox. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <radialGradient id="bell" cx="50%" cy="40%" r="55%">
+      <stop offset="0%" stop-color="#7a3fb8" stop-opacity="0.95"/>
+      <stop offset="60%" stop-color="#3b1361" stop-opacity="0.85"/>
+      <stop offset="100%" stop-color="#1b0830" stop-opacity="0.55"/>
+    </radialGradient>
+    <linearGradient id="arm" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#3b1361" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#3b1361" stop-opacity="0.0"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="45%" r="40%">
+      <stop offset="0%" stop-color="#7a3fb8" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#7a3fb8" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Navy backdrop -->
+  <rect width="256" height="256" fill="#0a0e27"/>
+
+  <!-- Faint glow halo behind the bell -->
+  <circle cx="128" cy="110" r="90" fill="url(#glow)"/>
+
+  <!-- Drifting trailing arms (two long, two short). Stroked, fading. -->
+  <path d="M 92 130 C 84 160, 96 180, 82 210 S 90 240, 78 252"
+        stroke="url(#arm)" stroke-width="3" fill="none" stroke-linecap="round" opacity="0.8"/>
+  <path d="M 112 138 C 108 168, 118 188, 108 220 S 116 244, 110 252"
+        stroke="url(#arm)" stroke-width="3" fill="none" stroke-linecap="round" opacity="0.7"/>
+  <path d="M 144 138 C 148 168, 138 188, 148 220 S 140 244, 146 252"
+        stroke="url(#arm)" stroke-width="3" fill="none" stroke-linecap="round" opacity="0.7"/>
+  <path d="M 164 130 C 172 160, 160 180, 174 210 S 166 240, 178 252"
+        stroke="url(#arm)" stroke-width="3" fill="none" stroke-linecap="round" opacity="0.8"/>
+
+  <!-- Inner shorter oral arms (thicker, more present) -->
+  <path d="M 116 136 C 114 156, 122 170, 118 188"
+        stroke="#3b1361" stroke-width="5" fill="none" stroke-linecap="round" opacity="0.95"/>
+  <path d="M 140 136 C 142 156, 134 170, 138 188"
+        stroke="#3b1361" stroke-width="5" fill="none" stroke-linecap="round" opacity="0.95"/>
+
+  <!-- The bell itself: a wide rounded dome with a scalloped rim. -->
+  <path d="M 36 130
+           C 36 70, 96 36, 128 36
+           C 160 36, 220 70, 220 130
+           C 210 132, 200 142, 188 134
+           C 176 142, 164 132, 152 140
+           C 140 132, 128 142, 116 134
+           C 104 142, 92 132, 80 140
+           C 68 132, 56 142, 44 134
+           C 40 134, 38 132, 36 130 Z"
+        fill="url(#bell)" stroke="#1b0830" stroke-width="1.5"/>
+
+  <!-- Bell highlight (translucent crescent suggesting volume) -->
+  <path d="M 72 70 C 88 50, 124 46, 150 56"
+        stroke="#b285e0" stroke-width="2.5" fill="none" stroke-linecap="round" opacity="0.45"/>
+  <path d="M 60 92 C 76 76, 96 70, 112 72"
+        stroke="#b285e0" stroke-width="1.5" fill="none" stroke-linecap="round" opacity="0.3"/>
+
+  <!-- Faint manubrium hint inside the bell -->
+  <ellipse cx="128" cy="108" rx="14" ry="22" fill="#1b0830" opacity="0.45"/>
+
+  <!-- Wordmark -->
+  <text x="128" y="228" text-anchor="middle"
+        font-family="Georgia, 'Times New Roman', serif"
+        font-size="20" font-weight="600"
+        fill="#d9c7f0" letter-spacing="1.5">Phantom Library</text>
+</svg>

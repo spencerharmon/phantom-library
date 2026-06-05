@@ -11,6 +11,44 @@ Mascot: *Stygiomedusa gigantea*, the giant phantom jelly.
 
 ---
 
+## Status (as of 2026-06-04)
+
+| Milestone | Status | Commit |
+|---|---|---|
+| M1 — gostream `POST /api/library/add`        | ✅ | `e4df693` on gostream `phantom-library/api-add` |
+| M2 — Plugin skeleton + packaging             | ✅ | `bbe5dbf` |
+| M3 — TMDB + remote search + image provider   | ✅ | `e837cd1` |
+| M4 — Materialisation pipeline                | ✅ | `2451075` |
+| M5 — Fake play button + splash hand-off      | ✅ | `8ca2f8b` |
+| M6 — Suggestions integration                 | ✅ | `abe0fd1` |
+| M6.5 — gostream Vault Mode                   | ✅ | `109c856` on gostream `phantom-library/vault-mode` |
+| M7 — Eviction + favourite-driven persistence | ✅ | `3377add` |
+| M8 — TV series + autopilot                   | ✅ | `60de538` |
+| M9 — Packaging + release polish              | ✅ | M9 release commit (this change) |
+
+### Documented partials
+
+- **Custom `QualityPreset` falls back to `GostreamDefault`** with a
+  warning log (M4 decision). Revisit when a real custom-scoring use
+  case appears.
+- **Per-user preferences via admin sub-page form** rather than
+  native Jellyfin user-prefs integration (M7). Functional; native
+  integration is v0.2 polish.
+- **Series-level `Materialise` returns `Error`** (M8). Correct
+  behaviour: a Series is a container, not a streamable file.
+  Materialise individual Episodes (the autopilot does this for the
+  next unwatched episode automatically).
+- **Splash overlay is static pixels** (M5). Per-item status is
+  surfaced via Jellyfin's native overview-text prefix rendered by
+  the client UI, not burnt into the splash video.
+
+### Excluded from v0.1
+
+See [§ Deferred features (post-v0.1)](#deferred-features-post-v01)
+and [§ Out of scope (forever, not just v0.1)](#out-of-scope-forever-not-just-v01).
+
+---
+
 ## Resolved Design Decisions
 
 Previous open questions have been answered. Recorded here so future
