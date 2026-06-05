@@ -155,4 +155,97 @@ public class TmdbClientTests
         await Assert.ThrowsAsync<TmdbApiException>(
             () => client.SearchMoviesAsync("x", null, null, CancellationToken.None));
     }
+
+    private const string TrendingMoviesPayload = """
+    {
+      "page": 1,
+      "results": [
+        {
+          "id": 603,
+          "title": "The Matrix",
+          "original_title": "The Matrix",
+          "overview": "Hacker vs machines.",
+          "poster_path": "/p.jpg",
+          "backdrop_path": "/b.jpg",
+          "release_date": "1999-03-30",
+          "vote_average": 8.2,
+          "vote_count": 24000,
+          "genre_ids": [28, 878]
+        },
+        {
+          "id": 11,
+          "title": "Star Wars",
+          "release_date": "1977-05-25",
+          "vote_average": 8.6,
+          "vote_count": 18000,
+          "genre_ids": [12, 28, 878]
+        }
+      ],
+      "total_pages": 1,
+      "total_results": 2
+    }
+    """;
+
+    private const string SimilarMoviesPayload = """
+    {
+      "page": 1,
+      "results": [
+        {
+          "id": 605,
+          "title": "The Matrix Revolutions",
+          "overview": "Sequel.",
+          "release_date": "2003-11-05",
+          "vote_average": 6.7,
+          "vote_count": 8000,
+          "genre_ids": [28]
+        }
+      ],
+      "total_pages": 1, "total_results": 1
+    }
+    """;
+
+    [Fact]
+    public async Task GetTrendingMovies_ParsesResults_AndUsesWeekWindow()
+    {
+        var handler = new QueuedHandler().Enqueue(HttpStatusCode.OK, TrendingMoviesPayload);
+        var client = Build(handler);
+
+        var hits = await client.GetTrendingMoviesAsync("week", "en-US", CancellationToken.None);
+
+        Assert.Equal(2, hits.Count);
+        Assert.Equal(603, hits[0].Id);
+        Assert.Equal("The Matrix", hits[0].Title);
+        Assert.NotNull(hits[0].GenreIds);
+        Assert.Contains(28, hits[0].GenreIds!);
+        var url = handler.Requests[0].RequestUri!.ToString();
+        Assert.Contains("/trending/movie/week", url, StringComparison.Ordinal);
+        Assert.Contains("page=1", url, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetTrendingMovies_NormalisesUnknownWindowToWeek()
+    {
+        var handler = new QueuedHandler().Enqueue(HttpStatusCode.OK, TrendingMoviesPayload);
+        var client = Build(handler);
+
+        await client.GetTrendingMoviesAsync("garbage", null, CancellationToken.None);
+
+        var url = handler.Requests[0].RequestUri!.ToString();
+        Assert.Contains("/trending/movie/week", url, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetSimilarMovies_ParsesResults_AndUsesCorrectEndpoint()
+    {
+        var handler = new QueuedHandler().Enqueue(HttpStatusCode.OK, SimilarMoviesPayload);
+        var client = Build(handler);
+
+        var hits = await client.GetSimilarMoviesAsync(603, "en-US", CancellationToken.None);
+
+        Assert.Single(hits);
+        Assert.Equal(605, hits[0].Id);
+        Assert.Equal("The Matrix Revolutions", hits[0].Title);
+        var url = handler.Requests[0].RequestUri!.ToString();
+        Assert.Contains("/movie/603/similar", url, StringComparison.Ordinal);
+    }
 }

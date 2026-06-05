@@ -66,7 +66,7 @@ public sealed class TmdbClient : ITmdbClient
 
         return resp.Results.Select(r => new TmdbSearchHit(
             r.Id, r.Title, r.OriginalTitle, r.Overview, r.PosterPath, r.BackdropPath,
-            r.ReleaseDate, r.VoteAverage, r.VoteCount)).ToList();
+            r.ReleaseDate, r.VoteAverage, r.VoteCount) { GenreIds = r.GenreIds }).ToList();
     }
 
     /// <inheritdoc/>
@@ -91,7 +91,7 @@ public sealed class TmdbClient : ITmdbClient
 
         return resp.Results.Select(r => new TmdbSearchHit(
             r.Id, r.Name, r.OriginalName, r.Overview, r.PosterPath, r.BackdropPath,
-            r.FirstAirDate, r.VoteAverage, r.VoteCount)).ToList();
+            r.FirstAirDate, r.VoteAverage, r.VoteCount) { GenreIds = r.GenreIds }).ToList();
     }
 
     /// <inheritdoc/>
@@ -246,6 +246,56 @@ public sealed class TmdbClient : ITmdbClient
         var path = BuildPath(endpoint, null, null);
         var dto = await GetJsonAsync<TmdbExternalIdsResponseDto>(path, cancellationToken, allow404: true).ConfigureAwait(false);
         return string.IsNullOrWhiteSpace(dto?.ImdbId) ? null : dto!.ImdbId;
+    }
+
+    /// <inheritdoc/>
+    public Task<IReadOnlyList<TmdbSearchHit>> GetTrendingMoviesAsync(string window, string? languageCode, CancellationToken cancellationToken)
+        => GetMovieHitsAsync($"/trending/movie/{NormaliseTrendingWindow(window)}", languageCode, cancellationToken);
+
+    /// <inheritdoc/>
+    public Task<IReadOnlyList<TmdbSearchHit>> GetTrendingSeriesAsync(string window, string? languageCode, CancellationToken cancellationToken)
+        => GetSeriesHitsAsync($"/trending/tv/{NormaliseTrendingWindow(window)}", languageCode, cancellationToken);
+
+    /// <inheritdoc/>
+    public Task<IReadOnlyList<TmdbSearchHit>> GetSimilarMoviesAsync(int tmdbId, string? languageCode, CancellationToken cancellationToken)
+        => GetMovieHitsAsync($"/movie/{tmdbId.ToString(CultureInfo.InvariantCulture)}/similar", languageCode, cancellationToken);
+
+    /// <inheritdoc/>
+    public Task<IReadOnlyList<TmdbSearchHit>> GetSimilarSeriesAsync(int tmdbId, string? languageCode, CancellationToken cancellationToken)
+        => GetSeriesHitsAsync($"/tv/{tmdbId.ToString(CultureInfo.InvariantCulture)}/similar", languageCode, cancellationToken);
+
+    /// <inheritdoc/>
+    public Task<IReadOnlyList<TmdbSearchHit>> GetMovieRecommendationsAsync(int tmdbId, string? languageCode, CancellationToken cancellationToken)
+        => GetMovieHitsAsync($"/movie/{tmdbId.ToString(CultureInfo.InvariantCulture)}/recommendations", languageCode, cancellationToken);
+
+    /// <inheritdoc/>
+    public Task<IReadOnlyList<TmdbSearchHit>> GetSeriesRecommendationsAsync(int tmdbId, string? languageCode, CancellationToken cancellationToken)
+        => GetSeriesHitsAsync($"/tv/{tmdbId.ToString(CultureInfo.InvariantCulture)}/recommendations", languageCode, cancellationToken);
+
+    private static string NormaliseTrendingWindow(string window)
+    {
+        if (string.IsNullOrWhiteSpace(window)) return "week";
+        return string.Equals(window.Trim(), "day", StringComparison.OrdinalIgnoreCase) ? "day" : "week";
+    }
+
+    private async Task<IReadOnlyList<TmdbSearchHit>> GetMovieHitsAsync(string endpoint, string? languageCode, CancellationToken ct)
+    {
+        var path = BuildPath(endpoint, languageCode, new[] { new KeyValuePair<string, string?>("page", "1") });
+        var resp = await GetJsonAsync<TmdbSearchResponse<TmdbMovieSearchHitDto>>(path, ct).ConfigureAwait(false);
+        if (resp?.Results is null) return Array.Empty<TmdbSearchHit>();
+        return resp.Results.Select(r => new TmdbSearchHit(
+            r.Id, r.Title, r.OriginalTitle, r.Overview, r.PosterPath, r.BackdropPath,
+            r.ReleaseDate, r.VoteAverage, r.VoteCount) { GenreIds = r.GenreIds }).ToList();
+    }
+
+    private async Task<IReadOnlyList<TmdbSearchHit>> GetSeriesHitsAsync(string endpoint, string? languageCode, CancellationToken ct)
+    {
+        var path = BuildPath(endpoint, languageCode, new[] { new KeyValuePair<string, string?>("page", "1") });
+        var resp = await GetJsonAsync<TmdbSearchResponse<TmdbSeriesSearchHitDto>>(path, ct).ConfigureAwait(false);
+        if (resp?.Results is null) return Array.Empty<TmdbSearchHit>();
+        return resp.Results.Select(r => new TmdbSearchHit(
+            r.Id, r.Name, r.OriginalName, r.Overview, r.PosterPath, r.BackdropPath,
+            r.FirstAirDate, r.VoteAverage, r.VoteCount) { GenreIds = r.GenreIds }).ToList();
     }
 
     // ---------- HTTP plumbing ----------

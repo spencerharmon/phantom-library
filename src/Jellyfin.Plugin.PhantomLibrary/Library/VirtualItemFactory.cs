@@ -50,6 +50,42 @@ public static class VirtualItemFactory
         return movie;
     }
 
+    /// <summary>Builds an unpersisted <see cref="Movie"/> from a TMDB search-surface hit (trending / similar / recommendations).</summary>
+    public static Movie CreateVirtualMovieFromHit(TmdbSearchHit hit)
+    {
+        ArgumentNullException.ThrowIfNull(hit);
+        var movie = new Movie
+        {
+            Name = hit.Title ?? string.Empty,
+            OriginalTitle = hit.OriginalTitle ?? string.Empty,
+            Overview = hit.Overview ?? string.Empty,
+            ProductionYear = ParseYear(hit.ReleaseDate),
+            PremiereDate = ParseDate(hit.ReleaseDate),
+            Genres = TmdbGenres.ResolveMovieGenres(hit.GenreIds),
+            CommunityRating = hit.VoteAverage.HasValue ? (float?)hit.VoteAverage.Value : null,
+        };
+        movie.ProviderIds["Tmdb"] = hit.Id.ToString(CultureInfo.InvariantCulture);
+        return movie;
+    }
+
+    /// <summary>Builds an unpersisted <see cref="Series"/> from a TMDB search-surface hit (trending / similar / recommendations).</summary>
+    public static Series CreateVirtualSeriesFromHit(TmdbSearchHit hit)
+    {
+        ArgumentNullException.ThrowIfNull(hit);
+        var series = new Series
+        {
+            Name = hit.Title ?? string.Empty,
+            OriginalTitle = hit.OriginalTitle ?? string.Empty,
+            Overview = hit.Overview ?? string.Empty,
+            ProductionYear = ParseYear(hit.ReleaseDate),
+            PremiereDate = ParseDate(hit.ReleaseDate),
+            Genres = TmdbGenres.ResolveSeriesGenres(hit.GenreIds),
+            CommunityRating = hit.VoteAverage.HasValue ? (float?)hit.VoteAverage.Value : null,
+        };
+        series.ProviderIds["Tmdb"] = hit.Id.ToString(CultureInfo.InvariantCulture);
+        return series;
+    }
+
     /// <summary>Builds an unpersisted <see cref="Series"/> from TMDB details.</summary>
     public static Series CreateVirtualSeries(TmdbSeriesDetails details)
     {

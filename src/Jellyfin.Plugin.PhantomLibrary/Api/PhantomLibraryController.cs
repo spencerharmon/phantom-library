@@ -2,6 +2,7 @@ using System;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
+using Jellyfin.Plugin.PhantomLibrary.Library;
 using Jellyfin.Plugin.PhantomLibrary.Materialisation;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Common.Configuration;
@@ -25,17 +26,20 @@ public sealed class PhantomLibraryController : ControllerBase
     private readonly IMaterialisationQueue _queue;
     private readonly IGostreamClient _gostream;
     private readonly IApplicationPaths _paths;
+    private readonly ISuggestionsContributor _suggestions;
 
     public PhantomLibraryController(
         IMaterialiser materialiser,
         IMaterialisationQueue queue,
         IGostreamClient gostream,
-        IApplicationPaths paths)
+        IApplicationPaths paths,
+        ISuggestionsContributor suggestions)
     {
         _materialiser = materialiser;
         _queue = queue;
         _gostream = gostream;
         _paths = paths;
+        _suggestions = suggestions;
     }
 
     /// <summary>Synchronously materialise an item and return its outcome.</summary>
@@ -91,5 +95,14 @@ public sealed class PhantomLibraryController : ControllerBase
             dbPath = System.IO.Path.Combine(_paths.PluginConfigurationsPath, "PhantomLibrary", "phantom.db"),
             gostreamReachable = reachable,
         });
+    }
+
+    /// <summary>Force a full TMDB suggestions refresh (Trending + per-user Recommended).</summary>
+    [HttpPost("Suggestions/Refresh")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    public async Task<IActionResult> RefreshSuggestions(CancellationToken ct = default)
+    {
+        var count = await _suggestions.RefreshAllAsync(ct).ConfigureAwait(false);
+        return Ok(new { created = count });
     }
 }

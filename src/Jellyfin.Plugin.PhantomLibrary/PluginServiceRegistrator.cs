@@ -1,13 +1,16 @@
 using System;
 using System.IO;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
+using Jellyfin.Plugin.PhantomLibrary.Library;
 using Jellyfin.Plugin.PhantomLibrary.Materialisation;
 using Jellyfin.Plugin.PhantomLibrary.Playback;
+using Jellyfin.Plugin.PhantomLibrary.Scheduled;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Plugins;
+using MediaBrowser.Model.Tasks;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Jellyfin.Plugin.PhantomLibrary;
@@ -80,5 +83,12 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
             sp => sp.GetRequiredService<PhantomMediaSourceProvider>());
         serviceCollection.AddSingleton<PhantomStatusDecorator>();
         serviceCollection.AddHostedService(sp => sp.GetRequiredService<PhantomStatusDecorator>());
+
+        // Suggestions (M6)
+        serviceCollection.AddSingleton<VirtualLibraryRoot>();
+        serviceCollection.AddSingleton<CachedTmdbReader>();
+        serviceCollection.AddSingleton<IEagerHintSink, EagerHintSink>();
+        serviceCollection.AddSingleton<ISuggestionsContributor, SuggestionsContributor>();
+        serviceCollection.AddSingleton<IScheduledTask, SuggestionsRefreshTask>();
     }
 }

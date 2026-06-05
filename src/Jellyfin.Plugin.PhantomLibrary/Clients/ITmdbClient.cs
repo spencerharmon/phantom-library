@@ -34,4 +34,22 @@ public interface ITmdbClient
 
     /// <summary>Returns the IMDB id for a series via /tv/{id}/external_ids, or null if absent.</summary>
     Task<string?> GetImdbIdForSeriesAsync(int tmdbId, CancellationToken cancellationToken);
+
+    /// <summary>Trending movies. <paramref name="window"/> is "day" or "week".</summary>
+    Task<IReadOnlyList<TmdbSearchHit>> GetTrendingMoviesAsync(string window, string? languageCode, CancellationToken cancellationToken);
+
+    /// <summary>Trending series. <paramref name="window"/> is "day" or "week".</summary>
+    Task<IReadOnlyList<TmdbSearchHit>> GetTrendingSeriesAsync(string window, string? languageCode, CancellationToken cancellationToken);
+
+    /// <summary>Movies similar to <paramref name="tmdbId"/>.</summary>
+    Task<IReadOnlyList<TmdbSearchHit>> GetSimilarMoviesAsync(int tmdbId, string? languageCode, CancellationToken cancellationToken);
+
+    /// <summary>Series similar to <paramref name="tmdbId"/>.</summary>
+    Task<IReadOnlyList<TmdbSearchHit>> GetSimilarSeriesAsync(int tmdbId, string? languageCode, CancellationToken cancellationToken);
+
+    /// <summary>Movies recommended off the back of <paramref name="tmdbId"/>.</summary>
+    Task<IReadOnlyList<TmdbSearchHit>> GetMovieRecommendationsAsync(int tmdbId, string? languageCode, CancellationToken cancellationToken);
+
+    /// <summary>Series recommended off the back of <paramref name="tmdbId"/>.</summary>
+    Task<IReadOnlyList<TmdbSearchHit>> GetSeriesRecommendationsAsync(int tmdbId, string? languageCode, CancellationToken cancellationToken);
 }

@@ -158,6 +158,20 @@
                         </div>
                     </fieldset>
 
+                    <fieldset class="verticalSection">
+                        <legend>Suggestions (TMDB Trending / Similar / Recommended)</legend>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="PhantomTargetLibraryId">Target library GUID (advanced; empty auto-picks first Movies / TV library)</label>
+                            <input id="PhantomTargetLibraryId" name="PhantomTargetLibraryId" type="text" is="emby-input" />
+                        </div>
+                        <div>
+                            <button is="emby-button" id="PhantomLibraryRefreshSuggestionsBtn" type="button" class="raised block">
+                                <span>Refresh suggestions now</span>
+                            </button>
+                            <div id="PhantomLibraryRefreshSuggestionsResult" class="fieldDescription"></div>
+                        </div>
+                    </fieldset>
+
                     <div>
                         <button is="emby-button" type="submit" class="raised button-submit block">
                             <span>Save</span>
@@ -198,6 +212,7 @@
                             document.querySelector('#SeriesAutopilotPrefetchEpisodes').value = cfg.SeriesAutopilotPrefetchEpisodes;
                             document.querySelector('#PhantomBadgeVisibility').value = cfg.PhantomBadgeVisibility || 'AlwaysShow';
                             document.querySelector('#SplashLoopAssetPath').value = cfg.SplashLoopAssetPath || '';
+                            document.querySelector('#PhantomTargetLibraryId').value = cfg.PhantomTargetLibraryId || '';
                             Dashboard.hideLoadingMsg();
                         });
                     });
@@ -229,11 +244,27 @@
                             cfg.SeriesAutopilotPrefetchEpisodes = parseInt(document.querySelector('#SeriesAutopilotPrefetchEpisodes').value, 10);
                             cfg.PhantomBadgeVisibility = document.querySelector('#PhantomBadgeVisibility').value;
                             cfg.SplashLoopAssetPath = document.querySelector('#SplashLoopAssetPath').value;
+                            cfg.PhantomTargetLibraryId = document.querySelector('#PhantomTargetLibraryId').value;
                             ApiClient.updatePluginConfiguration(PluginId, cfg).then(function (r) {
                                 Dashboard.processPluginConfigurationUpdateResult(r);
                             });
                         });
                         return false;
+                    });
+
+                document.querySelector('#PhantomLibraryRefreshSuggestionsBtn')
+                    .addEventListener('click', function () {
+                        var result = document.querySelector('#PhantomLibraryRefreshSuggestionsResult');
+                        result.textContent = 'Refreshing…';
+                        ApiClient.ajax({
+                            type: 'POST',
+                            url: ApiClient.getUrl('Plugins/PhantomLibrary/Suggestions/Refresh'),
+                            dataType: 'json'
+                        }).then(function (resp) {
+                            result.textContent = 'Done. Created/touched: ' + (resp && typeof resp.created === 'number' ? resp.created : '?');
+                        }, function (err) {
+                            result.textContent = 'Refresh failed (see server logs).';
+                        });
                     });
             })();
         </script>

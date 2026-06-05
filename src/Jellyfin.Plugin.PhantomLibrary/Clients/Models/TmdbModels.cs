@@ -12,7 +12,11 @@ public sealed record TmdbSearchHit(
     string? BackdropPath,
     string? ReleaseDate,
     double? VoteAverage,
-    int? VoteCount);
+    int? VoteCount)
+{
+    /// <summary>TMDB genre ids as returned by search / trending / similar / recommendations.</summary>
+    public int[]? GenreIds { get; init; }
+}
 
 /// <summary>TMDB movie details — superset of a search hit.</summary>
 public sealed record TmdbMovieDetails(
@@ -110,6 +114,7 @@ internal sealed class TmdbMovieSearchHitDto
     public string? ReleaseDate { get; set; }
     public double? VoteAverage { get; set; }
     public int? VoteCount { get; set; }
+    public int[]? GenreIds { get; set; }
 }
 
 internal sealed class TmdbSeriesSearchHitDto
@@ -123,6 +128,7 @@ internal sealed class TmdbSeriesSearchHitDto
     public string? FirstAirDate { get; set; }
     public double? VoteAverage { get; set; }
     public int? VoteCount { get; set; }
+    public int[]? GenreIds { get; set; }
 }
 
 internal sealed class TmdbGenreDto

@@ -51,6 +51,7 @@ public class PluginConfiguration : BasePluginConfiguration
         PhantomBadgeVisibility = PhantomBadgeVisibility.AlwaysShow;
 
         SplashLoopAssetPath = string.Empty;
+        PhantomTargetLibraryId = string.Empty;
     }
 
     /// <summary>Gets or sets the TMDB v3 API key used by the plugin's TMDB client.</summary>
@@ -128,6 +129,14 @@ public class PluginConfiguration : BasePluginConfiguration
     /// <c>PhantomMediaSourceProvider</c>. Empty means use the bundled default loop.
     /// </summary>
     public string SplashLoopAssetPath { get; set; }
+
+    /// <summary>
+    /// Gets or sets the GUID (hex/string) of the Jellyfin library Phantom
+    /// Library writes Virtual items into. Empty = first Movies / TV library
+    /// auto-picked at runtime. Advanced; the auto-pick is correct for
+    /// almost all single-library installs.
+    /// </summary>
+    public string PhantomTargetLibraryId { get; set; }
 }
 
 /// <summary>Quality-scoring preset chooser.</summary>

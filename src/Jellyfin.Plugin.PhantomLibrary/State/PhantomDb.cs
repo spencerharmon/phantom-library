@@ -115,7 +115,7 @@ public sealed class PhantomDb : IDisposable
         return conn;
     }
 
-    private const int CurrentSchemaVersion = 2;
+    private const int CurrentSchemaVersion = 3;
 
     private static void EnsureSchema(SqliteConnection conn)
     {
@@ -154,6 +154,15 @@ public sealed class PhantomDb : IDisposable
             using var cmd = conn.CreateCommand();
             cmd.Transaction = tx;
             cmd.CommandText = "ALTER TABLE phantom_items ADD COLUMN original_overview TEXT;";
+            cmd.ExecuteNonQuery();
+        }
+
+        if (version < 3)
+        {
+            // v3: tmdb_cache table for SuggestionsContributor (M6). Additive.
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = SchemaV3Sql;
             cmd.ExecuteNonQuery();
         }
 
@@ -537,6 +546,100 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
     // ---- user_prefs / autopilot_state: M7/M8 ----
     // TODO(M7/M8): implement real accessors. Returning defaults here so M4
     // callers don't break when these tables are referenced.
+
+    private const string SchemaV3Sql = @"
+CREATE TABLE IF NOT EXISTS tmdb_cache (
+    endpoint TEXT NOT NULL,
+    params_hash TEXT NOT NULL,
+    language TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    cached_at INTEGER NOT NULL,
+    ttl_seconds INTEGER NOT NULL,
+    PRIMARY KEY (endpoint, params_hash, language)
+);
+CREATE INDEX IF NOT EXISTS idx_tmdb_cache_expiry ON tmdb_cache(cached_at, ttl_seconds);
+";
+
+    // ---- tmdb_cache ----
+
+    /// <summary>
+    /// Returns cached TMDB response JSON for (endpoint, paramsHash, language) if present and unexpired, else null.
+    /// </summary>
+    public async Task<string?> GetTmdbCacheAsync(string endpoint, string paramsHash, string language, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(endpoint);
+        ArgumentNullException.ThrowIfNull(paramsHash);
+        ArgumentNullException.ThrowIfNull(language);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT response_json, cached_at, ttl_seconds FROM tmdb_cache
+            WHERE endpoint=$ep AND params_hash=$ph AND language=$lang LIMIT 1;";
+        cmd.Parameters.AddWithValue("$ep", endpoint);
+        cmd.Parameters.AddWithValue("$ph", paramsHash);
+        cmd.Parameters.AddWithValue("$lang", language);
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (!await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            return null;
+        }
+
+        var json = r.GetString(0);
+        var cachedAt = DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(1));
+        var ttlSec = r.GetInt64(2);
+        if (DateTimeOffset.UtcNow > cachedAt + TimeSpan.FromSeconds(ttlSec))
+        {
+            return null;
+        }
+
+        return json;
+    }
+
+    /// <summary>Writes or replaces a cached TMDB response.</summary>
+    public async Task PutTmdbCacheAsync(string endpoint, string paramsHash, string language, string responseJson, TimeSpan ttl, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(endpoint);
+        ArgumentNullException.ThrowIfNull(paramsHash);
+        ArgumentNullException.ThrowIfNull(language);
+        ArgumentNullException.ThrowIfNull(responseJson);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"INSERT OR REPLACE INTO tmdb_cache
+                (endpoint, params_hash, language, response_json, cached_at, ttl_seconds)
+                VALUES ($ep,$ph,$lang,$json,$cached,$ttl);";
+            cmd.Parameters.AddWithValue("$ep", endpoint);
+            cmd.Parameters.AddWithValue("$ph", paramsHash);
+            cmd.Parameters.AddWithValue("$lang", language);
+            cmd.Parameters.AddWithValue("$json", responseJson);
+            cmd.Parameters.AddWithValue("$cached", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            cmd.Parameters.AddWithValue("$ttl", (long)ttl.TotalSeconds);
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    /// <summary>Removes expired tmdb_cache rows. Returns count deleted.</summary>
+    public async Task<int> PurgeExpiredTmdbCacheAsync(CancellationToken ct)
+    {
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "DELETE FROM tmdb_cache WHERE (cached_at + ttl_seconds) < $now;";
+            cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
 
     private static void BindKey(SqliteCommand cmd, MagnetCacheKey key)
     {

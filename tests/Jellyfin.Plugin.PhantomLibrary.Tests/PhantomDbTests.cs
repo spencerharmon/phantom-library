@@ -116,6 +116,124 @@ public class PhantomDbTests : IDisposable
     }
 
     [Fact]
+    public async Task TmdbCache_RoundTrip_AndExpiry()
+    {
+        await _db.PutTmdbCacheAsync("trending/movie", "hash1", "en-US", "[{\"id\":1}]", TimeSpan.FromHours(1), default);
+        var hit = await _db.GetTmdbCacheAsync("trending/movie", "hash1", "en-US", default);
+        Assert.Equal("[{\"id\":1}]", hit);
+
+        Assert.Null(await _db.GetTmdbCacheAsync("trending/movie", "otherhash", "en-US", default));
+
+        await _db.PutTmdbCacheAsync("trending/tv", "hash2", "en-US", "[]", TimeSpan.FromSeconds(-10), default);
+        Assert.Null(await _db.GetTmdbCacheAsync("trending/tv", "hash2", "en-US", default));
+    }
+
+    [Fact]
+    public async Task PurgeExpiredTmdbCache_RemovesOnlyExpired()
+    {
+        await _db.PutTmdbCacheAsync("fresh", "h", "en", "[]", TimeSpan.FromHours(1), default);
+        await _db.PutTmdbCacheAsync("stale", "h", "en", "[]", TimeSpan.FromSeconds(-1), default);
+        await _db.PutTmdbCacheAsync("alsoStale", "h", "en", "[]", TimeSpan.FromSeconds(-1), default);
+
+        var n = await _db.PurgeExpiredTmdbCacheAsync(default);
+        Assert.Equal(2, n);
+
+        Assert.NotNull(await _db.GetTmdbCacheAsync("fresh", "h", "en", default));
+        Assert.Null(await _db.GetTmdbCacheAsync("stale", "h", "en", default));
+    }
+
+    [Fact]
+    public async Task V2_To_V3_Migration_Preserves_Data_And_Adds_TmdbCache()
+    {
+        var p = Path.Combine(Path.GetTempPath(), "phantommig3_" + Guid.NewGuid().ToString("N") + ".db");
+        try
+        {
+            using (var conn = new Microsoft.Data.Sqlite.SqliteConnection(
+                       new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder
+                       {
+                           DataSource = p,
+                           Mode = Microsoft.Data.Sqlite.SqliteOpenMode.ReadWriteCreate,
+                       }.ToString()))
+            {
+                conn.Open();
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = @"CREATE TABLE phantom_items (
+                        item_guid TEXT PRIMARY KEY,
+                        tmdb_id INTEGER,
+                        imdb_id TEXT,
+                        type TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        first_seen INTEGER NOT NULL,
+                        last_touched INTEGER NOT NULL,
+                        eviction_protected INTEGER NOT NULL DEFAULT 0,
+                        original_overview TEXT
+                    );";
+                    cmd.ExecuteNonQuery();
+                }
+
+                var id = Guid.NewGuid();
+                using (var ins = conn.CreateCommand())
+                {
+                    ins.CommandText = @"INSERT INTO phantom_items
+                        (item_guid, tmdb_id, imdb_id, type, state, first_seen, last_touched, eviction_protected, original_overview)
+                        VALUES ($g, 7, 'tt7', 'movie', 'Virtual', 1000, 2000, 0, 'preserved');";
+                    ins.Parameters.AddWithValue("$g", id.ToString("N"));
+                    ins.ExecuteNonQuery();
+                }
+
+                using (var sv = conn.CreateCommand())
+                {
+                    sv.CommandText = "PRAGMA user_version = 2;";
+                    sv.ExecuteNonQuery();
+                }
+
+                Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            }
+
+            using (var db = new PhantomDb(p))
+            {
+                await db.PutTmdbCacheAsync("x", "h", "en", "[]", TimeSpan.FromHours(1), default);
+                Assert.Equal("[]", await db.GetTmdbCacheAsync("x", "h", "en", default));
+            }
+
+            using var verify = new Microsoft.Data.Sqlite.SqliteConnection(
+                new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder
+                {
+                    DataSource = p,
+                    Mode = Microsoft.Data.Sqlite.SqliteOpenMode.ReadWrite,
+                }.ToString());
+            verify.Open();
+            using (var vc = verify.CreateCommand())
+            {
+                vc.CommandText = "PRAGMA user_version;";
+                Assert.Equal(3L, Convert.ToInt64(vc.ExecuteScalar(),
+                    System.Globalization.CultureInfo.InvariantCulture));
+            }
+
+            using (var sel = verify.CreateCommand())
+            {
+                sel.CommandText = "SELECT imdb_id, original_overview FROM phantom_items LIMIT 1;";
+                using var r = sel.ExecuteReader();
+                Assert.True(r.Read());
+                Assert.Equal("tt7", r.GetString(0));
+                Assert.Equal("preserved", r.GetString(1));
+            }
+
+            using (var t = verify.CreateCommand())
+            {
+                t.CommandText = "SELECT name FROM sqlite_master WHERE type='table' AND name='tmdb_cache';";
+                Assert.NotNull(t.ExecuteScalar());
+            }
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            try { File.Delete(p); File.Delete(p + "-wal"); File.Delete(p + "-shm"); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task V1_To_V2_Migration_Preserves_Data_And_Adds_Column()
     {
         var p = Path.Combine(Path.GetTempPath(), "phantommig_" + Guid.NewGuid().ToString("N") + ".db");
@@ -165,13 +283,13 @@ public class PhantomDbTests : IDisposable
                 Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
             }
 
-            // Open through PhantomDb — should auto-migrate to v2.
+            // Open through PhantomDb — should auto-migrate to current version.
             using var db = new PhantomDb(p);
             // Touch the DB so EnsureSchema runs.
             var entry = await db.GetPhantomItemAsync(Guid.NewGuid(), default);
             Assert.Null(entry); // missing row, but migration must not have thrown
 
-            // Verify migration: user_version=2 and column exists.
+            // Verify migration: user_version=current and column exists.
             using var verify = new Microsoft.Data.Sqlite.SqliteConnection(
                 new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder
                 {
@@ -182,7 +300,7 @@ public class PhantomDbTests : IDisposable
             using (var vc = verify.CreateCommand())
             {
                 vc.CommandText = "PRAGMA user_version;";
-                Assert.Equal(2L, Convert.ToInt64(vc.ExecuteScalar(),
+                Assert.Equal(3L, Convert.ToInt64(vc.ExecuteScalar(),
                     System.Globalization.CultureInfo.InvariantCulture));
             }
 
