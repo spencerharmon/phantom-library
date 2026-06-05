@@ -53,6 +53,7 @@ public sealed class SuggestionsContributor : ISuggestionsContributor
     private readonly IUserManager _userManager;
     private readonly PhantomDb _db;
     private readonly IEagerHintSink _hintSink;
+    private readonly IPhantomStubManager _stubs;
     private readonly ILogger<SuggestionsContributor> _logger;
 
     public SuggestionsContributor(
@@ -62,6 +63,7 @@ public sealed class SuggestionsContributor : ISuggestionsContributor
         IUserManager userManager,
         PhantomDb db,
         IEagerHintSink hintSink,
+        IPhantomStubManager stubs,
         ILogger<SuggestionsContributor> logger)
     {
         _reader = reader;
@@ -70,6 +72,7 @@ public sealed class SuggestionsContributor : ISuggestionsContributor
         _userManager = userManager;
         _db = db;
         _hintSink = hintSink;
+        _stubs = stubs;
         _logger = logger;
     }
 
@@ -299,6 +302,25 @@ public sealed class SuggestionsContributor : ISuggestionsContributor
             newItem.Id = _libraryManager.GetNewItemId(
                 $"phantom_{(kind == ItemKind.Movie ? "movie" : "series")}_{hit.Id}",
                 newItem.GetType());
+
+            // Attach phantom stub symlink + lock so the scanner cannot
+            // rename us via TMDB fuzzy match. See PLAN §M10.
+            if (_stubs.IsReady)
+            {
+                try
+                {
+                    var stubKind = kind == ItemKind.Movie ? PhantomMediaKind.Movie : PhantomMediaKind.Series;
+                    var stubPath = await _stubs.CreateAsync(newItem.Name ?? string.Empty, hit.Id, stubKind, ct).ConfigureAwait(false);
+                    newItem.Path = stubPath;
+                    newItem.IsLocked = true;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "[Suggestions] stub create failed for tmdb={Tmdb}; item will be path-less Virtual",
+                        hit.Id);
+                }
+            }
 
             if (hint != EagerHint.None)
             {

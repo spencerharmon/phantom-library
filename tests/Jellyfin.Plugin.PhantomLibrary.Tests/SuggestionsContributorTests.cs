@@ -87,7 +87,7 @@ public class SuggestionsContributorTests : IDisposable
     {
         var reader = new CachedTmdbReader(_tmdb.Object, _db, NullLogger<CachedTmdbReader>.Instance);
         return new SuggestionsContributor(
-            reader, _root, _lib.Object, _users.Object, _db, _hints,
+            reader, _root, _lib.Object, _users.Object, _db, _hints, new NullPhantomStubManager(),
             NullLogger<SuggestionsContributor>.Instance);
     }
 

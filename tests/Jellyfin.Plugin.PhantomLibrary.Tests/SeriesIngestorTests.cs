@@ -62,7 +62,7 @@ public class SeriesIngestorTests : IDisposable
     }
 
     private SeriesIngestor Build()
-        => new SeriesIngestor(_lib.Object, _tmdb.Object, _root, _db, NullLogger<SeriesIngestor>.Instance);
+        => new SeriesIngestor(_lib.Object, _tmdb.Object, _root, _db, new NullPhantomStubManager(), NullLogger<SeriesIngestor>.Instance);
 
     private static TmdbSeriesDetails Series(int id) => new TmdbSeriesDetails(
         id, "Show", "Show", "ov", null, null, "2020-01-01", 8.0, 100,

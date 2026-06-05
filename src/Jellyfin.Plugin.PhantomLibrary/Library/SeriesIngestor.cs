@@ -37,6 +37,7 @@ public sealed class SeriesIngestor : ISeriesIngestor
     private readonly ITmdbClient _tmdb;
     private readonly VirtualLibraryRoot _root;
     private readonly PhantomDb _db;
+    private readonly IPhantomStubManager _stubs;
     private readonly ILogger<SeriesIngestor> _logger;
 
     public SeriesIngestor(
@@ -44,12 +45,14 @@ public sealed class SeriesIngestor : ISeriesIngestor
         ITmdbClient tmdb,
         VirtualLibraryRoot root,
         PhantomDb db,
+        IPhantomStubManager stubs,
         ILogger<SeriesIngestor> logger)
     {
         _libraryManager = libraryManager;
         _tmdb = tmdb;
         _root = root;
         _db = db;
+        _stubs = stubs;
         _logger = logger;
     }
 
@@ -68,6 +71,25 @@ public sealed class SeriesIngestor : ISeriesIngestor
         var series = VirtualItemFactory.CreateVirtualSeries(details);
         series.Id = _libraryManager.GetNewItemId(
             $"phantom_series_{seriesTmdbId.ToString(CultureInfo.InvariantCulture)}", series.GetType());
+
+        // Attach phantom stub + lock so the scanner cannot rename us. See PLAN §M10.
+        // Episodes do NOT get stubs: the autopilot creates+materialises them in one
+        // operation, so a phantom episode symlink would be born-and-die immediately.
+        if (_stubs.IsReady)
+        {
+            try
+            {
+                var stubPath = await _stubs.CreateAsync(series.Name ?? string.Empty, seriesTmdbId, PhantomMediaKind.Series, ct).ConfigureAwait(false);
+                series.Path = stubPath;
+                series.IsLocked = true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "SeriesIngestor stub create failed for tmdb={Tmdb}; series will be path-less Virtual",
+                    seriesTmdbId);
+            }
+        }
 
         var parent = _root.ResolveSeriesParent() ?? _libraryManager.GetUserRootFolder();
         // See SuggestionsContributor: SetParent before CreateItem so ParentId is wired.
