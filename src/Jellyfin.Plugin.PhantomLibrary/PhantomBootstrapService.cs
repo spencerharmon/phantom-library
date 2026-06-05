@@ -71,11 +71,23 @@ internal sealed class PhantomBootstrapService : IHostedService
         // Initial bind.
         await SafeBindAsync(ct).ConfigureAwait(false);
 
-        // Periodic re-bind. The Jellyfin metadata-saver pipeline can race
-        // with our patch (PLAN §M10 §Jellyfin upstream issue) and revert
-        // the CollectionFolder's persisted state. Re-running the bind
-        // every 5 minutes recovers from that race within one cycle.
-        // No-ops cheaply once the binding is correct.
+        // Install event-driven watchdog. ItemUpdated fires when ANY
+        // BaseItem (including our gostream CollectionFolders) is
+        // saved. The watchdog re-patches if the save dropped our
+        // phantom path — closes the race with FolderMetadataService
+        // image-provider saves that capture a stale snapshot.
+        try { _binder.InstallWatchdog(); }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "[PhantomBootstrap] watchdog install failed; falling back to periodic re-bind only");
+        }
+
+        // Periodic re-bind. Belt-and-braces: the watchdog should
+        // catch race overwrites, the periodic re-bind catches
+        // anything the watchdog misses (e.g. plugin restart of
+        // gostream-shows binding while a save was in flight on
+        // gostream-movies). No-ops cheaply once the binding is
+        // correct.
         while (!ct.IsCancellationRequested)
         {
             try { await Task.Delay(TimeSpan.FromMinutes(5), ct).ConfigureAwait(false); }

@@ -19,9 +19,19 @@ namespace Jellyfin.Plugin.PhantomLibrary.Library;
 /// same library as materialised items. Idempotent; works around the
 /// Jellyfin AddMediaPath/refresh asymmetry documented in PLAN §M10.
 /// </summary>
-public interface IPhantomCollectionFolderBinder
+public interface IPhantomCollectionFolderBinder : IDisposable
 {
     Task BindAsync(CancellationToken ct);
+
+    /// <summary>
+    /// Install an event-driven watchdog that re-applies the binding
+    /// any time something else (e.g. FolderMetadataService's image
+    /// provider) saves the CollectionFolder and drops our phantom
+    /// path from PhysicalLocationsList/PhysicalFolderIds. Per PLAN
+    /// §M10 §Jellyfin upstream issue this race is a Jellyfin bug;
+    /// the watchdog is the plugin-side mitigation.
+    /// </summary>
+    void InstallWatchdog();
 }
 
 /// <inheritdoc />
@@ -30,6 +40,15 @@ public sealed class PhantomCollectionFolderBinder : IPhantomCollectionFolderBind
     private readonly ILibraryManager _libraryManager;
     private readonly ILogger<PhantomCollectionFolderBinder> _logger;
     private readonly Func<PluginConfiguration> _configProvider;
+
+    // Watchdog state. Populated on each BindOne call so the
+    // ItemUpdated event handler can recognise which CF ↔ phantomDir
+    // ↔ physFolderId triple to re-patch on overwrite.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, (string phantomDir, Guid physFolderId)> _bindings = new();
+    private bool _watchdogInstalled;
+    // Guard against re-entrancy when our own UpdateItemAsync fires
+    // ItemUpdated for the same CF.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, byte> _selfPatching = new();
 
     public PhantomCollectionFolderBinder(
         ILibraryManager libraryManager,
@@ -159,24 +178,51 @@ public sealed class PhantomCollectionFolderBinder : IPhantomCollectionFolderBind
             return;
         }
 
-        // Re-apply the patch in a loop. Concurrent racy metadata-saver
-        // writes can revert our patch; the loop outlasts them. Stop
-        // early when the in-memory state matches what we wrote AND has
-        // survived two consecutive attempts unchanged.
+        // Re-apply the patch in a loop until the PERSISTED state in
+        // the repository (not the in-memory cache) shows our phantom
+        // path. The metadata-saver pipeline (FolderMetadataService,
+        // BaseDynamicImageProvider) calls UpdateToRepositoryAsync
+        // milliseconds after we save, with a stale snapshot of
+        // PhysicalLocationsList/PhysicalFolderIds it captured before
+        // our patch. The in-memory CollectionFolder object still has
+        // our patch (Jellyfin caches by Id, mutates in-place), but
+        // the repository row was overwritten. Verify against the
+        // repository.
         var stableCount = 0;
-        for (var attempt = 0; attempt < 10; attempt++)
+        for (var attempt = 0; attempt < 30; attempt++)
         {
             try { await Task.Delay(TimeSpan.FromSeconds(1), ct).ConfigureAwait(false); }
             catch (OperationCanceledException) { return; }
 
-            var check = _libraryManager.GetItemById(cf.Id) as CollectionFolder;
-            if (check is null) break;
+            var persisted = RetrievePersistedCollectionFolder(cf.Id);
+            var persistedHasPhantom = persisted is not null
+                && (persisted.PhysicalLocationsList ?? Array.Empty<string>()).Contains(phantomDir, StringComparer.Ordinal)
+                && (persisted.PhysicalFolderIds ?? Array.Empty<Guid>()).Contains(physFolder.Id);
+
+            if (persistedHasPhantom)
+            {
+                stableCount++;
+                if (stableCount >= 3)
+                {
+                    _logger.LogDebug(
+                        "[PhantomBinder] {Lib} binding persisted to repository after {Attempts} attempts",
+                        libName, attempt + 1);
+                    break;
+                }
+                continue;
+            }
+
+            stableCount = 0;
+
+            // Re-fetch in-memory CF (may have been replaced) and
+            // re-apply the patch. Use the in-memory object so the
+            // change is visible to any concurrent reader; the
+            // UpdateItemAsync call will then re-serialise our patched
+            // state to the repository.
+            var check = (_libraryManager.GetItemById(cf.Id) as CollectionFolder) ?? freshCf;
 
             var preLoc = check.PhysicalLocationsList ?? Array.Empty<string>();
             var preFid = check.PhysicalFolderIds ?? Array.Empty<Guid>();
-            var preHadPhantom = preLoc.Contains(phantomDir, StringComparer.Ordinal)
-                && preFid.Contains(physFolder.Id);
-
             check.PhysicalLocationsList = preLoc.Append(phantomDir).Distinct(StringComparer.Ordinal).ToArray();
             check.PhysicalFolderIds = preFid.Append(physFolder.Id).Distinct().ToArray();
 
@@ -190,28 +236,121 @@ public sealed class PhantomCollectionFolderBinder : IPhantomCollectionFolderBind
                 _logger.LogDebug(ex, "[PhantomBinder] re-patch attempt {N} for {Lib} threw", attempt + 1, libName);
             }
             freshCf = check;
-
-            if (preHadPhantom)
-            {
-                stableCount++;
-                if (stableCount >= 3)
-                {
-                    _logger.LogDebug(
-                        "[PhantomBinder] {Lib} binding stable after {Attempts} attempts",
-                        libName, attempt + 1);
-                    break;
-                }
-            }
-            else
-            {
-                stableCount = 0;
-            }
         }
 
-        _logger.LogInformation(
-            "[PhantomBinder] Bound phantom dir {Dir} to {Lib}; PhysicalFolderIds now [{Ids}]",
-            phantomDir, libName,
-            string.Join(",", (freshCf.PhysicalFolderIds ?? Array.Empty<Guid>()).Select(g => g.ToString("N"))));
+        // Final persistence check; log loudly if the race still won.
+        var finalPersisted = RetrievePersistedCollectionFolder(cf.Id);
+        var finalHasPhantom = finalPersisted is not null
+            && (finalPersisted.PhysicalLocationsList ?? Array.Empty<string>()).Contains(phantomDir, StringComparer.Ordinal)
+            && (finalPersisted.PhysicalFolderIds ?? Array.Empty<Guid>()).Contains(physFolder.Id);
+
+        if (finalHasPhantom)
+        {
+            _logger.LogInformation(
+                "[PhantomBinder] Bound phantom dir {Dir} to {Lib} (persisted); PhysicalFolderIds now [{Ids}]",
+                phantomDir, libName,
+                string.Join(",", (finalPersisted!.PhysicalFolderIds ?? Array.Empty<Guid>()).Select(g => g.ToString("N"))));
+        }
+        else
+        {
+            _logger.LogWarning(
+                "[PhantomBinder] FAILED to persist phantom dir {Dir} to {Lib} after 30 attempts; " +
+                "will retry on next periodic re-bind. " +
+                "This is the documented Jellyfin AddMediaPath/metadata-saver race; " +
+                "upstream PR pending. In-memory state has the patch; " +
+                "persisted state does not.",
+                phantomDir, libName);
+        }
+
+        // Register this binding with the watchdog so any subsequent
+        // out-of-band save of this CF that drops the phantom path
+        // gets re-patched automatically.
+        _bindings[cf.Id] = (phantomDir, physFolder.Id);
+    }
+
+    /// <inheritdoc />
+    public void InstallWatchdog()
+    {
+        if (_watchdogInstalled) return;
+        _watchdogInstalled = true;
+        _libraryManager.ItemUpdated += OnItemUpdated;
+        _logger.LogDebug("[PhantomBinder] watchdog installed on ILibraryManager.ItemUpdated");
+    }
+
+    private void OnItemUpdated(object? sender, ItemChangeEventArgs e)
+    {
+        if (e?.Item is not CollectionFolder cf) return;
+        if (!_bindings.TryGetValue(cf.Id, out var binding)) return;
+
+        // Avoid self-trigger when our own UpdateItemAsync fires this event.
+        if (_selfPatching.ContainsKey(cf.Id)) return;
+
+        var loc = cf.PhysicalLocationsList ?? Array.Empty<string>();
+        var fid = cf.PhysicalFolderIds ?? Array.Empty<Guid>();
+        var hasPath = loc.Contains(binding.phantomDir, StringComparer.Ordinal);
+        var hasFid = fid.Contains(binding.physFolderId);
+
+        if (hasPath && hasFid) return;
+
+        // Fire-and-forget re-patch. CancellationToken.None is
+        // appropriate — we want this to run regardless of the
+        // upstream save's context.
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                _selfPatching[cf.Id] = 1;
+                _logger.LogDebug(
+                    "[PhantomBinder] watchdog: CF {Name} ({Id}) updated without phantom path; re-patching",
+                    cf.Name, cf.Id);
+
+                // Read fresh, mutate, save.
+                var fresh = (_libraryManager.GetItemById(cf.Id) as CollectionFolder) ?? cf;
+                var freshLoc = fresh.PhysicalLocationsList ?? Array.Empty<string>();
+                var freshFid = fresh.PhysicalFolderIds ?? Array.Empty<Guid>();
+                fresh.PhysicalLocationsList = freshLoc.Append(binding.phantomDir).Distinct(StringComparer.Ordinal).ToArray();
+                fresh.PhysicalFolderIds = freshFid.Append(binding.physFolderId).Distinct().ToArray();
+                await _libraryManager.UpdateItemAsync(fresh, fresh.GetParent(),
+                    ItemUpdateType.MetadataEdit, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "[PhantomBinder] watchdog re-patch for {Id} threw", cf.Id);
+            }
+            finally
+            {
+                // Brief debounce window so back-to-back saves from
+                // the metadata pipeline collapse to one re-patch.
+                await Task.Delay(TimeSpan.FromMilliseconds(500)).ConfigureAwait(false);
+                _selfPatching.TryRemove(cf.Id, out _);
+            }
+        });
+    }
+
+    /// <inheritdoc />
+    public void Dispose()
+    {
+        if (_watchdogInstalled)
+        {
+            try { _libraryManager.ItemUpdated -= OnItemUpdated; } catch { /* swallow */ }
+            _watchdogInstalled = false;
+        }
+    }
+
+    private CollectionFolder? RetrievePersistedCollectionFolder(Guid id)
+    {
+        // RetrieveItem bypasses the in-memory cache and reads directly
+        // from the SQLite repository. That is the only way to observe
+        // whether the metadata-saver pipeline overwrote our patch.
+        try
+        {
+            return _libraryManager.RetrieveItem(id) as CollectionFolder;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "[PhantomBinder] RetrieveItem({Id}) threw", id);
+            return null;
+        }
     }
 
     private CollectionFolder? FindCollectionFolder(string name)
