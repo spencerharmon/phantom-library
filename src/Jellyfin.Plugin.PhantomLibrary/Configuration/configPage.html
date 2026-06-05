@@ -164,6 +164,18 @@
                             <label class="inputLabel inputLabelUnfocused" for="PhantomTargetLibraryId">Target library GUID (advanced; empty auto-picks first Movies / TV library)</label>
                             <input id="PhantomTargetLibraryId" name="PhantomTargetLibraryId" type="text" is="emby-input" />
                         </div>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="PhantomStubRoot">Phantom stub root (writable dir owned by the Jellyfin user)</label>
+                            <input id="PhantomStubRoot" name="PhantomStubRoot" type="text" is="emby-input" />
+                        </div>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="PhantomMoviesLibraryName">Phantom movies library name (CollectionFolder to bind movie stubs into)</label>
+                            <input id="PhantomMoviesLibraryName" name="PhantomMoviesLibraryName" type="text" is="emby-input" />
+                        </div>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="PhantomShowsLibraryName">Phantom shows library name (CollectionFolder to bind series stubs into)</label>
+                            <input id="PhantomShowsLibraryName" name="PhantomShowsLibraryName" type="text" is="emby-input" />
+                        </div>
                         <div>
                             <button is="emby-button" id="PhantomLibraryRefreshSuggestionsBtn" type="button" class="raised block">
                                 <span>Refresh suggestions now</span>
@@ -223,6 +235,9 @@
                             document.querySelector('#PhantomBadgeVisibility').value = cfg.PhantomBadgeVisibility || 'AlwaysShow';
                             document.querySelector('#SplashLoopAssetPath').value = cfg.SplashLoopAssetPath || '';
                             document.querySelector('#PhantomTargetLibraryId').value = cfg.PhantomTargetLibraryId || '';
+                            document.querySelector('#PhantomStubRoot').value = cfg.PhantomStubRoot || '';
+                            document.querySelector('#PhantomMoviesLibraryName').value = cfg.PhantomMoviesLibraryName || '';
+                            document.querySelector('#PhantomShowsLibraryName').value = cfg.PhantomShowsLibraryName || '';
                             Dashboard.hideLoadingMsg();
                         });
                     });
@@ -255,6 +270,9 @@
                             cfg.PhantomBadgeVisibility = document.querySelector('#PhantomBadgeVisibility').value;
                             cfg.SplashLoopAssetPath = document.querySelector('#SplashLoopAssetPath').value;
                             cfg.PhantomTargetLibraryId = document.querySelector('#PhantomTargetLibraryId').value;
+                            cfg.PhantomStubRoot = document.querySelector('#PhantomStubRoot').value;
+                            cfg.PhantomMoviesLibraryName = document.querySelector('#PhantomMoviesLibraryName').value;
+                            cfg.PhantomShowsLibraryName = document.querySelector('#PhantomShowsLibraryName').value;
                             ApiClient.updatePluginConfiguration(PluginId, cfg).then(function (r) {
                                 Dashboard.processPluginConfigurationUpdateResult(r);
                             });

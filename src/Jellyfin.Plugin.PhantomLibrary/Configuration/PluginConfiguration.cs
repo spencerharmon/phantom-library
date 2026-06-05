@@ -52,6 +52,10 @@ public class PluginConfiguration : BasePluginConfiguration
 
         SplashLoopAssetPath = string.Empty;
         PhantomTargetLibraryId = string.Empty;
+
+        PhantomStubRoot = "/var/lib/jellyfin/phantom-library";
+        PhantomMoviesLibraryName = "gostream-movies";
+        PhantomShowsLibraryName = "gostream-shows";
     }
 
     /// <summary>Gets or sets the TMDB v3 API key used by the plugin's TMDB client.</summary>
@@ -137,6 +141,27 @@ public class PluginConfiguration : BasePluginConfiguration
     /// almost all single-library installs.
     /// </summary>
     public string PhantomTargetLibraryId { get; set; }
+
+    /// <summary>
+    /// Gets or sets the plugin-owned writable directory that holds per-phantom
+    /// symlinks (one symlink per phantom, all pointing at the extracted splash).
+    /// Operator must <c>mkdir -p</c> the <c>movies/</c> and <c>shows/</c>
+    /// subdirs and <c>chown</c> them to the Jellyfin user before first use.
+    /// </summary>
+    public string PhantomStubRoot { get; set; }
+
+    /// <summary>
+    /// Gets or sets the Jellyfin CollectionFolder name into which phantom
+    /// movie stubs are bound (default <c>gostream-movies</c>). Must match
+    /// an existing library name in Jellyfin's library settings.
+    /// </summary>
+    public string PhantomMoviesLibraryName { get; set; }
+
+    /// <summary>
+    /// Gets or sets the Jellyfin CollectionFolder name into which phantom
+    /// series stubs are bound (default <c>gostream-shows</c>).
+    /// </summary>
+    public string PhantomShowsLibraryName { get; set; }
 }
 
 /// <summary>Quality-scoring preset chooser.</summary>
