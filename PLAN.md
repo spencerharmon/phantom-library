@@ -25,7 +25,7 @@ Mascot: *Stygiomedusa gigantea*, the giant phantom jelly.
 | M7 — Eviction + favourite-driven persistence | ✅ | `3377add` |
 | M8 — TV series + autopilot                   | ✅ | `60de538` |
 | M9 — Packaging + release polish              | ✅ | M9 release commit (this change) |
-| M10 — Phantom symlink library + visibility fix | 🚧 in progress | — |
+| M10 — Phantom symlink library + visibility fix | ✅ | (unreleased) |
 
 ### Documented partials
 

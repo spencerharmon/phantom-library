@@ -4,6 +4,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **M10 — Phantom symlink library + visibility fix.** Phantoms are
+  now backed by per-item symlinks under a plugin-owned writable root
+  (default `/var/lib/jellyfin/phantom-library/{movies,shows}`) and
+  bound into the operator's existing `gostream-movies` /
+  `gostream-shows` libraries via a new
+  `PhantomCollectionFolderBinder`. Restores browse visibility for
+  Suggestions / SeriesIngestor rows that were invisible in v0.1
+  because `Path = null` caused the scanner to cull them. New config
+  knobs: `PhantomStubRoot`, `PhantomMoviesLibraryName`,
+  `PhantomShowsLibraryName`. New operator install step: `sudo mkdir
+  -p /var/lib/jellyfin/phantom-library/{movies,shows} && sudo chown
+  -R jellyfin:jellyfin /var/lib/jellyfin/phantom-library`. Includes
+  a documented workaround for an upstream Jellyfin bug in
+  `LibraryStructureController.AddMediaPath` (does not refresh the
+  `CollectionFolder`'s `PhysicalLocationsList` /
+  `PhysicalFolderIds`); upstream PR tracked separately.
+
 ## [0.1.0] - 2026-06-04
 
 Initial release. Movies + series + materialisation + splash hand-off +
