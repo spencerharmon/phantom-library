@@ -25,6 +25,7 @@ public class MaterialiserTests : IDisposable
     private readonly Mock<IProviderManager> _provMock = new();
     private readonly Mock<IGostreamClient> _gsMock = new();
     private readonly Mock<IIndexerClient> _idxMock = new();
+    private readonly NullPhantomStubManager _stubs = new();
 
     public MaterialiserTests()
     {
@@ -55,6 +56,7 @@ public class MaterialiserTests : IDisposable
             _gsMock.Object,
             new QualityScorer(NullLogger<QualityScorer>.Instance),
             _db,
+            _stubs,
             NullLogger<Materialiser>.Instance,
             () => cfg);
     }
@@ -292,5 +294,42 @@ public class MaterialiserTests : IDisposable
         var r = await m.MaterialiseAsync(id, MaterialiseTrigger.Favourite, CancellationToken.None);
         Assert.Equal(MaterialisationStatus.Error, r.Status);
         _gsMock.Verify(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task Promote_Success_DeletesPhantomStub()
+    {
+        var id = Guid.NewGuid();
+        var movie = BuildMovie(id);
+        movie.Path = "/var/lib/jellyfin/phantom-library/movies/Test_Movie__phantom_tmdb1.mp4";
+        _libMock.Setup(l => l.GetItemById(id)).Returns(movie);
+        _idxMock.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { Cand() });
+        _gsMock.Setup(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new GostreamAddResult { StubPath = "/r/x.mkv", FusePath = "/f/x.mkv", Hash = "DEAD", Size = 1 });
+
+        var m = BuildMaterialiser();
+        var r = await m.MaterialiseAsync(id, MaterialiseTrigger.Favourite, CancellationToken.None);
+        Assert.Equal(MaterialisationStatus.Success, r.Status);
+        Assert.Single(_stubs.Deleted);
+        Assert.Contains("__phantom_tmdb", _stubs.Deleted[0]);
+    }
+
+    [Fact]
+    public async Task Promote_Success_DoesNotDelete_NonPhantomPath()
+    {
+        var id = Guid.NewGuid();
+        var movie = BuildMovie(id);
+        movie.Path = "/some/real/file.mkv"; // no sentinel
+        _libMock.Setup(l => l.GetItemById(id)).Returns(movie);
+        _idxMock.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { Cand() });
+        _gsMock.Setup(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new GostreamAddResult { StubPath = "/r/x.mkv", FusePath = "/f/x.mkv", Hash = "DEAD", Size = 1 });
+
+        var m = BuildMaterialiser();
+        var r = await m.MaterialiseAsync(id, MaterialiseTrigger.Favourite, CancellationToken.None);
+        Assert.Equal(MaterialisationStatus.Success, r.Status);
+        Assert.Empty(_stubs.Deleted);
     }
 }

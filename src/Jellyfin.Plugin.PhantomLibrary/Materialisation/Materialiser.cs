@@ -36,6 +36,7 @@ public sealed class Materialiser : IMaterialiser
     private readonly IGostreamClient _gostream;
     private readonly QualityScorer _scorer;
     private readonly PhantomDb _db;
+    private readonly Jellyfin.Plugin.PhantomLibrary.Library.IPhantomStubManager _stubs;
     private readonly ILogger<Materialiser> _logger;
     private readonly Func<PluginConfiguration> _configProvider;
 
@@ -46,8 +47,9 @@ public sealed class Materialiser : IMaterialiser
         IGostreamClient gostream,
         QualityScorer scorer,
         PhantomDb db,
+        Jellyfin.Plugin.PhantomLibrary.Library.IPhantomStubManager stubs,
         ILogger<Materialiser> logger)
-        : this(libraryManager, providerManager, indexers, gostream, scorer, db, logger,
+        : this(libraryManager, providerManager, indexers, gostream, scorer, db, stubs, logger,
                () => Plugin.Instance?.Configuration ?? new PluginConfiguration())
     {
     }
@@ -59,6 +61,7 @@ public sealed class Materialiser : IMaterialiser
         IGostreamClient gostream,
         QualityScorer scorer,
         PhantomDb db,
+        Jellyfin.Plugin.PhantomLibrary.Library.IPhantomStubManager stubs,
         ILogger<Materialiser> logger,
         Func<PluginConfiguration> configProvider)
     {
@@ -68,6 +71,7 @@ public sealed class Materialiser : IMaterialiser
         _gostream = gostream;
         _scorer = scorer;
         _db = db;
+        _stubs = stubs;
         _logger = logger;
         _configProvider = configProvider;
     }
@@ -415,6 +419,12 @@ public sealed class Materialiser : IMaterialiser
 
     private async Task PromoteItemAsync(BaseItem item, string fusePath, CancellationToken ct)
     {
+        // Capture the existing Path BEFORE mutation. If it points at a
+        // phantom stub symlink, we will delete it after a successful
+        // in-place update. Defensive sentinel check protects real gostream
+        // files (or anything else) from accidental deletion.
+        var oldPath = item.Path;
+
         // Reflectively confirm IsVirtualItem is writable on this Jellyfin
         // build. On 10.10.x it is; the defensive check is per PLAN's hard
         // rule so a downstream API change does not silently break promotion.
@@ -431,6 +441,12 @@ public sealed class Materialiser : IMaterialiser
                 await _libraryManager.UpdateItemAsync(item, item.GetParent(),
                     ItemUpdateType.MetadataImport, ct).ConfigureAwait(false);
                 _logger.LogDebug("Promoted item {Id} via in-place update", item.Id);
+
+                if (IsPhantomStub(oldPath))
+                {
+                    try { await _stubs.DeleteAsync(oldPath!, ct).ConfigureAwait(false); }
+                    catch (Exception ex) { _logger.LogWarning(ex, "stub delete failed for {Path}", oldPath); }
+                }
                 return;
             }
             catch (Exception ex)
@@ -453,6 +469,10 @@ public sealed class Materialiser : IMaterialiser
             MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
         }, RefreshPriority.High);
     }
+
+    private static bool IsPhantomStub(string? path)
+        => !string.IsNullOrEmpty(path)
+            && path.Contains(Jellyfin.Plugin.PhantomLibrary.Library.PhantomStubManager.Sentinel, StringComparison.Ordinal);
 
     // Minimal IDirectoryService stub for MetadataRefreshOptions. Jellyfin
     // does not require a real on-disk service for QueueRefresh — it

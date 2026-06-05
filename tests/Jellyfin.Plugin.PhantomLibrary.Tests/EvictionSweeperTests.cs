@@ -54,6 +54,7 @@ public class EvictionSweeperTests : IDisposable
         cfg ??= new PluginConfiguration { EvictionEnabled = true, EvictionIdleDays = 7, PhantomRetentionDays = 7 };
         return new EvictionSweeper(
             _lib.Object, _userManager.Object, _userDataManager.Object, _gostream.Object, _db,
+            new NullPhantomStubManager(),
             NullLogger<EvictionSweeper>.Instance, () => cfg, now ?? (() => DateTimeOffset.UtcNow));
     }
 
@@ -259,6 +260,7 @@ public class EvictionSweeperTests : IDisposable
         var cfg = new PluginConfiguration { EvictionEnabled = true, EvictionIdleDays = 7, PhantomRetentionDays = 7 };
         var sweeper = new EvictionSweeper(
             _lib.Object, _userManager.Object, _userDataManager.Object, slowGs.Object, _db,
+            new NullPhantomStubManager(),
             NullLogger<EvictionSweeper>.Instance, () => cfg, () => DateTimeOffset.UtcNow);
 
         var first = sweeper.RunOnceAsync(CancellationToken.None);

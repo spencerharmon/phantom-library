@@ -1,13 +1,16 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
 using Jellyfin.Plugin.PhantomLibrary.Configuration;
+using Jellyfin.Plugin.PhantomLibrary.Library;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Controller.Entities;
+using MediaBrowser.Controller.Entities.TV;
 using MediaBrowser.Controller.Library;
 using NCrontab;
 using Microsoft.Extensions.Hosting;
@@ -29,6 +32,7 @@ public sealed class EvictionSweeper : IHostedService, IDisposable
     private readonly IUserDataManager _userDataManager;
     private readonly IGostreamClient _gostream;
     private readonly PhantomDb _db;
+    private readonly IPhantomStubManager _stubs;
     private readonly ILogger<EvictionSweeper> _logger;
     private readonly Func<PluginConfiguration> _configProvider;
     private readonly Func<DateTimeOffset> _nowProvider;
@@ -43,8 +47,9 @@ public sealed class EvictionSweeper : IHostedService, IDisposable
         IUserDataManager userDataManager,
         IGostreamClient gostream,
         PhantomDb db,
+        IPhantomStubManager stubs,
         ILogger<EvictionSweeper> logger)
-        : this(libraryManager, userManager, userDataManager, gostream, db, logger,
+        : this(libraryManager, userManager, userDataManager, gostream, db, stubs, logger,
             () => Plugin.Instance?.Configuration ?? new PluginConfiguration(),
             () => DateTimeOffset.UtcNow)
     {
@@ -56,6 +61,7 @@ public sealed class EvictionSweeper : IHostedService, IDisposable
         IUserDataManager userDataManager,
         IGostreamClient gostream,
         PhantomDb db,
+        IPhantomStubManager stubs,
         ILogger<EvictionSweeper> logger,
         Func<PluginConfiguration> configProvider,
         Func<DateTimeOffset> nowProvider)
@@ -65,6 +71,7 @@ public sealed class EvictionSweeper : IHostedService, IDisposable
         _userDataManager = userDataManager;
         _gostream = gostream;
         _db = db;
+        _stubs = stubs;
         _logger = logger;
         _configProvider = configProvider;
         _nowProvider = nowProvider;
@@ -300,15 +307,20 @@ public sealed class EvictionSweeper : IHostedService, IDisposable
             _logger.LogDebug("[Eviction] {Item} has no stub_path; skipping RemoveAsync", item.Id);
         }
 
-        // 3. Clear path + flip IsVirtualItem (reflective; mirrors Materialiser).
+        // 3. Rebind to a fresh phantom stub symlink + flip IsVirtualItem.
         var isVirtualProp = typeof(BaseItem).GetProperty(
             "IsVirtualItem", BindingFlags.Public | BindingFlags.Instance);
+        var newStub = await CreateReplacementStubAsync(item, row, ct).ConfigureAwait(false);
         try
         {
-            item.Path = string.Empty;
+            item.Path = newStub ?? string.Empty;
             if (isVirtualProp is not null && isVirtualProp.CanWrite)
             {
                 isVirtualProp.SetValue(item, true);
+            }
+            if (!string.IsNullOrEmpty(newStub))
+            {
+                item.IsLocked = true;
             }
 
             await _libraryManager.UpdateItemAsync(item, item.GetParent(),
@@ -319,7 +331,7 @@ public sealed class EvictionSweeper : IHostedService, IDisposable
             _logger.LogWarning(ex, "[Eviction] UpdateItemAsync (demote) failed for {Id}", item.Id);
         }
 
-        // 4. Update DB row: state=Virtual; clear stub/fuse/materialised_at.
+        // 4. Update DB row: state=Virtual; new stub path; clear fuse/materialised_at.
         await _db.UpsertPhantomItemAsync(item.Id, new PhantomItemRow
         {
             TmdbId = row.TmdbId,
@@ -330,11 +342,45 @@ public sealed class EvictionSweeper : IHostedService, IDisposable
             LastTouched = _nowProvider(),
             EvictionProtected = row.EvictionProtected,
             OriginalOverview = row.OriginalOverview,
-            StubPath = null,
+            StubPath = newStub,
             FusePath = null,
             MaterialisedAt = null,
         }, ct).ConfigureAwait(false);
 
         _logger.LogInformation("[Eviction] demoted {Item} to Virtual", item.Id);
+    }
+
+    private async Task<string?> CreateReplacementStubAsync(BaseItem item, PhantomItemRow row, CancellationToken ct)
+    {
+        if (!_stubs.IsReady)
+        {
+            _logger.LogDebug("[Eviction] PhantomStubManager not ready; demoting without stub for {Id}", item.Id);
+            return null;
+        }
+
+        int tmdbId = row.TmdbId ?? 0;
+        if (tmdbId <= 0 && item.ProviderIds is not null
+            && item.ProviderIds.TryGetValue("Tmdb", out var raw)
+            && int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed))
+        {
+            tmdbId = parsed;
+        }
+
+        if (tmdbId <= 0)
+        {
+            _logger.LogWarning("[Eviction] no tmdb id for {Id}; cannot rebind phantom stub", item.Id);
+            return null;
+        }
+
+        var kind = item is Series ? PhantomMediaKind.Series : PhantomMediaKind.Movie;
+        try
+        {
+            return await _stubs.CreateAsync(item.Name ?? string.Empty, tmdbId, kind, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "[Eviction] stub create failed for {Id}", item.Id);
+            return null;
+        }
     }
 }
