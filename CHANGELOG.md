@@ -23,7 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a documented workaround for an upstream Jellyfin bug in
   `LibraryStructureController.AddMediaPath` (does not refresh the
   `CollectionFolder`'s `PhysicalLocationsList` /
-  `PhysicalFolderIds`); upstream PR tracked separately.
+  `PhysicalFolderIds`); upstream PR tracked separately. The
+  workaround is best-effort: a metadata-saver race can revert the
+  patch on cold start (see PLAN §Documented partials), but a
+  background re-bind every 5 minutes recovers within one cycle
+  without operator intervention.
 
 ## [0.1.0] - 2026-06-04
 

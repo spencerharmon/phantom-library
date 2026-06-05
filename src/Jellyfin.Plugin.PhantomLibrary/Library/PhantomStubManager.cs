@@ -112,6 +112,14 @@ public sealed class PhantomStubManager : IPhantomStubManager
             }
             _rootForCachedSplash = root;
 
+            // Drop a non-media sentinel inside each subdir so Jellyfin's
+            // empty-folder skip in Folder.IsLibraryFolderAccessible does
+            // not cull our newly-bound physical folders before any
+            // phantoms have been created. Dotfile prefix keeps it out
+            // of any user-facing browse / scan results.
+            EnsureSentinel(movies);
+            EnsureSentinel(shows);
+
             IsReady = true;
             _logger.LogInformation(
                 "[PhantomStubManager] bootstrap OK: root={Root} splash={Splash}",
@@ -241,6 +249,23 @@ public sealed class PhantomStubManager : IPhantomStubManager
             root = "/var/lib/jellyfin/phantom-library";
         }
         return root;
+    }
+
+    private static void EnsureSentinel(string dir)
+    {
+        var sentinel = Path.Combine(dir, ".phantom-library-keep");
+        try
+        {
+            if (!File.Exists(sentinel))
+            {
+                File.WriteAllText(sentinel, "Phantom Library sentinel; do not delete. See PLAN §M10.\n");
+            }
+        }
+        catch
+        {
+            // Best-effort; the EnsureWritable probe above already proved
+            // the dir is writable, so a failure here is transient.
+        }
     }
 
     private static void EnsureWritable(string dir)

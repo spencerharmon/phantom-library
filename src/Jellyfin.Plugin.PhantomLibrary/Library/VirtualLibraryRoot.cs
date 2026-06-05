@@ -79,6 +79,17 @@ public sealed class VirtualLibraryRoot
 
     private Folder? Resolve(CollectionType desired)
     {
+        // 0. M10 path: phantoms must be parented into the per-kind phantom
+        //    physical Folder (a Folder under /var/lib/jellyfin/phantom-library/{movies,shows})
+        //    so their TopParentId matches one of the bound CollectionFolder's
+        //    PhysicalFolderIds and browse surfaces them. Falls through to the
+        //    legacy v0.1 resolution if the binder has not run yet.
+        var phantom = ResolvePhantomPhysicalFolder(desired);
+        if (phantom is not null)
+        {
+            return phantom;
+        }
+
         // 1. Operator-pinned library by GUID.
         var configuredId = _configProvider().PhantomTargetLibraryId;
         if (!string.IsNullOrWhiteSpace(configuredId)
@@ -130,5 +141,39 @@ public sealed class VirtualLibraryRoot
             "Set PhantomTargetLibraryId to silence this warning.",
             desired);
         return root;
+    }
+
+    private Folder? ResolvePhantomPhysicalFolder(CollectionType desired)
+    {
+        try
+        {
+            var cfg = _configProvider();
+            var rootCfg = cfg.PhantomStubRoot;
+            if (string.IsNullOrWhiteSpace(rootCfg))
+            {
+                return null;
+            }
+
+            var subdir = desired == CollectionType.movies ? "movies"
+                : desired == CollectionType.tvshows ? "shows"
+                : null;
+            if (subdir is null) return null;
+
+            var phantomDir = System.IO.Path.Combine(rootCfg, subdir);
+            var found = _libraryManager.FindByPath(phantomDir, isFolder: true);
+            if (found is Folder f && !(f is MediaBrowser.Controller.Entities.CollectionFolder))
+            {
+                _logger.LogDebug(
+                    "VirtualLibraryRoot using phantom physical folder {Path} ({Id}) for {Type}",
+                    phantomDir, f.Id, desired);
+                return f;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "ResolvePhantomPhysicalFolder failed for {Type}", desired);
+        }
+
+        return null;
     }
 }

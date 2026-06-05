@@ -68,6 +68,24 @@ internal sealed class PhantomBootstrapService : IHostedService
             // Continue to binder anyway; it is harmless if no stubs exist.
         }
 
+        // Initial bind.
+        await SafeBindAsync(ct).ConfigureAwait(false);
+
+        // Periodic re-bind. The Jellyfin metadata-saver pipeline can race
+        // with our patch (PLAN §M10 §Jellyfin upstream issue) and revert
+        // the CollectionFolder's persisted state. Re-running the bind
+        // every 5 minutes recovers from that race within one cycle.
+        // No-ops cheaply once the binding is correct.
+        while (!ct.IsCancellationRequested)
+        {
+            try { await Task.Delay(TimeSpan.FromMinutes(5), ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return; }
+            await SafeBindAsync(ct).ConfigureAwait(false);
+        }
+    }
+
+    private async Task SafeBindAsync(CancellationToken ct)
+    {
         try
         {
             await _binder.BindAsync(ct).ConfigureAwait(false);

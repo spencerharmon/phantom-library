@@ -97,6 +97,15 @@ public sealed class PhantomCollectionFolderBinder : IPhantomCollectionFolderBind
 
         await ValidateTopLibraryFoldersAsync(ct).ConfigureAwait(false);
 
+        // Wait for the post-ValidateTopLibraryFolders metadata-saver
+        // pipeline (image providers, dynamic image fetchers, etc.) to
+        // complete. Without this slack window concurrent saves race
+        // our patch and the persisted CollectionFolder reverts to the
+        // pre-bind snapshot. Verified live: at ~10s the pipeline has
+        // settled and our patch sticks.
+        try { await Task.Delay(TimeSpan.FromSeconds(15), ct).ConfigureAwait(false); }
+        catch (OperationCanceledException) { return; }
+
         // Re-fetch the CollectionFolder (it may have been replaced by validation).
         var freshCf = (_libraryManager.GetItemById(cf.Id) as CollectionFolder) ?? cf;
 
@@ -150,6 +159,55 @@ public sealed class PhantomCollectionFolderBinder : IPhantomCollectionFolderBind
             return;
         }
 
+        // Re-apply the patch in a loop. Concurrent racy metadata-saver
+        // writes can revert our patch; the loop outlasts them. Stop
+        // early when the in-memory state matches what we wrote AND has
+        // survived two consecutive attempts unchanged.
+        var stableCount = 0;
+        for (var attempt = 0; attempt < 10; attempt++)
+        {
+            try { await Task.Delay(TimeSpan.FromSeconds(1), ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return; }
+
+            var check = _libraryManager.GetItemById(cf.Id) as CollectionFolder;
+            if (check is null) break;
+
+            var preLoc = check.PhysicalLocationsList ?? Array.Empty<string>();
+            var preFid = check.PhysicalFolderIds ?? Array.Empty<Guid>();
+            var preHadPhantom = preLoc.Contains(phantomDir, StringComparer.Ordinal)
+                && preFid.Contains(physFolder.Id);
+
+            check.PhysicalLocationsList = preLoc.Append(phantomDir).Distinct(StringComparer.Ordinal).ToArray();
+            check.PhysicalFolderIds = preFid.Append(physFolder.Id).Distinct().ToArray();
+
+            try
+            {
+                await _libraryManager.UpdateItemAsync(check, check.GetParent(),
+                    ItemUpdateType.MetadataEdit, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "[PhantomBinder] re-patch attempt {N} for {Lib} threw", attempt + 1, libName);
+            }
+            freshCf = check;
+
+            if (preHadPhantom)
+            {
+                stableCount++;
+                if (stableCount >= 3)
+                {
+                    _logger.LogDebug(
+                        "[PhantomBinder] {Lib} binding stable after {Attempts} attempts",
+                        libName, attempt + 1);
+                    break;
+                }
+            }
+            else
+            {
+                stableCount = 0;
+            }
+        }
+
         _logger.LogInformation(
             "[PhantomBinder] Bound phantom dir {Dir} to {Lib}; PhysicalFolderIds now [{Ids}]",
             phantomDir, libName,
@@ -183,15 +241,24 @@ public sealed class PhantomCollectionFolderBinder : IPhantomCollectionFolderBind
     {
         try
         {
+            // The physical folder is registered as a Folder under the root,
+            // not necessarily a Children of the user root folder. Use the
+            // path index (FindByPath) which goes via the library DB.
+            var found = _libraryManager.FindByPath(phantomDir, isFolder: true);
+            if (found is Folder f) return f;
+
+            // Fallback: walk root children (covers the common case where
+            // ValidateTopLibraryFolders has registered the physical folder
+            // as a direct child of the user root).
             var root = _libraryManager.GetUserRootFolder();
             if (root is null) return null;
             foreach (var child in root.Children)
             {
-                if (child is Folder f
+                if (child is Folder folder
                     && !(child is CollectionFolder)
-                    && string.Equals(f.Path, phantomDir, StringComparison.Ordinal))
+                    && string.Equals(folder.Path, phantomDir, StringComparison.Ordinal))
                 {
-                    return f;
+                    return folder;
                 }
             }
         }

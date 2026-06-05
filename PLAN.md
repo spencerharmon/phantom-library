@@ -25,7 +25,7 @@ Mascot: *Stygiomedusa gigantea*, the giant phantom jelly.
 | M7 — Eviction + favourite-driven persistence | ✅ | `3377add` |
 | M8 — TV series + autopilot                   | ✅ | `60de538` |
 | M9 — Packaging + release polish              | ✅ | M9 release commit (this change) |
-| M10 — Phantom symlink library + visibility fix | ✅ | (unreleased) |
+| M10 — Phantom symlink library + visibility fix | ⚠️ partial | (unreleased) |
 
 ### Documented partials
 
@@ -42,6 +42,24 @@ Mascot: *Stygiomedusa gigantea*, the giant phantom jelly.
 - **Splash overlay is static pixels** (M5). Per-item status is
   surfaced via Jellyfin's native overview-text prefix rendered by
   the client UI, not burnt into the splash video.
+- **M10 binder vs. Jellyfin metadata-saver race.** The CollectionFolder
+  binder's UpdateItemAsync can race with Jellyfin's
+  `FolderMetadataService.RunMetadataSavers` pipeline (in particular
+  the `BaseDynamicImageProvider` that fires during folder metadata
+  refresh), and the latter can save a stale snapshot AFTER ours
+  that reverts `PhysicalLocationsList` /`PhysicalFolderIds` back to
+  the pre-bind state. Verified in the rig: the `gostream-shows`
+  CollectionFolder consistently wins the race; the
+  `gostream-movies` CollectionFolder consistently loses it on cold
+  start. Mitigation in place: `PhantomBootstrapService` re-runs
+  `BindAsync` every 5 minutes, so even a lost initial race recovers
+  within one cycle. The underlying race is the same upstream bug
+  documented under [§ Jellyfin upstream
+  issue](#jellyfin-upstream-issue-deferred); the upstream patch
+  (PR sketch in that section) removes the race because the
+  controller itself runs `RefreshMetadata` synchronously after
+  `AddMediaPath` instead of leaving the metadata-saver pipeline to
+  finish asynchronously.
 
 ### Excluded from v0.1
 

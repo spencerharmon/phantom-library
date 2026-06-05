@@ -136,8 +136,8 @@ public class PhantomCollectionFolderBinderTests
 
         _lib.Verify(l => l.AddMediaPath("gostream-movies", It.Is<MediaPathInfo>(m => m.Path == phantomMoviesDir)),
             Times.Once);
-        Assert.Single(updated);
-        Assert.Same(moviesCf, updated[0]);
+        Assert.NotEmpty(updated);
+        Assert.All(updated, i => Assert.Same(moviesCf, i));
         Assert.Contains(phantomMoviesDir, moviesCf.PhysicalLocationsList);
         Assert.Contains(newPhys.Id, moviesCf.PhysicalFolderIds);
         // Pre-existing entries preserved.
