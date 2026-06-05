@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
@@ -6,11 +8,20 @@ using Jellyfin.Plugin.PhantomLibrary.Library;
 using Jellyfin.Plugin.PhantomLibrary.Materialisation;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Common.Configuration;
+using MediaBrowser.Controller.Library;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 
 namespace Jellyfin.Plugin.PhantomLibrary.Api;
+
+/// <summary>Wire DTO for POST /Plugins/PhantomLibrary/UserPrefs/{userId}.</summary>
+public sealed class UserPrefsDto
+{
+    public bool ProtectFavourites { get; set; }
+    public bool ShowPhantoms { get; set; }
+    public bool AllowEager { get; set; }
+}
 
 /// <summary>
 /// Admin-only REST surface for debug / manual operations against the
@@ -27,19 +38,25 @@ public sealed class PhantomLibraryController : ControllerBase
     private readonly IGostreamClient _gostream;
     private readonly IApplicationPaths _paths;
     private readonly ISuggestionsContributor _suggestions;
+    private readonly IUserManager _userManager;
+    private readonly PhantomDb _db;
 
     public PhantomLibraryController(
         IMaterialiser materialiser,
         IMaterialisationQueue queue,
         IGostreamClient gostream,
         IApplicationPaths paths,
-        ISuggestionsContributor suggestions)
+        ISuggestionsContributor suggestions,
+        IUserManager userManager,
+        PhantomDb db)
     {
         _materialiser = materialiser;
         _queue = queue;
         _gostream = gostream;
         _paths = paths;
         _suggestions = suggestions;
+        _userManager = userManager;
+        _db = db;
     }
 
     /// <summary>Synchronously materialise an item and return its outcome.</summary>
@@ -104,5 +121,52 @@ public sealed class PhantomLibraryController : ControllerBase
     {
         var count = await _suggestions.RefreshAllAsync(ct).ConfigureAwait(false);
         return Ok(new { created = count });
+    }
+
+    /// <summary>Returns per-user preference rows for all Jellyfin users.</summary>
+    [HttpGet("UserPrefs")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    public async Task<IActionResult> ListUserPrefs(CancellationToken ct = default)
+    {
+        var stored = await _db.ListAllUserPrefsAsync(ct).ConfigureAwait(false);
+        var dict = stored.ToDictionary(t => t.UserId, t => t.Prefs);
+        var users = _userManager.GetUsers();
+        var result = new List<object>();
+        foreach (var u in users)
+        {
+            var prefs = dict.TryGetValue(u.Id, out var p) ? p : UserPrefsRow.Defaults;
+            result.Add(new
+            {
+                userId = u.Id.ToString("N"),
+                userName = u.Username,
+                protectFavourites = prefs.ProtectFavourites,
+                showPhantoms = prefs.ShowPhantoms,
+                allowEager = prefs.AllowEager,
+            });
+        }
+
+        return Ok(result);
+    }
+
+    /// <summary>Updates the per-user preference row for the given user.</summary>
+    [HttpPost("UserPrefs/{userId}")]
+    [ProducesResponseType(StatusCodes.Status204NoContent)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> UpsertUserPrefs(
+        [FromRoute] Guid userId,
+        [FromBody] UserPrefsDto body,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(body);
+        var user = _userManager.GetUserById(userId);
+        if (user is null) return NotFound();
+
+        await _db.UpsertUserPrefsAsync(userId, new UserPrefsRow
+        {
+            ProtectFavourites = body.ProtectFavourites,
+            ShowPhantoms = body.ShowPhantoms,
+            AllowEager = body.AllowEager,
+        }, ct).ConfigureAwait(false);
+        return NoContent();
     }
 }

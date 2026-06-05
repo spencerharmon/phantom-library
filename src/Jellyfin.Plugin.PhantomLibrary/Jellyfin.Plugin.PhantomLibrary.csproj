@@ -43,6 +43,7 @@
     <PackageReference Include="Jellyfin.Model" Version="10.11.9" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.0" />
     <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="9.0.0" />
+    <PackageReference Include="NCrontab" Version="3.3.3" />
   </ItemGroup>
 
   <ItemGroup>
@@ -55,6 +56,7 @@
 
   <ItemGroup>
     <EmbeddedResource Include="Configuration\configPage.html" />
+    <EmbeddedResource Include="Configuration\userPrefsPage.html" />
     <EmbeddedResource Include="Assets\splash.mp4" />
   </ItemGroup>
 

@@ -30,6 +30,8 @@ public class SeriesAutopilotTests : IDisposable
     private readonly Mock<IMaterialiser> _materialiser = new();
     private readonly Mock<IGostreamClient> _gostream = new();
     private readonly Mock<ILibraryManager> _lib = new();
+    private readonly Mock<IUserManager> _userManager = new();
+    private readonly Mock<IUserDataManager> _userDataManager = new();
     private readonly VirtualLibraryRoot _root;
     private readonly TestFolder _moviesParent;
     private readonly TestFolder _seriesParent;
@@ -78,6 +80,7 @@ public class SeriesAutopilotTests : IDisposable
         return new SeriesAutopilot(
             _tmdb.Object, _ingestor.Object, _queue.Object, _materialiser.Object,
             _gostream.Object, _db, _root, _lib.Object,
+            _userManager.Object, _userDataManager.Object,
             NullLogger<SeriesAutopilot>.Instance, () => cfg);
     }
 
@@ -229,6 +232,29 @@ public class SeriesAutopilotTests : IDisposable
         var ap = Build(new PluginConfiguration { SeriesAutopilotEnabled = false });
         await ap.OnMovieFavouritedAsync(Guid.NewGuid(), movie, CancellationToken.None);
         _tmdb.Verify(t => t.GetMovieCollectionSequelAsync(It.IsAny<int>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task Lifecycle_Finished_VaultPresent_NoFavourite_DoesNotPrestage()
+    {
+        _gostream.Setup(g => g.IsVaultModePresentAsync(It.IsAny<CancellationToken>())).ReturnsAsync(true);
+        _userManager.Setup(u => u.GetUsers()).Returns(Array.Empty<Jellyfin.Database.Implementations.Entities.User>());
+
+        var ap = Build();
+        await ap.StartAsync(CancellationToken.None);
+        try
+        {
+            _materialiser.Raise(m => m.LifecycleChanged += null,
+                this,
+                new MaterialisationLifecycleEvent(Guid.NewGuid(), MaterialisationLifecyclePhase.Finished,
+                    new MaterialisationOutcome { Status = MaterialisationStatus.Success, StubPath = "/r/x.mkv" }));
+            // Give the fire-and-forget task a moment.
+            for (var i = 0; i < 50; i++) { await Task.Delay(20); }
+        }
+        finally { await ap.StopAsync(CancellationToken.None); }
+
+        _gostream.Verify(g => g.PrestageAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()),
             Times.Never);
     }
 }

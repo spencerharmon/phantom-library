@@ -63,6 +63,14 @@ public class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
                     "{0}.Configuration.configPage.html",
                     GetType().Namespace),
             },
+            new PluginPageInfo
+            {
+                Name = Name + " \u2014 User Prefs",
+                EmbeddedResourcePath = string.Format(
+                    CultureInfo.InvariantCulture,
+                    "{0}.Configuration.userPrefsPage.html",
+                    GetType().Namespace),
+            },
         };
     }
 }

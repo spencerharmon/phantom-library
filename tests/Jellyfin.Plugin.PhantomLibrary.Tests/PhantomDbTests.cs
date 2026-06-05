@@ -207,7 +207,7 @@ public class PhantomDbTests : IDisposable
             using (var vc = verify.CreateCommand())
             {
                 vc.CommandText = "PRAGMA user_version;";
-                Assert.Equal(3L, Convert.ToInt64(vc.ExecuteScalar(),
+                Assert.Equal(4L, Convert.ToInt64(vc.ExecuteScalar(),
                     System.Globalization.CultureInfo.InvariantCulture));
             }
 
@@ -300,7 +300,7 @@ public class PhantomDbTests : IDisposable
             using (var vc = verify.CreateCommand())
             {
                 vc.CommandText = "PRAGMA user_version;";
-                Assert.Equal(3L, Convert.ToInt64(vc.ExecuteScalar(),
+                Assert.Equal(4L, Convert.ToInt64(vc.ExecuteScalar(),
                     System.Globalization.CultureInfo.InvariantCulture));
             }
 
@@ -329,6 +329,186 @@ public class PhantomDbTests : IDisposable
                 Assert.True(r.Read());
                 Assert.Equal("tt42", r.GetString(0));
                 Assert.True(r.IsDBNull(1));
+            }
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            try { File.Delete(p); File.Delete(p + "-wal"); File.Delete(p + "-shm"); } catch { }
+        }
+    }
+}
+
+public class PhantomDbM7Tests : IDisposable
+{
+    private readonly string _path;
+    private readonly PhantomDb _db;
+
+    public PhantomDbM7Tests()
+    {
+        _path = Path.Combine(Path.GetTempPath(), "phantomdbm7_" + Guid.NewGuid().ToString("N") + ".db");
+        _db = new PhantomDb(_path);
+    }
+
+    public void Dispose()
+    {
+        _db.Dispose();
+        try { File.Delete(_path); File.Delete(_path + "-wal"); File.Delete(_path + "-shm"); } catch { }
+    }
+
+    [Fact]
+    public async Task UserPrefs_RoundTrip_And_Defaults()
+    {
+        var u = Guid.NewGuid();
+        var def = await _db.GetUserPrefsAsync(u, default);
+        Assert.True(def.ProtectFavourites);
+        Assert.True(def.ShowPhantoms);
+        Assert.True(def.AllowEager);
+
+        await _db.UpsertUserPrefsAsync(u, new UserPrefsRow { ProtectFavourites = false, ShowPhantoms = false, AllowEager = false }, default);
+        var got = await _db.GetUserPrefsAsync(u, default);
+        Assert.False(got.ProtectFavourites);
+
+        var all = await _db.ListAllUserPrefsAsync(default);
+        Assert.Single(all);
+        Assert.Equal(u, all[0].UserId);
+    }
+
+    [Fact]
+    public async Task ListItemsByState_Filters_Correctly()
+    {
+        var v = Guid.NewGuid();
+        var m = Guid.NewGuid();
+        await _db.UpsertPhantomItemAsync(v, new PhantomItemRow
+        {
+            Type = "movie", State = PhantomItemState.Virtual,
+            FirstSeen = DateTimeOffset.UtcNow, LastTouched = DateTimeOffset.UtcNow,
+        }, default);
+        await _db.UpsertPhantomItemAsync(m, new PhantomItemRow
+        {
+            Type = "movie", State = PhantomItemState.Materialised,
+            FirstSeen = DateTimeOffset.UtcNow, LastTouched = DateTimeOffset.UtcNow,
+            StubPath = "/s", FusePath = "/f", MaterialisedAt = DateTimeOffset.UtcNow,
+        }, default);
+
+        var virt = await _db.ListItemsByStateAsync("Virtual", default);
+        var mat = await _db.ListItemsByStateAsync("Materialised", default);
+        Assert.Single(virt);
+        Assert.Equal(v, virt[0].ItemGuid);
+        Assert.Single(mat);
+        Assert.Equal("/s", mat[0].StubPath);
+        Assert.Equal("/f", mat[0].FusePath);
+        Assert.NotNull(mat[0].MaterialisedAt);
+    }
+
+    [Fact]
+    public async Task PurgeExpiredPhantoms_DeletesOlderThanRetention()
+    {
+        var old = Guid.NewGuid();
+        var fresh = Guid.NewGuid();
+        await _db.UpsertPhantomItemAsync(old, new PhantomItemRow
+        {
+            Type = "movie", State = PhantomItemState.Phantom,
+            FirstSeen = DateTimeOffset.UtcNow.AddDays(-30),
+            LastTouched = DateTimeOffset.UtcNow.AddDays(-30),
+        }, default);
+        await _db.UpsertPhantomItemAsync(fresh, new PhantomItemRow
+        {
+            Type = "movie", State = PhantomItemState.Phantom,
+            FirstSeen = DateTimeOffset.UtcNow.AddHours(-1),
+            LastTouched = DateTimeOffset.UtcNow,
+        }, default);
+
+        var n = await _db.PurgeExpiredPhantomsAsync(TimeSpan.FromDays(7), default);
+        Assert.Equal(1, n);
+        Assert.Null(await _db.GetPhantomItemAsync(old, default));
+        Assert.NotNull(await _db.GetPhantomItemAsync(fresh, default));
+    }
+
+    [Fact]
+    public async Task PurgeExpiredUnavailable_RemovesExpired()
+    {
+        var k = new UnavailableKey(101, null, "movie", null, null);
+        var fresh = new UnavailableKey(102, null, "movie", null, null);
+        await _db.MarkUnavailableAsync(k, TimeSpan.FromSeconds(-1), default);
+        await _db.MarkUnavailableAsync(fresh, TimeSpan.FromHours(1), default);
+
+        var n = await _db.PurgeExpiredUnavailableMarkersAsync(default);
+        Assert.Equal(1, n);
+    }
+
+    [Fact]
+    public async Task V3_To_V4_Migration_Adds_StubFuseMat_Columns()
+    {
+        var p = Path.Combine(Path.GetTempPath(), "phantommig4_" + Guid.NewGuid().ToString("N") + ".db");
+        try
+        {
+            using (var conn = new Microsoft.Data.Sqlite.SqliteConnection(
+                       new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder
+                       {
+                           DataSource = p,
+                           Mode = Microsoft.Data.Sqlite.SqliteOpenMode.ReadWriteCreate,
+                       }.ToString()))
+            {
+                conn.Open();
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = @"CREATE TABLE phantom_items (
+                        item_guid TEXT PRIMARY KEY,
+                        tmdb_id INTEGER,
+                        imdb_id TEXT,
+                        type TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        first_seen INTEGER NOT NULL,
+                        last_touched INTEGER NOT NULL,
+                        eviction_protected INTEGER NOT NULL DEFAULT 0,
+                        original_overview TEXT
+                    );
+                    INSERT INTO phantom_items (item_guid, type, state, first_seen, last_touched)
+                    VALUES ('keep', 'movie', 'Virtual', 1000, 2000);";
+                    cmd.ExecuteNonQuery();
+                }
+                using (var sv = conn.CreateCommand())
+                {
+                    sv.CommandText = "PRAGMA user_version = 3;";
+                    sv.ExecuteNonQuery();
+                }
+                Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            }
+
+            using (var db = new PhantomDb(p))
+            {
+                _ = await db.GetPhantomItemAsync(Guid.NewGuid(), default);
+            }
+
+            using var verify = new Microsoft.Data.Sqlite.SqliteConnection(
+                new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder
+                {
+                    DataSource = p, Mode = Microsoft.Data.Sqlite.SqliteOpenMode.ReadWrite,
+                }.ToString());
+            verify.Open();
+            using (var vc = verify.CreateCommand())
+            {
+                vc.CommandText = "PRAGMA user_version;";
+                Assert.Equal(4L, Convert.ToInt64(vc.ExecuteScalar(),
+                    System.Globalization.CultureInfo.InvariantCulture));
+            }
+            var cols = new System.Collections.Generic.HashSet<string>();
+            using (var ti = verify.CreateCommand())
+            {
+                ti.CommandText = "PRAGMA table_info(phantom_items);";
+                using var rd = ti.ExecuteReader();
+                while (rd.Read()) cols.Add(rd.GetString(1));
+            }
+            Assert.Contains("stub_path", cols);
+            Assert.Contains("fuse_path", cols);
+            Assert.Contains("materialised_at", cols);
+
+            using (var sel = verify.CreateCommand())
+            {
+                sel.CommandText = "SELECT COUNT(*) FROM phantom_items WHERE item_guid='keep';";
+                Assert.Equal(1L, Convert.ToInt64(sel.ExecuteScalar(),
+                    System.Globalization.CultureInfo.InvariantCulture));
             }
         }
         finally

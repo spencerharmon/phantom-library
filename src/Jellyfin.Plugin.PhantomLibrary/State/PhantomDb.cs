@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
@@ -58,6 +59,7 @@ public sealed record AutopilotStateRow
 
 public sealed record PhantomItemRow
 {
+    public Guid ItemGuid { get; init; }
     public int? TmdbId { get; init; }
     public string? ImdbId { get; init; }
     public required string Type { get; init; }
@@ -66,6 +68,23 @@ public sealed record PhantomItemRow
     public required DateTimeOffset LastTouched { get; init; }
     public bool EvictionProtected { get; init; }
     public string? OriginalOverview { get; init; }
+    public string? StubPath { get; init; }
+    public string? FusePath { get; init; }
+    public DateTimeOffset? MaterialisedAt { get; init; }
+}
+
+public sealed record UserPrefsRow
+{
+    public required bool ProtectFavourites { get; init; }
+    public required bool ShowPhantoms { get; init; }
+    public required bool AllowEager { get; init; }
+
+    public static UserPrefsRow Defaults { get; } = new()
+    {
+        ProtectFavourites = true,
+        ShowPhantoms = true,
+        AllowEager = true,
+    };
 }
 
 /// <summary>
@@ -129,7 +148,7 @@ public sealed class PhantomDb : IDisposable
         return conn;
     }
 
-    private const int CurrentSchemaVersion = 3;
+    private const int CurrentSchemaVersion = 4;
 
     private static void EnsureSchema(SqliteConnection conn)
     {
@@ -178,6 +197,38 @@ public sealed class PhantomDb : IDisposable
             cmd.Transaction = tx;
             cmd.CommandText = SchemaV3Sql;
             cmd.ExecuteNonQuery();
+        }
+
+        if (version < 4)
+        {
+            // v4: phantom_items gains stub_path, fuse_path, materialised_at
+            // (M7: needed by EvictionSweeper to call gostream RemoveAsync).
+            // ADD COLUMN IF NOT EXISTS is unavailable in older SQLite, so
+            // we PRAGMA table_info to check first.
+            var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            using (var info = conn.CreateCommand())
+            {
+                info.Transaction = tx;
+                info.CommandText = "PRAGMA table_info(phantom_items);";
+                using var rdr = info.ExecuteReader();
+                while (rdr.Read())
+                {
+                    existing.Add(rdr.GetString(1));
+                }
+            }
+
+            void AddColumnIfMissing(string col, string sqlType)
+            {
+                if (existing.Contains(col)) return;
+                using var cmd = conn.CreateCommand();
+                cmd.Transaction = tx;
+                cmd.CommandText = $"ALTER TABLE phantom_items ADD COLUMN {col} {sqlType};";
+                cmd.ExecuteNonQuery();
+            }
+
+            AddColumnIfMissing("stub_path", "TEXT");
+            AddColumnIfMissing("fuse_path", "TEXT");
+            AddColumnIfMissing("materialised_at", "INTEGER");
         }
 
         using (var sv = conn.CreateCommand())
@@ -421,8 +472,9 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
             await using var conn = await OpenAsync(ct).ConfigureAwait(false);
             await using var cmd = conn.CreateCommand();
             cmd.CommandText = @"INSERT INTO phantom_items
-                (item_guid, tmdb_id, imdb_id, type, state, first_seen, last_touched, eviction_protected, original_overview)
-                VALUES ($guid,$tmdb,$imdb,$type,$state,$first,$last,$prot,$orig)
+                (item_guid, tmdb_id, imdb_id, type, state, first_seen, last_touched, eviction_protected, original_overview,
+                 stub_path, fuse_path, materialised_at)
+                VALUES ($guid,$tmdb,$imdb,$type,$state,$first,$last,$prot,$orig,$stub,$fuse,$mat)
                 ON CONFLICT(item_guid) DO UPDATE SET
                     tmdb_id=excluded.tmdb_id,
                     imdb_id=excluded.imdb_id,
@@ -430,7 +482,10 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
                     state=excluded.state,
                     last_touched=excluded.last_touched,
                     eviction_protected=excluded.eviction_protected,
-                    original_overview=excluded.original_overview;";
+                    original_overview=excluded.original_overview,
+                    stub_path=excluded.stub_path,
+                    fuse_path=excluded.fuse_path,
+                    materialised_at=excluded.materialised_at;";
             cmd.Parameters.AddWithValue("$guid", jellyfinItemId.ToString("N"));
             cmd.Parameters.AddWithValue("$tmdb", (object?)row.TmdbId ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$imdb", (object?)row.ImdbId ?? DBNull.Value);
@@ -440,7 +495,97 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
             cmd.Parameters.AddWithValue("$last", row.LastTouched.ToUnixTimeSeconds());
             cmd.Parameters.AddWithValue("$prot", row.EvictionProtected ? 1 : 0);
             cmd.Parameters.AddWithValue("$orig", (object?)row.OriginalOverview ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$stub", (object?)row.StubPath ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$fuse", (object?)row.FusePath ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$mat",
+                row.MaterialisedAt is null ? DBNull.Value : (object)row.MaterialisedAt.Value.ToUnixTimeSeconds());
             await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<IReadOnlyList<PhantomItemRow>> ListItemsByStateAsync(string state, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(state);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT item_guid, tmdb_id, imdb_id, type, state, first_seen, last_touched,
+                eviction_protected, original_overview, stub_path, fuse_path, materialised_at
+            FROM phantom_items WHERE state=$state;";
+        cmd.Parameters.AddWithValue("$state", state);
+        var list = new List<PhantomItemRow>();
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            list.Add(new PhantomItemRow
+            {
+                ItemGuid = Guid.ParseExact(r.GetString(0), "N"),
+                TmdbId = r.IsDBNull(1) ? null : r.GetInt32(1),
+                ImdbId = r.IsDBNull(2) ? null : r.GetString(2),
+                Type = r.GetString(3),
+                State = Enum.Parse<PhantomItemState>(r.GetString(4)),
+                FirstSeen = DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(5)),
+                LastTouched = DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(6)),
+                EvictionProtected = r.GetInt32(7) != 0,
+                OriginalOverview = r.IsDBNull(8) ? null : r.GetString(8),
+                StubPath = r.IsDBNull(9) ? null : r.GetString(9),
+                FusePath = r.IsDBNull(10) ? null : r.GetString(10),
+                MaterialisedAt = r.IsDBNull(11) ? (DateTimeOffset?)null
+                    : DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(11)),
+            });
+        }
+
+        return list;
+    }
+
+    public async Task DeleteItemAsync(Guid jellyfinItemId, CancellationToken ct)
+    {
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "DELETE FROM phantom_items WHERE item_guid=$guid;";
+            cmd.Parameters.AddWithValue("$guid", jellyfinItemId.ToString("N"));
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<int> PurgeExpiredPhantomsAsync(TimeSpan retention, CancellationToken ct)
+    {
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "DELETE FROM phantom_items WHERE state='Phantom' AND first_seen < $cutoff;";
+            cmd.Parameters.AddWithValue("$cutoff",
+                DateTimeOffset.UtcNow.Subtract(retention).ToUnixTimeSeconds());
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<int> PurgeExpiredUnavailableMarkersAsync(CancellationToken ct)
+    {
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "DELETE FROM unavailable_marker WHERE retry_after < $now;";
+            cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
         finally
         {
@@ -452,7 +597,8 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
     {
         await using var conn = await OpenAsync(ct).ConfigureAwait(false);
         await using var cmd = conn.CreateCommand();
-        cmd.CommandText = @"SELECT tmdb_id, imdb_id, type, state, first_seen, last_touched, eviction_protected, original_overview
+        cmd.CommandText = @"SELECT tmdb_id, imdb_id, type, state, first_seen, last_touched, eviction_protected, original_overview,
+            stub_path, fuse_path, materialised_at
             FROM phantom_items WHERE item_guid=$guid LIMIT 1;";
         cmd.Parameters.AddWithValue("$guid", jellyfinItemId.ToString("N"));
         await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
@@ -463,6 +609,7 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
 
         return new PhantomItemRow
         {
+            ItemGuid = jellyfinItemId,
             TmdbId = r.IsDBNull(0) ? null : r.GetInt32(0),
             ImdbId = r.IsDBNull(1) ? null : r.GetString(1),
             Type = r.GetString(2),
@@ -471,6 +618,10 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
             LastTouched = DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(5)),
             EvictionProtected = r.GetInt32(6) != 0,
             OriginalOverview = r.IsDBNull(7) ? null : r.GetString(7),
+            StubPath = r.IsDBNull(8) ? null : r.GetString(8),
+            FusePath = r.IsDBNull(9) ? null : r.GetString(9),
+            MaterialisedAt = r.IsDBNull(10) ? (DateTimeOffset?)null
+                : DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(10)),
         };
     }
 
@@ -633,8 +784,81 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
         }
     }
 
-    // ---- user_prefs / autopilot_state: M7 ----
-    // TODO(M7): implement user_prefs accessors.
+    // ---- user_prefs (M7) ----
+
+    /// <summary>
+    /// Reads per-user preferences. Returns <see cref="UserPrefsRow.Defaults"/>
+    /// (ProtectFavourites=true, ShowPhantoms=true, AllowEager=true) if no row
+    /// exists for the user.
+    /// </summary>
+    public async Task<UserPrefsRow> GetUserPrefsAsync(Guid userId, CancellationToken ct)
+    {
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT protect_favourites, show_phantoms, allow_eager
+            FROM user_prefs WHERE user_id=$uid LIMIT 1;";
+        cmd.Parameters.AddWithValue("$uid", userId.ToString("N"));
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (!await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            return UserPrefsRow.Defaults;
+        }
+
+        return new UserPrefsRow
+        {
+            ProtectFavourites = r.GetInt32(0) != 0,
+            ShowPhantoms = r.GetInt32(1) != 0,
+            AllowEager = r.GetInt32(2) != 0,
+        };
+    }
+
+    public async Task UpsertUserPrefsAsync(Guid userId, UserPrefsRow prefs, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(prefs);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"INSERT INTO user_prefs
+                (user_id, protect_favourites, show_phantoms, allow_eager)
+                VALUES ($uid,$pf,$sp,$ae)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    protect_favourites=excluded.protect_favourites,
+                    show_phantoms=excluded.show_phantoms,
+                    allow_eager=excluded.allow_eager;";
+            cmd.Parameters.AddWithValue("$uid", userId.ToString("N"));
+            cmd.Parameters.AddWithValue("$pf", prefs.ProtectFavourites ? 1 : 0);
+            cmd.Parameters.AddWithValue("$sp", prefs.ShowPhantoms ? 1 : 0);
+            cmd.Parameters.AddWithValue("$ae", prefs.AllowEager ? 1 : 0);
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<IReadOnlyList<(Guid UserId, UserPrefsRow Prefs)>> ListAllUserPrefsAsync(CancellationToken ct)
+    {
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT user_id, protect_favourites, show_phantoms, allow_eager FROM user_prefs;";
+        var list = new List<(Guid, UserPrefsRow)>();
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            var uid = Guid.ParseExact(r.GetString(0), "N");
+            list.Add((uid, new UserPrefsRow
+            {
+                ProtectFavourites = r.GetInt32(1) != 0,
+                ShowPhantoms = r.GetInt32(2) != 0,
+                AllowEager = r.GetInt32(3) != 0,
+            }));
+        }
+
+        return list;
+    }
 
     private const string SchemaV3Sql = @"
 CREATE TABLE IF NOT EXISTS tmdb_cache (

@@ -31,6 +31,12 @@ public interface IGostreamClient
     /// the process lifetime.
     /// </summary>
     Task<bool> IsVaultModePresentAsync(CancellationToken ct);
+
+    /// <summary>
+    /// Best-effort: clears the Vault Mode persistence marker for the given
+    /// stub. 404 is swallowed (idempotent); 5xx throws.
+    /// </summary>
+    Task UnprestageAsync(string stubPath, CancellationToken ct);
 }
 
 public sealed record GostreamAddRequest

@@ -320,6 +320,9 @@ public sealed class Materialiser : IMaterialiser
                 State = PhantomItemState.Materialised,
                 FirstSeen = DateTimeOffset.UtcNow,
                 LastTouched = DateTimeOffset.UtcNow,
+                StubPath = addResult.StubPath,
+                FusePath = addResult.FusePath,
+                MaterialisedAt = DateTimeOffset.UtcNow,
             }, ct).ConfigureAwait(false);
 
             return new MaterialisationOutcome

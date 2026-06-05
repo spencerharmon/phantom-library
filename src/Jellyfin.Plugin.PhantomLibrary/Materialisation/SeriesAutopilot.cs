@@ -64,6 +64,8 @@ public sealed class SeriesAutopilot : ISeriesAutopilot, IHostedService, IDisposa
     private readonly PhantomDb _db;
     private readonly VirtualLibraryRoot _root;
     private readonly MediaBrowser.Controller.Library.ILibraryManager _libraryManager;
+    private readonly IUserManager _userManager;
+    private readonly IUserDataManager _userDataManager;
     private readonly ILogger<SeriesAutopilot> _logger;
     private readonly Func<PluginConfiguration> _configProvider;
 
@@ -79,8 +81,11 @@ public sealed class SeriesAutopilot : ISeriesAutopilot, IHostedService, IDisposa
         PhantomDb db,
         VirtualLibraryRoot root,
         ILibraryManager libraryManager,
+        IUserManager userManager,
+        IUserDataManager userDataManager,
         ILogger<SeriesAutopilot> logger)
-        : this(tmdb, ingestor, queue, materialiser, gostream, db, root, libraryManager, logger,
+        : this(tmdb, ingestor, queue, materialiser, gostream, db, root, libraryManager,
+               userManager, userDataManager, logger,
                () => Plugin.Instance?.Configuration ?? new PluginConfiguration())
     {
     }
@@ -94,6 +99,8 @@ public sealed class SeriesAutopilot : ISeriesAutopilot, IHostedService, IDisposa
         PhantomDb db,
         VirtualLibraryRoot root,
         ILibraryManager libraryManager,
+        IUserManager userManager,
+        IUserDataManager userDataManager,
         ILogger<SeriesAutopilot> logger,
         Func<PluginConfiguration> configProvider)
     {
@@ -105,6 +112,8 @@ public sealed class SeriesAutopilot : ISeriesAutopilot, IHostedService, IDisposa
         _db = db;
         _root = root;
         _libraryManager = libraryManager;
+        _userManager = userManager;
+        _userDataManager = userDataManager;
         _logger = logger;
         _configProvider = configProvider;
     }
@@ -376,11 +385,14 @@ public sealed class SeriesAutopilot : ISeriesAutopilot, IHostedService, IDisposa
     {
         // Vault Mode prestage hand-off: when an Episode finishes materialising,
         // and the underlying gostream exposes Vault Mode, request a prestage
-        // for the stub at priority 50. Best-effort; failures are logged.
+        // for the stub at priority 50 — but only if at least one user has
+        // IsFavorite=true on the item (or its parent Series/Movie) AND that
+        // user's ProtectFavourites pref is on. Best-effort; failures are logged.
         if (e.Phase != MaterialisationLifecyclePhase.Finished) return;
         if (e.Outcome?.Status != MaterialisationStatus.Success) return;
         var stub = e.Outcome.StubPath;
         if (string.IsNullOrWhiteSpace(stub)) return;
+        var itemId = e.ItemId;
 
         _ = Task.Run(async () =>
         {
@@ -388,6 +400,12 @@ public sealed class SeriesAutopilot : ISeriesAutopilot, IHostedService, IDisposa
             {
                 if (!await _gostream.IsVaultModePresentAsync(CancellationToken.None).ConfigureAwait(false))
                 {
+                    return;
+                }
+
+                if (!await AnyUserProtectFavouriteAsync(itemId, CancellationToken.None).ConfigureAwait(false))
+                {
+                    _logger.LogDebug("Vault prestage skipped for {Stub}: no protecting favourite", stub);
                     return;
                 }
 
@@ -399,5 +417,46 @@ public sealed class SeriesAutopilot : ISeriesAutopilot, IHostedService, IDisposa
                 _logger.LogDebug(ex, "Vault prestage failed for {Stub}", stub);
             }
         });
+    }
+
+    private async Task<bool> AnyUserProtectFavouriteAsync(Guid itemId, CancellationToken ct)
+    {
+        MediaBrowser.Controller.Entities.BaseItem? item;
+        try { item = _libraryManager.GetItemById(itemId); }
+        catch { return false; }
+        if (item is null) return false;
+
+        // Candidates: the item itself + (for Episode) its Series + (for Movie) itself only.
+        var candidates = new List<MediaBrowser.Controller.Entities.BaseItem> { item };
+        if (item is Episode ep)
+        {
+            var s = ep.Series ?? WalkToSeries(ep);
+            if (s is not null) candidates.Add(s);
+        }
+
+        IEnumerable<Jellyfin.Database.Implementations.Entities.User> users;
+        try { users = _userManager.GetUsers(); }
+        catch { return false; }
+
+        foreach (var user in users)
+        {
+            bool isFav = false;
+            foreach (var c in candidates)
+            {
+                try
+                {
+                    var ud = _userDataManager.GetUserData(user, c);
+                    if (ud is not null && ud.IsFavorite) { isFav = true; break; }
+                }
+                catch { }
+            }
+
+            if (!isFav) continue;
+
+            var prefs = await _db.GetUserPrefsAsync(user.Id, ct).ConfigureAwait(false);
+            if (prefs.ProtectFavourites) return true;
+        }
+
+        return false;
     }
 }

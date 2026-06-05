@@ -170,6 +170,37 @@ public sealed class GostreamClient : IGostreamClient
         throw new GostreamBadRequestException($"gostream prestage {status}: {err}");
     }
 
+    public async Task UnprestageAsync(string stubPath, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(stubPath))
+        {
+            throw new ArgumentException("stubPath required", nameof(stubPath));
+        }
+
+        var url = BuildUrl("/api/library/unprestage");
+        using var content = JsonContent.Create(new { stub_path = stubPath });
+        using var response = await _http.PostAsync(url, content, ct).ConfigureAwait(false);
+        var status = (int)response.StatusCode;
+        if (status >= 200 && status < 300)
+        {
+            return;
+        }
+
+        if (status == 404)
+        {
+            _logger.LogDebug("gostream /api/library/unprestage 404 for {Stub} (already gone)", stubPath);
+            return;
+        }
+
+        var err = await SafeReadErrorAsync(response, ct).ConfigureAwait(false);
+        if (status >= 500)
+        {
+            throw new GostreamServerException(status, $"gostream unprestage {status}: {err}");
+        }
+
+        throw new GostreamBadRequestException($"gostream unprestage {status}: {err}");
+    }
+
     public Task<bool> IsVaultModePresentAsync(CancellationToken ct)
     {
         // Probe /api/library/prestage/status?stub_path=__probe__ once per

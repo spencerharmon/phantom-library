@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>Phantom Library — User Prefs</title>
+</head>
+<body>
+    <div id="PhantomLibraryUserPrefsPage"
+         data-role="page"
+         class="page type-interior pluginConfigurationPage"
+         data-require="emby-input,emby-button,emby-checkbox">
+        <div data-role="content">
+            <div class="content-primary">
+                <h2>Phantom Library — Per-user preferences</h2>
+                <p class="fieldDescription">
+                    Admin form for v0.1. Each Jellyfin user has three Phantom Library toggles.
+                    Defaults apply to users with no row stored: Protect favourites ON,
+                    Show phantoms ON, Allow eager pre-resolve ON. Native user-settings
+                    integration is deferred to v0.2.
+                </p>
+
+                <form id="PhantomLibraryUserPrefsForm">
+                    <table id="UserPrefsTable" style="width:100%; border-collapse: collapse;">
+                        <thead>
+                            <tr>
+                                <th align="left">User</th>
+                                <th>Protect favourites</th>
+                                <th>Show phantoms</th>
+                                <th>Allow eager pre-resolve</th>
+                            </tr>
+                        </thead>
+                        <tbody id="UserPrefsTbody"></tbody>
+                    </table>
+
+                    <div style="margin-top:1em;">
+                        <button is="emby-button" type="submit" class="raised button-submit block">
+                            <span>Save</span>
+                        </button>
+                    </div>
+                    <div id="UserPrefsSaveResult" class="fieldDescription"></div>
+                </form>
+            </div>
+        </div>
+
+        <script type="text/javascript">
+            (function () {
+                var page = document.querySelector('#PhantomLibraryUserPrefsPage');
+
+                function render(rows) {
+                    var tbody = page.querySelector('#UserPrefsTbody');
+                    tbody.innerHTML = '';
+                    rows.forEach(function (r) {
+                        var tr = document.createElement('tr');
+                        tr.setAttribute('data-user-id', r.userId);
+                        tr.innerHTML =
+                            '<td>' + (r.userName || r.userId) + '</td>' +
+                            '<td align="center"><input type="checkbox" class="pf"' + (r.protectFavourites ? ' checked' : '') + ' /></td>' +
+                            '<td align="center"><input type="checkbox" class="sp"' + (r.showPhantoms ? ' checked' : '') + ' /></td>' +
+                            '<td align="center"><input type="checkbox" class="ae"' + (r.allowEager ? ' checked' : '') + ' /></td>';
+                        tbody.appendChild(tr);
+                    });
+                }
+
+                page.addEventListener('pageshow', function () {
+                    Dashboard.showLoadingMsg();
+                    ApiClient.ajax({
+                        type: 'GET',
+                        url: ApiClient.getUrl('Plugins/PhantomLibrary/UserPrefs'),
+                        dataType: 'json'
+                    }).then(function (rows) {
+                        render(rows || []);
+                        Dashboard.hideLoadingMsg();
+                    }, function () {
+                        Dashboard.hideLoadingMsg();
+                    });
+                });
+
+                page.querySelector('#PhantomLibraryUserPrefsForm')
+                    .addEventListener('submit', function (e) {
+                        e.preventDefault();
+                        var result = page.querySelector('#UserPrefsSaveResult');
+                        result.textContent = 'Saving…';
+                        var rows = page.querySelectorAll('#UserPrefsTbody tr');
+                        var promises = [];
+                        rows.forEach(function (tr) {
+                            var uid = tr.getAttribute('data-user-id');
+                            var body = {
+                                protectFavourites: tr.querySelector('.pf').checked,
+                                showPhantoms: tr.querySelector('.sp').checked,
+                                allowEager: tr.querySelector('.ae').checked
+                            };
+                            promises.push(ApiClient.ajax({
+                                type: 'POST',
+                                url: ApiClient.getUrl('Plugins/PhantomLibrary/UserPrefs/' + uid),
+                                contentType: 'application/json',
+                                data: JSON.stringify(body)
+                            }));
+                        });
+                        Promise.all(promises).then(function () {
+                            result.textContent = 'Saved.';
+                            Dashboard.processPluginConfigurationUpdateResult({});
+                        }, function () {
+                            result.textContent = 'Save failed (see server logs).';
+                        });
+                        return false;
+                    });
+            })();
+        </script>
+    </div>
+</body>
+</html>

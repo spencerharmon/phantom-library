@@ -157,6 +157,32 @@ public class GostreamClientTests
         Assert.False(await c.IsVaultModePresentAsync(CancellationToken.None));
     }
 
+    [Fact]
+    public async Task Unprestage_204_Succeeds()
+    {
+        var h = new QueuedHandler().Enqueue(HttpStatusCode.NoContent);
+        var c = MakeClient(h);
+        await c.UnprestageAsync("/r/x.mkv", CancellationToken.None);
+        Assert.EndsWith("/api/library/unprestage", h.Requests[0].RequestUri!.AbsolutePath, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Unprestage_404_Swallowed()
+    {
+        var h = new QueuedHandler().Enqueue(HttpStatusCode.NotFound, "{\"error\":\"not_found\"}");
+        var c = MakeClient(h);
+        await c.UnprestageAsync("/r/x.mkv", CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Unprestage_5xx_Throws()
+    {
+        var h = new QueuedHandler().Enqueue(HttpStatusCode.InternalServerError, "{\"error\":\"oops\"}");
+        var c = MakeClient(h);
+        await Assert.ThrowsAsync<GostreamServerException>(
+            () => c.UnprestageAsync("/r/x.mkv", CancellationToken.None));
+    }
+
     private sealed class ThrowingHandler : System.Net.Http.HttpMessageHandler
     {
         protected override System.Threading.Tasks.Task<System.Net.Http.HttpResponseMessage> SendAsync(

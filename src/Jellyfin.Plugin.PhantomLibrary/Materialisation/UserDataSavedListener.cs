@@ -3,6 +3,8 @@ using System.Collections.Concurrent;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Data.Enums;
+using Jellyfin.Plugin.PhantomLibrary.Clients;
+using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.Movies;
 using MediaBrowser.Controller.Entities.TV;
@@ -29,6 +31,8 @@ public sealed class UserDataSavedListener : IHostedService
     private readonly IUserDataManager _userData;
     private readonly IMaterialisationQueue _queue;
     private readonly ISeriesAutopilot _autopilot;
+    private readonly IGostreamClient _gostream;
+    private readonly PhantomDb _db;
     private readonly ILogger<UserDataSavedListener> _logger;
 
     // Track last-seen favourite per (user, item) so we only act on transitions.
@@ -38,11 +42,15 @@ public sealed class UserDataSavedListener : IHostedService
         IUserDataManager userData,
         IMaterialisationQueue queue,
         ISeriesAutopilot autopilot,
+        IGostreamClient gostream,
+        PhantomDb db,
         ILogger<UserDataSavedListener> logger)
     {
         _userData = userData;
         _queue = queue;
         _autopilot = autopilot;
+        _gostream = gostream;
+        _db = db;
         _logger = logger;
     }
 
@@ -103,9 +111,39 @@ public sealed class UserDataSavedListener : IHostedService
             return;
         }
 
+        // Vault Mode persistence hand-off on favourite transitions for already-
+        // Materialised items: prestage on true, unprestage on false. Best
+        // effort; failures are logged and do not block.
+        var item = e.Item;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var row = await _db.GetPhantomItemAsync(item.Id, CancellationToken.None).ConfigureAwait(false);
+                if (row is null || row.State != PhantomItemState.Materialised) return;
+                if (string.IsNullOrWhiteSpace(row.StubPath)) return;
+                if (!await _gostream.IsVaultModePresentAsync(CancellationToken.None).ConfigureAwait(false)) return;
+
+                if (nowFav)
+                {
+                    await _gostream.PrestageAsync(row.StubPath!, 50, CancellationToken.None).ConfigureAwait(false);
+                    _logger.LogDebug("Vault prestage requested for {Stub} (favourite=true)", row.StubPath);
+                }
+                else
+                {
+                    await _gostream.UnprestageAsync(row.StubPath!, CancellationToken.None).ConfigureAwait(false);
+                    _logger.LogDebug("Vault unprestage requested for {Stub} (favourite=false)", row.StubPath);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Vault prestage/unprestage hand-off failed for {Item}", item.Id);
+            }
+        });
+
         if (!nowFav)
         {
-            // M7: unmark-favourite handling. No-op in M4.
+            // No immediate eviction on un-favourite; sweeper handles it.
             return;
         }
 
