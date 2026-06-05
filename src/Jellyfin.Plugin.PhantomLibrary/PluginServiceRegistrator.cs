@@ -77,6 +77,12 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         serviceCollection.AddHostedService<EagerResolver>();
         serviceCollection.AddHostedService<UserDataSavedListener>();
 
+        // M8: TV series ingestion + autopilot
+        serviceCollection.AddSingleton<ISeriesIngestor, SeriesIngestor>();
+        serviceCollection.AddSingleton<SeriesAutopilot>();
+        serviceCollection.AddSingleton<ISeriesAutopilot>(sp => sp.GetRequiredService<SeriesAutopilot>());
+        serviceCollection.AddHostedService(sp => sp.GetRequiredService<SeriesAutopilot>());
+
         // Playback / splash
         serviceCollection.AddSingleton<PhantomMediaSourceProvider>();
         serviceCollection.AddSingleton<IMediaSourceProvider>(

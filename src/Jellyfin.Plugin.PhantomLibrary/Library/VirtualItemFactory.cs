@@ -112,6 +112,45 @@ public static class VirtualItemFactory
         return series;
     }
 
+    /// <summary>
+    /// Builds an unpersisted <see cref="Episode"/> populated from TMDB
+    /// season + episode payloads. When <paramref name="episode"/> is a
+    /// <see cref="TmdbEpisodeDetails"/> with an ImdbId, the Imdb provider
+    /// id is stamped onto the Episode in addition to Tmdb / TmdbSeries.
+    /// </summary>
+    public static Episode CreateVirtualEpisode(TmdbSeriesDetails series, TmdbSeasonDetails season, TmdbEpisodeSummary episode)
+    {
+        ArgumentNullException.ThrowIfNull(series);
+        ArgumentNullException.ThrowIfNull(season);
+        ArgumentNullException.ThrowIfNull(episode);
+
+        var ep = new Episode
+        {
+            Name = episode.Name ?? string.Empty,
+            Overview = episode.Overview ?? string.Empty,
+            ParentIndexNumber = season.SeasonNumber,
+            IndexNumber = episode.EpisodeNumber,
+            PremiereDate = ParseDate(episode.AirDate),
+            ProductionYear = ParseYear(episode.AirDate),
+            CommunityRating = episode.VoteAverage.HasValue ? (float?)episode.VoteAverage.Value : null,
+        };
+
+        if (episode.Runtime is int rt && rt > 0)
+        {
+            ep.RunTimeTicks = TimeSpan.FromMinutes(rt).Ticks;
+        }
+
+        ep.ProviderIds["Tmdb"] = episode.Id.ToString(CultureInfo.InvariantCulture);
+        ep.ProviderIds["TmdbSeries"] = series.Id.ToString(CultureInfo.InvariantCulture);
+
+        if (episode is TmdbEpisodeDetails details && !string.IsNullOrWhiteSpace(details.ImdbId))
+        {
+            ep.ProviderIds["Imdb"] = details.ImdbId!;
+        }
+
+        return ep;
+    }
+
     private static int? ParseYear(string? date)
     {
         if (string.IsNullOrWhiteSpace(date) || date.Length < 4)

@@ -22,6 +22,8 @@ public sealed record IndexerQuery
     public int? Year { get; init; }
     public int? Season { get; init; }
     public int? Episode { get; init; }
+    /// <summary>For episode queries: the parent Series' IMDB id, distinct from the per-episode IMDB.</summary>
+    public string? SeriesImdb { get; init; }
 }
 
 public sealed record IndexerCandidate

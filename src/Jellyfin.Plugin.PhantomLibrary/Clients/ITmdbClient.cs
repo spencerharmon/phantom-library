@@ -52,4 +52,17 @@ public interface ITmdbClient
 
     /// <summary>Series recommended off the back of <paramref name="tmdbId"/>.</summary>
     Task<IReadOnlyList<TmdbSearchHit>> GetSeriesRecommendationsAsync(int tmdbId, string? languageCode, CancellationToken cancellationToken);
+
+    /// <summary>Fetches a TV season payload (episode summaries).</summary>
+    Task<TmdbSeasonDetails?> GetSeasonAsync(int seriesTmdbId, int seasonNumber, string? languageCode, CancellationToken cancellationToken);
+
+    /// <summary>Fetches single-episode details including external_ids.</summary>
+    Task<TmdbEpisodeDetails?> GetEpisodeAsync(int seriesTmdbId, int seasonNumber, int episodeNumber, string? languageCode, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Resolves the immediate next entry in the same TMDB collection as
+    /// <paramref name="movieTmdbId"/>, ordered by release_date. Returns
+    /// null if the movie has no collection or is the last entry.
+    /// </summary>
+    Task<TmdbMovieDetails?> GetMovieCollectionSequelAsync(int movieTmdbId, string? languageCode, CancellationToken cancellationToken);
 }

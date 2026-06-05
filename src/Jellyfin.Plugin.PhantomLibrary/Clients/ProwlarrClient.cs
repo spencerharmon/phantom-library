@@ -56,22 +56,44 @@ public sealed class ProwlarrClient : IIndexerClient
             return Array.Empty<IndexerCandidate>();
         }
 
-        var cat = string.Equals(query.Type, "movie", StringComparison.OrdinalIgnoreCase) ? "2000" : "5000";
-        var queryStr = !string.IsNullOrWhiteSpace(query.Imdb)
-            ? query.Imdb!
-            : BuildTextQuery(query);
+        var isEpisode = string.Equals(query.Type, "episode", StringComparison.OrdinalIgnoreCase);
+        var cat = isEpisode ? "5000" : "2000";
+        var seriesImdb = query.SeriesImdb ?? (isEpisode ? query.Imdb : null);
 
-        if (string.IsNullOrWhiteSpace(queryStr))
+        string url;
+        if (isEpisode && !string.IsNullOrWhiteSpace(seriesImdb) && query.Season is int se && query.Episode is int ep)
         {
-            return Array.Empty<IndexerCandidate>();
+            // Newznab-style TV search keyed by series IMDB + season + ep.
+            var trimmedImdb = seriesImdb!.StartsWith("tt", StringComparison.OrdinalIgnoreCase)
+                ? seriesImdb[2..]
+                : seriesImdb;
+            url = string.Format(
+                CultureInfo.InvariantCulture,
+                "{0}/api/v1/search?type=tvsearch&imdbid={1}&season={2}&ep={3}&categories={4}",
+                baseUrl.TrimEnd('/'),
+                Uri.EscapeDataString(trimmedImdb),
+                se.ToString(CultureInfo.InvariantCulture),
+                ep.ToString(CultureInfo.InvariantCulture),
+                cat);
         }
+        else
+        {
+            var queryStr = !string.IsNullOrWhiteSpace(query.Imdb)
+                ? query.Imdb!
+                : BuildTextQuery(query);
 
-        var url = string.Format(
-            CultureInfo.InvariantCulture,
-            "{0}/api/v1/search?query={1}&type=search&categories={2}",
-            baseUrl.TrimEnd('/'),
-            Uri.EscapeDataString(queryStr),
-            cat);
+            if (string.IsNullOrWhiteSpace(queryStr))
+            {
+                return Array.Empty<IndexerCandidate>();
+            }
+
+            url = string.Format(
+                CultureInfo.InvariantCulture,
+                "{0}/api/v1/search?query={1}&type=search&categories={2}",
+                baseUrl.TrimEnd('/'),
+                Uri.EscapeDataString(queryStr),
+                cat);
+        }
 
         using var req = new HttpRequestMessage(HttpMethod.Get, url);
         req.Headers.Add("X-Api-Key", apiKey);

@@ -118,6 +118,37 @@ public sealed class Materialiser : IMaterialiser
                     .ConfigureAwait(false);
             }
 
+            // Series-level materialisation is intentionally unsupported. A Series
+            // is a container; episodes are the materialisation unit. The autopilot
+            // (M8 §5) ensures individual Episodes are pre-materialised.
+            if (item is Series)
+            {
+                const string reason = "Series-level materialisation is not supported; materialise individual Episodes instead (Series is the container).";
+                _logger.LogInformation("Materialise {Id}: {Reason}", jellyfinItemId, reason);
+                await LogAsync(sw, jellyfinItemId, trigger, "error", reason, indexerUsed, infoHashUsed, ct)
+                    .ConfigureAwait(false);
+                return new MaterialisationOutcome { Status = MaterialisationStatus.Error, Error = reason };
+            }
+
+            if (item is Episode ep0)
+            {
+                if (ep0.IndexNumber is null || ep0.ParentIndexNumber is null)
+                {
+                    var reason = "Episode missing IndexNumber/ParentIndexNumber; cannot resolve TV torrent";
+                    return await FailAsync(sw, jellyfinItemId, trigger, reason, indexerUsed, infoHashUsed, ct)
+                        .ConfigureAwait(false);
+                }
+
+                var sImdb = ResolveSeriesImdb(ep0);
+                if (string.IsNullOrWhiteSpace(sImdb))
+                {
+                    var reason = "Series has no IMDB id; cannot resolve TV torrent";
+                    _logger.LogWarning("Materialise {Id}: {Reason}", jellyfinItemId, reason);
+                    return await FailAsync(sw, jellyfinItemId, trigger, reason, indexerUsed, infoHashUsed, ct)
+                        .ConfigureAwait(false);
+                }
+            }
+
             if (!TryExtractIdentifiers(item, out var ids))
             {
                 return await FailAsync(sw, jellyfinItemId, trigger,
@@ -155,12 +186,15 @@ public sealed class Materialiser : IMaterialiser
                 var indexerQuery = new IndexerQuery
                 {
                     Type = ids.Type,
-                    Imdb = ids.Imdb,
+                    // For episode searches, the indexer chain needs the *series* IMDB,
+                    // not the episode's own (which is usually absent anyway).
+                    Imdb = ids.Type == "episode" ? (ids.SeriesImdb ?? ids.Imdb) : ids.Imdb,
                     Tmdb = ids.Tmdb,
                     Title = ids.Title,
                     Year = ids.Year,
                     Season = ids.Season,
                     Episode = ids.Episode,
+                    SeriesImdb = ids.SeriesImdb,
                 };
 
                 var candidates = new List<IndexerCandidate>();
@@ -433,7 +467,50 @@ public sealed class Materialiser : IMaterialiser
         public bool IsAccessible(string path) => false;
     }
 
-    private static bool TryExtractIdentifiers(BaseItem item, out ItemIdentifiers ids)
+    private string? ResolveSeriesImdb(Episode ep)
+    {
+        string? s = null;
+        try { s = ep.Series?.ProviderIds?.GetValueOrDefault("Imdb"); }
+        catch (Exception ex) { _logger.LogDebug(ex, "ep.Series accessor threw"); }
+        if (!string.IsNullOrWhiteSpace(s)) return s;
+
+        try
+        {
+            var p = ep.GetParent();
+            while (p is not null)
+            {
+                if (p is Series ser)
+                {
+                    var imdb = ser.ProviderIds?.GetValueOrDefault("Imdb");
+                    if (!string.IsNullOrWhiteSpace(imdb)) return imdb;
+                    break;
+                }
+
+                p = p.GetParent();
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "parent walk threw");
+        }
+
+        try
+        {
+            if (ep.SeriesId != Guid.Empty)
+            {
+                var ser = _libraryManager.GetItemById(ep.SeriesId) as Series;
+                return ser?.ProviderIds?.GetValueOrDefault("Imdb");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "SeriesId lookup threw");
+        }
+
+        return null;
+    }
+
+    private bool TryExtractIdentifiers(BaseItem item, out ItemIdentifiers ids)
     {
         ids = default;
         string? imdb = null;
@@ -467,11 +544,26 @@ public sealed class Materialiser : IMaterialiser
                 type = "episode";
                 season = ep.ParentIndexNumber;
                 episode = ep.IndexNumber;
-                seriesImdb = ep.Series?.ProviderIds?.GetValueOrDefault("Imdb");
+                seriesImdb = ResolveSeriesImdb(ep);
+                if (string.IsNullOrWhiteSpace(seriesImdb))
+                {
+                    // gostream's /api/library/add requires series_imdb for type=episode;
+                    // refuse rather than ship a placeholder.
+                    return false;
+                }
+
+                if (season is null || episode is null)
+                {
+                    return false;
+                }
+
                 break;
             case Series:
-                type = "movie"; // series-level materialisation falls back to first available; future M8 work
-                return false;   // until M8 properly handles series-level, refuse
+                // Series-level materialisation is not supported by design:
+                // a Series is a container; episodes are the materialisation
+                // unit. Materialiser surfaces this as an Error with the
+                // documented reason. See PLAN.md §M8.
+                return false;
             default:
                 return false;
         }

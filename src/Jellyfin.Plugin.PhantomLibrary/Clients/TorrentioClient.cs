@@ -57,7 +57,7 @@ public sealed class TorrentioClient : IIndexerClient
             return Array.Empty<IndexerCandidate>();
         }
 
-        if (string.IsNullOrWhiteSpace(query.Imdb))
+        if (string.IsNullOrWhiteSpace(query.Imdb) && string.IsNullOrWhiteSpace(query.SeriesImdb))
         {
             _logger.LogWarning("Torrentio requires an IMDB id; query for type={Type} title={Title} skipped", query.Type, query.Title);
             return Array.Empty<IndexerCandidate>();
@@ -76,8 +76,9 @@ public sealed class TorrentioClient : IIndexerClient
                 return Array.Empty<IndexerCandidate>();
             }
 
+            var seriesImdb = !string.IsNullOrWhiteSpace(query.SeriesImdb) ? query.SeriesImdb : query.Imdb;
             url = string.Format(CultureInfo.InvariantCulture, "{0}/stream/series/{1}:{2}:{3}.json",
-                baseUrl.TrimEnd('/'), query.Imdb, query.Season.Value, query.Episode.Value);
+                baseUrl.TrimEnd('/'), seriesImdb, query.Season.Value, query.Episode.Value);
         }
         else
         {

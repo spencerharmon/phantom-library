@@ -298,6 +298,111 @@ public sealed class TmdbClient : ITmdbClient
             r.FirstAirDate, r.VoteAverage, r.VoteCount) { GenreIds = r.GenreIds }).ToList();
     }
 
+    /// <inheritdoc/>
+    public async Task<TmdbSeasonDetails?> GetSeasonAsync(int seriesTmdbId, int seasonNumber, string? languageCode, CancellationToken cancellationToken)
+    {
+        var path = BuildPath(
+            $"/tv/{seriesTmdbId.ToString(CultureInfo.InvariantCulture)}/season/{seasonNumber.ToString(CultureInfo.InvariantCulture)}",
+            languageCode,
+            null);
+        var dto = await GetJsonAsync<TmdbSeasonDetailsDto>(path, cancellationToken, allow404: true).ConfigureAwait(false);
+        if (dto is null) return null;
+        var seasonNo = dto.SeasonNumber ?? seasonNumber;
+        var episodes = (dto.Episodes ?? Array.Empty<TmdbEpisodeDto>())
+            .Select(e => new TmdbEpisodeSummary
+            {
+                Id = e.Id,
+                EpisodeNumber = e.EpisodeNumber ?? 0,
+                SeasonNumber = e.SeasonNumber ?? seasonNo,
+                Name = e.Name,
+                Overview = e.Overview,
+                AirDate = e.AirDate,
+                StillPath = e.StillPath,
+                Runtime = e.Runtime,
+                VoteAverage = e.VoteAverage,
+            })
+            .ToList();
+        return new TmdbSeasonDetails
+        {
+            SeriesTmdbId = seriesTmdbId,
+            SeasonNumber = seasonNo,
+            Episodes = episodes,
+        };
+    }
+
+    /// <inheritdoc/>
+    public async Task<TmdbEpisodeDetails?> GetEpisodeAsync(int seriesTmdbId, int seasonNumber, int episodeNumber, string? languageCode, CancellationToken cancellationToken)
+    {
+        var path = BuildPath(
+            $"/tv/{seriesTmdbId.ToString(CultureInfo.InvariantCulture)}/season/{seasonNumber.ToString(CultureInfo.InvariantCulture)}/episode/{episodeNumber.ToString(CultureInfo.InvariantCulture)}",
+            languageCode,
+            new[] { new KeyValuePair<string, string?>("append_to_response", "external_ids") });
+        var dto = await GetJsonAsync<TmdbEpisodeDto>(path, cancellationToken, allow404: true).ConfigureAwait(false);
+        if (dto is null) return null;
+        return new TmdbEpisodeDetails
+        {
+            Id = dto.Id,
+            EpisodeNumber = dto.EpisodeNumber ?? episodeNumber,
+            SeasonNumber = dto.SeasonNumber ?? seasonNumber,
+            Name = dto.Name,
+            Overview = dto.Overview,
+            AirDate = dto.AirDate,
+            StillPath = dto.StillPath,
+            Runtime = dto.Runtime,
+            VoteAverage = dto.VoteAverage,
+            ImdbId = string.IsNullOrWhiteSpace(dto.ExternalIds?.ImdbId) ? null : dto.ExternalIds!.ImdbId,
+        };
+    }
+
+    /// <inheritdoc/>
+    public async Task<TmdbMovieDetails?> GetMovieCollectionSequelAsync(int movieTmdbId, string? languageCode, CancellationToken cancellationToken)
+    {
+        // 1. Re-fetch the movie with belongs_to_collection appended.
+        var moviePath = BuildPath(
+            $"/movie/{movieTmdbId.ToString(CultureInfo.InvariantCulture)}",
+            languageCode,
+            new[] { new KeyValuePair<string, string?>("append_to_response", "external_ids,belongs_to_collection") });
+        var movieDto = await GetJsonAsync<TmdbMovieDetailsWithCollectionDto>(moviePath, cancellationToken, allow404: true).ConfigureAwait(false);
+        if (movieDto?.BelongsToCollection is null || movieDto.BelongsToCollection.Id <= 0)
+        {
+            return null;
+        }
+
+        // 2. Fetch the collection.
+        var collectionPath = BuildPath(
+            $"/collection/{movieDto.BelongsToCollection.Id.ToString(CultureInfo.InvariantCulture)}",
+            languageCode,
+            null);
+        var collection = await GetJsonAsync<TmdbCollectionDto>(collectionPath, cancellationToken, allow404: true).ConfigureAwait(false);
+        if (collection?.Parts is null || collection.Parts.Length == 0)
+        {
+            return null;
+        }
+
+        // 3. Sort by release_date and pick the first part strictly after this movie's release_date.
+        var thisDate = ParseDateOrMin(movieDto.ReleaseDate);
+        var sorted = collection.Parts
+            .Where(p => p.Id > 0)
+            .Select(p => new { Part = p, Date = ParseDateOrMin(p.ReleaseDate) })
+            .OrderBy(x => x.Date)
+            .ToList();
+
+        var next = sorted.FirstOrDefault(x => x.Part.Id != movieTmdbId && x.Date > thisDate);
+        if (next is null)
+        {
+            return null;
+        }
+
+        return await GetMovieAsync(next.Part.Id, languageCode, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static DateTime ParseDateOrMin(string? date)
+    {
+        if (string.IsNullOrWhiteSpace(date)) return DateTime.MinValue;
+        return DateTime.TryParse(date, CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var dt) ? dt : DateTime.MinValue;
+    }
+
     // ---------- HTTP plumbing ----------
 
     private string BuildPath(string endpoint, string? languageCode, IEnumerable<KeyValuePair<string, string?>>? extra)

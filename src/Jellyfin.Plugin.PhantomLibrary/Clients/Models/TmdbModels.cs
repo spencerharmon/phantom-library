@@ -217,3 +217,81 @@ internal sealed class TmdbExternalIdsResponseDto
 {
     public string? ImdbId { get; set; }
 }
+
+/// <summary>Details for a single TMDB TV season (subset of /tv/{id}/season/{n}).</summary>
+public sealed record TmdbSeasonDetails
+{
+    public required int SeriesTmdbId { get; init; }
+    public required int SeasonNumber { get; init; }
+    public required System.Collections.Generic.IReadOnlyList<TmdbEpisodeSummary> Episodes { get; init; }
+}
+
+/// <summary>Episode entry as returned inside the season payload (no per-episode external_ids).</summary>
+public record TmdbEpisodeSummary
+{
+    public required int Id { get; init; }
+    public required int EpisodeNumber { get; init; }
+    public required int SeasonNumber { get; init; }
+    public string? Name { get; init; }
+    public string? Overview { get; init; }
+    public string? AirDate { get; init; }
+    public string? StillPath { get; init; }
+    public int? Runtime { get; init; }
+    public double? VoteAverage { get; init; }
+}
+
+/// <summary>Single-episode details endpoint, including external_ids when requested.</summary>
+public sealed record TmdbEpisodeDetails : TmdbEpisodeSummary
+{
+    public string? ImdbId { get; init; }
+}
+
+internal sealed class TmdbSeasonDetailsDto
+{
+    public int Id { get; set; }
+    public int? SeasonNumber { get; set; }
+    public TmdbEpisodeDto[]? Episodes { get; set; }
+}
+
+internal sealed class TmdbEpisodeDto
+{
+    public int Id { get; set; }
+    public int? EpisodeNumber { get; set; }
+    public int? SeasonNumber { get; set; }
+    public string? Name { get; set; }
+    public string? Overview { get; set; }
+    public string? AirDate { get; set; }
+    public string? StillPath { get; set; }
+    public int? Runtime { get; set; }
+    public double? VoteAverage { get; set; }
+    public TmdbExternalIdsDto? ExternalIds { get; set; }
+}
+
+internal sealed class TmdbCollectionRefDto
+{
+    public int Id { get; set; }
+    public string? Name { get; set; }
+    public string? PosterPath { get; set; }
+    public string? BackdropPath { get; set; }
+}
+
+internal sealed class TmdbMovieDetailsWithCollectionDto
+{
+    public int Id { get; set; }
+    public string? ReleaseDate { get; set; }
+    public TmdbCollectionRefDto? BelongsToCollection { get; set; }
+}
+
+internal sealed class TmdbCollectionDto
+{
+    public int Id { get; set; }
+    public string? Name { get; set; }
+    public TmdbCollectionPartDto[]? Parts { get; set; }
+}
+
+internal sealed class TmdbCollectionPartDto
+{
+    public int Id { get; set; }
+    public string? Title { get; set; }
+    public string? ReleaseDate { get; set; }
+}

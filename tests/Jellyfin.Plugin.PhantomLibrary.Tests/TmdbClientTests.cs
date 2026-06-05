@@ -248,4 +248,123 @@ public class TmdbClientTests
         var url = handler.Requests[0].RequestUri!.ToString();
         Assert.Contains("/movie/603/similar", url, StringComparison.Ordinal);
     }
+
+    private const string SeasonPayload = """
+    {
+      "id": 12345,
+      "season_number": 1,
+      "episodes": [
+        { "id": 100, "episode_number": 1, "season_number": 1, "name": "Pilot", "overview": "o1", "air_date": "2020-01-01", "runtime": 42, "vote_average": 7.5 },
+        { "id": 101, "episode_number": 2, "season_number": 1, "name": "E2", "air_date": "2020-01-08", "runtime": 44 }
+      ]
+    }
+    """;
+
+    [Fact]
+    public async Task GetSeason_ParsesEpisodes()
+    {
+        var handler = new QueuedHandler().Enqueue(HttpStatusCode.OK, SeasonPayload);
+        var client = Build(handler);
+
+        var season = await client.GetSeasonAsync(99, 1, "en-US", CancellationToken.None);
+
+        Assert.NotNull(season);
+        Assert.Equal(99, season!.SeriesTmdbId);
+        Assert.Equal(1, season.SeasonNumber);
+        Assert.Equal(2, season.Episodes.Count);
+        Assert.Equal("Pilot", season.Episodes[0].Name);
+        Assert.Equal(1, season.Episodes[0].EpisodeNumber);
+        Assert.Equal(42, season.Episodes[0].Runtime);
+        var url = handler.Requests[0].RequestUri!.ToString();
+        Assert.Contains("/tv/99/season/1", url, StringComparison.Ordinal);
+    }
+
+    private const string MovieWithCollectionPayload = """
+    {
+      "id": 671,
+      "title": "Harry Potter and the Philosopher's Stone",
+      "release_date": "2001-11-16",
+      "belongs_to_collection": { "id": 1241, "name": "Harry Potter Collection" }
+    }
+    """;
+
+    private const string CollectionPayload = """
+    {
+      "id": 1241,
+      "name": "Harry Potter Collection",
+      "parts": [
+        { "id": 671, "title": "Philosopher's Stone", "release_date": "2001-11-16" },
+        { "id": 672, "title": "Chamber of Secrets", "release_date": "2002-11-15" },
+        { "id": 673, "title": "Prisoner of Azkaban", "release_date": "2004-05-31" }
+      ]
+    }
+    """;
+
+    private const string SequelMoviePayload = """
+    {
+      "id": 672,
+      "title": "Harry Potter and the Chamber of Secrets",
+      "release_date": "2002-11-15",
+      "runtime": 161,
+      "status": "Released",
+      "genres": [],
+      "vote_average": 7.7,
+      "vote_count": 1000,
+      "external_ids": { "imdb_id": "tt0295297" }
+    }
+    """;
+
+    [Fact]
+    public async Task GetMovieCollectionSequel_ReturnsImmediateNextEntry()
+    {
+        var handler = new QueuedHandler()
+            .Enqueue(HttpStatusCode.OK, MovieWithCollectionPayload)
+            .Enqueue(HttpStatusCode.OK, CollectionPayload)
+            .Enqueue(HttpStatusCode.OK, SequelMoviePayload);
+        var client = Build(handler);
+
+        var sequel = await client.GetMovieCollectionSequelAsync(671, null, CancellationToken.None);
+
+        Assert.NotNull(sequel);
+        Assert.Equal(672, sequel!.Id);
+        Assert.Equal("tt0295297", sequel.ImdbId);
+        Assert.Equal(3, handler.Requests.Count);
+        Assert.Contains("append_to_response=external_ids%2Cbelongs_to_collection", handler.Requests[0].RequestUri!.ToString(), StringComparison.Ordinal);
+        Assert.Contains("/collection/1241", handler.Requests[1].RequestUri!.ToString(), StringComparison.Ordinal);
+        Assert.Contains("/movie/672", handler.Requests[2].RequestUri!.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetMovieCollectionSequel_NoCollection_ReturnsNull()
+    {
+        const string noCollection = """
+        { "id": 999, "title": "Standalone", "release_date": "2000-01-01" }
+        """;
+        var handler = new QueuedHandler().Enqueue(HttpStatusCode.OK, noCollection);
+        var client = Build(handler);
+
+        var sequel = await client.GetMovieCollectionSequelAsync(999, null, CancellationToken.None);
+        Assert.Null(sequel);
+        Assert.Single(handler.Requests);
+    }
+
+    [Fact]
+    public async Task GetMovieCollectionSequel_LastInCollection_ReturnsNull()
+    {
+        const string lastEntry = """
+        {
+          "id": 673,
+          "title": "Prisoner of Azkaban",
+          "release_date": "2004-05-31",
+          "belongs_to_collection": { "id": 1241, "name": "HP" }
+        }
+        """;
+        var handler = new QueuedHandler()
+            .Enqueue(HttpStatusCode.OK, lastEntry)
+            .Enqueue(HttpStatusCode.OK, CollectionPayload);
+        var client = Build(handler);
+
+        var sequel = await client.GetMovieCollectionSequelAsync(673, null, CancellationToken.None);
+        Assert.Null(sequel);
+    }
 }

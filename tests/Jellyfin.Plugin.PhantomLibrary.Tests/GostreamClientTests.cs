@@ -95,4 +95,88 @@ public class GostreamClientTests
         var c = MakeClient(h);
         await c.RemoveAsync("/r/x.mkv", CancellationToken.None);
     }
+
+    [Fact]
+    public async Task Prestage_Posts_Body_To_Endpoint()
+    {
+        string? bodySeen = null;
+        var captor = new BodyCaptureHandler(req =>
+        {
+            bodySeen = req.Content!.ReadAsStringAsync().Result;
+            return (HttpStatusCode.Accepted, null);
+        });
+        var http = new HttpClient(captor) { BaseAddress = null };
+        var c = new GostreamClient(http, NullLogger<GostreamClient>.Instance, () => "http://gs.test:9080");
+
+        await c.PrestageAsync("/r/x.mkv", 50, CancellationToken.None);
+
+        Assert.Single(captor.Requests);
+        Assert.EndsWith("/api/library/prestage", captor.Requests[0].RequestUri!.AbsolutePath, System.StringComparison.Ordinal);
+        Assert.NotNull(bodySeen);
+        Assert.Contains("\"stub_path\"", bodySeen!, System.StringComparison.Ordinal);
+        Assert.Contains("/r/x.mkv", bodySeen!, System.StringComparison.Ordinal);
+        Assert.Contains("\"priority\":50", bodySeen!, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Prestage_5xx_Throws()
+    {
+        var h = new QueuedHandler().Enqueue(HttpStatusCode.InternalServerError, "{\"error\":\"oops\"}");
+        var c = MakeClient(h);
+        await Assert.ThrowsAsync<GostreamServerException>(
+            () => c.PrestageAsync("/r/x.mkv", 50, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task IsVaultModePresent_404_With_Json_Returns_True_And_Caches()
+    {
+        var h = new QueuedHandler()
+            .Enqueue(HttpStatusCode.NotFound, "{\"error\":\"no such stub\"}");
+        var c = MakeClient(h);
+
+        Assert.True(await c.IsVaultModePresentAsync(CancellationToken.None));
+        // Second call must not hit HTTP again (cached).
+        Assert.True(await c.IsVaultModePresentAsync(CancellationToken.None));
+        Assert.Single(h.Requests);
+    }
+
+    [Fact]
+    public async Task IsVaultModePresent_405_Returns_False()
+    {
+        var h = new QueuedHandler().Enqueue(HttpStatusCode.MethodNotAllowed);
+        var c = MakeClient(h);
+        Assert.False(await c.IsVaultModePresentAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task IsVaultModePresent_ConnectionError_Returns_False()
+    {
+        var failing = new ThrowingHandler();
+        var http = new HttpClient(failing) { BaseAddress = null };
+        var c = new GostreamClient(http, NullLogger<GostreamClient>.Instance, () => "http://gs.test:9080");
+        Assert.False(await c.IsVaultModePresentAsync(CancellationToken.None));
+    }
+
+    private sealed class ThrowingHandler : System.Net.Http.HttpMessageHandler
+    {
+        protected override System.Threading.Tasks.Task<System.Net.Http.HttpResponseMessage> SendAsync(
+            System.Net.Http.HttpRequestMessage request, System.Threading.CancellationToken cancellationToken)
+            => throw new System.Net.Http.HttpRequestException("connection refused");
+    }
+
+    private sealed class BodyCaptureHandler : System.Net.Http.HttpMessageHandler
+    {
+        private readonly System.Func<System.Net.Http.HttpRequestMessage, (HttpStatusCode, string?)> _resp;
+        public System.Collections.Generic.List<System.Net.Http.HttpRequestMessage> Requests { get; } = new();
+        public BodyCaptureHandler(System.Func<System.Net.Http.HttpRequestMessage, (HttpStatusCode, string?)> resp) { _resp = resp; }
+        protected override System.Threading.Tasks.Task<System.Net.Http.HttpResponseMessage> SendAsync(
+            System.Net.Http.HttpRequestMessage request, System.Threading.CancellationToken cancellationToken)
+        {
+            Requests.Add(request);
+            var (status, body) = _resp(request);
+            var msg = new System.Net.Http.HttpResponseMessage(status);
+            if (body is not null) msg.Content = new System.Net.Http.StringContent(body);
+            return System.Threading.Tasks.Task.FromResult(msg);
+        }
+    }
 }

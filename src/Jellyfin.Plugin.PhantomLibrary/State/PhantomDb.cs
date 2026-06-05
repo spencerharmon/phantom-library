@@ -42,6 +42,20 @@ public sealed record MaterialisationLogEntry
     public string? InfoHash { get; init; }
 }
 
+/// <summary>Per-user, per-series autopilot tracking row (autopilot_state table).</summary>
+public sealed record AutopilotStateRow
+{
+    public required Guid UserId { get; init; }
+    public required string SeriesImdb { get; init; }
+    public int? LastPlayedSeason { get; init; }
+    public int? LastPlayedEpisode { get; init; }
+    public int? NextMaterialisedSeason { get; init; }
+    public int? NextMaterialisedEpisode { get; init; }
+    public int? PrefetchCursorSeason { get; init; }
+    public int? PrefetchCursorEpisode { get; init; }
+    public required long UpdatedAt { get; init; }
+}
+
 public sealed record PhantomItemRow
 {
     public int? TmdbId { get; init; }
@@ -543,9 +557,84 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
         }
     }
 
-    // ---- user_prefs / autopilot_state: M7/M8 ----
-    // TODO(M7/M8): implement real accessors. Returning defaults here so M4
-    // callers don't break when these tables are referenced.
+    // ---- user_prefs / autopilot_state ----
+
+    /// <summary>Reads autopilot state for (user, series_imdb) or returns null if absent.</summary>
+    public async Task<AutopilotStateRow?> GetAutopilotStateAsync(Guid userId, string seriesImdb, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(seriesImdb);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT last_played_season, last_played_episode,
+            next_materialised_season, next_materialised_episode,
+            prefetch_cursor_season, prefetch_cursor_episode, updated_at
+            FROM autopilot_state
+            WHERE user_id=$uid AND series_imdb=$imdb LIMIT 1;";
+        cmd.Parameters.AddWithValue("$uid", userId.ToString("N"));
+        cmd.Parameters.AddWithValue("$imdb", seriesImdb);
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (!await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            return null;
+        }
+
+        static int? NullableInt(Microsoft.Data.Sqlite.SqliteDataReader r, int ord) => r.IsDBNull(ord) ? null : r.GetInt32(ord);
+        return new AutopilotStateRow
+        {
+            UserId = userId,
+            SeriesImdb = seriesImdb,
+            LastPlayedSeason = NullableInt(r, 0),
+            LastPlayedEpisode = NullableInt(r, 1),
+            NextMaterialisedSeason = NullableInt(r, 2),
+            NextMaterialisedEpisode = NullableInt(r, 3),
+            PrefetchCursorSeason = NullableInt(r, 4),
+            PrefetchCursorEpisode = NullableInt(r, 5),
+            UpdatedAt = r.GetInt64(6),
+        };
+    }
+
+    /// <summary>Upserts an autopilot_state row.</summary>
+    public async Task UpsertAutopilotStateAsync(AutopilotStateRow row, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(row);
+        ArgumentException.ThrowIfNullOrWhiteSpace(row.SeriesImdb);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"INSERT INTO autopilot_state
+                (user_id, series_imdb, last_played_season, last_played_episode,
+                 next_materialised_season, next_materialised_episode,
+                 prefetch_cursor_season, prefetch_cursor_episode, updated_at)
+                VALUES ($uid,$imdb,$lps,$lpe,$nms,$nme,$pcs,$pce,$updated)
+                ON CONFLICT(user_id, series_imdb) DO UPDATE SET
+                    last_played_season=excluded.last_played_season,
+                    last_played_episode=excluded.last_played_episode,
+                    next_materialised_season=excluded.next_materialised_season,
+                    next_materialised_episode=excluded.next_materialised_episode,
+                    prefetch_cursor_season=excluded.prefetch_cursor_season,
+                    prefetch_cursor_episode=excluded.prefetch_cursor_episode,
+                    updated_at=excluded.updated_at;";
+            cmd.Parameters.AddWithValue("$uid", row.UserId.ToString("N"));
+            cmd.Parameters.AddWithValue("$imdb", row.SeriesImdb);
+            cmd.Parameters.AddWithValue("$lps", (object?)row.LastPlayedSeason ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$lpe", (object?)row.LastPlayedEpisode ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$nms", (object?)row.NextMaterialisedSeason ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$nme", (object?)row.NextMaterialisedEpisode ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$pcs", (object?)row.PrefetchCursorSeason ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$pce", (object?)row.PrefetchCursorEpisode ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$updated", row.UpdatedAt);
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    // ---- user_prefs / autopilot_state: M7 ----
+    // TODO(M7): implement user_prefs accessors.
 
     private const string SchemaV3Sql = @"
 CREATE TABLE IF NOT EXISTS tmdb_cache (
