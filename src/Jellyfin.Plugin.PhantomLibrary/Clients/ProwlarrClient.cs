@@ -29,7 +29,8 @@ public sealed class ProwlarrClient : IIndexerClient
     {
     }
 
-    public ProwlarrClient(HttpClient http, ILogger<ProwlarrClient> logger, Func<(string, string)> configProvider)
+    // Test-only ctor (not picked by DI — marked internal so ActivatorUtilities ignores it).
+    internal ProwlarrClient(HttpClient http, ILogger<ProwlarrClient> logger, Func<(string, string)> configProvider)
     {
         _http = http;
         _logger = logger;

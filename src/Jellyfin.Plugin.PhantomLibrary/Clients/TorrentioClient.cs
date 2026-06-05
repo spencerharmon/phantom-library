@@ -37,7 +37,8 @@ public sealed class TorrentioClient : IIndexerClient
     {
     }
 
-    public TorrentioClient(HttpClient http, ILogger<TorrentioClient> logger, Func<string> baseUrlProvider)
+    // Test-only ctor (internal so ActivatorUtilities does not consider it).
+    internal TorrentioClient(HttpClient http, ILogger<TorrentioClient> logger, Func<string> baseUrlProvider)
     {
         _http = http;
         _logger = logger;

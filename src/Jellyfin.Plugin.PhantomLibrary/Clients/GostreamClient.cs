@@ -35,8 +35,8 @@ public sealed class GostreamClient : IGostreamClient
     {
     }
 
-    // Test-friendly ctor: lets tests inject a base URL provider without a live Plugin singleton.
-    public GostreamClient(HttpClient http, ILogger<GostreamClient> logger, Func<string> baseUrlProvider)
+    // Test-friendly ctor: internal so ActivatorUtilities ignores it during DI resolution.
+    internal GostreamClient(HttpClient http, ILogger<GostreamClient> logger, Func<string> baseUrlProvider)
     {
         _http = http;
         _logger = logger;
