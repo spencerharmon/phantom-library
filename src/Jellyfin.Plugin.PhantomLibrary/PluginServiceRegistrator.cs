@@ -97,5 +97,10 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         serviceCollection.AddSingleton<IEagerHintSink, EagerHintSink>();
         serviceCollection.AddSingleton<ISuggestionsContributor, SuggestionsContributor>();
         serviceCollection.AddSingleton<IScheduledTask, SuggestionsRefreshTask>();
+
+        // Phantom stubs + CollectionFolder binder (M10).
+        serviceCollection.AddSingleton<IPhantomStubManager, PhantomStubManager>();
+        serviceCollection.AddSingleton<IPhantomCollectionFolderBinder, PhantomCollectionFolderBinder>();
+        serviceCollection.AddHostedService<PhantomBootstrapService>();
     }
 }
