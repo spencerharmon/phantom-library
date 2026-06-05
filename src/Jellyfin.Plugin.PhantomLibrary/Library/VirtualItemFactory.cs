@@ -47,6 +47,7 @@ public static class VirtualItemFactory
             movie.ProviderIds["Imdb"] = details.ImdbId!;
         }
 
+        movie.IsVirtualItem = true;
         return movie;
     }
 
@@ -65,6 +66,7 @@ public static class VirtualItemFactory
             CommunityRating = hit.VoteAverage.HasValue ? (float?)hit.VoteAverage.Value : null,
         };
         movie.ProviderIds["Tmdb"] = hit.Id.ToString(CultureInfo.InvariantCulture);
+        movie.IsVirtualItem = true;
         return movie;
     }
 
@@ -83,6 +85,7 @@ public static class VirtualItemFactory
             CommunityRating = hit.VoteAverage.HasValue ? (float?)hit.VoteAverage.Value : null,
         };
         series.ProviderIds["Tmdb"] = hit.Id.ToString(CultureInfo.InvariantCulture);
+        series.IsVirtualItem = true;
         return series;
     }
 
@@ -109,6 +112,7 @@ public static class VirtualItemFactory
             series.ProviderIds["Imdb"] = details.ImdbId!;
         }
 
+        series.IsVirtualItem = true;
         return series;
     }
 
@@ -148,6 +152,7 @@ public static class VirtualItemFactory
             ep.ProviderIds["Imdb"] = details.ImdbId!;
         }
 
+        ep.IsVirtualItem = true;
         return ep;
     }
 
