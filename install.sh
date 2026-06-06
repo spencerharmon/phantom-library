@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
-# Phantom Library — installer.
+# Phantom Library — local operator installer.
 #
-# Builds the plugin DLL, drops it into Jellyfin's plugins dir under
+# Installs the pre-built plugin DLL into Jellyfin's plugins dir under
 # the canonical versioned name, creates the writable phantom-stub
-# tree required by M10, fixes ownership, and offers to restart
-# Jellyfin via systemd.
+# tree required by M10, fixes ownership, loads the patched gostream
+# container image (mrrobotogit/gostream:testing) into root podman
+# storage, and offers to restart Jellyfin via systemd.
+#
+# This is the operator's local installer; not for general users.
+# By default it does NOT rebuild — the agent builds during testing,
+# the operator runs this to install the already-built artefacts.
 #
 # Idempotent. Safe to re-run after a `git pull && ./install.sh`.
 #
 # Usage:
-#   ./install.sh                              # auto-detect everything
+#   ./install.sh                              # install pre-built DLL + load gostream image
+#   ./install.sh --build                      # also (re)build the plugin first
 #   ./install.sh --jellyfin-data /custom/dir  # override data dir
 #   ./install.sh --jellyfin-user myuser       # override service user
 #   ./install.sh --no-restart                 # skip the systemctl prompt
-#   ./install.sh --skip-build                 # use an existing build
+#   ./install.sh --no-gostream                # skip gostream image load
 #   ./install.sh --help
 
 set -euo pipefail
@@ -45,14 +51,18 @@ fi
 JELLYFIN_DATA=""
 JELLYFIN_USER=""
 NO_RESTART=0
-SKIP_BUILD=0
+DO_BUILD=0
+DO_GOSTREAM=1
+GOSTREAM_IMAGE="docker.io/mrrobotogit/gostream:testing"
+GOSTREAM_TARBALL="/tmp/gostream-testing.tar"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --jellyfin-data)  JELLYFIN_DATA="$2"; shift 2 ;;
     --jellyfin-user)  JELLYFIN_USER="$2"; shift 2 ;;
     --no-restart)     NO_RESTART=1; shift ;;
-    --skip-build)     SKIP_BUILD=1; shift ;;
+    --build)          DO_BUILD=1; shift ;;
+    --no-gostream)    DO_GOSTREAM=0; shift ;;
     -h|--help)        usage ;;
     *) die "Unknown option: $1 (try --help)" ;;
   esac
@@ -125,20 +135,20 @@ echo "  Plugin dest:        $PLUGINS_DIR"
 echo "  Phantom stub root:  $PHANTOM_STUB_ROOT"
 echo
 
-# ---------------------------------------------------------------- build
-if [ "$SKIP_BUILD" -eq 0 ]; then
+# ---------------------------------------------------------------- build (opt-in)
+if [ "$DO_BUILD" -eq 1 ]; then
   if ! command -v dotnet >/dev/null 2>&1; then
-    die "'dotnet' not found in PATH. Install the .NET 9 SDK or pass --skip-build."
+    die "'dotnet' not found in PATH. Install the .NET 9 SDK or drop --build."
   fi
-  bold "Building plugin (Release)..."
+  bold "Building plugin (Release)... [--build]"
   dotnet build -c Release
   echo
 else
-  yellow "Skipping build (--skip-build)."
+  yellow "Skipping build (pass --build to rebuild). Using existing artefacts."
 fi
 
 if [ ! -f "$DLL_OUT" ]; then
-  die "Built DLL not found at $DLL_OUT. Re-run without --skip-build, or check the build output."
+  die "Built DLL not found at $DLL_OUT. Re-run with --build, or build manually first."
 fi
 
 # ---------------------------------------------------------------- install dll
@@ -165,6 +175,34 @@ $SUDO chmod 755 "$PHANTOM_STUB_ROOT" "$PHANTOM_STUB_ROOT/movies" "$PHANTOM_STUB_
 green "  $PHANTOM_STUB_ROOT/{movies,shows} ready"
 yellow "  NOTE: if your plugin config has PhantomStubRoot set to a"
 yellow "        different path, also chown that path to $JELLYFIN_USER:$JELLYFIN_GROUP."
+
+# ---------------------------------------------------------------- gostream image
+if [ "$DO_GOSTREAM" -eq 1 ]; then
+  echo
+  bold "Loading gostream image into root podman storage..."
+  if ! command -v podman >/dev/null 2>&1; then
+    yellow "  podman not in PATH — skipping. Install podman or pass --no-gostream."
+  elif [ ! -f "$GOSTREAM_TARBALL" ]; then
+    yellow "  $GOSTREAM_TARBALL not found."
+    yellow "  The agent produces this with:"
+    yellow "    cd gostream && podman build -f docker/Dockerfile -t $GOSTREAM_IMAGE ."
+    yellow "    podman save -o $GOSTREAM_TARBALL $GOSTREAM_IMAGE"
+    yellow "  Skipping image load."
+  else
+    if $SUDO podman image exists "$GOSTREAM_IMAGE" 2>/dev/null; then
+      yellow "  $GOSTREAM_IMAGE already present in root podman storage; reloading."
+      $SUDO podman rmi -f "$GOSTREAM_IMAGE" >/dev/null 2>&1 || true
+    fi
+    $SUDO podman load -i "$GOSTREAM_TARBALL"
+    if $SUDO podman image exists "$GOSTREAM_IMAGE"; then
+      green "  $GOSTREAM_IMAGE loaded into root podman storage."
+    else
+      red "  podman load succeeded but $GOSTREAM_IMAGE not found in root storage; check output above."
+    fi
+  fi
+else
+  yellow "Skipping gostream image load (--no-gostream)."
+fi
 
 # ---------------------------------------------------------------- post-install hints
 echo
