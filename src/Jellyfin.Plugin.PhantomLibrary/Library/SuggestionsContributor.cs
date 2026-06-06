@@ -21,6 +21,7 @@ namespace Jellyfin.Plugin.PhantomLibrary.Library;
 public interface ISuggestionsContributor
 {
     Task<int> RefreshTrendingAsync(CancellationToken ct);
+    Task<int> RefreshCatalogueAsync(CancellationToken ct);
     Task<int> RefreshSimilarToAsync(Guid itemId, CancellationToken ct);
     Task<int> RefreshRecommendedForUserAsync(Guid userId, CancellationToken ct);
     Task<int> RefreshAllAsync(CancellationToken ct);
@@ -43,6 +44,9 @@ public sealed class SuggestionsContributor : ISuggestionsContributor
 
     /// <summary>Per-user-recommended favourite fan-out: take last N favourited movies + N series.</summary>
     public const int FavouritesFanOutPerType = 5;
+
+    /// <summary>Inter-page delay to stay under the TMDB 40-req/10s rate limit.</summary>
+    private static readonly TimeSpan DiscoverPageDelay = TimeSpan.FromMilliseconds(300);
 
     private const string TrendingWindow = "week";
     private const string TmdbProvider = "Tmdb";
@@ -238,10 +242,94 @@ public sealed class SuggestionsContributor : ISuggestionsContributor
             }
         }
 
+        try
+        {
+            total += await RefreshCatalogueAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "[Suggestions] RefreshAll: catalogue walk failed; continuing");
+        }
+
         _logger.LogInformation(
             "[Suggestions] RefreshAll: total created={Total} duration={Ms}ms",
             total, sw.ElapsedMilliseconds);
         return total;
+    }
+
+    /// <summary>
+    /// Walks TMDB /discover/movie and /discover/tv page-by-page,
+    /// materialising Virtual items until either an empty page is
+    /// returned or the per-kind cap (floor(SuggestionsCatalogueMaxItems/2))
+    /// is reached. See PLAN §M11 issue #1.
+    /// </summary>
+    public async Task<int> RefreshCatalogueAsync(CancellationToken ct)
+    {
+        var sw = Stopwatch.StartNew();
+        var cfg = Plugin.Instance?.Configuration ?? new Configuration.PluginConfiguration();
+        var perKindCap = Math.Max(0, cfg.SuggestionsCatalogueMaxItems / 2);
+        var totalCreated = 0;
+
+        totalCreated += await WalkDiscoverAsync(
+            ItemKind.Movie, perKindCap, ct).ConfigureAwait(false);
+        totalCreated += await WalkDiscoverAsync(
+            ItemKind.Series, perKindCap, ct).ConfigureAwait(false);
+
+        _logger.LogInformation(
+            "[Suggestions] Catalogue refresh: created={Created} perKindCap={Cap} duration={Ms}ms",
+            totalCreated, perKindCap, sw.ElapsedMilliseconds);
+        return totalCreated;
+    }
+
+    private async Task<int> WalkDiscoverAsync(ItemKind kind, int cap, CancellationToken ct)
+    {
+        if (cap <= 0) return 0;
+        var created = 0;
+        var page = 1;
+        while (created < cap)
+        {
+            ct.ThrowIfCancellationRequested();
+            var label = $"Discover/{kind}/p{page}";
+            var fetch = kind == ItemKind.Movie
+                ? await SafeFetchAsync(() => _reader.GetDiscoverMoviesAsync(page, null, ct), label).ConfigureAwait(false)
+                : await SafeFetchAsync(() => _reader.GetDiscoverSeriesAsync(page, null, ct), label).ConfigureAwait(false);
+
+            if (fetch.Hits.Count == 0)
+            {
+                _logger.LogInformation(
+                    "[Suggestions] Catalogue page {Page} for {Kind}: empty page, stopping walk",
+                    page, kind);
+                break;
+            }
+
+            var remaining = cap - created;
+            var (c, s) = await MaterialiseHitsAsync(
+                fetch.Hits, kind, remaining, EagerHint.None, ct).ConfigureAwait(false);
+            created += c;
+
+            _logger.LogInformation(
+                "[Suggestions] Catalogue page {Page} for {Kind}: created={N} skipped={K}",
+                page, kind, c, s);
+
+            page++;
+            if (created < cap)
+            {
+                try
+                {
+                    await Task.Delay(DiscoverPageDelay, ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+            }
+        }
+
+        return created;
     }
 
     private async Task<(IReadOnlyList<TmdbSearchHit> Hits, bool FromCache)> SafeFetchAsync(

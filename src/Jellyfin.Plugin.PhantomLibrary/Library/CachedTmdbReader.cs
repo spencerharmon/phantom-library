@@ -71,6 +71,24 @@ public sealed class CachedTmdbReader
             innerCt => _tmdb.GetTrendingSeriesAsync(window, language, innerCt),
             ct);
 
+    public Task<(IReadOnlyList<TmdbSearchHit> Hits, bool FromCache)> GetDiscoverMoviesAsync(int page, string? language, CancellationToken ct)
+        => FetchAsync(
+            "discover/movie",
+            new Dictionary<string, string?> { ["page"] = page.ToString(CultureInfo.InvariantCulture) },
+            language,
+            TrendingTtl,
+            innerCt => _tmdb.DiscoverMoviesAsync(page, language, innerCt),
+            ct);
+
+    public Task<(IReadOnlyList<TmdbSearchHit> Hits, bool FromCache)> GetDiscoverSeriesAsync(int page, string? language, CancellationToken ct)
+        => FetchAsync(
+            "discover/tv",
+            new Dictionary<string, string?> { ["page"] = page.ToString(CultureInfo.InvariantCulture) },
+            language,
+            TrendingTtl,
+            innerCt => _tmdb.DiscoverSeriesAsync(page, language, innerCt),
+            ct);
+
     public Task<(IReadOnlyList<TmdbSearchHit> Hits, bool FromCache)> SimilarMoviesAsync(int tmdbId, string? language, CancellationToken ct)
         => FetchAsync(
             "movie/similar",

@@ -38,6 +38,18 @@ public interface ITmdbClient
     /// <summary>Trending movies. <paramref name="window"/> is "day" or "week".</summary>
     Task<IReadOnlyList<TmdbSearchHit>> GetTrendingMoviesAsync(string window, string? languageCode, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// Discover movies, popularity-sorted. <paramref name="page"/> is 1-indexed (TMDB convention).
+    /// Returns up to 20 hits per page; empty page → empty array.
+    /// </summary>
+    Task<IReadOnlyList<TmdbSearchHit>> DiscoverMoviesAsync(int page, string? languageCode, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Discover TV series, popularity-sorted. <paramref name="page"/> is 1-indexed (TMDB convention).
+    /// Returns up to 20 hits per page; empty page → empty array.
+    /// </summary>
+    Task<IReadOnlyList<TmdbSearchHit>> DiscoverSeriesAsync(int page, string? languageCode, CancellationToken cancellationToken);
+
     /// <summary>Trending series. <paramref name="window"/> is "day" or "week".</summary>
     Task<IReadOnlyList<TmdbSearchHit>> GetTrendingSeriesAsync(string window, string? languageCode, CancellationToken cancellationToken);
 

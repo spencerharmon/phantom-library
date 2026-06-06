@@ -176,6 +176,10 @@
                             <label class="inputLabel inputLabelUnfocused" for="PhantomShowsLibraryName">Phantom shows library name (CollectionFolder to bind series stubs into)</label>
                             <input id="PhantomShowsLibraryName" name="PhantomShowsLibraryName" type="text" is="emby-input" />
                         </div>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="SuggestionsCatalogueMaxItems">Catalogue cap (max Virtual items across movies+series; default 5000)</label>
+                            <input id="SuggestionsCatalogueMaxItems" name="SuggestionsCatalogueMaxItems" type="number" min="0" is="emby-input" />
+                        </div>
                         <div>
                             <button is="emby-button" id="PhantomLibraryRefreshSuggestionsBtn" type="button" class="raised block">
                                 <span>Refresh suggestions now</span>
@@ -238,6 +242,7 @@
                             document.querySelector('#PhantomStubRoot').value = cfg.PhantomStubRoot || '';
                             document.querySelector('#PhantomMoviesLibraryName').value = cfg.PhantomMoviesLibraryName || '';
                             document.querySelector('#PhantomShowsLibraryName').value = cfg.PhantomShowsLibraryName || '';
+                            document.querySelector('#SuggestionsCatalogueMaxItems').value = cfg.SuggestionsCatalogueMaxItems;
                             Dashboard.hideLoadingMsg();
                         });
                     });
@@ -273,6 +278,7 @@
                             cfg.PhantomStubRoot = document.querySelector('#PhantomStubRoot').value;
                             cfg.PhantomMoviesLibraryName = document.querySelector('#PhantomMoviesLibraryName').value;
                             cfg.PhantomShowsLibraryName = document.querySelector('#PhantomShowsLibraryName').value;
+                            cfg.SuggestionsCatalogueMaxItems = parseInt(document.querySelector('#SuggestionsCatalogueMaxItems').value, 10);
                             ApiClient.updatePluginConfiguration(PluginId, cfg).then(function (r) {
                                 Dashboard.processPluginConfigurationUpdateResult(r);
                             });
