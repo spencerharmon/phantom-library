@@ -186,13 +186,30 @@ public sealed class UserDataSavedListener : IHostedService
             return false;
         }
 
-        // Treat virtual / un-pathed items as materialisable. If the item
-        // already has a real path, do nothing (it's Materialised).
-        if (!string.IsNullOrWhiteSpace(item.Path))
+        // Path-less items (legacy pre-M10 virtual rows) are
+        // materialisable. From M10 onward phantoms have a path
+        // pointing at a symlink under the phantom stub root; those
+        // are still virtual from our perspective and must be
+        // materialisable too. Only items whose Path points OUTSIDE
+        // the phantom-stub root (i.e. real gostream-backed media)
+        // are skipped.
+        if (string.IsNullOrWhiteSpace(item.Path))
         {
-            return false;
+            return true;
         }
 
-        return true;
+        return IsPhantomPath(item.Path);
     }
+
+    /// <summary>
+    /// Returns true if the path is a phantom-stub symlink (per the
+    /// M10 sentinel naming convention). Used to distinguish phantoms
+    /// from materialised gostream-backed items even though both have
+    /// a non-null Path post-M10.
+    /// </summary>
+    internal static bool IsPhantomPath(string? path)
+        => !string.IsNullOrEmpty(path)
+            && path.Contains(
+                Jellyfin.Plugin.PhantomLibrary.Library.PhantomStubManager.Sentinel,
+                StringComparison.Ordinal);
 }
