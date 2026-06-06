@@ -153,8 +153,32 @@ public sealed class Materialiser : IMaterialiser
                 }
             }
 
+            // M11 #5 downstream: BaseItem.ProviderIds is often empty
+            // after the scanner re-resolves a phantom stub. Fall back
+            // to phantom_items.tmdb_id so materialise can still run.
+            var resolved = await ResolveProviderIdsAsync(item, ct).ConfigureAwait(false);
+            if (resolved.Tmdb is not null)
+            {
+                item.ProviderIds ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                if (!item.ProviderIds.ContainsKey("Tmdb"))
+                {
+                    item.ProviderIds["Tmdb"] = resolved.Tmdb;
+                }
+                if (resolved.Imdb is not null && !item.ProviderIds.ContainsKey("Imdb"))
+                {
+                    item.ProviderIds["Imdb"] = resolved.Imdb;
+                }
+            }
+
             if (!TryExtractIdentifiers(item, out var ids))
             {
+                if (resolved.Tmdb is null)
+                {
+                    return await FailAsync(sw, jellyfinItemId, trigger,
+                        $"item {jellyfinItemId} has no TMDB id in BaseItem.ProviderIds OR phantom_items row — Suggestions may have lost the id during scan; check phantom.db",
+                        indexerUsed, infoHashUsed, ct).ConfigureAwait(false);
+                }
+
                 return await FailAsync(sw, jellyfinItemId, trigger,
                     "item lacks TMDB/IMDB provider ids — cannot materialise", indexerUsed, infoHashUsed, ct)
                     .ConfigureAwait(false);
@@ -531,6 +555,41 @@ public sealed class Materialiser : IMaterialiser
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Resolves TMDB / IMDB provider ids for an item, falling back to
+    /// the phantom_items row when BaseItem.ProviderIds has been stripped
+    /// by the scanner (M11 #5 downstream).
+    /// </summary>
+    internal async Task<(string? Tmdb, string? Imdb, string? Type)> ResolveProviderIdsAsync(
+        BaseItem item, CancellationToken ct)
+    {
+        if (item.ProviderIds is not null
+            && item.ProviderIds.TryGetValue("Tmdb", out var tmdb)
+            && !string.IsNullOrWhiteSpace(tmdb))
+        {
+            item.ProviderIds.TryGetValue("Imdb", out var imdb);
+            string? kind = item switch
+            {
+                Movie => "movie",
+                Episode => "episode",
+                Series => "series",
+                _ => null,
+            };
+            return (tmdb, string.IsNullOrWhiteSpace(imdb) ? null : imdb, kind);
+        }
+
+        var row = await _db.GetPhantomItemAsync(item.Id, ct).ConfigureAwait(false);
+        if (row is not null && row.TmdbId is not null)
+        {
+            return (
+                row.TmdbId.Value.ToString(CultureInfo.InvariantCulture),
+                string.IsNullOrWhiteSpace(row.ImdbId) ? null : row.ImdbId,
+                row.Type);
+        }
+
+        return (null, null, null);
     }
 
     private bool TryExtractIdentifiers(BaseItem item, out ItemIdentifiers ids)
