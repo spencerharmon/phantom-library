@@ -96,6 +96,20 @@ public sealed class SeriesIngestor : ISeriesIngestor
         if (parent is Folder pf) series.SetParent(pf);
         _libraryManager.CreateItem(series, parent);
 
+        // Re-stamp Name / IsLocked / ProviderIds / images after CreateItem so the
+        // scanner cannot win. See SuggestionsContributor for the rationale.
+        try
+        {
+            await _libraryManager.UpdateItemAsync(
+                series, parent, ItemUpdateType.MetadataEdit, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "SeriesIngestor UpdateItemAsync re-stamp failed for tmdb={Tmdb}; row created but may show scanner-clobbered metadata",
+                seriesTmdbId);
+        }
+
         await _db.UpsertPhantomItemAsync(series.Id, new PhantomItemRow
         {
             TmdbId = seriesTmdbId,

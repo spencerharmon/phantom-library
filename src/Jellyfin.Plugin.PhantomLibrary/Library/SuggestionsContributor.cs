@@ -348,6 +348,25 @@ public sealed class SuggestionsContributor : ISuggestionsContributor
                 continue;
             }
 
+            // Re-stamp Name / IsLocked / ProviderIds / images after CreateItem.
+            // CreateItem triggers a scanner pass that can resolve the stub path
+            // back to a TMDB fuzzy match and clobber Name + ProviderIds with
+            // garbage. UpdateItemAsync flushes the in-memory values back to disk.
+            // IsLocked is set unconditionally (even without a stub path) so
+            // metadata providers will not overwrite our title.
+            newItem.IsLocked = true;
+            try
+            {
+                await _libraryManager.UpdateItemAsync(
+                    newItem, parent, ItemUpdateType.MetadataEdit, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "[Suggestions] UpdateItemAsync re-stamp failed for tmdb={Tmdb} ({Name}); row created but may show scanner-clobbered metadata",
+                    hit.Id, hit.Title);
+            }
+
             await UpsertPhantomRowAsync(newItem.Id, hit.Id, kind, PhantomItemState.Virtual, ct).ConfigureAwait(false);
             created++;
         }
