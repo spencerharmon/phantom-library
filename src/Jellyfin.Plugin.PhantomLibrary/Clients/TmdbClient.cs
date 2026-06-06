@@ -257,6 +257,30 @@ public sealed class TmdbClient : ITmdbClient
         => GetSeriesHitsAsync($"/trending/tv/{NormaliseTrendingWindow(window)}", languageCode, cancellationToken);
 
     /// <inheritdoc/>
+    public Task<IReadOnlyList<TmdbSearchHit>> DiscoverMoviesAsync(int page, string? languageCode, CancellationToken cancellationToken)
+    {
+        var p = page < 1 ? 1 : page;
+        var extras = new[]
+        {
+            new KeyValuePair<string, string?>("page", p.ToString(CultureInfo.InvariantCulture)),
+            new KeyValuePair<string, string?>("sort_by", "popularity.desc"),
+        };
+        return GetMovieHitsWithExtrasAsync("/discover/movie", languageCode, extras, cancellationToken);
+    }
+
+    /// <inheritdoc/>
+    public Task<IReadOnlyList<TmdbSearchHit>> DiscoverSeriesAsync(int page, string? languageCode, CancellationToken cancellationToken)
+    {
+        var p = page < 1 ? 1 : page;
+        var extras = new[]
+        {
+            new KeyValuePair<string, string?>("page", p.ToString(CultureInfo.InvariantCulture)),
+            new KeyValuePair<string, string?>("sort_by", "popularity.desc"),
+        };
+        return GetSeriesHitsWithExtrasAsync("/discover/tv", languageCode, extras, cancellationToken);
+    }
+
+    /// <inheritdoc/>
     public Task<IReadOnlyList<TmdbSearchHit>> GetSimilarMoviesAsync(int tmdbId, string? languageCode, CancellationToken cancellationToken)
         => GetMovieHitsAsync($"/movie/{tmdbId.ToString(CultureInfo.InvariantCulture)}/similar", languageCode, cancellationToken);
 
@@ -278,9 +302,13 @@ public sealed class TmdbClient : ITmdbClient
         return string.Equals(window.Trim(), "day", StringComparison.OrdinalIgnoreCase) ? "day" : "week";
     }
 
-    private async Task<IReadOnlyList<TmdbSearchHit>> GetMovieHitsAsync(string endpoint, string? languageCode, CancellationToken ct)
+    private Task<IReadOnlyList<TmdbSearchHit>> GetMovieHitsAsync(string endpoint, string? languageCode, CancellationToken ct)
+        => GetMovieHitsWithExtrasAsync(endpoint, languageCode, new[] { new KeyValuePair<string, string?>("page", "1") }, ct);
+
+    private async Task<IReadOnlyList<TmdbSearchHit>> GetMovieHitsWithExtrasAsync(
+        string endpoint, string? languageCode, IEnumerable<KeyValuePair<string, string?>> extras, CancellationToken ct)
     {
-        var path = BuildPath(endpoint, languageCode, new[] { new KeyValuePair<string, string?>("page", "1") });
+        var path = BuildPath(endpoint, languageCode, extras);
         var resp = await GetJsonAsync<TmdbSearchResponse<TmdbMovieSearchHitDto>>(path, ct).ConfigureAwait(false);
         if (resp?.Results is null) return Array.Empty<TmdbSearchHit>();
         return resp.Results.Select(r => new TmdbSearchHit(
@@ -288,9 +316,13 @@ public sealed class TmdbClient : ITmdbClient
             r.ReleaseDate, r.VoteAverage, r.VoteCount) { GenreIds = r.GenreIds }).ToList();
     }
 
-    private async Task<IReadOnlyList<TmdbSearchHit>> GetSeriesHitsAsync(string endpoint, string? languageCode, CancellationToken ct)
+    private Task<IReadOnlyList<TmdbSearchHit>> GetSeriesHitsAsync(string endpoint, string? languageCode, CancellationToken ct)
+        => GetSeriesHitsWithExtrasAsync(endpoint, languageCode, new[] { new KeyValuePair<string, string?>("page", "1") }, ct);
+
+    private async Task<IReadOnlyList<TmdbSearchHit>> GetSeriesHitsWithExtrasAsync(
+        string endpoint, string? languageCode, IEnumerable<KeyValuePair<string, string?>> extras, CancellationToken ct)
     {
-        var path = BuildPath(endpoint, languageCode, new[] { new KeyValuePair<string, string?>("page", "1") });
+        var path = BuildPath(endpoint, languageCode, extras);
         var resp = await GetJsonAsync<TmdbSearchResponse<TmdbSeriesSearchHitDto>>(path, ct).ConfigureAwait(false);
         if (resp?.Results is null) return Array.Empty<TmdbSearchHit>();
         return resp.Results.Select(r => new TmdbSearchHit(

@@ -56,6 +56,8 @@ public class PluginConfiguration : BasePluginConfiguration
         PhantomStubRoot = "/var/lib/jellyfin/phantom-library";
         PhantomMoviesLibraryName = "gostream-movies";
         PhantomShowsLibraryName = "gostream-shows";
+
+        SuggestionsCatalogueMaxItems = 5000;
     }
 
     /// <summary>Gets or sets the TMDB v3 API key used by the plugin's TMDB client.</summary>
@@ -162,6 +164,13 @@ public class PluginConfiguration : BasePluginConfiguration
     /// series stubs are bound (default <c>gostream-shows</c>).
     /// </summary>
     public string PhantomShowsLibraryName { get; set; }
+
+    /// <summary>
+    /// Gets or sets the total cap on Virtual items materialised by the
+    /// Discover catalogue walk (split evenly between movies and series).
+    /// Default 5000 → ~2500 of each kind across ~125 TMDB pages per kind.
+    /// </summary>
+    public int SuggestionsCatalogueMaxItems { get; set; }
 }
 
 /// <summary>Quality-scoring preset chooser.</summary>
