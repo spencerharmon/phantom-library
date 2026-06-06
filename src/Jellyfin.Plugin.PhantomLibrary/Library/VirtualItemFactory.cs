@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using Jellyfin.Plugin.PhantomLibrary.Clients.Models;
+using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.Movies;
 using MediaBrowser.Controller.Entities.TV;
 using MediaBrowser.Model.Entities;
@@ -47,6 +49,9 @@ public static class VirtualItemFactory
             movie.ProviderIds["Imdb"] = details.ImdbId!;
         }
 
+        movie.ForcedSortName = movie.Name;
+        movie.PresentationUniqueKey = $"phantom_movie_tmdb{details.Id.ToString(CultureInfo.InvariantCulture)}";
+        movie.ImageInfos = BuildImageInfos(details.PosterPath, details.BackdropPath);
         movie.IsVirtualItem = true;
         return movie;
     }
@@ -55,17 +60,21 @@ public static class VirtualItemFactory
     public static Movie CreateVirtualMovieFromHit(TmdbSearchHit hit)
     {
         ArgumentNullException.ThrowIfNull(hit);
+        var title = hit.Title ?? string.Empty;
         var movie = new Movie
         {
-            Name = hit.Title ?? string.Empty,
+            Name = title,
             OriginalTitle = hit.OriginalTitle ?? string.Empty,
             Overview = hit.Overview ?? string.Empty,
             ProductionYear = ParseYear(hit.ReleaseDate),
             PremiereDate = ParseDate(hit.ReleaseDate),
             Genres = TmdbGenres.ResolveMovieGenres(hit.GenreIds),
             CommunityRating = hit.VoteAverage.HasValue ? (float?)hit.VoteAverage.Value : null,
+            ForcedSortName = title,
+            PresentationUniqueKey = $"phantom_movie_tmdb{hit.Id.ToString(CultureInfo.InvariantCulture)}",
         };
         movie.ProviderIds["Tmdb"] = hit.Id.ToString(CultureInfo.InvariantCulture);
+        movie.ImageInfos = BuildImageInfos(hit.PosterPath, hit.BackdropPath);
         movie.IsVirtualItem = true;
         return movie;
     }
@@ -74,19 +83,45 @@ public static class VirtualItemFactory
     public static Series CreateVirtualSeriesFromHit(TmdbSearchHit hit)
     {
         ArgumentNullException.ThrowIfNull(hit);
+        var title = hit.Title ?? string.Empty;
         var series = new Series
         {
-            Name = hit.Title ?? string.Empty,
+            Name = title,
             OriginalTitle = hit.OriginalTitle ?? string.Empty,
             Overview = hit.Overview ?? string.Empty,
             ProductionYear = ParseYear(hit.ReleaseDate),
             PremiereDate = ParseDate(hit.ReleaseDate),
             Genres = TmdbGenres.ResolveSeriesGenres(hit.GenreIds),
             CommunityRating = hit.VoteAverage.HasValue ? (float?)hit.VoteAverage.Value : null,
+            ForcedSortName = title,
+            PresentationUniqueKey = $"phantom_series_tmdb{hit.Id.ToString(CultureInfo.InvariantCulture)}",
         };
         series.ProviderIds["Tmdb"] = hit.Id.ToString(CultureInfo.InvariantCulture);
+        series.ImageInfos = BuildImageInfos(hit.PosterPath, hit.BackdropPath);
         series.IsVirtualItem = true;
         return series;
+    }
+
+    private static ItemImageInfo[] BuildImageInfos(string? posterPath, string? backdropPath)
+    {
+        var list = new List<ItemImageInfo>(2);
+        if (!string.IsNullOrWhiteSpace(posterPath))
+        {
+            list.Add(new ItemImageInfo
+            {
+                Type = ImageType.Primary,
+                Path = $"https://image.tmdb.org/t/p/original{posterPath}",
+            });
+        }
+        if (!string.IsNullOrWhiteSpace(backdropPath))
+        {
+            list.Add(new ItemImageInfo
+            {
+                Type = ImageType.Backdrop,
+                Path = $"https://image.tmdb.org/t/p/original{backdropPath}",
+            });
+        }
+        return list.Count == 0 ? Array.Empty<ItemImageInfo>() : list.ToArray();
     }
 
     /// <summary>Builds an unpersisted <see cref="Series"/> from TMDB details.</summary>
@@ -112,6 +147,9 @@ public static class VirtualItemFactory
             series.ProviderIds["Imdb"] = details.ImdbId!;
         }
 
+        series.ForcedSortName = series.Name;
+        series.PresentationUniqueKey = $"phantom_series_tmdb{details.Id.ToString(CultureInfo.InvariantCulture)}";
+        series.ImageInfos = BuildImageInfos(details.PosterPath, details.BackdropPath);
         series.IsVirtualItem = true;
         return series;
     }
