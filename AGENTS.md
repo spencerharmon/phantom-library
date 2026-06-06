@@ -6,6 +6,30 @@ authoritative project docs. This file translates them into
 conventions an agent needs to operate session-to-session
 without re-deriving them.
 
+## Operator hand-off rule (always)
+
+When finishing a change the operator will install or test, **always
+end the message with an explicit, ordered list of operator steps**.
+This includes anything not handled by `./install.sh` alone:
+
+- DB migrations or repair scripts (e.g. `sudo /tmp/foo-repair.sh`).
+- Stopping or restarting services (`gostream.service`, `jellyfin.service`).
+- Triggering scheduled tasks from the dashboard (e.g.
+  Suggestions / Refresh Library / Validate Vault).
+- Re-running install with non-default flags (`--build`,
+  `--no-gostream`).
+- Anything that touches `/var/lib/jellyfin`, `/var/gostream`, or
+  root podman storage.
+
+The operator should never have to infer whether "run the install
+script" is enough or whether they also need to run Suggestions, or
+wait for a periodic re-bind cycle, or `chown` something. Make it
+explicit, every time, even when the steps feel obvious.
+
+If the change requires *no* operator action beyond the next install,
+say so explicitly: "No operator steps needed; `./install.sh` is
+sufficient." Silence on this question costs the operator time.
+
 ## Read first
 
 - `PLAN.md` — milestone tracker, design decisions, the
