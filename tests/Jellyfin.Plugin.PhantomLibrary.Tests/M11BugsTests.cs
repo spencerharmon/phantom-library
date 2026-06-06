@@ -149,22 +149,18 @@ public class M11BugsTests : IDisposable
         // SuggestionsContributor exposes a RefreshCatalogueAsync that
         // calls DiscoverMoviesAsync repeatedly across pages until it
         // has either created Cap items or TMDB returns an empty page.
-        // This test stubs the discover client to return 20 hits/page
-        // and asserts the method paginates beyond a single page.
-        var page1 = Enumerable.Range(1, 20).Select(i => Hit(i, $"M{i}")).ToArray();
-        var page2 = Enumerable.Range(21, 20).Select(i => Hit(i, $"M{i}")).ToArray();
-        var page3 = Array.Empty<TmdbSearchHit>();
-
-        var mock = new Mock<ITmdbClient>();
-        mock.Setup(t => t.GetType().GetMethod("DiscoverMoviesAsync")).Returns((System.Reflection.MethodInfo?)null);
-
-        // Use reflection to invoke the new method via Moq's setup-by-name
-        // pattern is not feasible; instead skip the live page assertion
-        // here and rely on the method-existence check above PLUS the
-        // integration assertion below that the public RefreshCatalogue
-        // method exists on the contributor.
+        //
+        // This test pins the method's existence + return type. The
+        // pagination behaviour is verified end-to-end by the live
+        // integration tests; mocking page-by-page would require the
+        // CachedTmdbReader's internal Discover wrappers to be public,
+        // which is out of scope here.
+        await Task.Yield();
         var method = typeof(SuggestionsContributor).GetMethod("RefreshCatalogueAsync");
         Assert.NotNull(method);
+        Assert.True(
+            typeof(Task<int>).IsAssignableFrom(method!.ReturnType),
+            "RefreshCatalogueAsync must return Task<int> (total items created)");
     }
 
     // ─────────────────────────────────────────────────────────────────
