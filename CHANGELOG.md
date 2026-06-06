@@ -30,6 +30,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   end-to-end verified that both `gostream-movies` and
   `gostream-shows` bindings persist across multiple
   metadata-refresh cycles.
+- **M11 — Post-M10 phantom UX polish.** Six bugs surfaced by
+  operator live testing:
+  1. *Catalogue too small.* New `ITmdbClient.DiscoverMoviesAsync`
+     / `DiscoverSeriesAsync` (paginated). New config field
+     `SuggestionsCatalogueMaxItems` (default 5000). New
+     `SuggestionsContributor.RefreshCatalogueAsync` walks
+     Discover pages until the cap is hit or the API runs out.
+     Cached per-page via `CachedTmdbReader`. Respects TMDB rate
+     limits via inter-page delays.
+  2. *Display name showed `__phantom_tmdb<id>` filename stem.*
+     `VirtualItemFactory` now stamps `ForcedSortName` and
+     `SuggestionsContributor` / `SeriesIngestor` re-stamp the
+     item via `UpdateItemAsync` immediately after `CreateItem`
+     so the scanner's filename-derived Name cannot win.
+  3. *Phantom image was splash thumbnail instead of TMDB poster.*
+     `VirtualItemFactory` now stamps `ImageInfos[Primary]` with
+     `https://image.tmdb.org/t/p/original<PosterPath>` at create
+     time, plus a Backdrop entry. Jellyfin's image cache fetches
+     lazily on first client browse; no extra TMDB round-trip
+     during Suggestions.
+  4. *TV Series phantoms invisible in browse.* Series rows now
+     get `PresentationUniqueKey` set (was empty, which caused
+     dedupe-collapse in some browse queries) and the Series-
+     from-hit path uses the same stub-symlink + lock + re-stamp
+     pattern as Movies.
+  5. *Pressing Play never triggered materialise.* New
+     `PlaybackTriggerListener` subscribes to
+     `ISessionManager.PlaybackStart` and enqueues
+     `MaterialiseTrigger.Play` when the played item is a phantom
+     (Movie / Episode; Series is a container, autopilot handles
+     it). Additionally, `UserDataSavedListener.IsMaterialisable`
+     now treats items whose Path matches the
+     `PhantomStubManager.Sentinel` as phantoms (not
+     already-materialised) so favouriting also re-enqueues.
+     `Materialiser.ResolveProviderIdsAsync` falls back to the
+     plugin DB when `BaseItem.ProviderIds` is empty post-scan;
+     the operator-observed "item lacks TMDB/IMDB provider ids"
+     error is now self-healing.
+  6. *Splash playback marked the phantom as played.*
+     `PlaybackTriggerListener.OnPlaybackStopped` resets UserData
+     (`PlayCount=0`, `Played=false`, `PlaybackPositionTicks=0`,
+     `LastPlayedDate=null`) for each session user on a phantom
+     when playback stops, so the splash doesn't pollute watch
+     history. Real materialised playback continues to count
+     normally.
+  Regression suite (11 tests) added in `M11BugsTests.cs`;
+  full suite is 153/153 passing.
 
 ## [0.1.0] - 2026-06-04
 
