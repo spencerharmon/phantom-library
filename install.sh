@@ -189,15 +189,43 @@ if [ "$DO_GOSTREAM" -eq 1 ]; then
     yellow "    podman save -o $GOSTREAM_TARBALL $GOSTREAM_IMAGE"
     yellow "  Skipping image load."
   else
-    if $SUDO podman image exists "$GOSTREAM_IMAGE" 2>/dev/null; then
-      yellow "  $GOSTREAM_IMAGE already present in root podman storage; reloading."
+    # Capture the pre-load image id (if any) so we can detect whether
+    # the load actually replaced anything new. Empty string if absent.
+    OLD_IMG_ID="$($SUDO podman image inspect --format '{{.Id}}' "$GOSTREAM_IMAGE" 2>/dev/null || true)"
+
+    if [ -n "$OLD_IMG_ID" ]; then
+      yellow "  $GOSTREAM_IMAGE already present (id=${OLD_IMG_ID:0:12}); reloading."
       $SUDO podman rmi -f "$GOSTREAM_IMAGE" >/dev/null 2>&1 || true
     fi
     $SUDO podman load -i "$GOSTREAM_TARBALL"
-    if $SUDO podman image exists "$GOSTREAM_IMAGE"; then
-      green "  $GOSTREAM_IMAGE loaded into root podman storage."
-    else
+    NEW_IMG_ID="$($SUDO podman image inspect --format '{{.Id}}' "$GOSTREAM_IMAGE" 2>/dev/null || true)"
+
+    if [ -z "$NEW_IMG_ID" ]; then
       red "  podman load succeeded but $GOSTREAM_IMAGE not found in root storage; check output above."
+    else
+      green "  $GOSTREAM_IMAGE loaded into root podman storage (id=${NEW_IMG_ID:0:12})."
+
+      # Restart gostream.service only if the image id actually
+      # changed (or there was no prior image). No point bouncing
+      # the container if the tarball matched what was already loaded.
+      if [ "$OLD_IMG_ID" != "$NEW_IMG_ID" ]; then
+        if command -v systemctl >/dev/null 2>&1 \
+           && $SUDO systemctl list-unit-files gostream.service >/dev/null 2>&1 \
+           && $SUDO systemctl list-unit-files gostream.service 2>/dev/null | grep -q gostream.service; then
+          bold "  Restarting gostream.service (image changed)..."
+          $SUDO systemctl restart gostream.service
+          sleep 2
+          if $SUDO systemctl is-active --quiet gostream.service; then
+            green "    gostream.service active."
+          else
+            red "    gostream.service failed to become active. Check: journalctl -u gostream -n 50"
+          fi
+        else
+          yellow "  gostream.service not found in systemd; restart your container manually."
+        fi
+      else
+        yellow "  Image id unchanged; gostream.service not restarted."
+      fi
     fi
   fi
 else
