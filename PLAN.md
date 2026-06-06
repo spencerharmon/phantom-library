@@ -26,6 +26,7 @@ Mascot: *Stygiomedusa gigantea*, the giant phantom jelly.
 | M8 — TV series + autopilot                   | ✅ | `60de538` |
 | M9 — Packaging + release polish              | ✅ | M9 release commit (this change) |
 | M10 — Phantom symlink library + visibility fix | ✅ | (unreleased, multiple commits) |
+| M11 — Post-M10 phantom UX polish               | 🚧 planning | — |
 
 ### Documented partials
 
@@ -1291,6 +1292,211 @@ returned the new path. The real plugin path through
 8. Upstream bug report filed (referenced in CHANGELOG and PR
    description). Upstream PR is **not** a blocker for tagging
    v0.1.1.
+
+### M11 — Post-M10 phantom UX polish (≤ 4 days)
+
+M10 restored phantom **visibility**. Live operator testing on
+2026-06-05 revealed six distinct UX problems that block usable
+phantom browse + play. Each is small individually; together they
+are the difference between "phantoms appear in the library" and
+"phantoms are usable". Track and fix in this milestone.
+
+Observed issues (with diagnosis where known):
+
+1. **Phantom catalogue is far too small.** Operator expected the
+   entire TMDB catalogue but saw ~10 movies. SuggestionsContributor
+   currently fetches **Trending** (defaults to 40 movies + 40 series
+   per refresh) plus per-user **Recommended** (which falls back to
+   Trending when the user has no favourites). With two users + no
+   favourites the actual surface is one cached Trending list, ~40
+   titles, of which ~30 already exist as real gostream items so
+   only ~10 are net-new phantoms.
+
+   **Fix (one of, or both):**
+   - **TMDB Discover / catalogue walk.** Add a `Discover`
+     suggestion source that paginates `GET /discover/movie` and
+     `GET /discover/tv` to back-fill the library with thousands of
+     titles. Capped by config (`SuggestionsCatalogueMaxItems`,
+     default e.g. 5000). Refreshes incrementally; respects TMDB
+     rate limits (40 req / 10 s).
+   - **TMDB Popular** as a higher-cardinality fallback than
+     Trending. ~10 000 popular movies + ~10 000 popular shows
+     across many pages.
+
+   The architectural intent (PLAN §Goals) is "the entire TMDB
+   catalogue appears to exist". Trending alone never delivered
+   that even before M10; the symptom was masked while phantoms
+   were invisible. M11 makes the catalogue source operator-tunable
+   and ships a sensible default (Discover paginated to 5000
+   movies + 5000 series).
+
+2. **Display name shows filename stem with underscores and
+   sentinel** (e.g. `Backrooms__phantom_tmdb1083381` instead of
+   `Backrooms`).
+
+   **Diagnosis:** `VirtualItemFactory.CreateVirtualMovieFromHit`
+   sets `Name` to the TMDB title, then `SuggestionsContributor`
+   stamps `Path = stubPath` and `IsLocked = true`. `IsLocked`
+   should prevent any provider from overwriting Name, but on M10
+   the on-disk filename is the *only* source the scanner can use
+   when it encounters the symlink, and *something* downstream is
+   either re-resolving the Name from the path stem or the lock is
+   not being honoured. (Possibly: the scanner ran *before* the
+   Name was persisted, given how Suggestions builds the item
+   in-memory and then `AddChild`s it; the resolver picks the file
+   first, derives Name from filename, then Save commits that
+   over-mutated state.)
+
+   **Fix:**
+   - Verify `IsLocked = true` is persisted on the BaseItem before
+     `parent.AddChild` triggers any scanner pass.
+   - Set `ForcedSortName = title` and `SortName = title` so even
+     if Name is wrong, sorting is correct.
+   - Investigate whether the resolver derives Name from filename
+     before our `UpdateItemAsync` lands. If so, the create flow
+     needs an explicit `UpdateItemAsync` with the correct Name
+     after `AddChild`, with `IsLocked=true`, to overwrite the
+     stem-derived Name.
+   - As a belt-and-braces measure, override `Name` in a metadata
+     provider that runs at locked items too (TBD whether possible).
+
+3. **Image displays as the plugin's splash thumbnail instead of
+   the TMDB poster.**
+
+   **Diagnosis:** `VirtualItemFactory` does not stamp
+   `ImageInfos[Primary]` from TMDB at create time; the existing
+   `TmdbImageProvider` populates images on metadata refresh. But
+   M10 set `IsLocked = true`, which **skips** all metadata
+   providers including image providers. The image falls back to
+   whatever the scanner derives from the on-disk file — in our
+   case the splash.mp4's embedded thumbnail (or a folder image
+   composite).
+
+   **Fix:** in SuggestionsContributor, after constructing the
+   item with TMDB hit data, **eagerly fetch the TMDB primary
+   image URL and stamp it on the BaseItem before AddChild**:
+   ```csharp
+   newItem.ImageInfos = new[]
+   {
+       new ItemImageInfo
+       {
+           Path = tmdbImageUrl,  // remote URL; Jellyfin caches on first fetch
+           Type = ImageType.Primary,
+       },
+   };
+   ```
+   TMDB hits include `PosterPath`; the URL is
+   `https://image.tmdb.org/t/p/original<poster_path>`.
+   Same for backdrop (`BackdropPath` → ImageType.Backdrop).
+   The image is fetched lazily by Jellyfin's image cache the
+   first time a client requests it, so this does not add a TMDB
+   round-trip during Suggestions.
+
+   Alternative: leave `IsLocked = false` and let the existing
+   TmdbImageProvider populate images. But then we lose the
+   Name-protection from issue 2. The eager-stamp approach lets
+   us keep `IsLocked = true` (Name protection) AND get correct
+   images.
+
+4. **No phantom TV series visible** despite log showing 5 series
+   symlinks were created in `phantom-library/shows/`.
+
+   **Diagnosis:** unclear. Candidates:
+   - Series-level browse filter differs from movies (e.g. Jellyfin
+     hides Series rows with no Season/Episode children).
+   - SeriesIngestor's stub path is not landing in the bound
+     phantom phys folder (different TopParentId from the series
+     CollectionFolder).
+   - `gostream-shows` library's PhysicalFolderIds was set
+     correctly (verified earlier) but the BaseItems for our
+     phantom Series may have a different `TopParentId` from the
+     phantom phys folder.
+
+   **Action:** dump DB to verify what `Type`, `Path`, `ParentId`,
+   `TopParentId`, `IsVirtualItem`, `MediaType` the symlinked
+   Series rows actually have. Compare with a real gostream Series
+   row. Fix the discrepancy.
+
+5. **Materialise never fires when user presses Play on a phantom.**
+   The splash plays, then the splash ends, no real torrent is
+   added, item stays Virtual.
+
+   **Diagnosis:** M5's `PhantomMediaSourceProvider` returns the
+   splash MediaSource on play-press but the **materialisation
+   trigger** is `UserDataSavedListener` watching for
+   `IsFavorite=true`, not for play. Per PLAN §M5 the play-press
+   workflow was: "fake play button → splash hand-off". The
+   trigger to actually materialise on play was implicit ("user
+   marks favourite") and never wired to play events.
+
+   **Fix:** subscribe to `ISessionManager.PlaybackStart` (or
+   `IUserDataManager.UserDataSaved` with `PlaybackPositionTicks > 0`)
+   and when a phantom's splash is played, enqueue the item for
+   materialisation. Materialise runs in background while splash
+   loops/ends; next play press hits the now-real fuse path.
+   Per-user toggle (already exists in PluginConfiguration) gates
+   the auto-materialise-on-play behaviour.
+
+   Sub-decision: should the splash auto-restart while
+   materialisation is in progress, so the user sees "loading"
+   instead of "playback ended"? Probably yes — looping the splash
+   for up to N seconds (e.g. 60) gives a UX of "it's working".
+   After materialisation completes, the next MediaSource refresh
+   returns the real source.
+
+6. **Playing the splash marks the phantom as played**, polluting
+   watch history with garbage "watched" state.
+
+   **Diagnosis:** Jellyfin's playback reporting sees a media
+   session for the BaseItem, increments PlayCount, sets
+   PlayedDate. There is no signal to Jellyfin that the splash is
+   not the real content.
+
+   **Fix (probably best):** in the playback-completion event
+   handler for any phantom item, reset its UserData
+   (`PlayCount = 0`, `Played = false`, `PlaybackPositionTicks = 0`,
+   `LastPlayedDate = null`). The user's intent on a phantom Play
+   is "materialise + play", not "watch and mark watched". Real
+   played-state only counts after materialisation, when the user
+   plays the actual torrent-backed file.
+
+   Alternative: customise `PhantomMediaSourceProvider` to return
+   `RunTimeTicks = 0` or set `SupportsTranscoding = false` so
+   Jellyfin treats the splash as a non-content session. Likely
+   does not stop the played-mark on its own.
+
+#### Tests
+
+- Unit: `VirtualItemFactory` stamps ImageInfos[Primary] from TMDB
+  `PosterPath` (when present).
+- Unit: name-with-stem-and-sentinel round-trip —
+  PhantomStubManager creates filename, plugin creates BaseItem
+  with `Name=<title>`, after a simulated scan pass the Name
+  still equals `<title>` and is not the filename stem.
+- Integration: full play-press → splash → materialise loop in
+  the rig. Verify (a) splash plays, (b) materialise fires
+  in-process, (c) next /Users/{}/Items?Ids=<id> returns a
+  MediaSource backed by a real fuse path, (d) PlayCount on the
+  phantom remains 0 after splash playback completes.
+- Integration: Series phantoms visible in `gostream-shows`
+  browse with correct Name + image.
+- Integration: catalogue walk (Discover) creates N phantoms
+  bounded by the config cap, respects TMDB rate limits.
+
+#### Done criteria
+
+1. Operator sees thousands of phantom items in `gostream-movies`
+   and `gostream-shows` after Discover-driven first refresh
+   (bounded by `SuggestionsCatalogueMaxItems`).
+2. Phantom item Names display as TMDB titles, not filename stems.
+3. Phantom item primary images are TMDB posters (cached locally
+   by Jellyfin's image system on first browse).
+4. TV Series phantoms are visible and browseable.
+5. Pressing Play on a phantom triggers materialisation; splash
+   loops/transitions; next play hits the real fuse path.
+6. Splash playback does not increment PlayCount or set
+   PlayedDate. Real materialised playback does.
+7. Unit + integration tests green.
 
 ---
 
