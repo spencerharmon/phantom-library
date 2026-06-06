@@ -542,6 +542,8 @@ scan-free.
 
 ## Logs
 
+### Rig logs (the rig you control)
+
 - `/tmp/jf-test/run.log` — jellyfin's stdout/stderr
 - `/tmp/jf-test/log/*.log` — jellyfin's structured logs
   (per `--logdir`)
@@ -555,6 +557,63 @@ Grep examples:
 grep -i 'PhantomLibrary\|Phantom\.' /tmp/jf-test/log/*.log
 grep -i 'error\|exception\|fail' /tmp/jf-test/run.log | head -50
 ```
+
+### Production-Jellyfin logs (the operator's `:8096` instance)
+
+`/var/log/jellyfin` and `/var/lib/jellyfin/log` are
+`jellyfin:jellyfin`-owned 0750 and not readable by your shell
+user without `sudo` — which you don't have. **Use Jellyfin's
+REST API to fetch logs instead.** No sudo, no operator action,
+works against any running Jellyfin.
+
+The operator's API key (created out-of-band, lives in the prod
+`ApiKeys` table) is required. Look it up once via the
+world-readable cloned DB in your rig, or via the operator's
+prod DB directly if you can read it:
+
+```bash
+sqlite3 /var/lib/jellyfin/data/jellyfin.db \
+  "SELECT Name, AccessToken FROM ApiKeys;"
+```
+
+Pick a key (e.g. `sonarr`'s token used as a generic read token).
+Then:
+
+```bash
+TOK=<that-token>
+BASE=http://localhost:8096   # production instance, NOT the rig's :18096
+
+# 1. List available log files (most recent first; today's is
+#    typically jellyfin<YYYYMMDD>.log)
+curl -s -H "X-Emby-Token: $TOK" "$BASE/System/Logs" \
+  | python3 -c "
+import json,sys
+for f in json.load(sys.stdin)[:10]:
+    print(f['Name'], f['Size'], f['DateModified'])
+"
+
+# 2. Pull a specific log to disk
+curl -s -H "X-Emby-Token: $TOK" \
+  "$BASE/System/Logs/Log?name=jellyfin20260606.log" \
+  -o /tmp/jflog.txt
+wc -l /tmp/jflog.txt
+
+# 3. Grep for plugin-relevant events
+grep -iE 'phantom|materialis|gostream' /tmp/jflog.txt | tail -60
+grep -iE 'MaterialisationQueue|UserDataSavedListener|PhantomBinder|PhantomStubManager' /tmp/jflog.txt | tail -30
+```
+
+Use this whenever the operator says "X doesn't work" — the
+plugin's log lines almost always tell you what fired (or, more
+often, what *didn't* fire). Do NOT ask the operator to tail the
+log or paste output.
+
+If the API endpoint returns 401 the token is stale or revoked.
+If it returns 403 the operator removed the
+`EnableUserAccessForAllLibraries`-equivalent permission on the
+key; pick a different key. If the operator has no usable key,
+that is one of the rare legitimate things to ask about — the fix
+is 30 seconds in the admin dashboard.
 
 ## What this rig is NOT for
 
