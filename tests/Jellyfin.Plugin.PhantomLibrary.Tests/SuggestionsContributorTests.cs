@@ -213,4 +213,123 @@ public class SuggestionsContributorTests : IDisposable
         _tmdb.Verify(t => t.GetTrendingMoviesAsync(It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()),
             Times.Once);
     }
+
+    // ----- M12: dedupe-gap heal-on-rediscovery -----
+
+    [Fact]
+    public async Task FindExistingByTmdbId_FallsBackToNameContains_WhenProviderMissing()
+    {
+        // The bug: legacy rows had their providers stripped by an
+        // earlier persistence-layer interaction. HasAnyProviderId
+        // dedupe misses them. The fix adds a NameContains fallback
+        // for our sentinel.
+        var legacyId = Guid.NewGuid();
+        var legacy = new Movie
+        {
+            Name = "Some_Title__phantom_tmdb777",
+            IsLocked = false,
+        };
+        legacy.Id = legacyId;
+        // No ProviderIds populated.
+
+        _tmdb.Setup(t => t.GetTrendingMoviesAsync(It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { Hit(777, "Some Title") });
+        _tmdb.Setup(t => t.GetTrendingSeriesAsync(It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Array.Empty<TmdbSearchHit>());
+
+        // Provider lookup returns nothing (the bug). Name-contains
+        // lookup returns the legacy row (the fix).
+        _lib.Setup(l => l.GetItemList(It.Is<InternalItemsQuery>(q =>
+                q.HasAnyProviderId != null && q.HasAnyProviderId.ContainsKey("Tmdb") && q.HasAnyProviderId["Tmdb"] == "777")))
+            .Returns(Array.Empty<BaseItem>());
+        _lib.Setup(l => l.GetItemList(It.Is<InternalItemsQuery>(q =>
+                q.NameContains == "__phantom_tmdb777")))
+            .Returns(new[] { (BaseItem)legacy });
+
+        var createdCount = 0;
+        _lib.Setup(l => l.CreateItem(It.IsAny<BaseItem>(), It.IsAny<BaseItem>()))
+            .Callback(() => createdCount++);
+
+        var s = Build();
+        var n = await s.RefreshTrendingAsync(CancellationToken.None);
+
+        // The legacy row was matched; no new row created.
+        Assert.Equal(0, n);
+        Assert.Equal(0, createdCount);
+    }
+
+    [Fact]
+    public async Task HealBrokenPhantom_StampsNameLockProviders_AndCallsUpdateItemAsync()
+    {
+        // Dedupe-hit on a broken legacy row triggers a re-stamp via
+        // UpdateItemAsync with corrected Name + IsLocked + ProviderIds.
+        var legacyId = Guid.NewGuid();
+        var legacy = new Movie
+        {
+            Name = "Some_Title__phantom_tmdb888",
+            IsLocked = false,
+        };
+        legacy.Id = legacyId;
+
+        _tmdb.Setup(t => t.GetTrendingMoviesAsync(It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { Hit(888, "Some Title") });
+        _tmdb.Setup(t => t.GetTrendingSeriesAsync(It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Array.Empty<TmdbSearchHit>());
+
+        _lib.Setup(l => l.GetItemList(It.Is<InternalItemsQuery>(q =>
+                q.HasAnyProviderId != null && q.HasAnyProviderId.ContainsKey("Tmdb") && q.HasAnyProviderId["Tmdb"] == "888")))
+            .Returns(Array.Empty<BaseItem>());
+        _lib.Setup(l => l.GetItemList(It.Is<InternalItemsQuery>(q =>
+                q.NameContains == "__phantom_tmdb888")))
+            .Returns(new[] { (BaseItem)legacy });
+
+        var s = Build();
+        await s.RefreshTrendingAsync(CancellationToken.None);
+
+        // The legacy row should have been mutated in place.
+        Assert.Equal("Some Title", legacy.Name);
+        Assert.True(legacy.IsLocked);
+        Assert.Equal("888", legacy.ProviderIds["Tmdb"]);
+
+        // UpdateItemAsync was called for the same item id.
+        _lib.Verify(l => l.UpdateItemAsync(
+            It.Is<BaseItem>(i => i.Id == legacyId && i.Name == "Some Title" && i.IsLocked),
+            It.IsAny<BaseItem>(),
+            It.IsAny<ItemUpdateType>(),
+            It.IsAny<CancellationToken>()),
+            Times.AtLeastOnce);
+    }
+
+    [Fact]
+    public async Task FindExistingByTmdbId_NameContains_AvoidsPartialIdMatch()
+    {
+        // tmdb=12 must not match a row with Name containing
+        // __phantom_tmdb12345. The fallback checks the next char
+        // after the sentinel.
+        var unrelatedId = Guid.NewGuid();
+        var unrelated = new Movie { Name = "Other__phantom_tmdb12345" };
+        unrelated.Id = unrelatedId;
+
+        _tmdb.Setup(t => t.GetTrendingMoviesAsync(It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { Hit(12, "Target") });
+        _tmdb.Setup(t => t.GetTrendingSeriesAsync(It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Array.Empty<TmdbSearchHit>());
+
+        _lib.Setup(l => l.GetItemList(It.Is<InternalItemsQuery>(q =>
+                q.HasAnyProviderId != null && q.HasAnyProviderId.ContainsKey("Tmdb") && q.HasAnyProviderId["Tmdb"] == "12")))
+            .Returns(Array.Empty<BaseItem>());
+        _lib.Setup(l => l.GetItemList(It.Is<InternalItemsQuery>(q =>
+                q.NameContains == "__phantom_tmdb12")))
+            .Returns(new[] { (BaseItem)unrelated });
+
+        var createdCount = 0;
+        _lib.Setup(l => l.CreateItem(It.IsAny<BaseItem>(), It.IsAny<BaseItem>()))
+            .Callback(() => createdCount++);
+
+        var s = Build();
+        await s.RefreshTrendingAsync(CancellationToken.None);
+
+        // Substring rejected. New row CREATED for the real tmdb=12.
+        Assert.Equal(1, createdCount);
+    }
 }

@@ -377,6 +377,22 @@ public sealed class SuggestionsContributor : ISuggestionsContributor
             {
                 // Duplicate — do not create. Upsert phantom_items row + bump last_touched.
                 await UpsertPhantomRowAsync(existing.Id, hit.Id, kind, PhantomItemState.Virtual, ct).ConfigureAwait(false);
+
+                // Heal if broken: detect rows that have lost their
+                // Name / IsLocked / ProviderIds (legacy from M10/M11
+                // era when the persistence layer or scanner clobbered
+                // them). The dedupe-hit branch is the only place we
+                // re-encounter these rows; if we don't heal here, they
+                // stay broken forever because nothing else re-touches
+                // them. Per PLAN M12 + docs/plans/M12-investigation-
+                // results.md.
+                var nameIsStem = (existing.Name ?? string.Empty)
+                    .Contains("__phantom_tmdb", StringComparison.Ordinal);
+                var hasTmdbProvider = existing.ProviderIds.ContainsKey(TmdbProvider);
+                if (nameIsStem || !existing.IsLocked || !hasTmdbProvider)
+                {
+                    await HealBrokenPhantomAsync(existing, hit, kind, parent, ct).ConfigureAwait(false);
+                }
                 skipped++;
                 continue;
             }
@@ -467,19 +483,129 @@ public sealed class SuggestionsContributor : ISuggestionsContributor
     {
         try
         {
-            var query = new InternalItemsQuery
+            // First pass: standard provider-based lookup. Catches rows
+            // we created where the Tmdb provider survived persistence.
+            var byProvider = _libraryManager.GetItemList(new InternalItemsQuery
             {
                 IncludeItemTypes = new[] { kind == ItemKind.Movie ? BaseItemKind.Movie : BaseItemKind.Series },
                 HasAnyProviderId = new Dictionary<string, string> { [TmdbProvider] = tmdbId },
                 Limit = 1,
-            };
-            var matches = _libraryManager.GetItemList(query);
-            return matches.Count > 0 ? matches[0] : null;
+            });
+            if (byProvider.Count > 0)
+            {
+                return byProvider[0];
+            }
+
+            // Second pass: legacy broken-row recovery. If an earlier
+            // run stripped the row's providers (M11-era + earlier),
+            // the row is invisible to the provider-based query above.
+            // Match against the Name (which the scanner fell back to
+            // from the filename stem) for our sentinel
+            // `__phantom_tmdb<id>`. This is unique to our plugin and
+            // cannot collide with real media filenames.
+            var sentinel = "__phantom_tmdb" + tmdbId;
+            var byName = _libraryManager.GetItemList(new InternalItemsQuery
+            {
+                IncludeItemTypes = new[] { kind == ItemKind.Movie ? BaseItemKind.Movie : BaseItemKind.Series },
+                NameContains = sentinel,
+                Limit = 2,
+            });
+            // NameContains is substring; be defensive about partial
+            // overlap (e.g. tmdb=1234 should NOT match tmdb=12345).
+            // Require the sentinel be followed by a non-digit or end
+            // of string.
+            foreach (var candidate in byName)
+            {
+                var name = candidate.Name ?? string.Empty;
+                var idx = name.IndexOf(sentinel, StringComparison.Ordinal);
+                if (idx < 0)
+                {
+                    continue;
+                }
+                var after = idx + sentinel.Length;
+                if (after >= name.Length || !char.IsDigit(name[after]))
+                {
+                    return candidate;
+                }
+            }
+            return null;
         }
         catch (Exception ex)
         {
             _logger.LogDebug(ex, "[Suggestions] duplicate-lookup query failed for tmdb={Tmdb}", tmdbId);
             return null;
+        }
+    }
+
+    /// <summary>
+    /// Repairs a legacy phantom BaseItem whose Name / IsLocked /
+    /// ProviderIds got stripped by an earlier persistence-layer
+    /// or scanner interaction. Restamps from the live TMDB hit
+    /// data, then commits via UpdateItemAsync. Also tries to
+    /// re-create the phantom stub symlink if it's missing on disk.
+    /// Called from the dedupe-hit branch in MaterialiseHitsAsync.
+    /// </summary>
+    private async Task HealBrokenPhantomAsync(
+        BaseItem existing, TmdbSearchHit hit, ItemKind kind, BaseItem parent, CancellationToken ct)
+    {
+        try
+        {
+            // Rebuild fresh metadata from the hit (factory output).
+            BaseItem template = kind == ItemKind.Movie
+                ? VirtualItemFactory.CreateVirtualMovieFromHit(hit)
+                : VirtualItemFactory.CreateVirtualSeriesFromHit(hit);
+
+            // Mutate the existing item in place so we keep its Id
+            // (and therefore its UserData associations).
+            existing.Name = template.Name;
+            existing.OriginalTitle = template.OriginalTitle;
+            existing.Overview = template.Overview;
+            existing.ProductionYear = template.ProductionYear;
+            existing.PremiereDate = template.PremiereDate;
+            existing.Genres = template.Genres;
+            existing.CommunityRating = template.CommunityRating;
+            existing.ForcedSortName = template.ForcedSortName;
+            existing.PresentationUniqueKey = template.PresentationUniqueKey;
+            existing.ProviderIds[TmdbProvider] = hit.Id.ToString(CultureInfo.InvariantCulture);
+            if (template.ImageInfos is { Length: > 0 })
+            {
+                existing.ImageInfos = template.ImageInfos;
+            }
+            existing.IsLocked = true;
+
+            // Re-create the stub symlink if needed. CreateAsync is
+            // idempotent — returns the existing path if already there.
+            if (_stubs.IsReady)
+            {
+                try
+                {
+                    var stubKind = kind == ItemKind.Movie ? PhantomMediaKind.Movie : PhantomMediaKind.Series;
+                    var stubPath = await _stubs.CreateAsync(existing.Name ?? string.Empty, hit.Id, stubKind, ct).ConfigureAwait(false);
+                    if (string.IsNullOrEmpty(existing.Path) || !existing.Path.Contains("__phantom_tmdb", StringComparison.Ordinal))
+                    {
+                        existing.Path = stubPath;
+                    }
+                }
+                catch (Exception stubEx)
+                {
+                    _logger.LogDebug(stubEx,
+                        "[Suggestions] heal: stub create failed for tmdb={Tmdb}; proceeding with metadata-only heal",
+                        hit.Id);
+                }
+            }
+
+            await _libraryManager.UpdateItemAsync(
+                existing, parent, ItemUpdateType.MetadataEdit, ct).ConfigureAwait(false);
+
+            _logger.LogInformation(
+                "[Suggestions] healed broken phantom row tmdb={Tmdb} ({Title}) item={ItemId}",
+                hit.Id, hit.Title, existing.Id);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "[Suggestions] heal failed for tmdb={Tmdb} item={ItemId}; row remains broken",
+                hit.Id, existing.Id);
         }
     }
 
