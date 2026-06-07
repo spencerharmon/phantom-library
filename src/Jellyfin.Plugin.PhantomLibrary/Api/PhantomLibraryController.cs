@@ -59,6 +59,30 @@ public sealed class PhantomLibraryController : ControllerBase
         _db = db;
     }
 
+    /// <summary>
+    /// Serve the kebab-shim JS for browser injection. Public route
+    /// (no auth) so the SPA can <script src="…"> it before login.
+    /// Returns text/javascript so Firefox+nosniff doesn't reject it
+    /// the way it does for application/javascript on the
+    /// /web/ConfigurationPage route.
+    /// </summary>
+    [HttpGet("kebab.js")]
+    [AllowAnonymous]
+    [Produces("text/javascript")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public IActionResult KebabScript()
+    {
+        var asm = typeof(Plugin).Assembly;
+        var name = "Jellyfin.Plugin.PhantomLibrary.Configuration.phantomKebab.js";
+        var stream = asm.GetManifestResourceStream(name);
+        if (stream is null)
+        {
+            return NotFound();
+        }
+        return File(stream, "text/javascript");
+    }
+
     /// <summary>Synchronously materialise an item and return its outcome.</summary>
     [HttpPost("Materialise/{itemId}")]
     [ProducesResponseType(StatusCodes.Status200OK)]

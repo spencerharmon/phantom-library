@@ -320,9 +320,14 @@ done
 if [ -z "$INDEX_PATH" ]; then
   yellow "jellyfin-web index.html not found in standard locations; skipping kebab shim install."
   yellow "To install manually, add this line before </body> in your jellyfin-web index.html:"
-  yellow '  <script src="/web/ConfigurationPage?name=PhantomKebab" defer></script>'
-elif $SUDO grep -q 'name=PhantomKebab' "$INDEX_PATH" 2>/dev/null; then
-  green "PhantomKebab shim already present in $INDEX_PATH"
+  yellow '  <script src="/Plugins/PhantomLibrary/kebab.js" defer></script>'
+elif $SUDO grep -qE 'name=PhantomKebab|Plugins/PhantomLibrary/kebab\.js' "$INDEX_PATH" 2>/dev/null; then
+  # If an older snippet (?name=PhantomKebab) is present, replace it.
+  if $SUDO grep -q 'name=PhantomKebab' "$INDEX_PATH" 2>/dev/null; then
+    bold "Upgrading PhantomKebab shim URL to controller route"
+    $SUDO sed -i 's|<!--phantom-library-kebab--><script src="/web/ConfigurationPage?name=PhantomKebab" defer></script>|<!--phantom-library-kebab--><script src="/Plugins/PhantomLibrary/kebab.js" defer></script>|' "$INDEX_PATH"
+  fi
+  green "PhantomKebab shim present in $INDEX_PATH"
 else
   bold "Injecting PhantomKebab shim into $INDEX_PATH"
   # Backup once. Subsequent runs keep the original backup.
@@ -331,7 +336,7 @@ else
   fi
   # Insert just before </body>. Use a sentinel comment so we can grep
   # for it later and avoid double-injection.
-  SNIPPET='<!--phantom-library-kebab--><script src="/web/ConfigurationPage?name=PhantomKebab" defer></script>'
+  SNIPPET='<!--phantom-library-kebab--><script src="/Plugins/PhantomLibrary/kebab.js" defer></script>'
   $SUDO sed -i "s|</body>|${SNIPPET}</body>|" "$INDEX_PATH"
   if $SUDO grep -q 'name=PhantomKebab' "$INDEX_PATH"; then
     green "  injected. (Backup at ${INDEX_PATH}.phantom-orig)"
