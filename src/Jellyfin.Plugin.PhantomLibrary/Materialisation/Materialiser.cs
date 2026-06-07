@@ -37,9 +37,13 @@ public sealed class Materialiser : IMaterialiser
     private readonly QualityScorer _scorer;
     private readonly PhantomDb _db;
     private readonly Jellyfin.Plugin.PhantomLibrary.Library.IPhantomStubManager _stubs;
+    private readonly Jellyfin.Plugin.PhantomLibrary.Clients.ITmdbClient? _tmdb;
     private readonly ILogger<Materialiser> _logger;
     private readonly Func<PluginConfiguration> _configProvider;
 
+    /// <summary>Production DI ctor. ITmdbClient is required so the
+    /// IMDB-id enrichment fallback can fire when a phantom row lacks Imdb
+    /// (Torrentio and several other indexers refuse non-imdb queries).</summary>
     public Materialiser(
         ILibraryManager libraryManager,
         IProviderManager providerManager,
@@ -48,13 +52,17 @@ public sealed class Materialiser : IMaterialiser
         QualityScorer scorer,
         PhantomDb db,
         Jellyfin.Plugin.PhantomLibrary.Library.IPhantomStubManager stubs,
+        Jellyfin.Plugin.PhantomLibrary.Clients.ITmdbClient tmdb,
         ILogger<Materialiser> logger)
         : this(libraryManager, providerManager, indexers, gostream, scorer, db, stubs, logger,
-               () => Plugin.Instance?.Configuration ?? new PluginConfiguration())
+               () => Plugin.Instance?.Configuration ?? new PluginConfiguration(),
+               tmdb)
     {
     }
 
-    public Materialiser(
+    /// <summary>Internal ctor for unit tests; tmdb optional so tests
+    /// that don't exercise IMDB enrichment don't need to mock it.</summary>
+    internal Materialiser(
         ILibraryManager libraryManager,
         IProviderManager providerManager,
         IEnumerable<IIndexerClient> indexers,
@@ -63,7 +71,8 @@ public sealed class Materialiser : IMaterialiser
         PhantomDb db,
         Jellyfin.Plugin.PhantomLibrary.Library.IPhantomStubManager stubs,
         ILogger<Materialiser> logger,
-        Func<PluginConfiguration> configProvider)
+        Func<PluginConfiguration> configProvider,
+        Jellyfin.Plugin.PhantomLibrary.Clients.ITmdbClient? tmdb = null)
     {
         _libraryManager = libraryManager;
         _providerManager = providerManager;
@@ -72,6 +81,7 @@ public sealed class Materialiser : IMaterialiser
         _scorer = scorer;
         _db = db;
         _stubs = stubs;
+        _tmdb = tmdb;
         _logger = logger;
         _configProvider = configProvider;
     }
@@ -182,6 +192,50 @@ public sealed class Materialiser : IMaterialiser
                 return await FailAsync(sw, jellyfinItemId, trigger,
                     "item lacks TMDB/IMDB provider ids — cannot materialise", indexerUsed, infoHashUsed, ct)
                     .ConfigureAwait(false);
+            }
+
+            // Step 2.5: enrich IMDB from TMDB if missing. Torrentio (and
+            // some other indexers) require an IMDB id. Phantom rows often
+            // only have a Tmdb id because the user discovered them via
+            // TMDB trending/discover; resolve to imdb via TMDB external_ids.
+            // Cached by tmdb-cache, so this is cheap on repeat plays.
+            if (string.IsNullOrWhiteSpace(ids.Imdb) && ids.Tmdb is int tid && _tmdb is not null)
+            {
+                try
+                {
+                    string? resolvedImdb = ids.Type switch
+                    {
+                        "movie" => await _tmdb.GetImdbIdForMovieAsync(tid, ct).ConfigureAwait(false),
+                        "series" => await _tmdb.GetImdbIdForSeriesAsync(tid, ct).ConfigureAwait(false),
+                        _ => null,
+                    };
+                    if (!string.IsNullOrWhiteSpace(resolvedImdb))
+                    {
+                        ids.Imdb = resolvedImdb;
+                        _logger.LogDebug(
+                            "Materialise {Id}: enriched IMDB={Imdb} from TMDB={Tmdb}",
+                            jellyfinItemId, resolvedImdb, tid);
+                        // Also persist back to the BaseItem so subsequent
+                        // materialise calls (or other plugins) see it.
+                        item.ProviderIds["Imdb"] = resolvedImdb;
+                        try
+                        {
+                            await _libraryManager.UpdateItemAsync(
+                                item, item.GetParent(), ItemUpdateType.MetadataEdit, ct).ConfigureAwait(false);
+                        }
+                        catch (Exception ux)
+                        {
+                            _logger.LogDebug(ux,
+                                "Materialise {Id}: UpdateItemAsync for IMDB-stamp failed (non-fatal)", jellyfinItemId);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex,
+                        "Materialise {Id}: TMDB->IMDB enrichment failed for tmdb={Tmdb}; proceeding without imdb",
+                        jellyfinItemId, tid);
+                }
             }
 
             var cfg = _configProvider();

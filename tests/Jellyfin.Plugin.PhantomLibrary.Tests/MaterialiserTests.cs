@@ -61,6 +61,24 @@ public class MaterialiserTests : IDisposable
             () => cfg);
     }
 
+    private Materialiser BuildMaterialiserWithTmdb(
+        Jellyfin.Plugin.PhantomLibrary.Clients.ITmdbClient tmdb,
+        PluginConfiguration? cfg = null)
+    {
+        cfg ??= new PluginConfiguration { MinSeeders = 1, MinSizeGb1080p = 0, MinSizeGb4K = 0 };
+        return new Materialiser(
+            _libMock.Object,
+            _provMock.Object,
+            new[] { _idxMock.Object },
+            _gsMock.Object,
+            new QualityScorer(NullLogger<QualityScorer>.Instance),
+            _db,
+            _stubs,
+            NullLogger<Materialiser>.Instance,
+            () => cfg,
+            tmdb);
+    }
+
     private static Movie BuildMovie(Guid id, int tmdb = 1, string? imdb = "tt1")
     {
         var m = new Movie { Name = "Test Movie", ProductionYear = 2020 };
@@ -331,5 +349,89 @@ public class MaterialiserTests : IDisposable
         var r = await m.MaterialiseAsync(id, MaterialiseTrigger.Favourite, CancellationToken.None);
         Assert.Equal(MaterialisationStatus.Success, r.Status);
         Assert.Empty(_stubs.Deleted);
+    }
+
+    // ----- M12: IMDB enrichment from TMDB when item has no Imdb -----
+
+    [Fact]
+    public async Task Materialise_EnrichesImdbFromTmdb_WhenItemHasNoImdb()
+    {
+        // Operator-observed failure: phantom rows have Tmdb but no
+        // Imdb. Torrentio refuses queries without Imdb -> indexer
+        // returns 0 candidates -> Materialiser bails. Fix: fetch the
+        // Imdb via ITmdbClient.GetImdbIdForMovieAsync.
+        var id = Guid.NewGuid();
+        var movie = BuildMovie(id, tmdb: 1083381, imdb: null);
+        _libMock.Setup(l => l.GetItemById(id)).Returns(movie);
+
+        var tmdbMock = new Mock<Jellyfin.Plugin.PhantomLibrary.Clients.ITmdbClient>();
+        tmdbMock.Setup(t => t.GetImdbIdForMovieAsync(1083381, It.IsAny<CancellationToken>()))
+            .ReturnsAsync("tt9999999");
+
+        _idxMock.Setup(i => i.SearchAsync(
+                It.Is<IndexerQuery>(q => q.Imdb == "tt9999999"),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { Cand() });
+        _gsMock.Setup(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new GostreamAddResult
+            { StubPath = "/s.mkv", FusePath = "/f.mkv", Hash = "DEAD", Size = 1 });
+
+        var m = BuildMaterialiserWithTmdb(tmdbMock.Object);
+        var r = await m.MaterialiseAsync(id, MaterialiseTrigger.Play, CancellationToken.None);
+
+        Assert.Equal(MaterialisationStatus.Success, r.Status);
+        tmdbMock.Verify(t => t.GetImdbIdForMovieAsync(1083381, It.IsAny<CancellationToken>()),
+            Times.Once);
+        _idxMock.Verify(i => i.SearchAsync(
+                It.Is<IndexerQuery>(q => q.Imdb == "tt9999999"),
+                It.IsAny<CancellationToken>()),
+            Times.AtLeastOnce);
+        Assert.Equal("tt9999999", movie.ProviderIds["Imdb"]);
+    }
+
+    [Fact]
+    public async Task Materialise_SkipsImdbEnrichment_WhenItemAlreadyHasImdb()
+    {
+        var id = Guid.NewGuid();
+        var movie = BuildMovie(id, tmdb: 1083381, imdb: "tt0000001");
+        _libMock.Setup(l => l.GetItemById(id)).Returns(movie);
+
+        var tmdbMock = new Mock<Jellyfin.Plugin.PhantomLibrary.Clients.ITmdbClient>();
+        _idxMock.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { Cand() });
+        _gsMock.Setup(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new GostreamAddResult
+            { StubPath = "/s.mkv", FusePath = "/f.mkv", Hash = "DEAD", Size = 1 });
+
+        var m = BuildMaterialiserWithTmdb(tmdbMock.Object);
+        var r = await m.MaterialiseAsync(id, MaterialiseTrigger.Play, CancellationToken.None);
+
+        Assert.Equal(MaterialisationStatus.Success, r.Status);
+        tmdbMock.Verify(t => t.GetImdbIdForMovieAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task Materialise_TmdbEnrichmentReturnsNull_ProceedsWithoutImdb()
+    {
+        var id = Guid.NewGuid();
+        var movie = BuildMovie(id, tmdb: 99999999, imdb: null);
+        _libMock.Setup(l => l.GetItemById(id)).Returns(movie);
+
+        var tmdbMock = new Mock<Jellyfin.Plugin.PhantomLibrary.Clients.ITmdbClient>();
+        tmdbMock.Setup(t => t.GetImdbIdForMovieAsync(99999999, It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string?)null);
+
+        _idxMock.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { Cand() });
+        _gsMock.Setup(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new GostreamAddResult
+            { StubPath = "/s.mkv", FusePath = "/f.mkv", Hash = "DEAD", Size = 1 });
+
+        var m = BuildMaterialiserWithTmdb(tmdbMock.Object);
+        var r = await m.MaterialiseAsync(id, MaterialiseTrigger.Play, CancellationToken.None);
+
+        Assert.Equal(MaterialisationStatus.Success, r.Status);
+        Assert.False(movie.ProviderIds.ContainsKey("Imdb"));
     }
 }
