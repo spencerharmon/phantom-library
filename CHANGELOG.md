@@ -8,19 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **M12 — Dedupe-gap heal-on-rediscovery.** Suggestions now finds
-  legacy broken phantom rows (those that lost their providers /
-  IsLocked / Name to an earlier persistence-layer or scanner
-  interaction) via a NameContains fallback on the
-  `__phantom_tmdb<id>` sentinel, and heals them in place via
-  `UpdateItemAsync` instead of silently creating a duplicate. Same
-  `BaseItem.Id` is preserved, so any UserData associations survive
-  the heal. Self-healing: every Suggestions / Catalogue cycle
-  repairs every broken row that re-appears in the TMDB feed.
-  Operator action after install: trigger Suggestions/Refresh; no
-  repair script required. Also adds a TMDB-base-URL config knob
-  (`TmdbApiBaseUrl`) so test rigs can point at a local mock, and
-  ships a persistent test rig (`tools/rig-scenarios/`) for
+- **M12 — Dedupe-gap heal-on-rediscovery + IMDB enrichment.**
+  Suggestions now finds legacy broken phantom rows (those that
+  lost their providers / IsLocked / Name to an earlier
+  persistence-layer or scanner interaction) via a NameContains
+  fallback on the `__phantom_tmdb<id>` sentinel, and heals them
+  in place via `UpdateItemAsync` instead of silently creating a
+  duplicate. Same `BaseItem.Id` is preserved, so any UserData
+  associations survive the heal. Self-healing: every Suggestions
+  / Catalogue cycle repairs every broken row that re-appears in
+  the TMDB feed. **Also**: Materialiser now enriches missing
+  IMDB id from TMDB before querying indexers — fixes Torrentio's
+  "requires an IMDB id" rejection that was silently bailing the
+  materialise path on phantom rows discovered via TMDB-only
+  flows (Trending / Discover). Operator action after install:
+  trigger Suggestions/Refresh and then press Play on a phantom;
+  no repair script required. Also adds a TMDB-base-URL config
+  knob (`TmdbApiBaseUrl`) so test rigs can point at a local mock,
+  and ships a persistent test rig (`tools/rig-scenarios/`) for
   scripted multi-step investigations under user-mode systemd.
 
 - **M10 — Phantom symlink library + visibility fix.** Phantoms are
