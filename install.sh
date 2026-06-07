@@ -293,4 +293,51 @@ case "${ans:-y}" in
     ;;
 esac
 
+# ---------------------------------------------------------------
+# PhantomKebab: inject the item-detail Materialise-button shim into
+# jellyfin-web's index.html. The 10.11.x BrandingOptions only exposes
+# CustomCss (no CustomJs field), and the SPA wraps CustomCss in a
+# <style> tag, so a CSS-injected <script> would not execute. We patch
+# /usr/share/jellyfin/web/index.html directly. The patch is idempotent
+# (skips re-add if marker already present) and survives plugin
+# reinstalls. NOTE: a jellyfin-web package upgrade will overwrite
+# index.html and remove the patch — re-run install.sh after such an
+# upgrade to reapply.
+# ---------------------------------------------------------------
+INDEX_CANDIDATES=(
+  "/usr/share/jellyfin/web/index.html"
+  "/usr/share/jellyfin-web/index.html"
+  "/var/lib/jellyfin/jellyfin-web/index.html"
+)
+INDEX_PATH=""
+for cand in "${INDEX_CANDIDATES[@]}"; do
+  if [ -f "$cand" ]; then
+    INDEX_PATH="$cand"
+    break
+  fi
+done
+
+if [ -z "$INDEX_PATH" ]; then
+  yellow "jellyfin-web index.html not found in standard locations; skipping kebab shim install."
+  yellow "To install manually, add this line before </body> in your jellyfin-web index.html:"
+  yellow '  <script src="/web/ConfigurationPage?name=PhantomKebab" defer></script>'
+elif $SUDO grep -q 'name=PhantomKebab' "$INDEX_PATH" 2>/dev/null; then
+  green "PhantomKebab shim already present in $INDEX_PATH"
+else
+  bold "Injecting PhantomKebab shim into $INDEX_PATH"
+  # Backup once. Subsequent runs keep the original backup.
+  if [ ! -f "${INDEX_PATH}.phantom-orig" ]; then
+    $SUDO cp "$INDEX_PATH" "${INDEX_PATH}.phantom-orig"
+  fi
+  # Insert just before </body>. Use a sentinel comment so we can grep
+  # for it later and avoid double-injection.
+  SNIPPET='<!--phantom-library-kebab--><script src="/web/ConfigurationPage?name=PhantomKebab" defer></script>'
+  $SUDO sed -i "s|</body>|${SNIPPET}</body>|" "$INDEX_PATH"
+  if $SUDO grep -q 'name=PhantomKebab' "$INDEX_PATH"; then
+    green "  injected. (Backup at ${INDEX_PATH}.phantom-orig)"
+  else
+    red "  injection failed; index.html unchanged. Inspect manually."
+  fi
+fi
+
 green "Done."
