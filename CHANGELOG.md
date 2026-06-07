@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **M12 — Dedupe-gap heal-on-rediscovery.** Suggestions now finds
+  legacy broken phantom rows (those that lost their providers /
+  IsLocked / Name to an earlier persistence-layer or scanner
+  interaction) via a NameContains fallback on the
+  `__phantom_tmdb<id>` sentinel, and heals them in place via
+  `UpdateItemAsync` instead of silently creating a duplicate. Same
+  `BaseItem.Id` is preserved, so any UserData associations survive
+  the heal. Self-healing: every Suggestions / Catalogue cycle
+  repairs every broken row that re-appears in the TMDB feed.
+  Operator action after install: trigger Suggestions/Refresh; no
+  repair script required. Also adds a TMDB-base-URL config knob
+  (`TmdbApiBaseUrl`) so test rigs can point at a local mock, and
+  ships a persistent test rig (`tools/rig-scenarios/`) for
+  scripted multi-step investigations under user-mode systemd.
+
 - **M10 — Phantom symlink library + visibility fix.** Phantoms are
   now backed by per-item symlinks under a plugin-owned writable root
   (default `/var/lib/jellyfin/phantom-library/{movies,shows}`) and

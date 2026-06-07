@@ -27,6 +27,7 @@ Mascot: *Stygiomedusa gigantea*, the giant phantom jelly.
 | M9 — Packaging + release polish              | ✅ | M9 release commit (this change) |
 | M10 — Phantom symlink library + visibility fix | ✅ | (unreleased, multiple commits) |
 | M11 — Post-M10 phantom UX polish               | ✅ | (unreleased, multiple commits) |
+| M12 — Dedupe-gap heal-on-rediscovery           | ✅ | (unreleased) |
 
 ### Documented partials
 
