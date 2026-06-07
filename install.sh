@@ -275,9 +275,12 @@ if [ -z "$JELLYFIN_UNIT" ]; then
 fi
 
 echo
-read -r -p "Restart $JELLYFIN_UNIT now? [y/N] " ans
-case "${ans:-}" in
-  y|Y|yes|YES)
+read -r -p "Restart $JELLYFIN_UNIT now? [Y/n] " ans
+case "${ans:-y}" in
+  n|N|no|NO)
+    yellow "Skipped restart. Run: sudo systemctl restart $JELLYFIN_UNIT"
+    ;;
+  *)
     bold "Restarting $JELLYFIN_UNIT..."
     $SUDO systemctl restart "$JELLYFIN_UNIT"
     sleep 2
@@ -287,9 +290,6 @@ case "${ans:-}" in
       red "  $JELLYFIN_UNIT failed to become active. Check: journalctl -u $JELLYFIN_UNIT -n 50"
       exit 1
     fi
-    ;;
-  *)
-    yellow "Skipped restart. Run: sudo systemctl restart $JELLYFIN_UNIT"
     ;;
 esac
 
