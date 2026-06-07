@@ -6,9 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `install.sh` restart prompt now defaults to **yes** (`[Y/n]`).
+  A new DLL has no effect until Jellyfin restarts; the previous
+  `[y/N]` default caused operators hitting Enter to silently
+  skip the restart and keep running the old in-memory code
+  while a new DLL sat on disk.
+
 ### Added
 
-- **M12 — Dedupe-gap heal-on-rediscovery + IMDB enrichment.**
+- **M12 — Dedupe-gap heal-on-rediscovery + IMDB enrichment + host-path translation.**
   Suggestions now finds legacy broken phantom rows (those that
   lost their providers / IsLocked / Name to an earlier
   persistence-layer or scanner interaction) via a NameContains
@@ -17,11 +25,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   duplicate. Same `BaseItem.Id` is preserved, so any UserData
   associations survive the heal. Self-healing: every Suggestions
   / Catalogue cycle repairs every broken row that re-appears in
-  the TMDB feed. **Also**: Materialiser now enriches missing
-  IMDB id from TMDB before querying indexers — fixes Torrentio's
-  "requires an IMDB id" rejection that was silently bailing the
-  materialise path on phantom rows discovered via TMDB-only
-  flows (Trending / Discover). Operator action after install:
+  the TMDB feed. Materialiser now enriches missing IMDB id from
+  TMDB before querying indexers — fixes Torrentio's "requires an
+  IMDB id" rejection that was silently bailing the materialise
+  path on phantom rows discovered via TMDB-only flows (Trending
+  / Discover). Materialiser now also translates gostream's
+  container-internal FUSE path (e.g. `/mnt/gostream-mkv-virtual/
+  movies/X.mkv`) into the operator's host-visible path (e.g.
+  `/var/gostream/gostream-mkv-virtual/movies/X.mkv`) before
+  promoting the BaseItem — without this, Jellyfin stored a path
+  that didn't exist on the host filesystem and the library
+  scanner culled the BaseItem on the next sweep. Translation is
+  zero-config: it reads the parent CollectionFolder's
+  `PhysicalLocations`, excludes the plugin-owned phantom-stub
+  dir, and concats the remaining (host) location with gostream's
+  filename. Uses `LibraryManager.GetCollectionFolders` (not a
+  ParentId walk) to find the CollectionFolder, since phantom
+  items are parented at the phantom-library physical Folder, not
+  the CollectionFolder directly. Operator action after install:
   trigger Suggestions/Refresh and then press Play on a phantom;
   no repair script required. Also adds a TMDB-base-URL config
   knob (`TmdbApiBaseUrl`) so test rigs can point at a local mock,
