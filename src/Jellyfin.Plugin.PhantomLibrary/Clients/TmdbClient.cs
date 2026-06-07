@@ -21,7 +21,6 @@ namespace Jellyfin.Plugin.PhantomLibrary.Clients;
 /// </summary>
 public sealed class TmdbClient : ITmdbClient
 {
-    private const string BaseUrl = "https://api.themoviedb.org/3";
     private const int MaxRetryAfterSeconds = 30;
     private static readonly TimeSpan ConfigurationCacheTtl = TimeSpan.FromHours(12);
 
@@ -447,7 +446,7 @@ public sealed class TmdbClient : ITmdbClient
         }
 
         var sb = new System.Text.StringBuilder();
-        sb.Append(BaseUrl).Append(endpoint);
+        sb.Append(_keyProvider.GetBaseUrl()).Append(endpoint);
         sb.Append("?api_key=").Append(Uri.EscapeDataString(key));
         if (!string.IsNullOrWhiteSpace(languageCode))
         {

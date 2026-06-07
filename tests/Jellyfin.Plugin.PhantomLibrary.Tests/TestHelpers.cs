@@ -11,8 +11,14 @@ namespace Jellyfin.Plugin.PhantomLibrary.Tests;
 internal sealed class StubKeyProvider : ITmdbApiKeyProvider
 {
     private readonly string _key;
-    public StubKeyProvider(string key) => _key = key;
+    private readonly string _baseUrl;
+    public StubKeyProvider(string key, string baseUrl = "https://api.themoviedb.org/3")
+    {
+        _key = key;
+        _baseUrl = baseUrl;
+    }
     public string GetApiKey() => _key;
+    public string GetBaseUrl() => _baseUrl;
 }
 
 internal sealed class QueuedHandler : HttpMessageHandler

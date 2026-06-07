@@ -10,6 +10,13 @@ public interface ITmdbApiKeyProvider
 {
     /// <summary>Gets the current TMDB API key, or empty/whitespace when unconfigured.</summary>
     string GetApiKey();
+
+    /// <summary>
+    /// Gets the TMDB v3 base URL (no trailing slash). Production default
+    /// is <c>https://api.themoviedb.org/3</c>. Test rigs override to point
+    /// at a local mock; operators normally never set this.
+    /// </summary>
+    string GetBaseUrl();
 }
 
 /// <summary>Default key provider sourcing from the live plugin configuration.</summary>
@@ -17,4 +24,13 @@ public sealed class PluginConfigTmdbApiKeyProvider : ITmdbApiKeyProvider
 {
     /// <inheritdoc/>
     public string GetApiKey() => Plugin.Instance?.Configuration.TmdbApiKey ?? string.Empty;
+
+    /// <inheritdoc/>
+    public string GetBaseUrl()
+    {
+        var configured = Plugin.Instance?.Configuration.TmdbApiBaseUrl;
+        return string.IsNullOrWhiteSpace(configured)
+            ? "https://api.themoviedb.org/3"
+            : configured!.TrimEnd('/');
+    }
 }

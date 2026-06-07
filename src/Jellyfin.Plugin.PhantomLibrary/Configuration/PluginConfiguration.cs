@@ -52,6 +52,7 @@ public class PluginConfiguration : BasePluginConfiguration
 
         SplashLoopAssetPath = string.Empty;
         PhantomTargetLibraryId = string.Empty;
+        TmdbApiBaseUrl = string.Empty;
 
         PhantomStubRoot = "/var/lib/jellyfin/phantom-library";
         PhantomMoviesLibraryName = "gostream-movies";
@@ -62,6 +63,14 @@ public class PluginConfiguration : BasePluginConfiguration
 
     /// <summary>Gets or sets the TMDB v3 API key used by the plugin's TMDB client.</summary>
     public string TmdbApiKey { get; set; }
+
+    /// <summary>
+    /// Optional TMDB v3 base URL override. Empty (default) means use the
+    /// production endpoint at <c>https://api.themoviedb.org/3</c>. Test
+    /// rigs point this at a local mock server. Operators normally never
+    /// set this.
+    /// </summary>
+    public string TmdbApiBaseUrl { get; set; }
 
     /// <summary>
     /// Gets or sets the gostream library-control base URL. Targets the
