@@ -239,6 +239,61 @@ public sealed class Materialiser : IMaterialiser
                 }
             }
 
+            // Step 2.6: enrich ProductionYear from TMDB if missing.
+            // gostream rejects movie/episode requests with empty year
+            // (returns 400 "year required for movie"). Phantom rows
+            // that haven't been healed (Name still stub-stem,
+            // providers not re-stamped) often have ProductionYear=null
+            // even though Tmdb id is present.
+            if (ids.Year is null && ids.Tmdb is int tidYear && _tmdb is not null)
+            {
+                try
+                {
+                    int? resolvedYear = null;
+                    switch (ids.Type)
+                    {
+                        case "movie":
+                        {
+                            var details = await _tmdb.GetMovieAsync(tidYear, null, ct).ConfigureAwait(false);
+                            resolvedYear = ParseYearFromIsoDate(details?.ReleaseDate);
+                            break;
+                        }
+                        case "series":
+                        case "episode":
+                        {
+                            var details = await _tmdb.GetSeriesAsync(tidYear, null, ct).ConfigureAwait(false);
+                            resolvedYear = ParseYearFromIsoDate(details?.FirstAirDate);
+                            break;
+                        }
+                    }
+
+                    if (resolvedYear is int y && y > 1800 && y < 3000)
+                    {
+                        ids.Year = y;
+                        _logger.LogDebug(
+                            "Materialise {Id}: enriched Year={Year} from TMDB={Tmdb}",
+                            jellyfinItemId, y, tidYear);
+                        try
+                        {
+                            item.ProductionYear = y;
+                            await _libraryManager.UpdateItemAsync(
+                                item, item.GetParent(), ItemUpdateType.MetadataEdit, ct).ConfigureAwait(false);
+                        }
+                        catch (Exception ux)
+                        {
+                            _logger.LogDebug(ux,
+                                "Materialise {Id}: UpdateItemAsync for Year-stamp failed (non-fatal)", jellyfinItemId);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex,
+                        "Materialise {Id}: TMDB year enrichment failed for tmdb={Tmdb}; proceeding without year",
+                        jellyfinItemId, tidYear);
+                }
+            }
+
             var cfg = _configProvider();
 
             // Step 3: unavailable marker
@@ -592,6 +647,15 @@ public sealed class Materialiser : IMaterialiser
             ReplaceAllImages = false,
             MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
         }, RefreshPriority.High);
+    }
+
+    private static int? ParseYearFromIsoDate(string? iso)
+    {
+        if (string.IsNullOrWhiteSpace(iso) || iso.Length < 4)
+        {
+            return null;
+        }
+        return int.TryParse(iso.AsSpan(0, 4), NumberStyles.Integer, CultureInfo.InvariantCulture, out var y) ? y : null;
     }
 
     private static bool IsPhantomStub(string? path)
