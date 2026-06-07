@@ -55,6 +55,100 @@ Grep before assuming. The Plugin SDK alone does not expose
 these internals; reading source is the only honest way to
 know what the host will do.
 
+## Two rig layouts: pick one
+
+There are now **two rigs** depending on what you're doing:
+
+- **`/tmp/jf-test/` — the legacy one-shot rig.** Bring-up + drive +
+  tear-down in a single bash invocation. Each scenario script
+  rebuilds rig state. Use when you need a deterministic, throwaway
+  full-cycle test. Documented in the rest of this file.
+
+- **`/tmp/jf-rig/` — the persistent investigative rig** (added
+  during M12 investigation, 2026-06-07). Long-running services
+  under user-mode systemd (`systemctl --user`) so jellyfin and the
+  TMDB mock survive across tool-call pgroup teardowns. Includes a
+  bundled TMDB mock (`tmdb-mock.py`), DB observer (`db-observer.py`),
+  and scripted scenarios. Use when you need to poke at a running
+  jellyfin across multiple separate tool calls, or when you need
+  deterministic TMDB responses without burning the operator's real
+  API key. Source: `tools/rig-scenarios/`.
+
+If you're integration-testing a single change, the one-shot rig
+is simpler. If you're investigating a multi-step interaction or
+need to script a scenario with assertions, the persistent rig is
+better.
+
+### Persistent rig (`/tmp/jf-rig/`) quick reference
+
+```bash
+# Copy the scripts from the repo into the rig dir if first run.
+mkdir -p /tmp/jf-rig/{bin,scenarios,logs,fixtures/tmdb}
+cp tools/rig-scenarios/*.{sh,py} /tmp/jf-rig/bin/   # mock + observer
+cp tools/rig-scenarios/[0-9I]*.sh /tmp/jf-rig/scenarios/  # scenario scripts
+chmod +x /tmp/jf-rig/bin/*.sh /tmp/jf-rig/bin/*.py /tmp/jf-rig/scenarios/*.sh
+
+# Build the plugin DLL (the rig copies it into place).
+dotnet build -c Release
+
+# Start: clones prod DB into /tmp/jf-test, drops fresh DLL, writes
+# plugin config pointing at the TMDB mock (port 18099), launches
+# jellyfin + mock under `systemd-run --user` as transient services.
+bash /tmp/jf-rig/bin/rig-up.sh --reset
+
+# Status check (units survive across tool calls).
+systemctl --user list-units 'rig-*'
+
+# Run a scenario. Each scenario is one synchronous bash invocation
+# that resets phantom-related state, drives REST, dumps assertions
+# to /tmp/jf-rig/logs/<scenario>.log.
+bash /tmp/jf-rig/scenarios/01-suggestions.sh
+cat /tmp/jf-rig/logs/scenario-suggestions.log
+
+# Observe a specific row's mutations over time (background, also
+# under systemd-run --user).
+systemd-run --user --unit=rig-observer --setenv=JF_RIG_ROOT=/tmp/jf-rig \
+  -- /usr/bin/python3 /tmp/jf-rig/bin/db-observer.py \
+     "/tmp/jf-test/data/data/jellyfin.db:BaseItems:Path LIKE '%phantom_tmdb99000001%'" \
+     "/tmp/jf-test/data/data/jellyfin.db:BaseItemProviders:ItemId IN (SELECT Id FROM BaseItems WHERE Path LIKE '%phantom_tmdb99000001%')"
+# ... run test ...
+systemctl --user stop rig-observer
+ls /tmp/jf-rig/logs/observer-*.log   # mutation timeline
+
+# Tear down.
+bash /tmp/jf-rig/bin/rig-down.sh
+```
+
+Key facts about the persistent rig:
+
+- **TMDB mock on `127.0.0.1:18099`** serves a fixed set of 3
+  movies (ids 99000001/02/03) + 2 series (ids 99100001/02). Titles
+  like "Phantom Rig Alpha" are deliberately NON-fuzzy-matchable to
+  anything in real TMDB, so the Jellyfin built-in TmdbProvider
+  cannot rescue our items if a code path strips metadata. That's
+  how we distinguish "our stamp survived" from "scanner re-fetched
+  it for us."
+- **Mock poster paths (`/alpha.jpg`) are fake.** This is
+  intentional but has a known side effect:
+  `LibraryManager.UpdateItemsAsync` → `RunMetadataSavers` →
+  `UpdateImagesAsync` mutates the in-memory item's `ImageInfos`
+  array to empty when the URL can't be locally verified. With real
+  TMDB ids, `ImageInfos` survives. If you're testing image
+  persistence specifically, use real TMDB — see
+  `docs/plans/M12-investigation-results.md` for the trace.
+- **Plugin config field `TmdbApiBaseUrl`** controls whether the
+  plugin hits the mock or real TMDB. Empty = real; set =
+  `<http://127.0.0.1:18099/3>` for the mock. Operators normally
+  never set this; the rig writes it in.
+- **`systemd-run --user`** detaches units from the parent tool's
+  pgroup. They survive across multiple tool calls. Requires the
+  user session systemd to be available (`systemctl --user status`
+  must work). Lingering not required for our session-attached use.
+- **Plugin source pulls the splash mp4 into
+  `/tmp/jf-test/cache/PhantomLibrary/splash.mp4` lazily on first
+  PhantomStubManager bootstrap.** The rig's phantom symlinks all
+  resolve to this single file.
+
 ## Rig layout
 
 The test rig lives under `/tmp/jf-test/`. Once seeded it looks
@@ -544,6 +638,8 @@ scan-free.
 
 ### Rig logs (the rig you control)
 
+#### One-shot rig (`/tmp/jf-test/`)
+
 - `/tmp/jf-test/run.log` — jellyfin's stdout/stderr
 - `/tmp/jf-test/log/*.log` — jellyfin's structured logs
   (per `--logdir`)
@@ -557,6 +653,30 @@ Grep examples:
 grep -i 'PhantomLibrary\|Phantom\.' /tmp/jf-test/log/*.log
 grep -i 'error\|exception\|fail' /tmp/jf-test/run.log | head -50
 ```
+
+#### Persistent rig (`/tmp/jf-rig/`)
+
+Jellyfin runs under user systemd; logs go to the user journal:
+
+```bash
+journalctl --user -u rig-jellyfin --no-pager --since '5 min ago'
+journalctl --user -u rig-jellyfin -f                # live tail
+```
+
+The `--logdir` is still `/tmp/jf-test/log` (the two rigs share
+that dir), so structured logs are at the same place. Use
+`journalctl --user` for stdout/stderr from the .NET host (faults,
+crashes, startup output).
+
+TMDB mock log: `/tmp/jf-rig/logs/tmdb-mock.log` (every request +
+status).
+
+Observer logs (one per `db-observer.py` invocation):
+`/tmp/jf-rig/logs/observer-<pid>.log`. Each line records a state
+change (with full row dump) timestamped to the ms.
+
+Scenario logs: `/tmp/jf-rig/logs/scenario-<name>.log` for each
+scenario run (one entry per run; latest overwrites).
 
 ### Production-Jellyfin logs (the operator's `:8096` instance)
 
@@ -634,10 +754,19 @@ is 30 seconds in the admin dashboard.
 
 ## Tear-down
 
+**One-shot rig (`/tmp/jf-test/`):**
+
 ```bash
 pkill -u "$USER" -9 -f "dotnet.*jellyfin.dll.*jf-test"
 rm -rf /tmp/jf-test
 ```
 
-The rig is disposable. Rebuild from prod whenever you suspect
+**Persistent rig (`/tmp/jf-rig/` + user systemd units):**
+
+```bash
+bash /tmp/jf-rig/bin/rig-down.sh   # stops rig-jellyfin / rig-tmdb-mock / rig-observer cleanly
+# Optional: rm -rf /tmp/jf-rig /tmp/jf-test
+```
+
+Both rigs are disposable. Rebuild from prod whenever you suspect
 drift from production state.
