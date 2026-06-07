@@ -38,6 +38,12 @@ public class MaterialiserTests : IDisposable
         _libMock.Setup(l => l.UpdateItemAsync(
             It.IsAny<BaseItem>(), It.IsAny<BaseItem>(), It.IsAny<ItemUpdateType>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
+
+        // BaseItem.GetParent() reads from a static LibraryManager. Wire
+        // it so any test that uses parent traversal (ResolveHostPath
+        // tests, the materialise-loop tests that touch item.GetParent)
+        // sees our mock.
+        BaseItem.LibraryManager = _libMock.Object;
     }
 
     public void Dispose()
@@ -433,5 +439,102 @@ public class MaterialiserTests : IDisposable
 
         Assert.Equal(MaterialisationStatus.Success, r.Status);
         Assert.False(movie.ProviderIds.ContainsKey("Imdb"));
+    }
+
+    // ----- M12: gostream path translation via library locations -----
+
+    private sealed class TestCollectionFolder : MediaBrowser.Controller.Entities.CollectionFolder
+    {
+        public TestCollectionFolder(string containerPath, string[] locations)
+        {
+            Path = containerPath;
+            PhysicalLocationsList = locations;
+        }
+    }
+
+    [Fact]
+    public void ResolveHostPath_OneNonPhantomLocation_ConcatsFilename()
+    {
+        var cf = new TestCollectionFolder(
+            "/var/lib/jellyfin/root/default/gostream-movies",
+            new[]
+            {
+                "/var/lib/jellyfin/root/default/gostream-movies",
+                "/var/lib/jellyfin/phantom-library/movies",
+                "/var/gostream/gostream-mkv-virtual/movies",
+            });
+        cf.Id = Guid.NewGuid();
+        var movie = new Movie { Name = "X" };
+        movie.Id = Guid.NewGuid();
+        movie.SetParent(cf);
+        _libMock.Setup(l => l.GetItemById(cf.Id)).Returns(cf);
+
+        var cfg = new PluginConfiguration
+        {
+            PhantomStubRoot = "/var/lib/jellyfin/phantom-library",
+        };
+
+        var m = BuildMaterialiser(cfg);
+        var result = m.ResolveHostPath(
+            "/mnt/gostream-mkv-virtual/movies/Backrooms_2026_1080p_fdf0872d.mkv",
+            movie,
+            cfg);
+
+        Assert.Equal(
+            "/var/gostream/gostream-mkv-virtual/movies/Backrooms_2026_1080p_fdf0872d.mkv",
+            result);
+    }
+
+    [Fact]
+    public void ResolveHostPath_NoCollectionFolderParent_ReturnsOriginal()
+    {
+        var movie = new Movie { Name = "X" };
+        movie.Id = Guid.NewGuid();
+        // No parent set.
+
+        var cfg = new PluginConfiguration
+        {
+            PhantomStubRoot = "/var/lib/jellyfin/phantom-library",
+        };
+
+        var m = BuildMaterialiser(cfg);
+        var input = "/mnt/gostream-mkv-virtual/movies/X.mkv";
+        var result = m.ResolveHostPath(input, movie, cfg);
+        Assert.Same(input, result);
+    }
+
+    [Fact]
+    public void ResolveHostPath_OnlyPhantomLocation_ReturnsOriginal()
+    {
+        var cf = new TestCollectionFolder(
+            "/var/lib/jellyfin/root/default/gostream-movies",
+            new[]
+            {
+                "/var/lib/jellyfin/root/default/gostream-movies",
+                "/var/lib/jellyfin/phantom-library/movies",
+            });
+        cf.Id = Guid.NewGuid();
+        var movie = new Movie { Name = "X" };
+        movie.Id = Guid.NewGuid();
+        movie.SetParent(cf);
+        _libMock.Setup(l => l.GetItemById(cf.Id)).Returns(cf);
+
+        var cfg = new PluginConfiguration
+        {
+            PhantomStubRoot = "/var/lib/jellyfin/phantom-library",
+        };
+
+        var m = BuildMaterialiser(cfg);
+        var input = "/mnt/gostream-mkv-virtual/movies/X.mkv";
+        var result = m.ResolveHostPath(input, movie, cfg);
+        Assert.Same(input, result);
+    }
+
+    [Fact]
+    public void ResolveHostPath_EmptyInput_PassThrough()
+    {
+        var cfg = new PluginConfiguration();
+        var m = BuildMaterialiser(cfg);
+        Assert.Equal(string.Empty, m.ResolveHostPath(string.Empty, new Movie(), cfg));
     }
 }

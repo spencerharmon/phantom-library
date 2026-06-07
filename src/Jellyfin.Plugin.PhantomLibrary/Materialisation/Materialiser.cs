@@ -383,6 +383,30 @@ public sealed class Materialiser : IMaterialiser
                 return new MaterialisationOutcome { Status = MaterialisationStatus.Error, Error = ex.Message };
             }
 
+            // Step 8.5: translate gostream container-internal paths to
+            // host-visible paths. Gostream runs in a container and
+            // returns /mnt/...; Jellyfin runs on the host and sees the
+            // same files at whatever the operator bind-mounted (e.g.
+            // /var/gostream/...). Resolve by finding the parent
+            // CollectionFolder's non-phantom Location and re-joining
+            // with gostream's filename. See ResolveHostPath below.
+            var translatedFuse = ResolveHostPath(addResult.FusePath, item, cfg);
+            var translatedStub = addResult.StubPath; // stub stays container-internal; only the gostream container reads it.
+            if (!ReferenceEquals(translatedFuse, addResult.FusePath))
+            {
+                addResult = new GostreamAddResult
+                {
+                    StubPath = translatedStub,
+                    FusePath = translatedFuse,
+                    Hash = addResult.Hash,
+                    Size = addResult.Size,
+                    AlreadyExisted = addResult.AlreadyExisted,
+                };
+                _logger.LogDebug(
+                    "Materialise {Id}: translated gostream fuse path to host-visible {Fuse}",
+                    jellyfinItemId, translatedFuse);
+            }
+
             // Step 9: poll for FUSE-path settle
             await WaitForFusePathAsync(addResult.FusePath, ct).ConfigureAwait(false);
 
@@ -644,6 +668,103 @@ public sealed class Materialiser : IMaterialiser
         }
 
         return (null, null, null);
+    }
+
+    /// <summary>
+    /// Translate a gostream-returned FUSE path to its host-visible
+    /// equivalent. Gostream runs containerised and returns paths inside
+    /// its container (e.g. <c>/mnt/gostream-mkv-virtual/movies/X.mkv</c>);
+    /// from Jellyfin's perspective the same file lives at the host
+    /// bind-mount target.
+    ///
+    /// Resolution: take the filename from gostream's path; ask the item's
+    /// CollectionFolder for its Locations; exclude the phantom-stub root
+    /// (that's our own dir, never gostream's); the remaining Location is
+    /// the gostream FUSE mount. If multiple remain, probe each with
+    /// File.Exists for the filename. If none match, fall through to
+    /// gostream's original path — Jellyfin's scanner will then drop the
+    /// row, which is at least a visible failure mode.
+    ///
+    /// Returns the SAME string reference if no translation occurred so
+    /// callers can detect via <c>ReferenceEquals</c>.
+    /// </summary>
+    internal string ResolveHostPath(string gostreamPath, BaseItem item, PluginConfiguration cfg)
+    {
+        if (string.IsNullOrEmpty(gostreamPath)) return gostreamPath;
+
+        var filename = System.IO.Path.GetFileName(gostreamPath);
+        if (string.IsNullOrEmpty(filename)) return gostreamPath;
+
+        // CollectionFolder for this item. Look one level up; if the item
+        // is an Episode under Season under Series under CollectionFolder,
+        // walk further.
+        var cf = item.GetParent();
+        while (cf is not null && cf is not MediaBrowser.Controller.Entities.CollectionFolder)
+        {
+            cf = cf.GetParent();
+        }
+        if (cf is not MediaBrowser.Controller.Entities.CollectionFolder collection)
+        {
+            return gostreamPath;
+        }
+
+        var locations = collection.PhysicalLocations ?? Array.Empty<string>();
+        var phantomRoot = (cfg?.PhantomStubRoot ?? "/var/lib/jellyfin/phantom-library")
+            .TrimEnd('/');
+
+        // Candidates: library locations that are NOT inside the phantom
+        // stub root AND are not the CollectionFolder's container path
+        // itself (which is the .mblink container, not a media dir).
+        var candidates = locations
+            .Where(l => !string.IsNullOrEmpty(l))
+            .Where(l => !l.Equals(collection.Path, StringComparison.Ordinal))
+            .Where(l => !IsUnderPhantomRoot(l, phantomRoot))
+            .ToList();
+
+        if (candidates.Count == 0)
+        {
+            _logger.LogWarning(
+                "Materialise: cannot translate gostream path {Path} — collection {Lib} has no non-phantom location",
+                gostreamPath, collection.Name);
+            return gostreamPath;
+        }
+
+        // Fast path: one non-phantom location — use it directly without
+        // probing the filesystem. gostream is the only thing writing
+        // there in any operator setup we support.
+        if (candidates.Count == 1)
+        {
+            return System.IO.Path.Combine(candidates[0], filename);
+        }
+
+        // Multi-location: probe each for the actual file. Whichever one
+        // exists is the right answer. If none exist (gostream just made
+        // it; FUSE may not have settled yet), pick the first candidate;
+        // WaitForFusePathAsync below will poll for visibility anyway.
+        foreach (var loc in candidates)
+        {
+            var trial = System.IO.Path.Combine(loc, filename);
+            try
+            {
+                if (System.IO.File.Exists(trial))
+                {
+                    return trial;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Materialise: probe failed for {Trial}", trial);
+            }
+        }
+        return System.IO.Path.Combine(candidates[0], filename);
+    }
+
+    private static bool IsUnderPhantomRoot(string location, string phantomRoot)
+    {
+        if (string.IsNullOrEmpty(phantomRoot)) return false;
+        var loc = location.TrimEnd('/');
+        return loc.Equals(phantomRoot, StringComparison.Ordinal)
+            || loc.StartsWith(phantomRoot + "/", StringComparison.Ordinal);
     }
 
     private bool TryExtractIdentifiers(BaseItem item, out ItemIdentifiers ids)
