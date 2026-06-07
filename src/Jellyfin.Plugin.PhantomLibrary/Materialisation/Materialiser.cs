@@ -695,15 +695,36 @@ public sealed class Materialiser : IMaterialiser
         var filename = System.IO.Path.GetFileName(gostreamPath);
         if (string.IsNullOrEmpty(filename)) return gostreamPath;
 
-        // CollectionFolder for this item. Look one level up; if the item
-        // is an Episode under Season under Series under CollectionFolder,
-        // walk further.
-        var cf = item.GetParent();
-        while (cf is not null && cf is not MediaBrowser.Controller.Entities.CollectionFolder)
+        // Find the CollectionFolder this item ultimately belongs to.
+        // Walking ParentId only goes BaseItem -> phys-Folder -> root
+        // (AggregateFolder); the CollectionFolder isn't in that
+        // chain. LibraryManager.GetCollectionFolders walks up to
+        // root and then queries which CollectionFolders include this
+        // item's physical location.
+        MediaBrowser.Controller.Entities.CollectionFolder? collection = null;
+        try
         {
-            cf = cf.GetParent();
+            var cfs = _libraryManager.GetCollectionFolders(item);
+            collection = cfs.OfType<MediaBrowser.Controller.Entities.CollectionFolder>().FirstOrDefault();
         }
-        if (cf is not MediaBrowser.Controller.Entities.CollectionFolder collection)
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Materialise: GetCollectionFolders threw for item {Id}", item.Id);
+        }
+
+        if (collection is null)
+        {
+            // Fallback: walk ParentId chain (works when an item is
+            // directly under a CollectionFolder).
+            BaseItem? walk = item.GetParent();
+            while (walk is not null && walk is not MediaBrowser.Controller.Entities.CollectionFolder)
+            {
+                walk = walk.GetParent();
+            }
+            collection = walk as MediaBrowser.Controller.Entities.CollectionFolder;
+        }
+
+        if (collection is null)
         {
             return gostreamPath;
         }

@@ -537,4 +537,60 @@ public class MaterialiserTests : IDisposable
         var m = BuildMaterialiser(cfg);
         Assert.Equal(string.Empty, m.ResolveHostPath(string.Empty, new Movie(), cfg));
     }
+
+    [Fact]
+    public void ResolveHostPath_ItemUnderPhantomPhysFolder_UsesGetCollectionFolders()
+    {
+        // Repro of the operator-observed prod state: phantom items
+        // are persisted with ParentId = phantom-library physical
+        // Folder (not the CollectionFolder directly). Walking ParentId
+        // never reaches a CollectionFolder. The fix uses
+        // LibraryManager.GetCollectionFolders to find the CF via
+        // PhysicalLocations lookup.
+        var cf = new TestCollectionFolder(
+            "/var/lib/jellyfin/root/default/gostream-movies",
+            new[]
+            {
+                "/var/lib/jellyfin/root/default/gostream-movies",
+                "/var/lib/jellyfin/phantom-library/movies",
+                "/var/gostream/gostream-mkv-virtual/movies",
+            });
+        cf.Id = Guid.NewGuid();
+
+        // Phantom physical Folder under AggregateFolder root.
+        var phantomPhys = new TestPhysicalFolder { Name = "movies", Path = "/var/lib/jellyfin/phantom-library/movies" };
+        phantomPhys.Id = Guid.NewGuid();
+        var aggRoot = new TestPhysicalFolder { Name = "root", Path = "/var/lib/jellyfin/root" };
+        aggRoot.Id = Guid.NewGuid();
+        phantomPhys.SetParent(aggRoot);
+
+        var movie = new Movie { Name = "X" };
+        movie.Id = Guid.NewGuid();
+        movie.SetParent(phantomPhys);
+        _libMock.Setup(l => l.GetItemById(phantomPhys.Id)).Returns(phantomPhys);
+        _libMock.Setup(l => l.GetItemById(aggRoot.Id)).Returns(aggRoot);
+
+        // GetCollectionFolders returns our cf for this item.
+        _libMock.Setup(l => l.GetCollectionFolders(It.IsAny<BaseItem>()))
+            .Returns(new List<Folder> { cf });
+
+        var cfg = new PluginConfiguration
+        {
+            PhantomStubRoot = "/var/lib/jellyfin/phantom-library",
+        };
+
+        var m = BuildMaterialiser(cfg);
+        var result = m.ResolveHostPath(
+            "/mnt/gostream-mkv-virtual/movies/28_Years_Later_2025_2160p_511a90f7.mkv",
+            movie,
+            cfg);
+
+        Assert.Equal(
+            "/var/gostream/gostream-mkv-virtual/movies/28_Years_Later_2025_2160p_511a90f7.mkv",
+            result);
+    }
+
+    private sealed class TestPhysicalFolder : Folder
+    {
+    }
 }
