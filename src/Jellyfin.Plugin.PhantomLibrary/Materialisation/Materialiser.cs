@@ -595,6 +595,26 @@ public sealed class Materialiser : IMaterialiser
             item.Path = fusePath;
             isVirtualProp!.SetValue(item, false);
 
+            // Stamp Size directly from filesystem. MetadataService's
+            // refresh path also does this but only via its full
+            // DirectoryService (with IFileSystem). Our minimal stub
+            // doesn't, so the queued re-probe won't update Size. Do
+            // it inline here so the BaseItem's reported Size matches
+            // the real file the moment Promote finishes.
+            try
+            {
+                var fi = new FileInfo(fusePath);
+                if (fi.Exists)
+                {
+                    item.Size = fi.Length;
+                    item.DateModified = fi.LastWriteTimeUtc;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Promote {Id}: file-size stat failed for {Path}", item.Id, fusePath);
+            }
+
             // Re-parent the item under the physical Folder that owns
             // the host directory containing fusePath. Without this,
             // the item keeps ParentId pointing at the phantom-library
@@ -626,6 +646,31 @@ public sealed class Materialiser : IMaterialiser
                     try { await _stubs.DeleteAsync(oldPath!, ct).ConfigureAwait(false); }
                     catch (Exception ex) { _logger.LogWarning(ex, "stub delete failed for {Path}", oldPath); }
                 }
+
+                // Force a media-stream re-probe. UpdateItemAsync only
+                // persists BaseItem metadata; MediaStreamInfos +
+                // BaseItem.Size were stamped from the splash file at
+                // virtual-item creation time and stay stale otherwise.
+                // Without this re-probe, the player asks for the item's
+                // streams, gets splash codecs (h264/aac, 100KB), tries to
+                // play those against the real gostream mkv, and fails
+                // (splash-only playback or playback error).
+                //
+                // QueueRefresh w/ MetadataRefreshMode.FullRefresh +
+                // ReplaceAllMetadata=false runs FFProbeVideoInfo which
+                // re-stamps MediaStreamInfos, Size, RunTimeTicks,
+                // Container, etc. from the real file on disk.
+                var probeDir = new DirectoryService();
+                _providerManager.QueueRefresh(item.Id, new MetadataRefreshOptions(probeDir)
+                {
+                    MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
+                    ImageRefreshMode = MetadataRefreshMode.Default,
+                    ReplaceAllMetadata = false,
+                    ReplaceAllImages = false,
+                    EnableRemoteContentProbe = true,
+                    ForceSave = true,
+                }, RefreshPriority.High);
+                _logger.LogDebug("Promote {Id}: queued media-stream re-probe", item.Id);
                 return;
             }
             catch (Exception ex)
