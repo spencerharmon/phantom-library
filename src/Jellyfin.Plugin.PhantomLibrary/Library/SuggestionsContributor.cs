@@ -389,7 +389,14 @@ public sealed class SuggestionsContributor : ISuggestionsContributor
                 var nameIsStem = (existing.Name ?? string.Empty)
                     .Contains("__phantom_tmdb", StringComparison.Ordinal);
                 var hasTmdbProvider = existing.ProviderIds.ContainsKey(TmdbProvider);
-                if (nameIsStem || !existing.IsLocked || !hasTmdbProvider)
+                // A materialised item points at a real gostream file
+                // (not a phantom sentinel) and is no longer locked.
+                // Heal targets virtual-stage broken rows; do not
+                // "heal" a materialised row — that would clobber its
+                // real Path and the scanner would cull the row.
+                var isMaterialised = !string.IsNullOrEmpty(existing.Path)
+                    && !existing.Path.Contains("__phantom_tmdb", StringComparison.Ordinal);
+                if (!isMaterialised && (nameIsStem || !existing.IsLocked || !hasTmdbProvider))
                 {
                     await HealBrokenPhantomAsync(existing, hit, kind, parent, ct).ConfigureAwait(false);
                 }
@@ -575,13 +582,22 @@ public sealed class SuggestionsContributor : ISuggestionsContributor
 
             // Re-create the stub symlink if needed. CreateAsync is
             // idempotent — returns the existing path if already there.
-            if (_stubs.IsReady)
+            // Only reset Path back to the stub for items that are NOT
+            // already materialised. Once an item points at a real
+            // gostream file (post-Materialiser), heal must not yank
+            // it back to the phantom symlink — that re-virtualises a
+            // materialised row, then the scanner culls it on the
+            // next folder validation. Detect materialised by
+            // "Path is not empty AND not a phantom sentinel".
+            var alreadyMaterialised = !string.IsNullOrEmpty(existing.Path)
+                && !existing.Path.Contains("__phantom_tmdb", StringComparison.Ordinal);
+            if (_stubs.IsReady && !alreadyMaterialised)
             {
                 try
                 {
                     var stubKind = kind == ItemKind.Movie ? PhantomMediaKind.Movie : PhantomMediaKind.Series;
                     var stubPath = await _stubs.CreateAsync(existing.Name ?? string.Empty, hit.Id, stubKind, ct).ConfigureAwait(false);
-                    if (string.IsNullOrEmpty(existing.Path) || !existing.Path.Contains("__phantom_tmdb", StringComparison.Ordinal))
+                    if (string.IsNullOrEmpty(existing.Path))
                     {
                         existing.Path = stubPath;
                     }

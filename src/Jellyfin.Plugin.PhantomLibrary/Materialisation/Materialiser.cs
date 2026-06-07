@@ -7,6 +7,7 @@ using System.Linq;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
+using Jellyfin.Data.Enums;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
 using Jellyfin.Plugin.PhantomLibrary.Configuration;
 using Jellyfin.Plugin.PhantomLibrary.State;
@@ -538,9 +539,30 @@ public sealed class Materialiser : IMaterialiser
         {
             item.Path = fusePath;
             isVirtualProp!.SetValue(item, false);
+
+            // Re-parent the item under the physical Folder that owns
+            // the host directory containing fusePath. Without this,
+            // the item keeps ParentId pointing at the phantom-library
+            // physical folder (where the now-deleted stub symlink
+            // used to live). Jellyfin's next folder-validation cycle
+            // of the phantom-library folder then removes the item
+            // because the symlink's BaseItem -> filesystem mapping
+            // is broken. Reparenting to the gostream-virtual physical
+            // folder makes the validation walk match the file that's
+            // actually on disk and keeps the row alive.
+            var newParent = FindPhysicalFolderForPath(fusePath);
+            var parentForUpdate = newParent ?? item.GetParent();
+            if (newParent is not null && newParent.Id != item.ParentId)
+            {
+                _logger.LogDebug(
+                    "Promote {Id}: reparenting from {OldParent} to {NewParent} ({Path})",
+                    item.Id, item.ParentId, newParent.Id, newParent.Path);
+                item.SetParent((Folder)newParent);
+            }
+
             try
             {
-                await _libraryManager.UpdateItemAsync(item, item.GetParent(),
+                await _libraryManager.UpdateItemAsync(item, parentForUpdate,
                     ItemUpdateType.MetadataImport, ct).ConfigureAwait(false);
                 _logger.LogDebug("Promoted item {Id} via in-place update", item.Id);
 
@@ -575,6 +597,50 @@ public sealed class Materialiser : IMaterialiser
     private static bool IsPhantomStub(string? path)
         => !string.IsNullOrEmpty(path)
             && path.Contains(Jellyfin.Plugin.PhantomLibrary.Library.PhantomStubManager.Sentinel, StringComparison.Ordinal);
+
+    /// <summary>
+    /// Find the physical Folder BaseItem whose Path equals the
+    /// directory containing <paramref name="filePath"/>. Used by
+    /// PromoteItemAsync to re-parent a materialised item out of the
+    /// phantom-library physical folder and into the host-visible
+    /// gostream-virtual physical folder. Returns null if no such
+    /// folder is registered as a BaseItem yet (e.g. the operator
+    /// hasn't scanned the gostream-virtual mount, or it isn't bound
+    /// to a CollectionFolder).
+    /// </summary>
+    private Folder? FindPhysicalFolderForPath(string filePath)
+    {
+        try
+        {
+            var dir = Path.GetDirectoryName(filePath);
+            if (string.IsNullOrEmpty(dir))
+            {
+                return null;
+            }
+            // Two-step lookup: BaseItemKind.Folder (and Season for TV)
+            // by Path. Use library-manager's query rather than walking
+            // every item ourselves.
+            var folders = _libraryManager.GetItemList(new InternalItemsQuery
+            {
+                IncludeItemTypes = new[]
+                {
+                    BaseItemKind.Folder,
+                    BaseItemKind.Season,
+                    BaseItemKind.Series,
+                    BaseItemKind.CollectionFolder,
+                },
+                Path = dir,
+                Limit = 5,
+            });
+            return folders.OfType<Folder>().FirstOrDefault(
+                f => string.Equals(f.Path, dir, StringComparison.OrdinalIgnoreCase));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "FindPhysicalFolderForPath query failed for {Path}", filePath);
+            return null;
+        }
+    }
 
     // Minimal IDirectoryService stub for MetadataRefreshOptions. Jellyfin
     // does not require a real on-disk service for QueueRefresh — it
