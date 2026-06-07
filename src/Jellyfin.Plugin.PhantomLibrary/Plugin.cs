@@ -71,6 +71,21 @@ public class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
                     "{0}.Configuration.userPrefsPage.html",
                     GetType().Namespace),
             },
+            // PhantomKebab: browser-side JS shim that injects a
+            // 'Materialise' entry into the item kebab/action-sheet
+            // menu on detail pages. Served via this PluginPageInfo so
+            // the operator can wire it via Dashboard → General →
+            // Custom HTML/Branding with a single <script> tag:
+            //   <script src="/web/ConfigurationPage?name=PhantomKebab" defer></script>
+            // Name='PhantomKebab' (no spaces) so the URL is clean.
+            new PluginPageInfo
+            {
+                Name = "PhantomKebab",
+                EmbeddedResourcePath = string.Format(
+                    CultureInfo.InvariantCulture,
+                    "{0}.Configuration.phantomKebab.js",
+                    GetType().Namespace),
+            },
         };
     }
 }
