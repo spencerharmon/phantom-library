@@ -277,29 +277,59 @@ public sealed class EvictionSweeper : IHostedService, IDisposable
 
     private async Task DemoteAsync(BaseItem item, PhantomItemRow row, CancellationToken ct)
     {
+        // PLAN §M13: for Series rows, row.StubPath is the per-series
+        // directory; gostream's RemoveAsync expects the inner episode
+        // file (the S01E01 splash symlink), so re-derive that path here.
+        string? removeTarget = row.StubPath;
+        if (item is Series && !string.IsNullOrWhiteSpace(row.StubPath))
+        {
+            var seriesTmdb = row.TmdbId ?? 0;
+            if (seriesTmdb <= 0 && item.ProviderIds is not null
+                && item.ProviderIds.TryGetValue("Tmdb", out var rawTmdb)
+                && int.TryParse(rawTmdb, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedTmdb))
+            {
+                seriesTmdb = parsedTmdb;
+            }
+
+            if (seriesTmdb > 0)
+            {
+                try
+                {
+                    var (_, _, episodeFile) = _stubs.DeriveSeriesStubPaths(item.Name ?? string.Empty, seriesTmdb);
+                    removeTarget = episodeFile;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex,
+                        "[Eviction] DeriveSeriesStubPaths failed for {Id}; falling back to series dir for RemoveAsync",
+                        item.Id);
+                }
+            }
+        }
+
         // 1. Vault Mode unprestage (best effort)
-        if (!string.IsNullOrWhiteSpace(row.StubPath))
+        if (!string.IsNullOrWhiteSpace(removeTarget))
         {
             try
             {
                 if (await _gostream.IsVaultModePresentAsync(ct).ConfigureAwait(false))
                 {
-                    await _gostream.UnprestageAsync(row.StubPath!, ct).ConfigureAwait(false);
+                    await _gostream.UnprestageAsync(removeTarget!, ct).ConfigureAwait(false);
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogDebug(ex, "[Eviction] UnprestageAsync failed for {Stub}", row.StubPath);
+                _logger.LogDebug(ex, "[Eviction] UnprestageAsync failed for {Stub}", removeTarget);
             }
 
             // 2. gostream RemoveAsync — required by sweeper contract.
             try
             {
-                await _gostream.RemoveAsync(row.StubPath!, ct).ConfigureAwait(false);
+                await _gostream.RemoveAsync(removeTarget!, ct).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "[Eviction] gostream RemoveAsync failed for {Stub}; continuing demotion", row.StubPath);
+                _logger.LogWarning(ex, "[Eviction] gostream RemoveAsync failed for {Stub}; continuing demotion", removeTarget);
             }
         }
         else

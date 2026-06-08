@@ -589,6 +589,13 @@ public sealed class SuggestionsContributor : ISuggestionsContributor
             // materialised row, then the scanner culls it on the
             // next folder validation. Detect materialised by
             // "Path is not empty AND not a phantom sentinel".
+            //
+            // PLAN §M13: virtual Series rows now have Path =
+            // <shows>/<SafeName>__phantom_tmdb<id>/ — the per-series
+            // directory. The leaf still carries the `__phantom_tmdb`
+            // sentinel, so the substring check below correctly
+            // classifies the row as "phantom" (i.e. NOT materialised)
+            // and heal proceeds.
             var alreadyMaterialised = !string.IsNullOrEmpty(existing.Path)
                 && !existing.Path.Contains("__phantom_tmdb", StringComparison.Ordinal);
             if (_stubs.IsReady && !alreadyMaterialised)

@@ -136,6 +136,10 @@ public sealed class Materialiser : IMaterialiser
             // Series-level materialisation is intentionally unsupported. A Series
             // is a container; episodes are the materialisation unit. The autopilot
             // (M8 §5) ensures individual Episodes are pre-materialised.
+            //
+            // PLAN §M13: a Series row's Path is now a directory (the per-series
+            // stub dir). Bailing out here keeps PromoteItemAsync / ResolveHostPath
+            // — both of which assume a single file Path — off the Series code path.
             if (item is Series)
             {
                 const string reason = "Series-level materialisation is not supported; materialise individual Episodes instead (Series is the container).";

@@ -6,6 +6,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **M13 — Per-series subdir stub layout for TV phantoms.**
+  Replaces the loose-file phantom-show layout from M10 (one
+  symlink per series at the top of `phantom-library/shows/`)
+  with a per-series subdirectory layout that Jellyfin's
+  `tvshows` resolver can parse into a proper
+  `Series → Season → Episode` tree. Each phantom series gets
+  `phantom-library/shows/<SafeName>__phantom_tmdb<id>/Season 01/<stem> S01E01.<splashExt>`
+  where the inner `S01E01.<ext>` is a symlink to the shared
+  splash file; the series stub *directory* (with the
+  `__phantom_tmdb<id>` sentinel still in its leaf name, so
+  Suggestions' NameContains fallback in
+  `FindExistingByTmdbId` keeps working) is what the Series
+  BaseItem's `Path` points at. `EvictionSweeper.DemoteAsync`
+  derives the inner episode file via the new
+  `IPhantomStubManager.DeriveSeriesStubPaths(...)` helper and
+  calls `gostream.RemoveAsync` against THAT path — gostream
+  expects a file, not a directory. `PhantomStubManager.DeleteAsync`
+  on a series stub recursively removes the tree only when the
+  leaf carries the phantom sentinel; refuses any other dir.
+  Movie stubs are byte-identical to M10 (loose-file symlinks
+  under `movies/`). Operator must run
+  `scripts/phantom-shows-cleanup.sh` once before triggering
+  Suggestions on the new code — the loose-file phantom-show
+  state from the M10 era leaves orphan Episode BaseItems that
+  block the new Series rows from binding. See PLAN.md §M13 for
+  the full design.
+
 ### Changed
 
 - `install.sh` restart prompt now defaults to **yes** (`[Y/n]`).

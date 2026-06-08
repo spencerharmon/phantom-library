@@ -141,4 +141,93 @@ public class PhantomStubManagerTests : IDisposable
             () => m.BootstrapAsync(default));
         Assert.Contains("chown", ex.Message, StringComparison.Ordinal);
     }
+
+    // ── PLAN §M13: per-series subdir stub layout ────────────────────
+
+    [Fact]
+    public async Task CreateAsync_Series_CreatesPerSeriesDir()
+    {
+        var m = Build();
+        await m.BootstrapAsync(default);
+        var dir = await m.CreateAsync("Cool Show", 555, PhantomMediaKind.Series, default);
+        Assert.True(Directory.Exists(dir),
+            $"Series stub must be a directory; got {dir}");
+        Assert.StartsWith(Path.Combine(_tempRoot, "shows"), dir, StringComparison.Ordinal);
+        Assert.Contains("__phantom_tmdb555", Path.GetFileName(dir), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task CreateAsync_Series_CreatesSeasonOneAndS01E01Symlink()
+    {
+        var m = Build();
+        await m.BootstrapAsync(default);
+        var dir = await m.CreateAsync("Show Two", 42, PhantomMediaKind.Series, default);
+        var seasonDir = Path.Combine(dir, "Season 01");
+        Assert.True(Directory.Exists(seasonDir));
+
+        var (_, _, episodeFile) = m.DeriveSeriesStubPaths("Show Two", 42);
+        Assert.True(File.Exists(episodeFile),
+            $"Expected episode symlink at {episodeFile}");
+        var fi = new FileInfo(episodeFile);
+        Assert.False(string.IsNullOrEmpty(fi.LinkTarget),
+            "Episode entry must be a symlink to the splash.");
+        Assert.Contains(" S01E01.", Path.GetFileName(episodeFile), StringComparison.Ordinal);
+        Assert.Contains("__phantom_tmdb42", Path.GetFileName(episodeFile), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task CreateAsync_Series_IsIdempotent()
+    {
+        var m = Build();
+        await m.BootstrapAsync(default);
+        var d1 = await m.CreateAsync("Show Three", 77, PhantomMediaKind.Series, default);
+        var d2 = await m.CreateAsync("Show Three", 77, PhantomMediaKind.Series, default);
+        Assert.Equal(d1, d2);
+        Assert.True(Directory.Exists(d2));
+        var (_, _, episodeFile) = m.DeriveSeriesStubPaths("Show Three", 77);
+        Assert.True(File.Exists(episodeFile));
+    }
+
+    [Fact]
+    public async Task CreateAsync_Series_ReturnsSeriesDirNotInnerFile()
+    {
+        var m = Build();
+        await m.BootstrapAsync(default);
+        var ret = await m.CreateAsync("Show Four", 11, PhantomMediaKind.Series, default);
+        Assert.True(Directory.Exists(ret));
+        Assert.False(File.Exists(ret) && !Directory.Exists(ret));
+        var (seriesDir, _, episodeFile) = m.DeriveSeriesStubPaths("Show Four", 11);
+        Assert.Equal(seriesDir, ret);
+        Assert.NotEqual(episodeFile, ret);
+    }
+
+    [Fact]
+    public async Task DeleteAsync_RecursivelyRemovesSeriesDir()
+    {
+        var m = Build();
+        await m.BootstrapAsync(default);
+        var dir = await m.CreateAsync("Show Five", 1234, PhantomMediaKind.Series, default);
+        Assert.True(Directory.Exists(dir));
+        await m.DeleteAsync(dir, default);
+        Assert.False(Directory.Exists(dir));
+        // Idempotent on missing.
+        await m.DeleteAsync(dir, default);
+    }
+
+    [Fact]
+    public async Task DeleteAsync_RefusesToRemoveDirWithoutSentinel()
+    {
+        var m = Build();
+        await m.BootstrapAsync(default);
+        var foreignDir = Path.Combine(_tempRoot, "shows", "not_a_phantom_dir");
+        Directory.CreateDirectory(foreignDir);
+        var canary = Path.Combine(foreignDir, "keep.txt");
+        File.WriteAllText(canary, "do not delete");
+
+        await m.DeleteAsync(foreignDir, default);
+
+        Assert.True(Directory.Exists(foreignDir),
+            "DeleteAsync must refuse to recursively delete a directory without the phantom sentinel.");
+        Assert.True(File.Exists(canary));
+    }
 }

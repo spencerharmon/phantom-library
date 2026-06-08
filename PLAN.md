@@ -28,6 +28,7 @@ Mascot: *Stygiomedusa gigantea*, the giant phantom jelly.
 | M10 — Phantom symlink library + visibility fix | ✅ | (unreleased, multiple commits) |
 | M11 — Post-M10 phantom UX polish               | ✅ | (unreleased, multiple commits) |
 | M12 — Dedupe-gap heal-on-rediscovery           | ✅ | (unreleased) |
+| M13 — Per-series subdir stub layout for TV phantoms | ✅ | (unreleased) |
 
 ### Documented partials
 
@@ -1498,6 +1499,56 @@ Observed issues (with diagnosis where known):
 6. Splash playback does not increment PlayCount or set
    PlayedDate. Real materialised playback does.
 7. Unit + integration tests green.
+
+---
+
+### M13 — Per-series subdir stub layout for TV phantoms (≤ 2 days)
+
+Shipped: PLAN §M13 design implemented in full. See `CHANGELOG.md`
+entry under `[Unreleased] / Added` for the user-visible summary;
+this section is left in place as the design record so future
+milestones can refer back to the rationale.
+
+#### What shipped
+
+- `PhantomStubManager.CreateAsync(Series)` now creates
+  `phantom-library/shows/<SafeName>__phantom_tmdb<id>/Season 01/<stem> S01E01.<splashExt>`
+  and returns the **per-series directory** path. Movie stubs
+  unchanged.
+- New pure helper `DeriveSeriesStubPaths(title, tmdbId)` returns
+  the `(SeriesDir, SeasonDir, EpisodeFile)` triple. Used by
+  `EvictionSweeper.DemoteAsync` to point `gostream.RemoveAsync`
+  at the inner episode file (not the dir).
+- `PhantomStubManager.DeleteAsync` recursively removes a series
+  dir only if its leaf carries the `__phantom_tmdb` sentinel;
+  refuses any other directory. Movie symlink delete unchanged.
+- `SuggestionsContributor.MaterialiseHitsAsync` /
+  `HealBrokenPhantomAsync`: the series Path assignment line is
+  unchanged — it now stores the series dir. The heal
+  `alreadyMaterialised` substring check still correctly
+  classifies a virtual series row (the dir leaf carries the
+  sentinel).
+- `Materialiser.MaterialiseCoreAsync`: the existing Series
+  early-return keeps `PromoteItemAsync` / `ResolveHostPath` off
+  the Series code path (their single-file Path assumption is
+  preserved).
+- Tests: new `PhantomStubManagerTests` for the per-series dir
+  layout, S01E01 symlink, idempotency, recursive delete, and
+  sentinel refusal. New `SuggestionsContributorTests` covering
+  series Path assignment + `phantom_items` row write. New
+  `EvictionSweeperTests` covering the Series demote branch
+  (RemoveAsync against the inner episode file) and the rebind
+  (stub_path replaced with a fresh series dir).
+
+#### Tradeoffs
+
+- Season number / episode number are hardcoded to `Season 01`
+  / `S01E01`. Phantom series only ever expose a single
+  placeholder; the autopilot creates the real Season NN / SNNENN
+  paths under the gostream physical folder when the user plays.
+- The series stub directory itself is a plain directory, not a
+  symlink. Recursive delete on it is safe under the sentinel
+  guard. We don't try to chase reparse points.
 
 ---
 

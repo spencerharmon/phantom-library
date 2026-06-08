@@ -376,14 +376,27 @@ public class M11BugsTests : IDisposable
         public Task<string> CreateAsync(string title, int tmdbId, PhantomMediaKind kind, CancellationToken ct)
         {
             Created.Add((title, tmdbId, kind));
-            var sub = kind == PhantomMediaKind.Movie ? "movies" : "shows";
+            if (kind == PhantomMediaKind.Series)
+            {
+                var (seriesDir, _, _) = DeriveSeriesStubPaths(title, tmdbId);
+                return Task.FromResult(seriesDir);
+            }
             return Task.FromResult(
-                $"/var/lib/jellyfin/phantom-library/{sub}/{title.Replace(' ', '_')}__phantom_tmdb{tmdbId}.mp4");
+                $"/var/lib/jellyfin/phantom-library/movies/{title.Replace(' ', '_')}__phantom_tmdb{tmdbId}.mp4");
         }
 
         public Task DeleteAsync(string symlinkPath, CancellationToken ct) => Task.CompletedTask;
 
         public string DeriveFilename(string title, int tmdbId, PhantomMediaKind kind)
             => $"{title.Replace(' ', '_')}__phantom_tmdb{tmdbId}.mp4";
+
+        public (string SeriesDir, string SeasonDir, string EpisodeFile) DeriveSeriesStubPaths(string title, int tmdbId)
+        {
+            var stem = $"{title.Replace(' ', '_')}__phantom_tmdb{tmdbId}";
+            var seriesDir = $"/var/lib/jellyfin/phantom-library/shows/{stem}";
+            var seasonDir = $"{seriesDir}/Season 01";
+            var episodeFile = $"{seasonDir}/{stem} S01E01.mp4";
+            return (seriesDir, seasonDir, episodeFile);
+        }
     }
 }
