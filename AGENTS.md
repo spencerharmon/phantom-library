@@ -30,6 +30,44 @@ If the change requires *no* operator action beyond the next install,
 say so explicitly: "No operator steps needed; `./install.sh` is
 sufficient." Silence on this question costs the operator time.
 
+## Single-operator deployment
+
+This project is deployed in a single-operator environment. The
+operator owns the box and the Jellyfin process. There are no
+external users, no SLA, and no "can we afford an outage" question
+to weigh — **stopping `jellyfin.service` for maintenance is always
+acceptable.**
+
+The operational consequence: **prefer offline bash scripts (run
+with `jellyfin.service` stopped) over in-plugin
+`IHostedService` migrations or any runtime data-mutation service
+that touches the Jellyfin DB or the on-disk media tree.** With
+Jellyfin stopped, the entire DB and filesystem sit still while
+the script works; there is no library scanner, no file watcher,
+no user playback, nothing to race.
+
+Concrete failure that motivated this rule (do not repeat):
+v0.2.0.0 shipped an in-plugin `StubLayoutMigration` IHostedService
+that ran on plugin startup while Jellyfin was live. It moved
+stub files on disk and called `UpdateItemAsync` to repoint
+`BaseItem.Path`. The live library scanner saw old paths vanish
+before the `UpdateItemAsync` landed, saw the new-format paths
+appear, and created **fresh BaseItems** for them — leaving the
+library with duplicate BaseItems and the UI still showing the
+legacy scanner-derived names. The fix was to delete the
+IHostedService and consolidate the migration into
+`scripts/migrate-stub-layout-v1.sh`, which the operator runs
+with Jellyfin stopped. **Do not reintroduce a runtime migration
+service.**
+
+When a one-shot migration needs to record "this has run" across
+plugin restarts, the `plugin_meta` key/value table in `phantom.db`
+is the right place. A bash script can read/write it via
+`sqlite3` while Jellyfin is stopped, with no concurrency to
+worry about. The plugin reads it on startup to decide whether to
+emit a "migration not yet run" warning, but does not perform the
+migration itself.
+
 ## Read first
 
 - `PLAN.md` — milestone tracker, design decisions, the

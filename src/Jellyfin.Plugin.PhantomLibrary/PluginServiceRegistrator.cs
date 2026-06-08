@@ -92,8 +92,12 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         serviceCollection.AddSingleton<PhantomStatusDecorator>();
         serviceCollection.AddHostedService(sp => sp.GetRequiredService<PhantomStatusDecorator>());
 
-        // Spike: one-shot stub-layout migration (legacy __phantom_tmdb -> [tmdbid-N]).
-        serviceCollection.AddHostedService<StubLayoutMigration>();
+        // NOTE: legacy stub-layout migration runs offline via
+        // scripts/migrate-stub-layout-v1.sh (Jellyfin stopped). An
+        // earlier in-plugin IHostedService raced the live library
+        // scanner and produced duplicate BaseItems; see AGENTS.md
+        // "Single-operator deployment". Do not reintroduce a runtime
+        // migration service.
 
         // Suggestions (M6)
         serviceCollection.AddSingleton<VirtualLibraryRoot>();

@@ -29,7 +29,7 @@ Mascot: *Stygiomedusa gigantea*, the giant phantom jelly.
 | M11 — Post-M10 phantom UX polish               | ✅ | (unreleased, multiple commits) |
 | M12 — Dedupe-gap heal-on-rediscovery           | ✅ | (unreleased) |
 | M13 — Per-series subdir stub layout for TV phantoms | ✅ | (unreleased) |
-| Spike — Jellyfin-native `[tmdbid-<id>]` stub layout | 🚧 IN PROGRESS — operator validating | (unreleased) |
+| Spike — Jellyfin-native `[tmdbid-<id>]` stub layout | 🚧 IN PROGRESS — operator re-validating after rollback | (unreleased) |
 
 ### Documented partials
 
@@ -1526,11 +1526,18 @@ BaseItem.Name is the real title (e.g. `The Boys` instead of
 - Call sites threaded with `int? year` from `BaseItem.ProductionYear`:
   `SuggestionsContributor` (create + heal), `SeriesIngestor`,
   `EvictionSweeper`.
-- `StubLayoutMigration` hosted service runs once at startup;
-  renames legacy stubs, updates `BaseItems.Path`, records completion
-  in a new `plugin_meta` table. Idempotent at per-row level.
-- `scripts/migrate-stub-layout-v1.sh` manual fallback for when the
-  in-plugin migration cannot complete.
+- `scripts/migrate-stub-layout-v1.sh` is the **canonical** offline
+  migration (Jellyfin stopped). It handles legacy renames, recovers
+  half-migrated rows, and collapses duplicate BaseItems from the
+  failed in-plugin run. Records `plugin_meta.stub_layout_v1_complete`
+  on a clean pass.
+- *(2026-06-08 rollback)* The in-plugin `StubLayoutMigration`
+  IHostedService that originally shipped with v0.2.0.0 was
+  **deleted**: it raced the live library scanner and produced
+  duplicate BaseItems. AGENTS.md gained a "Single-operator
+  deployment" section codifying the rule: prefer offline bash
+  scripts over in-plugin runtime data-mutation services. Do not
+  reintroduce a runtime migration service.
 - Plugin version bumped to `0.2.0.0`; rig + docs updated.
 
 #### Intentionally left in place (spike scope)

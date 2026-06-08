@@ -6,6 +6,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **In-plugin `StubLayoutMigration` IHostedService.** Ran on plugin
+  startup while Jellyfin was live, moved stub files on disk, and
+  called `UpdateItemAsync` to repoint `BaseItem.Path`. It raced
+  Jellyfin's live library scanner: the watcher saw old paths
+  vanish, the scanner saw new-format paths appear and created
+  **fresh BaseItems** for them — leaving the library with
+  duplicate BaseItems and the UI still showing the legacy
+  scanner-derived names. Replaced by the offline
+  `scripts/migrate-stub-layout-v1.sh` bash script, run with
+  Jellyfin stopped. AGENTS.md gains a new "Single-operator
+  deployment" section codifying the rule: prefer offline bash
+  scripts over in-plugin runtime migrations.
+
+### Migration
+
+- Operators on v0.2.0.0 must stop Jellyfin and run
+  `scripts/migrate-stub-layout-v1.sh` to complete the layout
+  migration cleanly. The script handles the partially-broken
+  half-migration the in-plugin run produced: renames any
+  unfinished legacy stubs, recovers `BaseItem.Path` values that
+  point at moved-but-not-yet-DB-updated files, and collapses
+  duplicate BaseItems (same Tmdb id + Type) the live-scanner
+  race produced, preferring the survivor whose path is on disk
+  in new format and whose UserData rows must be preserved.
+  Records `plugin_meta.stub_layout_v1_complete` on a clean pass.
+  `--dry-run` performs zero writes; both DBs are backed up to
+  `<dir>/<dbname>.bak.<ts>` before any write in a real run.
+
 ### Fixed
 
 - **StubLayoutMigration: source `oldPath` from `BaseItem.Path`, not
@@ -23,6 +53,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `scripts/migrate-stub-layout-v1.sh` (also updated to use the
   Jellyfin 10.11 TEXT-form `BaseItems.Id` join, not the obsolete
   BLOB-form `hex(Id)`).
+
+  *(Historical note: this fix targeted the now-deleted in-plugin
+  migration. The behaviour it describes is preserved in the
+  current offline bash script: source `BaseItem.Path` as the
+  authoritative legacy path; bring `phantom_items.stub_path` into
+  sync for rows already on the new format.)*
 
 ### Added
 
@@ -44,16 +80,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   eviction / migration paths — no more scattered
   `Contains("__phantom_tmdb")` substring checks.
 
-- **One-shot stub-layout migration.** A new `StubLayoutMigration`
-  hosted service runs at plugin startup, renames every existing
-  Virtual phantom stub from the legacy filename scheme to the new
-  path-token scheme, and updates `BaseItems.Path` atomically.
-  Records completion in a new `plugin_meta` table
-  (`stub_layout_v1_complete` key) so subsequent startups no-op.
-  Idempotent at the per-row level; refuses to overwrite an existing
-  destination. A manual fallback bash script ships at
-  `scripts/migrate-stub-layout-v1.sh` for cases where the in-plugin
-  migration cannot complete (operator runs with Jellyfin stopped).
+- **One-shot stub-layout migration.** Canonical migration ships as
+  `scripts/migrate-stub-layout-v1.sh`, run offline with
+  Jellyfin stopped (see `Removed` above for why an in-plugin
+  version was attempted and pulled). Renames every existing
+  legacy phantom stub from `__phantom_tmdb<id>` to
+  `<Title> (<Year>) [tmdbid-<id>]`, updates `BaseItems.Path`, and
+  records completion in a new `plugin_meta` table
+  (`stub_layout_v1_complete` key). Idempotent at the per-row
+  level; refuses to run while Jellyfin is active.
 
 ### Notes
 
