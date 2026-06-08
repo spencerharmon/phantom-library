@@ -6,6 +6,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`scripts/migrate-stub-layout-v1.sh`: orphan reassociation,
+  conflict-resolution, and relaxed marker criteria.** Dry-run
+  against prod revealed ~19345 phantom_items rows whose
+  `item_guid` pointed at BaseItems the live scanner had culled
+  (the broken v0.2.0.0 in-plugin migration moved the files out
+  from under the scanner, which then created replacement
+  BaseItems with fresh GUIDs). The migration script now:
+  1. Adds an **orphan-reassociation pass** after duplicate
+     collapse: looks up the surviving BaseItem by
+     `(Tmdb id, type)` under `--stub-root` and rewrites
+     `phantom_items.item_guid` (and `materialisation_log`) so
+     tracked state (autopilot, eviction_protected,
+     original_overview, materialisation history) is preserved
+     across the rename. New counters: `reassociated`,
+     `orphan_no_baseitem`, `orphan_multi_match`,
+     `orphan_collision`, `orphan_pruned`.
+  2. **Resolves conflict cases** where both the legacy and
+     new-format files exist on disk as symlinks to the same
+     target (deletes the legacy link, treats as migrated).
+     Applies to both movies and series.
+  3. **Relaxes marker-set criteria**: `new_format_missing_on_disk`,
+     `orphan_no_baseitem`, `skipped_not_phantom`,
+     `orphan_multi_match`, and `orphan_collision` no longer
+     block the `stub_layout_v1_complete` marker (they are
+     observations, not failures). `failed`, unresolved
+     `skipped_conflict`, and `both_missing` still block.
+  4. **`--prune-orphans` semantics changed**: orphan deletion
+     is deferred to *after* the reassociation pass so the flag
+     only removes rows that genuinely cannot be rebound to any
+     surviving BaseItem. Previously orphans were deleted during
+     the per-row pass, destroying state the reassociation pass
+     could have recovered.
+  Re-runnability: a clean follow-up run reports everything 0
+  except `already_new`. Repro harness at
+  `tools/rig-scenarios/migrate-orphan-repro.sh`.
+
 ### Removed
 
 - **In-plugin `StubLayoutMigration` IHostedService.** Ran on plugin
