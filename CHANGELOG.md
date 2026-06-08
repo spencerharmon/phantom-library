@@ -8,6 +8,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Spike: Jellyfin-native stub-layout (`[tmdbid-<id>]` path tokens).**
+  Phantom stubs now use the Jellyfin-native
+  `<Title> (<Year>) [tmdbid-<id>]` filename / directory layout
+  instead of the custom `__phantom_tmdb<id>` sentinel scheme.
+  Newly-created stubs (movies and series) render with the real
+  title in Jellyfin — no more `Word_Word__phantom_tmdb1234`
+  scanner-derived names. Year segment is omitted when TMDB lacks
+  it. Episode filenames under series stubs intentionally drop the
+  bracketed token (the series directory carries it) so the
+  `tvshows` resolver derives clean episode names. `PhantomStubManager`
+  exposes year-aware overloads of `CreateAsync`,
+  `DeriveFilename`, and `DeriveSeriesStubPaths`; old overloads
+  forward with `year: null` for back-compat. A new
+  `PhantomPathUtilities` helper centralises the dual-recognition
+  logic (legacy sentinel OR new token) used by dedupe / heal /
+  eviction / migration paths — no more scattered
+  `Contains("__phantom_tmdb")` substring checks.
+
+- **One-shot stub-layout migration.** A new `StubLayoutMigration`
+  hosted service runs at plugin startup, renames every existing
+  Virtual phantom stub from the legacy filename scheme to the new
+  path-token scheme, and updates `BaseItems.Path` atomically.
+  Records completion in a new `plugin_meta` table
+  (`stub_layout_v1_complete` key) so subsequent startups no-op.
+  Idempotent at the per-row level; refuses to overwrite an existing
+  destination. A manual fallback bash script ships at
+  `scripts/migrate-stub-layout-v1.sh` for cases where the in-plugin
+  migration cannot complete (operator runs with Jellyfin stopped).
+
+### Notes
+
+- **This is an A/B spike.** The heal-on-rediscovery logic, the
+  forced `IsLocked = true` re-stamp dance, `PhantomImageProvider`,
+  and `PhantomStatusDecorator`'s Overview-prefix mutation are
+  intentionally left in place pending operator validation that the
+  new layout actually fixes the scanner-derived-name bug. Follow-up
+  cleanup PR will remove the now-unnecessary cruft once validation
+  confirms the spike works end-to-end.
+
+- Plugin version bumped to `0.2.0.0` (on-disk layout change is
+  unambiguously user-visible). Test rig + install docs updated
+  accordingly.
+
+## [0.1.x-pre]
+
+### Added
+
 - **M13 — Per-series subdir stub layout for TV phantoms.**
   Replaces the loose-file phantom-show layout from M10 (one
   symlink per series at the top of `phantom-library/shows/`)

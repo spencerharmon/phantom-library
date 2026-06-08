@@ -295,7 +295,7 @@ public sealed class EvictionSweeper : IHostedService, IDisposable
             {
                 try
                 {
-                    var (_, _, episodeFile) = _stubs.DeriveSeriesStubPaths(item.Name ?? string.Empty, seriesTmdb);
+                    var (_, _, episodeFile) = _stubs.DeriveSeriesStubPaths(item.Name ?? string.Empty, item.ProductionYear, seriesTmdb);
                     removeTarget = episodeFile;
                 }
                 catch (Exception ex)
@@ -405,7 +405,7 @@ public sealed class EvictionSweeper : IHostedService, IDisposable
         var kind = item is Series ? PhantomMediaKind.Series : PhantomMediaKind.Movie;
         try
         {
-            return await _stubs.CreateAsync(item.Name ?? string.Empty, tmdbId, kind, ct).ConfigureAwait(false);
+            return await _stubs.CreateAsync(item.Name ?? string.Empty, item.ProductionYear, tmdbId, kind, ct).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

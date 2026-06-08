@@ -29,6 +29,7 @@ Mascot: *Stygiomedusa gigantea*, the giant phantom jelly.
 | M11 — Post-M10 phantom UX polish               | ✅ | (unreleased, multiple commits) |
 | M12 — Dedupe-gap heal-on-rediscovery           | ✅ | (unreleased) |
 | M13 — Per-series subdir stub layout for TV phantoms | ✅ | (unreleased) |
+| Spike — Jellyfin-native `[tmdbid-<id>]` stub layout | 🚧 IN PROGRESS — operator validating | (unreleased) |
 
 ### Documented partials
 
@@ -1501,6 +1502,53 @@ Observed issues (with diagnosis where known):
 7. Unit + integration tests green.
 
 ---
+
+### Spike — Jellyfin-native `[tmdbid-<id>]` stub layout (≤ 1 day)
+
+Status: **IN PROGRESS — operator validating.** A/B spike that swaps
+the on-disk phantom-stub filename / dirname scheme from the custom
+`__phantom_tmdb<id>` sentinel to Jellyfin's native
+`[tmdbid-<id>]` path-token form, so the scanner-derived
+BaseItem.Name is the real title (e.g. `The Boys` instead of
+`The_Boys__phantom_tmdb1234`).
+
+#### What shipped (this PR)
+
+- New `PhantomPathUtilities` helper recognises BOTH the legacy
+  sentinel and the new bracketed token. All
+  `Contains("__phantom_tmdb")` checks in feature code routed through
+  it.
+- `PhantomStubManager` gains year-aware overloads of `CreateAsync`,
+  `DeriveFilename`, `DeriveSeriesStubPaths` emitting
+  `<Title> (<Year>) [tmdbid-<id>]` layout. `DisplaySanitize`
+  preserves spaces / parens / hyphens; strips only filesystem-
+  hostile chars.
+- Call sites threaded with `int? year` from `BaseItem.ProductionYear`:
+  `SuggestionsContributor` (create + heal), `SeriesIngestor`,
+  `EvictionSweeper`.
+- `StubLayoutMigration` hosted service runs once at startup;
+  renames legacy stubs, updates `BaseItems.Path`, records completion
+  in a new `plugin_meta` table. Idempotent at per-row level.
+- `scripts/migrate-stub-layout-v1.sh` manual fallback for when the
+  in-plugin migration cannot complete.
+- Plugin version bumped to `0.2.0.0`; rig + docs updated.
+
+#### Intentionally left in place (spike scope)
+
+- `HealBrokenPhantomAsync` + dedupe-hit healing branch.
+- `IsLocked = true` re-stamp after `CreateItem` / `UpdateItemAsync`.
+- `PhantomImageProvider`.
+- `PhantomStatusDecorator` Overview-prefix mutation.
+- `PhantomStubManager.Sentinel` legacy constant.
+
+#### Follow-up cleanup PR (blocked on operator validation)
+
+- Remove `HealBrokenPhantomAsync` + dedupe-hit healing branch.
+- Drop default `IsLocked = true` for new phantom items.
+- Remove (or scope down) `PhantomImageProvider`.
+- Remove `PhantomStatusDecorator` Overview mutation + the
+  `original_overview` round-trip column.
+- Remove `Sentinel` constant + `PhantomPathUtilities` legacy branch.
 
 ### M13 — Per-series subdir stub layout for TV phantoms (≤ 2 days)
 

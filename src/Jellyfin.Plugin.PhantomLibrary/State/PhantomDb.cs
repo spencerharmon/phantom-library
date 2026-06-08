@@ -148,7 +148,7 @@ public sealed class PhantomDb : IDisposable
         return conn;
     }
 
-    private const int CurrentSchemaVersion = 4;
+    private const int CurrentSchemaVersion = 5;
 
     private static void EnsureSchema(SqliteConnection conn)
     {
@@ -229,6 +229,20 @@ public sealed class PhantomDb : IDisposable
             AddColumnIfMissing("stub_path", "TEXT");
             AddColumnIfMissing("fuse_path", "TEXT");
             AddColumnIfMissing("materialised_at", "INTEGER");
+        }
+
+        if (version < 5)
+        {
+            // v5: plugin_meta key/value table used by one-shot
+            // migrations (e.g. stub layout v1) to record completion
+            // markers so they do not re-run on every startup.
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = @"CREATE TABLE IF NOT EXISTS plugin_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);";
+            cmd.ExecuteNonQuery();
         }
 
         using (var sv = conn.CreateCommand())
@@ -947,6 +961,42 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_cache_expiry ON tmdb_cache(cached_at, ttl_se
             cmd.CommandText = "DELETE FROM tmdb_cache WHERE (cached_at + ttl_seconds) < $now;";
             cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
             return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    // ---- plugin_meta (one-shot migration markers) ----
+
+    /// <summary>Reads a plugin_meta value by key, or null if absent.</summary>
+    public async Task<string?> GetMetaAsync(string key, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(key);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT value FROM plugin_meta WHERE key=$k LIMIT 1;";
+        cmd.Parameters.AddWithValue("$k", key);
+        var v = await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
+        return v is null or DBNull ? null : (string)v;
+    }
+
+    /// <summary>Upserts a plugin_meta key/value pair.</summary>
+    public async Task SetMetaAsync(string key, string value, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(key);
+        ArgumentNullException.ThrowIfNull(value);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"INSERT INTO plugin_meta(key, value) VALUES($k, $v)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value;";
+            cmd.Parameters.AddWithValue("$k", key);
+            cmd.Parameters.AddWithValue("$v", value);
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
         finally
         {
