@@ -6,6 +6,91 @@ authoritative project docs. This file translates them into
 conventions an agent needs to operate session-to-session
 without re-deriving them.
 
+## No database migrations until v1.0 (always, no exceptions)
+
+**Pre-v1.0, this project does not ship database migrations.** Not
+for `phantom.db`, not for `jellyfin.db`, not for any persistent
+state the plugin owns. If the schema changes — a new column, a
+new table, a renamed field, a rekeyed primary key, a change to
+what any existing column stores — the upgrade path is **wipe and
+rebuild**, not migrate.
+
+What "wipe and rebuild" means concretely:
+
+- Operator stops Jellyfin.
+- Phantom state is deleted (`phantom.db` removed, phantom-tracked
+  `BaseItems` removed from `jellyfin.db`, stub directories
+  emptied). The repo's existing `/tmp/phantom-wipe.sh`-style
+  one-off scripts are the template for this.
+- Operator restarts Jellyfin.
+- Plugin recreates schema via `PhantomDb.EnsureSchemaAsync` and
+  starts from zero state.
+- `SuggestionsRefreshTask` repopulates from TMDB on its next tick
+  (or operator triggers it manually).
+
+Forbidden patterns under this rule:
+
+- Shipping an `IHostedService` migration that mutates operator
+  state on plugin startup. (Already independently forbidden per
+  the *Single-operator deployment* section, for race-condition
+  reasons. This rule additionally forbids it for state-evolution
+  reasons.)
+- Shipping a bash script in the repo that migrates between two
+  pre-v1.0 schema versions. One-off recovery scripts for a
+  specific botched upgrade are fine (they live in `/tmp/`, not
+  the repo), but no general-purpose migration tooling.
+- Adding an `ALTER TABLE` or `ADD COLUMN` branch keyed on a
+  detected old schema version. Bump the schema, expect a wipe.
+- Writing code that reads old-format rows and rewrites them on
+  the fly. Old-format rows do not exist after a wipe.
+- Calling something a "non-destructive schema upgrade" because it
+  only adds columns / tables. Every assumed-non-destructive
+  upgrade has had a non-obvious failure mode in this codebase
+  (see the v0.2.0.0 in-plugin `StubLayoutMigration` post-mortem
+  in `PLAN.md`).
+
+What to do instead when you change schema or persistent format:
+
+1. Bump `PhantomDb`'s schema version constant.
+2. Update `EnsureSchemaAsync` to produce the new schema from
+   scratch.
+3. Update the relevant on-disk layout / naming if needed.
+4. Add a `CHANGELOG.md` entry under Unreleased with a
+   **"BREAKING: requires wipe"** prefix and an inline pointer
+   to the wipe procedure.
+5. Add the wipe procedure to the operator handoff at the end of
+   the PR message. The operator runs the wipe before installing
+   the new plugin DLL.
+6. **Do not** write a migration to bridge between old and new.
+
+Why this rule exists:
+
+- The project has zero external users. Wipe-and-rebuild has no
+  cost to a user base because there is no user base.
+- The operator's repopulation cost is one TMDB refresh tick. No
+  irreplaceable state lives in `phantom.db` — user-visible state
+  (favourites, watched, watch history) is in `jellyfin.db`'s
+  `UserDatas` table, keyed on `BaseItems.Id`. Wiping phantom
+  state does not touch user data.
+- Migration testing requires reproducing the operator's actual
+  data shape in a sandbox, validating every schema-version pair,
+  and trusting the migration to behave the same on dirty real
+  data as on clean test data. The v0.2.0.0 attempt failed this
+  bar four separate ways (race with scanner, wrong column
+  assumption, wrong SQL dialect assumption, wrong row-target
+  assumption). The cost of "just test the migration" has
+  empirically been higher than the cost of "wipe and rebuild."
+- A clean wipe also resets accumulated cruft: orphan rows,
+  collision artifacts, stale `phantom_items.stub_path = NULL`
+  rows from older plugin versions, half-materialised state from
+  crashed operations. Migrations preserve all of this, often
+  invisibly. Wipes do not.
+
+**At v1.0**, this rule lifts: real migrations become required
+because the project will then have a stable on-disk format that
+operators reasonably expect to upgrade in place. Until then,
+schema evolution = wipe.
+
 ## Canonical phantom stub naming scheme (always, no exceptions)
 
 The canonical on-disk naming scheme for phantom stubs is Jellyfin's
