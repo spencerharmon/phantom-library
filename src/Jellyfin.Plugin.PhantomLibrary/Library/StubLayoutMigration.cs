@@ -102,18 +102,6 @@ internal sealed class StubLayoutMigration : IHostedService
         foreach (var row in rows)
         {
             ct.ThrowIfCancellationRequested();
-            if (string.IsNullOrWhiteSpace(row.StubPath))
-            {
-                continue;
-            }
-
-            if (!PhantomPathUtilities.IsLegacyStubPath(row.StubPath))
-            {
-                // Already on new format (or unrecognised). Idempotent skip.
-                summary.AlreadyNewFormat++;
-                continue;
-            }
-
             try
             {
                 await MigrateRowAsync(row, summary, ct).ConfigureAwait(false);
@@ -122,22 +110,31 @@ internal sealed class StubLayoutMigration : IHostedService
             {
                 summary.Failed++;
                 _logger.LogWarning(ex,
-                    "[StubLayoutMigration] failed for item {Id} ({Path})",
-                    row.ItemGuid, row.StubPath);
+                    "[StubLayoutMigration] failed for item {Id} (stub_path={Path})",
+                    row.ItemGuid, row.StubPath ?? "<null>");
             }
         }
 
         _logger.LogInformation(
-            "[StubLayoutMigration] done: scanned={S} migrated={M} alreadyNew={N} skippedConflict={C} skippedNoBaseItem={O} failed={F}",
+            "[StubLayoutMigration] done: scanned={S} migrated={M} alreadyNew={N} skippedConflict={C} skippedNoBaseItem={O} skippedNoPath={P} skippedNotPhantom={X} failed={F}",
             summary.Scanned, summary.Migrated, summary.AlreadyNewFormat,
-            summary.SkippedConflict, summary.SkippedNoBaseItem, summary.Failed);
+            summary.SkippedConflict, summary.SkippedNoBaseItem,
+            summary.SkippedNoPath, summary.SkippedNotPhantom, summary.Failed);
 
         if (summary.Failed == 0)
         {
-            // Orphan rows (missing BaseItem) don't block marker write —
-            // they will never recover from a re-run. Genuine failures
-            // (IOException etc.) do block the marker so the next start
-            // retries them.
+            // Marker semantics:
+            //  - Orphan rows (SkippedNoBaseItem) and path-less Virtual
+            //    rows (SkippedNoPath) do not block the marker — they
+            //    will never improve on re-run and we don't want to
+            //    rescan the entire Virtual table on every startup.
+            //  - SkippedNotPhantom is an inconsistency (phantom row
+            //    references a BaseItem that points outside the
+            //    phantom-stub tree). It's logged as a WARNING per item
+            //    above so the operator can investigate, but does NOT
+            //    block the marker for the same reason — re-running
+            //    will not fix it without operator intervention.
+            //  - Only real failures (Failed > 0) block the marker.
             var now = DateTimeOffset.UtcNow.ToString("o", CultureInfo.InvariantCulture);
             await _db.SetMetaAsync(MarkerKey, now, ct).ConfigureAwait(false);
             summary.MarkerSet = true;
@@ -154,14 +151,62 @@ internal sealed class StubLayoutMigration : IHostedService
 
     private async Task MigrateRowAsync(PhantomItemRow row, MigrationSummary summary, CancellationToken ct)
     {
-        var oldPath = row.StubPath!;
+        // Authoritative source of the on-disk path is BaseItem.Path —
+        // phantom_items.stub_path is only populated by Materialiser, so
+        // Virtual rows created by SuggestionsContributor / SeriesIngestor
+        // have stub_path = NULL even though a real stub exists on disk
+        // and Jellyfin's BaseItem.Path points at it. Using BaseItem.Path
+        // as the source matches what the UI shows and what Jellyfin
+        // scans.
         var baseItem = TryGetItem(row.ItemGuid);
         if (baseItem is null)
         {
             _logger.LogInformation(
-                "[StubLayoutMigration] no BaseItem for {Id} ({Path}); orphan row, skipping",
-                row.ItemGuid, oldPath);
+                "[StubLayoutMigration] no BaseItem for {Id} (stub_path={Path}); orphan row, skipping",
+                row.ItemGuid, row.StubPath ?? "<null>");
             summary.SkippedNoBaseItem++;
+            return;
+        }
+
+        var oldPath = baseItem.Path;
+        if (string.IsNullOrWhiteSpace(oldPath))
+        {
+            // Path-less Virtual items: Jellyfin sometimes drops Path on
+            // refresh. Nothing to rename. Documented in
+            // SuggestionsContributor's UpsertPhantomRowAsync (~:444-453).
+            _logger.LogDebug(
+                "[StubLayoutMigration] BaseItem {Id} has no Path; skipping",
+                row.ItemGuid);
+            summary.SkippedNoPath++;
+            return;
+        }
+
+        if (!PhantomPathUtilities.IsPhantomStubPath(oldPath))
+        {
+            // phantom_items row exists but BaseItem.Path points outside
+            // the phantom-stub tree. This shouldn't happen and warrants
+            // operator inspection. Log loudly, count, but don't block
+            // the marker (re-running won't fix it).
+            _logger.LogWarning(
+                "[StubLayoutMigration] BaseItem {Id} path is not a phantom stub: {Path}; skipping",
+                row.ItemGuid, oldPath);
+            summary.SkippedNotPhantom++;
+            return;
+        }
+
+        if (!PhantomPathUtilities.IsLegacyStubPath(oldPath))
+        {
+            // Already on new format. If phantom_items.stub_path is stale
+            // or null, bring it into sync so downstream consumers that
+            // do trust stub_path (e.g. Materialiser) see the right path.
+            if (!string.Equals(row.StubPath, oldPath, StringComparison.Ordinal))
+            {
+                await _db.UpsertPhantomItemAsync(
+                    row.ItemGuid,
+                    row with { StubPath = oldPath, LastTouched = DateTimeOffset.UtcNow },
+                    ct).ConfigureAwait(false);
+            }
+            summary.AlreadyNewFormat++;
             return;
         }
 
@@ -320,6 +365,8 @@ internal sealed class StubLayoutMigration : IHostedService
         public int AlreadyNewFormat { get; set; }
         public int SkippedConflict { get; set; }
         public int SkippedNoBaseItem { get; set; }
+        public int SkippedNoPath { get; set; }
+        public int SkippedNotPhantom { get; set; }
         public int Failed { get; set; }
         public bool MarkerSet { get; set; }
         public bool AlreadyComplete { get; set; }

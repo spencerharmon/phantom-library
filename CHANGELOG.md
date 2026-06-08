@@ -6,6 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **StubLayoutMigration: source `oldPath` from `BaseItem.Path`, not
+  `phantom_items.stub_path`.** The migration was scanning every Virtual
+  row but migrating zero, because Suggestions-created Virtual rows
+  have `stub_path = NULL` (only `Materialiser` populates that column).
+  The real path lives on `BaseItem.Path` — that's what Jellyfin
+  scans, that's what the UI reflects, that's what needs renaming.
+  Migration now looks up the BaseItem first, takes its `Path` as the
+  authoritative legacy path, and brings `phantom_items.stub_path`
+  into sync when the BaseItem is already on the new format. New
+  counters `SkippedNoPath` / `SkippedNotPhantom` cover the
+  edge cases (path-less BaseItems; phantom rows whose BaseItem points
+  outside the stub tree). The same fix applied to
+  `scripts/migrate-stub-layout-v1.sh` (also updated to use the
+  Jellyfin 10.11 TEXT-form `BaseItems.Id` join, not the obsolete
+  BLOB-form `hex(Id)`).
+
 ### Added
 
 - **Spike: Jellyfin-native stub-layout (`[tmdbid-<id>]` path tokens).**

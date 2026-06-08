@@ -88,19 +88,34 @@ fi
 migrated=0
 skipped_conflict=0
 skipped_new=0
+skipped_no_phantom=0
 failed=0
 
-# List Virtual rows from phantom_items with legacy stub paths.
-# Fields: item_guid|tmdb_id|type|stub_path
+# Source of truth for on-disk paths is BaseItems.Path — phantom_items.stub_path
+# is NULL for Virtual rows created by SuggestionsContributor /
+# SeriesIngestor (only Materialiser populates it). Drive the iteration
+# from BaseItems joined to phantom_items so we operate on what Jellyfin
+# actually thinks the path is.
+#
+# Jellyfin 10.11 BaseItems.Id is a dashed uppercase GUID TEXT;
+# phantom_items.item_guid is a 32-char lowercase hex with no dashes.
+# Match on lower(replace(BaseItems.Id,'-','')) == phantom_items.item_guid.
+#
+# We also pick up rows where stub_path already has the legacy sentinel
+# (legacy from older migrations or Materialised-then-demoted items).
+# Both jellyfin.db and phantom.db are external; we cross-join in shell
+# rather than ATTACH so the operator can point --phantom-db / --jellyfin-db
+# at unusual locations without permission games.
+
+# Pull every Virtual phantom row + its BaseItem path + name + year.
+# We fetch BaseItem fields in a second per-row query for clarity.
 rows=$(sqlite3 -separator $'\t' "$PHANTOM_DB" \
-    "SELECT item_guid, COALESCE(tmdb_id, 0), type, stub_path
+    "SELECT item_guid, COALESCE(tmdb_id, 0), type, COALESCE(stub_path,'')
        FROM phantom_items
-       WHERE state='Virtual'
-         AND stub_path IS NOT NULL
-         AND stub_path LIKE '%__phantom_tmdb%';")
+       WHERE state='Virtual';")
 
 if [[ -z "$rows" ]]; then
-    echo "[migrate-stub-layout-v1] no legacy rows to migrate."
+    echo "[migrate-stub-layout-v1] no Virtual rows to inspect."
     exit 0
 fi
 
@@ -112,18 +127,58 @@ sanitize_title() {
     sed -E 's#[/\\\[\]:*?<>|"]+# #g' | tr -s '[:space:]' ' ' | sed -E 's/^ +| +$//g'
 }
 
-while IFS=$'\t' read -r guid tmdb type old_path; do
+while IFS=$'\t' read -r guid tmdb type stub_path; do
     [[ -z "$guid" ]] && continue
 
-    # Look up BaseItem name + production year. BaseItems.Id is a BLOB GUID;
-    # the plugin stores GUID as 32-char hex with no dashes. Try both forms.
-    # The DB stores GUID as raw 16 bytes in jellyfin; the phantom plugin
-    # stores as 32-char hex. Convert: e.g. abcdef...
-    formatted_guid="${guid:0:8}-${guid:8:4}-${guid:12:4}-${guid:16:4}-${guid:20:12}"
-    name=$(sqlite3 "$JELLYFIN_DB" \
-        "SELECT COALESCE(Name,'') FROM BaseItems WHERE lower(hex(Id))='$(echo -n $guid | tr 'A-Z' 'a-z')' LIMIT 1;" 2>/dev/null || true)
-    year=$(sqlite3 "$JELLYFIN_DB" \
-        "SELECT COALESCE(ProductionYear,0) FROM BaseItems WHERE lower(hex(Id))='$(echo -n $guid | tr 'A-Z' 'a-z')' LIMIT 1;" 2>/dev/null || true)
+    # Look up the BaseItem row by joining on the de-dashed hex form of
+    # BaseItems.Id (Jellyfin 10.11 stores Id as dashed uppercase TEXT).
+    bi=$(sqlite3 -separator $'\t' "$JELLYFIN_DB" \
+        "SELECT COALESCE(Path,''), COALESCE(Name,''), COALESCE(ProductionYear,0)
+           FROM BaseItems
+           WHERE lower(replace(Id,'-',''))='${guid}'
+           LIMIT 1;" 2>/dev/null || true)
+
+    if [[ -z "$bi" ]]; then
+        # No BaseItem; orphan phantom row. Skip (matches plugin
+        # SkippedNoBaseItem behaviour).
+        continue
+    fi
+
+    bi_path=$(echo "$bi" | cut -f1)
+    name=$(echo "$bi" | cut -f2)
+    year=$(echo "$bi" | cut -f3)
+
+    if [[ -z "$bi_path" ]]; then
+        # Path-less Virtual item; nothing to rename.
+        continue
+    fi
+
+    # Authoritative on-disk path is BaseItems.Path. stub_path is
+    # advisory and is often NULL for Suggestions-created rows.
+    old_path="$bi_path"
+
+    # Must be one of ours: either legacy sentinel or new token.
+    case "$old_path" in
+        *__phantom_tmdb*|*\[tmdbid-*\]*) ;;
+        *)
+            echo "[NOT-PHANTOM] $guid path=$old_path (skipping; investigate)"
+            ((skipped_no_phantom++)); continue
+            ;;
+    esac
+
+    # Already on the new format? Sync stub_path if needed, otherwise no-op.
+    case "$old_path" in
+        *__phantom_tmdb*) : ;;
+        *)
+            if [[ "$stub_path" != "$old_path" && "$DRY_RUN" -eq 0 ]]; then
+                np_esc=$(printf "%s" "$old_path" | sed "s/'/''/g")
+                sqlite3 "$PHANTOM_DB" \
+                    "UPDATE phantom_items SET stub_path='$np_esc' WHERE item_guid='$guid';" \
+                    || true
+            fi
+            ((skipped_new++)); continue
+            ;;
+    esac
 
     if [[ -z "$name" || "$name" == *"__phantom_tmdb"* ]]; then
         # Reverse-derive from filename / dirname leaf.
@@ -199,14 +254,14 @@ while IFS=$'\t' read -r guid tmdb type old_path; do
             "UPDATE phantom_items SET stub_path='$np_esc' WHERE item_guid='$guid';" \
             || { echo "  [FAIL phantom_items update]"; ((failed++)); continue; }
         sqlite3 "$JELLYFIN_DB" \
-            "UPDATE BaseItems SET Path='$np_esc' WHERE lower(hex(Id))='$(echo -n $guid | tr 'A-Z' 'a-z')';" \
+            "UPDATE BaseItems SET Path='$np_esc' WHERE lower(replace(Id,'-',''))='$guid';" \
             || { echo "  [FAIL jellyfin.db update]"; ((failed++)); continue; }
     fi
     ((migrated++))
 done <<< "$rows"
 
 echo
-echo "[migrate-stub-layout-v1] done: migrated=$migrated skipped_new=$skipped_new skipped_conflict=$skipped_conflict failed=$failed"
+echo "[migrate-stub-layout-v1] done: migrated=$migrated skipped_new=$skipped_new skipped_conflict=$skipped_conflict skipped_no_phantom=$skipped_no_phantom failed=$failed"
 
 if [[ "$failed" -gt 0 ]]; then exit 1; fi
 exit 0
