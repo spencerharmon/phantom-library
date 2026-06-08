@@ -11,6 +11,19 @@ Mascot: *Stygiomedusa gigantea*, the giant phantom jelly.
 
 ---
 
+> **⚠ DEPRECATED naming scheme.** Historical sections of this
+> document (especially §§ M10, M11, M13, and the linked
+> `docs/plans/M12-*.md` investigations) describe the legacy
+> `__phantom_tmdb<id>` filename sentinel. That scheme is
+> **deprecated** and retained only for back-compat parsing in the
+> one-shot migration script. The canonical on-disk layout is
+> Jellyfin-native `[tmdbid-<id>]` per the spike milestone below.
+> See `AGENTS.md` § "Canonical phantom stub naming scheme" for
+> the hard rule. Do not propagate `__phantom_tmdb` into new code,
+> tests, or design docs.
+
+---
+
 ## Status (as of 2026-06-04)
 
 | Milestone | Status | Commit |
@@ -853,6 +866,15 @@ meaningful, but the API patch (M1) does not depend on it.
 
 ### M10 — Phantom symlink library + visibility fix (≤ 3 days)
 
+> **⚠ DEPRECATED naming scheme described below.** The
+> `__phantom_tmdb<id>` filename sentinel introduced in this
+> milestone has been replaced by Jellyfin-native `[tmdbid-<id>]`
+> path tokens. The scanner-derived-name problem that motivated
+> the `IsLocked = true` + re-stamp dance only existed because of
+> the legacy scheme. See AGENTS.md § "Canonical phantom stub
+> naming scheme" and the spike milestone at the bottom of this
+> file. Content below is kept for historical context only.
+
 v0.1 shipped with phantom / virtual items that have `Path = null`
 and `IsVirtualItem = true`. **Jellyfin's library scanner culls
 such items from user-facing browse**, so the Suggestions feature
@@ -1297,6 +1319,15 @@ returned the new path. The real plugin path through
 
 ### M11 — Post-M10 phantom UX polish (≤ 4 days)
 
+> **⚠ References deprecated naming scheme.** The bug symptoms
+> documented below (filename stems with underscores and the
+> `__phantom_tmdb<id>` sentinel appearing as user-visible Names)
+> are artifacts of the legacy on-disk scheme that has since been
+> replaced by Jellyfin-native `[tmdbid-<id>]`. The healing logic
+> the M11 work added is now redundant under the new scheme and
+> scheduled for removal in the spike follow-up. See AGENTS.md
+> § "Canonical phantom stub naming scheme."
+
 M10 restored phantom **visibility**. Live operator testing on
 2026-06-05 revealed six distinct UX problems that block usable
 phantom browse + play. Each is small individually; together they
@@ -1503,6 +1534,15 @@ Observed issues (with diagnosis where known):
 ---
 
 ### M13 — Per-series subdir stub layout for TV phantoms (≤ 2 days)
+
+> **⚠ DEPRECATED naming scheme described below.** The directory
+> structure documented here used `<SafeName>__phantom_tmdb<id>/`
+> as the series-level subdir name. That has been replaced by
+> `<DisplayTitle> (<Year>) [tmdbid-<id>]/` in the spike milestone
+> below. The per-series subdir architectural decision (one dir
+> per series rather than a flat shows root) is preserved; only
+> the naming token changed. See AGENTS.md § "Canonical phantom
+> stub naming scheme."
 
 Shipped: PLAN §M13 design implemented in full. See `CHANGELOG.md`
 entry under `[Unreleased] / Added` for the user-visible summary;

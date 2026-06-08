@@ -1,5 +1,11 @@
 # M12 investigation results (2026-06-07)
 
+> **⚠ Historical investigation. References deprecated naming
+> scheme.** SQL queries and code examples below use the legacy
+> `__phantom_tmdb<id>` sentinel. That scheme is deprecated;
+> canonical is `[tmdbid-<id>]`. See AGENTS.md § "Canonical
+> phantom stub naming scheme."
+
 ## TL;DR
 
 The original M12 diagnosis was wrong on the specific mechanism. Two

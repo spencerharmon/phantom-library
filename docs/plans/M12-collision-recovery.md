@@ -1,5 +1,15 @@
 # M12 — Phantom item ID-collision recovery (plan)
 
+> **⚠ Historical investigation. References deprecated naming
+> scheme.** SQL recipes and design rationale below reference the
+> legacy `__phantom_tmdb<id>` filename sentinel. That scheme is
+> deprecated; the canonical scheme is Jellyfin-native
+> `[tmdbid-<id>]`. For current stub identification, use
+> `PhantomPathUtilities.IsPhantomStubPath` (recognises both forms)
+> or the bracketed `[tmdbid-<id>]` token. See AGENTS.md §
+> "Canonical phantom stub naming scheme." Content below is kept
+> as the historical investigation record.
+
 Date: 2026-06-07
 Status: **diagnosis disputed by critic; investigation required before any code change**
 Author: agent

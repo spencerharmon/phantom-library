@@ -109,8 +109,8 @@ cat /tmp/jf-rig/logs/scenario-suggestions.log
 # under systemd-run --user).
 systemd-run --user --unit=rig-observer --setenv=JF_RIG_ROOT=/tmp/jf-rig \
   -- /usr/bin/python3 /tmp/jf-rig/bin/db-observer.py \
-     "/tmp/jf-test/data/data/jellyfin.db:BaseItems:Path LIKE '%phantom_tmdb99000001%'" \
-     "/tmp/jf-test/data/data/jellyfin.db:BaseItemProviders:ItemId IN (SELECT Id FROM BaseItems WHERE Path LIKE '%phantom_tmdb99000001%')"
+     "/tmp/jf-test/data/data/jellyfin.db:BaseItems:Path LIKE '%[tmdbid-99000001]%'" \
+     "/tmp/jf-test/data/data/jellyfin.db:BaseItemProviders:ItemId IN (SELECT Id FROM BaseItems WHERE Path LIKE '%[tmdbid-99000001]%')"
 # ... run test ...
 systemctl --user stop rig-observer
 ls /tmp/jf-rig/logs/observer-*.log   # mutation timeline
