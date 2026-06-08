@@ -386,8 +386,7 @@ public sealed class SuggestionsContributor : ISuggestionsContributor
                 // stay broken forever because nothing else re-touches
                 // them. Per PLAN M12 + docs/plans/M12-investigation-
                 // results.md.
-                var nameIsStem = (existing.Name ?? string.Empty)
-                    .Contains("__phantom_tmdb", StringComparison.Ordinal);
+                var nameIsStem = PhantomPathUtilities.IsPhantomStubPath(existing.Name);
                 var hasTmdbProvider = existing.ProviderIds.ContainsKey(TmdbProvider);
                 // A materialised item points at a real gostream file
                 // (not a phantom sentinel) and is no longer locked.
@@ -395,7 +394,7 @@ public sealed class SuggestionsContributor : ISuggestionsContributor
                 // "heal" a materialised row — that would clobber its
                 // real Path and the scanner would cull the row.
                 var isMaterialised = !string.IsNullOrEmpty(existing.Path)
-                    && !existing.Path.Contains("__phantom_tmdb", StringComparison.Ordinal);
+                    && !PhantomPathUtilities.IsPhantomStubPath(existing.Path);
                 if (!isMaterialised && (nameIsStem || !existing.IsLocked || !hasTmdbProvider))
                 {
                     await HealBrokenPhantomAsync(existing, hit, kind, parent, ct).ConfigureAwait(false);
@@ -421,7 +420,7 @@ public sealed class SuggestionsContributor : ISuggestionsContributor
                 try
                 {
                     var stubKind = kind == ItemKind.Movie ? PhantomMediaKind.Movie : PhantomMediaKind.Series;
-                    var stubPath = await _stubs.CreateAsync(newItem.Name ?? string.Empty, hit.Id, stubKind, ct).ConfigureAwait(false);
+                    var stubPath = await _stubs.CreateAsync(newItem.Name ?? string.Empty, newItem.ProductionYear, hit.Id, stubKind, ct).ConfigureAwait(false);
                     newItem.Path = stubPath;
                     newItem.IsLocked = true;
                 }
@@ -597,13 +596,13 @@ public sealed class SuggestionsContributor : ISuggestionsContributor
             // classifies the row as "phantom" (i.e. NOT materialised)
             // and heal proceeds.
             var alreadyMaterialised = !string.IsNullOrEmpty(existing.Path)
-                && !existing.Path.Contains("__phantom_tmdb", StringComparison.Ordinal);
+                && !PhantomPathUtilities.IsPhantomStubPath(existing.Path);
             if (_stubs.IsReady && !alreadyMaterialised)
             {
                 try
                 {
                     var stubKind = kind == ItemKind.Movie ? PhantomMediaKind.Movie : PhantomMediaKind.Series;
-                    var stubPath = await _stubs.CreateAsync(existing.Name ?? string.Empty, hit.Id, stubKind, ct).ConfigureAwait(false);
+                    var stubPath = await _stubs.CreateAsync(existing.Name ?? string.Empty, existing.ProductionYear, hit.Id, stubKind, ct).ConfigureAwait(false);
                     if (string.IsNullOrEmpty(existing.Path))
                     {
                         existing.Path = stubPath;

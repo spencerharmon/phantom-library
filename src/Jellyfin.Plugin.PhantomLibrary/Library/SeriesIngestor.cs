@@ -79,7 +79,7 @@ public sealed class SeriesIngestor : ISeriesIngestor
         {
             try
             {
-                var stubPath = await _stubs.CreateAsync(series.Name ?? string.Empty, seriesTmdbId, PhantomMediaKind.Series, ct).ConfigureAwait(false);
+                var stubPath = await _stubs.CreateAsync(series.Name ?? string.Empty, series.ProductionYear, seriesTmdbId, PhantomMediaKind.Series, ct).ConfigureAwait(false);
                 series.Path = stubPath;
                 series.IsLocked = true;
             }

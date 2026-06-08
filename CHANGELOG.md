@@ -8,6 +8,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Jellyfin-native stub-layout (`[tmdbid-<id>]` path tokens).**
+  Phantom stubs use the Jellyfin-native
+  `<Title> (<Year>) [tmdbid-<id>]` filename / directory layout
+  instead of the custom `__phantom_tmdb<id>` sentinel scheme.
+  Newly-created stubs (movies and series) render with the real
+  title in Jellyfin — no more `Word_Word__phantom_tmdb1234`
+  scanner-derived names. Year segment is omitted when TMDB lacks
+  it. Episode filenames under series stubs intentionally drop the
+  bracketed token (the series directory carries it) so the
+  `tvshows` resolver derives clean episode names.
+  `PhantomStubManager` exposes year-aware overloads of
+  `CreateAsync`, `DeriveFilename`, and `DeriveSeriesStubPaths`;
+  old overloads forward with `year: null` for back-compat. A new
+  `PhantomPathUtilities` helper centralises the dual-recognition
+  logic (legacy sentinel OR new token) used by dedupe / heal /
+  eviction paths — no more scattered `Contains("__phantom_tmdb")`
+  substring checks.
+
+- `phantom.db` schema v5 adds a `plugin_meta` key/value table
+  for cross-restart marker storage (see AGENTS.md § "Single-
+  operator deployment" for the design rationale).
+
+### BREAKING — requires wipe
+
+This release changes the on-disk phantom stub layout AND bumps
+the `phantom.db` schema. Per `AGENTS.md` § "No database migrations
+  until v1.0", the project does not ship migration tooling pre-v1.0;
+the upgrade path is **wipe and rebuild**.
+
+**Operator steps to upgrade from any earlier version:**
+
+1. `sudo systemctl stop jellyfin`
+2. Delete `phantom.db` (plus `-wal` / `-shm` sidecars). Plugin
+   recreates the schema on next start.
+3. Delete every BaseItem in `jellyfin.db` whose `Path` begins with
+   the phantom stub root (default
+   `/var/lib/jellyfin/phantom-library/`). Cascade-clean FK rows
+   in `UserDatas`, `BaseItemProviders`, `MediaStreams`,
+   `MediaAttachments`, `Chapters2`, `AncestorIds`, etc.
+3. `rm -rf` everything under the phantom stub root EXCEPT the
+   `.phantom-library-keep` sentinel files and the `.splash.*`
+   asset.
+4. `./install.sh --build` to install the new plugin DLL.
+5. `sudo systemctl start jellyfin`
+6. Dashboard → Scheduled Tasks → trigger **"Phantom Library —
+   refresh suggestions"** to repopulate with the new layout.
+
+User-visible state in `jellyfin.db` outside the phantom tree
+(favourites, watched, watch history on real-media items) is not
+touched by this procedure.
+
+### Removed
+
+- **In-plugin `StubLayoutMigration` IHostedService.** Ran on
+  plugin startup while Jellyfin was live, moved stub files on
+  disk, and called `UpdateItemAsync` to repoint `BaseItem.Path`.
+  It raced Jellyfin's live library scanner — the watcher saw old
+  paths vanish, the scanner saw new-format paths appear and
+  created **fresh BaseItems** for them — leaving the library
+  with duplicate BaseItems and the UI still showing the legacy
+  scanner-derived names. AGENTS.md gains "Single-operator
+  deployment" + "No database migrations until v1.0" sections
+  codifying the rule that motivated this rollback.
+
+- Repo-shipped migration scripts and their rig harnesses.
+  Pre-v1.0, schema evolution is wipe-and-rebuild per the
+  AGENTS.md rule above.
+
+### Notes
+
+- **A/B spike scope.** The heal-on-rediscovery logic, the forced
+  `IsLocked = true` re-stamp dance, `PhantomImageProvider`, and
+  `PhantomStatusDecorator`'s Overview-prefix mutation are
+  intentionally left in place pending operator validation that
+  the new layout actually fixes the scanner-derived-name bug.
+  Follow-up cleanup PR will remove the now-unnecessary cruft
+  once validation confirms the spike works end-to-end.
+
+- Plugin version bumped to `0.2.0.0`. Test rig + install docs
+  updated accordingly.
+
+## [0.1.x-pre]
+
+### Added
+
 - **M13 — Per-series subdir stub layout for TV phantoms.**
   Replaces the loose-file phantom-show layout from M10 (one
   symlink per series at the top of `phantom-library/shows/`)

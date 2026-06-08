@@ -207,7 +207,7 @@ public class PhantomDbTests : IDisposable
             using (var vc = verify.CreateCommand())
             {
                 vc.CommandText = "PRAGMA user_version;";
-                Assert.Equal(4L, Convert.ToInt64(vc.ExecuteScalar(),
+                Assert.Equal(5L, Convert.ToInt64(vc.ExecuteScalar(),
                     System.Globalization.CultureInfo.InvariantCulture));
             }
 
@@ -300,7 +300,7 @@ public class PhantomDbTests : IDisposable
             using (var vc = verify.CreateCommand())
             {
                 vc.CommandText = "PRAGMA user_version;";
-                Assert.Equal(4L, Convert.ToInt64(vc.ExecuteScalar(),
+                Assert.Equal(5L, Convert.ToInt64(vc.ExecuteScalar(),
                     System.Globalization.CultureInfo.InvariantCulture));
             }
 
@@ -490,7 +490,7 @@ public class PhantomDbM7Tests : IDisposable
             using (var vc = verify.CreateCommand())
             {
                 vc.CommandText = "PRAGMA user_version;";
-                Assert.Equal(4L, Convert.ToInt64(vc.ExecuteScalar(),
+                Assert.Equal(5L, Convert.ToInt64(vc.ExecuteScalar(),
                     System.Globalization.CultureInfo.InvariantCulture));
             }
             var cols = new System.Collections.Generic.HashSet<string>();

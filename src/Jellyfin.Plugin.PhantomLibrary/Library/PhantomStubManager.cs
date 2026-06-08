@@ -1,7 +1,6 @@
 using System;
 using System.Globalization;
 using System.IO;
-using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -46,6 +45,18 @@ public interface IPhantomStubManager
     Task<string> CreateAsync(string title, int tmdbId, PhantomMediaKind kind, CancellationToken ct);
 
     /// <summary>
+    /// Year-aware overload. Emits the new Jellyfin-native
+    /// <c>&lt;Title&gt; (&lt;Year&gt;) [tmdbid-&lt;id&gt;]</c> layout so
+    /// Jellyfin's resolver derives a clean Name without scanner-driven
+    /// underscore garbage. <paramref name="year"/> may be null when
+    /// genuinely unknown (TMDB lacks it). Default implementation
+    /// forwards to the no-year overload for back-compat with test
+    /// doubles; production <see cref="PhantomStubManager"/> overrides.
+    /// </summary>
+    Task<string> CreateAsync(string title, int? year, int tmdbId, PhantomMediaKind kind, CancellationToken ct)
+        => CreateAsync(title, tmdbId, kind, ct);
+
+    /// <summary>
     /// Deletes the stub. Idempotent; swallows not-found. For series stubs
     /// (directories under <c>shows/</c> carrying the <c>__phantom_tmdb</c>
     /// sentinel in the leaf name) the whole tree is removed recursively.
@@ -57,12 +68,20 @@ public interface IPhantomStubManager
     /// <summary>Deterministic filename for a phantom. Pure / testable.</summary>
     string DeriveFilename(string title, int tmdbId, PhantomMediaKind kind);
 
+    /// <summary>Year-aware overload; produces the new layout filename.</summary>
+    string DeriveFilename(string title, int? year, int tmdbId, PhantomMediaKind kind)
+        => DeriveFilename(title, tmdbId, kind);
+
     /// <summary>
     /// Deterministic per-series stub layout (PLAN §M13). Returns the
     /// series directory, season directory, and the inner S01E01 symlink
     /// file path. Pure / testable; does not touch disk.
     /// </summary>
     (string SeriesDir, string SeasonDir, string EpisodeFile) DeriveSeriesStubPaths(string title, int tmdbId);
+
+    /// <summary>Year-aware overload; produces the new series stub layout.</summary>
+    (string SeriesDir, string SeasonDir, string EpisodeFile) DeriveSeriesStubPaths(string title, int? year, int tmdbId)
+        => DeriveSeriesStubPaths(title, tmdbId);
 
     /// <summary>True once BootstrapAsync has completed successfully at least once.</summary>
     bool IsReady { get; }
@@ -73,10 +92,29 @@ public sealed class PhantomStubManager : IPhantomStubManager
 {
     internal const string MoviesSubdir = "movies";
     internal const string ShowsSubdir = "shows";
+
+    /// <summary>
+    /// Legacy filename sentinel used by the pre-spike stub layout. New
+    /// stubs use <see cref="TmdbIdTokenPrefix"/> /
+    /// <see cref="TmdbIdTokenSuffix"/>. This constant is retained for
+    /// back-compat: the one-shot migration recognises legacy paths via
+    /// it, and the delete-safety / heal-detection logic still accepts
+    /// it via <see cref="PhantomPathUtilities.IsPhantomStubPath"/>.
+    /// Do not use for newly-created stubs.
+    /// </summary>
     internal const string Sentinel = "__phantom_tmdb";
+
+    /// <summary>Opening literal of the Jellyfin-native tmdb path token.</summary>
+    internal const string TmdbIdTokenPrefix = "[tmdbid-";
+
+    /// <summary>Closing literal of the Jellyfin-native tmdb path token.</summary>
+    internal const string TmdbIdTokenSuffix = "]";
 
     private static readonly Regex UnsafeChars = new("[^A-Za-z0-9_]", RegexOptions.Compiled);
     private static readonly Regex CollapseUnderscores = new("_+", RegexOptions.Compiled);
+    // DisplaySanitize: replace filesystem-hostile chars with space, then collapse whitespace.
+    private static readonly Regex DisplayUnsafeChars = new("[\\\\/\\[\\]:*?<>|\"\u0000]", RegexOptions.Compiled);
+    private static readonly Regex CollapseWhitespace = new("\\s+", RegexOptions.Compiled);
 
     private readonly IApplicationPaths _paths;
     private readonly ILogger<PhantomStubManager> _logger;
@@ -154,7 +192,11 @@ public sealed class PhantomStubManager : IPhantomStubManager
     }
 
     /// <inheritdoc />
-    public async Task<string> CreateAsync(string title, int tmdbId, PhantomMediaKind kind, CancellationToken ct)
+    public Task<string> CreateAsync(string title, int tmdbId, PhantomMediaKind kind, CancellationToken ct)
+        => CreateAsync(title, null, tmdbId, kind, ct);
+
+    /// <inheritdoc />
+    public async Task<string> CreateAsync(string title, int? year, int tmdbId, PhantomMediaKind kind, CancellationToken ct)
     {
         if (!IsReady || _splashPath is null)
         {
@@ -170,7 +212,7 @@ public sealed class PhantomStubManager : IPhantomStubManager
 
         if (kind == PhantomMediaKind.Series)
         {
-            var (seriesDir, seasonDir, episodeFile) = DeriveSeriesStubPaths(title, tmdbId);
+            var (seriesDir, seasonDir, episodeFile) = DeriveSeriesStubPaths(title, year, tmdbId);
             Directory.CreateDirectory(seasonDir);
             EnsureSplashSymlink(episodeFile);
             return seriesDir;
@@ -180,7 +222,7 @@ public sealed class PhantomStubManager : IPhantomStubManager
         var dir = Path.Combine(root, MoviesSubdir);
         Directory.CreateDirectory(dir);
 
-        var filename = DeriveFilename(title, tmdbId, kind);
+        var filename = DeriveFilename(title, year, tmdbId, kind);
         var full = Path.Combine(dir, filename);
         EnsureSplashSymlink(full);
         return full;
@@ -202,9 +244,10 @@ public sealed class PhantomStubManager : IPhantomStubManager
                 }
 
                 // Existing entry points elsewhere (or is a real file we did not create).
-                // Replace only if its filename carries our sentinel; never clobber non-phantom files.
+                // Replace only if its filename carries the legacy sentinel OR the
+                // new [tmdbid-] token; never clobber non-phantom files.
                 var filename = Path.GetFileName(fullPath);
-                if (filename.Contains(Sentinel, StringComparison.Ordinal))
+                if (PhantomPathUtilities.IsPhantomStubPath(filename))
                 {
                     File.Delete(fullPath);
                 }
@@ -236,7 +279,7 @@ public sealed class PhantomStubManager : IPhantomStubManager
             if (Directory.Exists(symlinkPath) && !IsReparseSymlink(symlinkPath))
             {
                 var leaf = Path.GetFileName(symlinkPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
-                if (leaf.Contains(Sentinel, StringComparison.Ordinal))
+                if (PhantomPathUtilities.IsPhantomStubPath(leaf))
                 {
                     Directory.Delete(symlinkPath, recursive: true);
                 }
@@ -283,41 +326,73 @@ public sealed class PhantomStubManager : IPhantomStubManager
 
     /// <inheritdoc />
     public string DeriveFilename(string title, int tmdbId, PhantomMediaKind kind)
-    {
-        var safe = Sanitize(title);
-        if (string.IsNullOrEmpty(safe))
-        {
-            safe = "untitled";
-        }
+        => DeriveFilename(title, null, tmdbId, kind);
 
+    /// <inheritdoc />
+    public string DeriveFilename(string title, int? year, int tmdbId, PhantomMediaKind kind)
+    {
+        var stem = DeriveStem(title, year, tmdbId);
         var ext = _splashExt ?? "mp4";
-        var sb = new StringBuilder(safe.Length + 32);
-        sb.Append(safe).Append(Sentinel).Append(tmdbId.ToString(CultureInfo.InvariantCulture)).Append('.').Append(ext);
-        return sb.ToString();
+        return stem + "." + ext;
     }
 
     /// <inheritdoc />
     public (string SeriesDir, string SeasonDir, string EpisodeFile) DeriveSeriesStubPaths(string title, int tmdbId)
-    {
-        var safe = Sanitize(title);
-        if (string.IsNullOrEmpty(safe))
-        {
-            safe = "untitled";
-        }
+        => DeriveSeriesStubPaths(title, null, tmdbId);
 
+    /// <inheritdoc />
+    public (string SeriesDir, string SeasonDir, string EpisodeFile) DeriveSeriesStubPaths(string title, int? year, int tmdbId)
+    {
         var ext = _splashExt ?? "mp4";
-        var stem = safe + Sentinel + tmdbId.ToString(CultureInfo.InvariantCulture);
+        var dirStem = DeriveStem(title, year, tmdbId);
+        // Episode filename intentionally omits the [tmdbid-] token: the
+        // bracketed token belongs on the series directory; the episode
+        // gets a clean <Title> (<Year>) S01E01.<ext> for Jellyfin's
+        // tvshows resolver.
+        var episodeStem = DeriveDisplayStem(title, year);
         var root = ResolveRoot();
-        var seriesDir = Path.Combine(root, ShowsSubdir, stem);
+        var seriesDir = Path.Combine(root, ShowsSubdir, dirStem);
         // PLAN §M13: Season 01 is hardcoded; phantom series expose a
         // single placeholder episode. Real episodes land under canonical
         // Season NN paths under the gostream physical folder once the
         // user plays the placeholder.
         var seasonDir = Path.Combine(seriesDir, "Season 01");
-        var episodeFile = Path.Combine(seasonDir, stem + " S01E01." + ext);
+        var episodeFile = Path.Combine(seasonDir, episodeStem + " S01E01." + ext);
         return (seriesDir, seasonDir, episodeFile);
     }
 
+    /// <summary>
+    /// Filesystem-safe stem in the new <c>&lt;Title&gt; (&lt;Year&gt;)
+    /// [tmdbid-&lt;id&gt;]</c> Jellyfin-native form. Year segment omitted
+    /// when null. Internal: used by both the file and dir derivers.
+    /// </summary>
+    private static string DeriveStem(string title, int? year, int tmdbId)
+    {
+        var display = DeriveDisplayStem(title, year);
+        return display + " " + TmdbIdTokenPrefix
+            + tmdbId.ToString(CultureInfo.InvariantCulture) + TmdbIdTokenSuffix;
+    }
+
+    private static string DeriveDisplayStem(string title, int? year)
+    {
+        var safe = DisplaySanitize(title);
+        if (string.IsNullOrEmpty(safe))
+        {
+            safe = "Untitled";
+        }
+
+        return year.HasValue
+            ? safe + " (" + year.Value.ToString(CultureInfo.InvariantCulture) + ")"
+            : safe;
+    }
+
+    /// <summary>
+    /// Legacy underscore-only sanitiser. Retained for migration reverse-
+    /// derivation and any back-compat call sites. Do NOT use for new
+    /// stub names — use <see cref="DisplaySanitize"/> instead, which
+    /// preserves spaces / parens / hyphens so Jellyfin's resolver
+    /// derives a clean Name.
+    /// </summary>
     private static string Sanitize(string? title)
     {
         if (string.IsNullOrWhiteSpace(title))
@@ -328,6 +403,26 @@ public sealed class PhantomStubManager : IPhantomStubManager
         var replaced = UnsafeChars.Replace(title, "_");
         var collapsed = CollapseUnderscores.Replace(replaced, "_");
         return collapsed.Trim('_');
+    }
+
+    /// <summary>
+    /// Display-friendly sanitiser: keeps alphanumerics, spaces, parens,
+    /// hyphens, dots, apostrophes, commas, ampersands. Strips genuinely
+    /// filesystem-hostile chars (<c>/, \, [, ], :, ?, *, &lt;, &gt;,
+    /// |, "</c> and NUL) by replacing them with a single space; collapses
+    /// runs of whitespace; trims. Brackets are stripped because the
+    /// caller appends a literal <c>[tmdbid-&lt;id&gt;]</c> token.
+    /// </summary>
+    internal static string DisplaySanitize(string? title)
+    {
+        if (string.IsNullOrWhiteSpace(title))
+        {
+            return string.Empty;
+        }
+
+        var replaced = DisplayUnsafeChars.Replace(title, " ");
+        var collapsed = CollapseWhitespace.Replace(replaced, " ");
+        return collapsed.Trim();
     }
 
     private string ResolveRoot()

@@ -93,10 +93,10 @@ contents must be readable + writable by the `jellyfin` user, or the
 plugin will fail to write its `meta.json` on first load.
 
 ```sh
-sudo mkdir -p /var/lib/jellyfin/plugins/Jellyfin.Plugin.PhantomLibrary_0.1.0.0
+sudo mkdir -p /var/lib/jellyfin/plugins/Jellyfin.Plugin.PhantomLibrary_0.2.0.0
 sudo cp src/Jellyfin.Plugin.PhantomLibrary/bin/Release/net9.0/Jellyfin.Plugin.PhantomLibrary.dll \
-        /var/lib/jellyfin/plugins/Jellyfin.Plugin.PhantomLibrary_0.1.0.0/
-sudo chown -R jellyfin:jellyfin /var/lib/jellyfin/plugins/Jellyfin.Plugin.PhantomLibrary_0.1.0.0
+        /var/lib/jellyfin/plugins/Jellyfin.Plugin.PhantomLibrary_0.2.0.0/
+sudo chown -R jellyfin:jellyfin /var/lib/jellyfin/plugins/Jellyfin.Plugin.PhantomLibrary_0.2.0.0
 sudo systemctl restart jellyfin
 ```
 

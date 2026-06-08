@@ -172,7 +172,7 @@ like this:
 │       ├── configurations/
 │       │   ├── Jellyfin.Plugin.PhantomLibrary.xml   # plugin config seed
 │       │   └── PhantomLibrary/phantom.db            # plugin SQLite
-│       └── Jellyfin.Plugin.PhantomLibrary_0.1.0.0/
+│       └── Jellyfin.Plugin.PhantomLibrary_0.2.0.0/
 │           └── Jellyfin.Plugin.PhantomLibrary.dll   # the build under test
 ├── config/                     # --configdir
 │   └── network.xml             # MUST pre-seed to force port 18096
@@ -205,7 +205,7 @@ sleep 2
 # ("Could not find a part of the path .../<libname>/<safename>.mblink")
 # because Jellyfin's library config dir on disk is missing.
 rm -rf /tmp/jf-test
-mkdir -p /tmp/jf-test/{data/data,data/plugins/configurations/PhantomLibrary,data/plugins/Jellyfin.Plugin.PhantomLibrary_0.1.0.0,data/root/default,config,cache,log,media/tv,media/movies}
+mkdir -p /tmp/jf-test/{data/data,data/plugins/configurations/PhantomLibrary,data/plugins/Jellyfin.Plugin.PhantomLibrary_0.2.0.0,data/root/default,config,cache,log,media/tv,media/movies}
 cp /var/lib/jellyfin/data/jellyfin.db       /tmp/jf-test/data/data/jellyfin.db
 cp /var/lib/jellyfin/data/jellyfin.db-wal   /tmp/jf-test/data/data/jellyfin.db-wal
 cp /var/lib/jellyfin/data/jellyfin.db-shm   /tmp/jf-test/data/data/jellyfin.db-shm
@@ -217,9 +217,9 @@ cp /var/lib/jellyfin/plugins/configurations/PhantomLibrary/phantom.db \
 cd /home/spencer/git-repos/spencerharmon/phantom-library
 dotnet build -c Release
 cp src/Jellyfin.Plugin.PhantomLibrary/bin/Release/net9.0/Jellyfin.Plugin.PhantomLibrary.dll \
-   /tmp/jf-test/data/plugins/Jellyfin.Plugin.PhantomLibrary_0.1.0.0/
+   /tmp/jf-test/data/plugins/Jellyfin.Plugin.PhantomLibrary_0.2.0.0/
 md5sum src/Jellyfin.Plugin.PhantomLibrary/bin/Release/net9.0/Jellyfin.Plugin.PhantomLibrary.dll \
-       /tmp/jf-test/data/plugins/Jellyfin.Plugin.PhantomLibrary_0.1.0.0/Jellyfin.Plugin.PhantomLibrary.dll
+       /tmp/jf-test/data/plugins/Jellyfin.Plugin.PhantomLibrary_0.2.0.0/Jellyfin.Plugin.PhantomLibrary.dll
 # ALWAYS md5 both sides. The plugin csproj has incremental-build
 # quirks and the dest dir is easy to forget; mismatched md5 = your
 # edits did not take and you will waste an hour wondering why the

@@ -64,32 +64,34 @@ public class PhantomStubManagerTests : IDisposable
         var b = m.DeriveFilename("Foo/Bar?", 2, PhantomMediaKind.Movie);
         // Both sanitize to the same safe stem, but the tmdb id keeps them apart.
         Assert.NotEqual(a, b);
-        Assert.Contains("__phantom_tmdb1.", a);
-        Assert.Contains("__phantom_tmdb2.", b);
+        Assert.Contains("[tmdbid-1]", a, StringComparison.Ordinal);
+        Assert.Contains("[tmdbid-2]", b, StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task DeriveFilename_SentinelAlwaysPresent()
+    public async Task DeriveFilename_TmdbIdTokenAlwaysPresent()
     {
         var m = Build();
         await m.BootstrapAsync(default);
         var name = m.DeriveFilename("Anything", 99, PhantomMediaKind.Series);
-        Assert.Contains(PhantomStubManager.Sentinel, name, StringComparison.Ordinal);
+        Assert.Contains(PhantomStubManager.TmdbIdTokenPrefix + "99]", name, StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task DeriveFilename_StripsSpecialChars()
+    public async Task DeriveFilename_StripsHostileChars_KeepsDisplayFriendlyChars()
     {
         var m = Build();
         await m.BootstrapAsync(default);
         var name = m.DeriveFilename("Hello: World's / Test ☃ Show", 7, PhantomMediaKind.Movie);
-        // Only A-Z, 0-9, underscore, dot are allowed.
+        // New layout: spaces, apostrophes, etc are preserved; only
+        // filesystem-hostile chars (/, :, [, ]) are stripped. The
+        // [tmdbid-N] token is the only bracketed segment.
         var stem = Path.GetFileNameWithoutExtension(name);
-        foreach (var ch in stem)
-        {
-            Assert.True(char.IsLetterOrDigit(ch) || ch == '_',
-                $"Unexpected character '{ch}' in '{name}'");
-        }
+        Assert.DoesNotContain('/', stem);
+        Assert.DoesNotContain(':', stem);
+        // The literal token is the only place [tmdbid- appears.
+        Assert.Contains("[tmdbid-7]", stem, StringComparison.Ordinal);
+        Assert.Contains("World's", stem, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -98,7 +100,7 @@ public class PhantomStubManagerTests : IDisposable
         var m = Build();
         await m.BootstrapAsync(default);
         var name = m.DeriveFilename("   ", 5, PhantomMediaKind.Movie);
-        Assert.StartsWith("untitled__phantom_tmdb5.", name);
+        Assert.StartsWith("Untitled [tmdbid-5]", name, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -153,7 +155,7 @@ public class PhantomStubManagerTests : IDisposable
         Assert.True(Directory.Exists(dir),
             $"Series stub must be a directory; got {dir}");
         Assert.StartsWith(Path.Combine(_tempRoot, "shows"), dir, StringComparison.Ordinal);
-        Assert.Contains("__phantom_tmdb555", Path.GetFileName(dir), StringComparison.Ordinal);
+        Assert.Contains("[tmdbid-555]", Path.GetFileName(dir), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -172,7 +174,9 @@ public class PhantomStubManagerTests : IDisposable
         Assert.False(string.IsNullOrEmpty(fi.LinkTarget),
             "Episode entry must be a symlink to the splash.");
         Assert.Contains(" S01E01.", Path.GetFileName(episodeFile), StringComparison.Ordinal);
-        Assert.Contains("__phantom_tmdb42", Path.GetFileName(episodeFile), StringComparison.Ordinal);
+        // Episode filename intentionally omits the [tmdbid-] token; the
+        // series directory carries it. The directory's name does.
+        Assert.Contains("[tmdbid-42]", Path.GetFileName(dir), StringComparison.Ordinal);
     }
 
     [Fact]

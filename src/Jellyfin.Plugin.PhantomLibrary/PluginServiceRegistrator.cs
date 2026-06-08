@@ -32,7 +32,7 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         serviceCollection.AddSingleton<ITmdbApiKeyProvider, PluginConfigTmdbApiKeyProvider>();
         serviceCollection.AddHttpClient<ITmdbClient, TmdbClient>(c =>
         {
-            c.DefaultRequestHeaders.UserAgent.ParseAdd("Jellyfin.Plugin.PhantomLibrary/0.1.0");
+            c.DefaultRequestHeaders.UserAgent.ParseAdd("Jellyfin.Plugin.PhantomLibrary/0.2.0");
             c.Timeout = TimeSpan.FromSeconds(15);
         });
 
@@ -52,7 +52,7 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         serviceCollection.AddHttpClient<IGostreamClient, GostreamClient>(c =>
         {
             c.Timeout = TimeSpan.FromSeconds(60);
-            c.DefaultRequestHeaders.UserAgent.ParseAdd("Jellyfin.Plugin.PhantomLibrary/0.1.0");
+            c.DefaultRequestHeaders.UserAgent.ParseAdd("Jellyfin.Plugin.PhantomLibrary/0.2.0");
         });
 
         // Indexers — registered as IIndexerClient in the order Prowlarr → Torrentio.
@@ -63,7 +63,7 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         serviceCollection.AddHttpClient<TorrentioClient>(c =>
         {
             c.Timeout = TimeSpan.FromSeconds(30);
-            c.DefaultRequestHeaders.UserAgent.ParseAdd("Jellyfin.Plugin.PhantomLibrary/0.1.0");
+            c.DefaultRequestHeaders.UserAgent.ParseAdd("Jellyfin.Plugin.PhantomLibrary/0.2.0");
         });
         serviceCollection.AddTransient<IIndexerClient>(sp => sp.GetRequiredService<ProwlarrClient>());
         serviceCollection.AddTransient<IIndexerClient>(sp => sp.GetRequiredService<TorrentioClient>());
@@ -91,6 +91,13 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
             sp => sp.GetRequiredService<PhantomMediaSourceProvider>());
         serviceCollection.AddSingleton<PhantomStatusDecorator>();
         serviceCollection.AddHostedService(sp => sp.GetRequiredService<PhantomStatusDecorator>());
+
+        // NOTE: legacy stub-layout migration runs offline via
+        // scripts/migrate-stub-layout-v1.sh (Jellyfin stopped). An
+        // earlier in-plugin IHostedService raced the live library
+        // scanner and produced duplicate BaseItems; see AGENTS.md
+        // "Single-operator deployment". Do not reintroduce a runtime
+        // migration service.
 
         // Suggestions (M6)
         serviceCollection.AddSingleton<VirtualLibraryRoot>();

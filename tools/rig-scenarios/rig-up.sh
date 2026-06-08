@@ -8,7 +8,7 @@ JF_CFG=/tmp/jf-test/config
 JF_CACHE=/tmp/jf-test/cache
 JF_LOG=/tmp/jf-test/log
 DLL=/home/spencer/git-repos/spencerharmon/phantom-library/src/Jellyfin.Plugin.PhantomLibrary/bin/Release/net9.0/Jellyfin.Plugin.PhantomLibrary.dll
-PLUGIN_DIR=$JF_DATA/plugins/Jellyfin.Plugin.PhantomLibrary_0.1.0.0
+PLUGIN_DIR=$JF_DATA/plugins/Jellyfin.Plugin.PhantomLibrary_0.2.0.0
 PHANTOM_ROOT=$JF_DATA/phantom-library
 
 # ---------------------------------------------------------------- helpers
@@ -47,7 +47,7 @@ if [ $RESET -eq 1 ] || [ ! -f "$JF_DATA/data/jellyfin.db" ]; then
   log "reseed jellyfin rig from prod"
   rm -rf /tmp/jf-test
   mkdir -p $JF_DATA/{data,plugins/configurations/PhantomLibrary,root/default} \
-           $JF_DATA/plugins/Jellyfin.Plugin.PhantomLibrary_0.1.0.0 \
+           $JF_DATA/plugins/Jellyfin.Plugin.PhantomLibrary_0.2.0.0 \
            $JF_CFG $JF_CACHE $JF_LOG
   cp /var/lib/jellyfin/data/jellyfin.db       $JF_DATA/data/jellyfin.db
   cp /var/lib/jellyfin/data/jellyfin.db-wal   $JF_DATA/data/jellyfin.db-wal 2>/dev/null || true
