@@ -7,10 +7,12 @@ using System.Threading.Tasks;
 using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
 using Jellyfin.Plugin.PhantomLibrary.Configuration;
+using Jellyfin.Plugin.PhantomLibrary.Library;
 using Jellyfin.Plugin.PhantomLibrary.Materialisation;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.Movies;
+using MediaBrowser.Controller.Entities.TV;
 using MediaBrowser.Controller.Library;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
@@ -273,5 +275,86 @@ public class EvictionSweeperTests : IDisposable
         await first;
         // Second tick after release: succeeds (no stale items left).
         await sweeper.RunOnceAsync(CancellationToken.None);
+    }
+
+    // ── PLAN §M13: per-series subdir layout demote/rebind ───────────────
+
+    [Fact]
+    public async Task Demote_Series_CallsGostreamRemoveOnInnerEpisodeFile()
+    {
+        var stubs = new NullPhantomStubManager { IsReady = true };
+        var series = (Series)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Series));
+        typeof(BaseItem).GetProperty("Id")!.SetValue(series, Guid.NewGuid());
+        series.Name = "Cool Show";
+        series.Path = "/tmp/phantom-test/shows/Cool Show__phantom_tmdb321";
+        _lib.Setup(l => l.GetItemById(series.Id)).Returns(series);
+        _lib.Setup(l => l.UpdateItemAsync(It.IsAny<BaseItem>(), It.IsAny<BaseItem>(),
+            It.IsAny<ItemUpdateType>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+
+        await _db.UpsertPhantomItemAsync(series.Id, new PhantomItemRow
+        {
+            TmdbId = 321,
+            Type = "series",
+            State = PhantomItemState.Materialised,
+            FirstSeen = DateTimeOffset.UtcNow.AddDays(-30),
+            LastTouched = DateTimeOffset.UtcNow,
+            // StubPath = per-series directory (per M13 layout).
+            StubPath = "/tmp/phantom-test/shows/Cool Show__phantom_tmdb321",
+            MaterialisedAt = DateTimeOffset.UtcNow.AddDays(-30),
+        }, default);
+
+        var cfg = new PluginConfiguration { EvictionEnabled = true, EvictionIdleDays = 7, PhantomRetentionDays = 7 };
+        var sweeper = new EvictionSweeper(
+            _lib.Object, _userManager.Object, _userDataManager.Object, _gostream.Object, _db,
+            stubs,
+            NullLogger<EvictionSweeper>.Instance, () => cfg, () => DateTimeOffset.UtcNow);
+
+        await sweeper.RunOnceAsync(CancellationToken.None);
+
+        var (_, _, expectedEpisode) = stubs.DeriveSeriesStubPaths("Cool Show", 321);
+        _gostream.Verify(g => g.RemoveAsync(expectedEpisode, It.IsAny<CancellationToken>()), Times.Once);
+        // Must NOT have been called against the dir itself.
+        _gostream.Verify(g => g.RemoveAsync(
+            "/tmp/phantom-test/shows/Cool Show__phantom_tmdb321", It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task Demote_Series_RebindsToFreshSeriesDir()
+    {
+        var stubs = new NullPhantomStubManager { IsReady = true };
+        var series = (Series)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Series));
+        typeof(BaseItem).GetProperty("Id")!.SetValue(series, Guid.NewGuid());
+        series.Name = "Reb Show";
+        series.Path = "/old/materialised/path";
+        _lib.Setup(l => l.GetItemById(series.Id)).Returns(series);
+        _lib.Setup(l => l.UpdateItemAsync(It.IsAny<BaseItem>(), It.IsAny<BaseItem>(),
+            It.IsAny<ItemUpdateType>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+
+        await _db.UpsertPhantomItemAsync(series.Id, new PhantomItemRow
+        {
+            TmdbId = 654,
+            Type = "series",
+            State = PhantomItemState.Materialised,
+            FirstSeen = DateTimeOffset.UtcNow.AddDays(-30),
+            LastTouched = DateTimeOffset.UtcNow,
+            StubPath = "/tmp/phantom-test/shows/Reb Show__phantom_tmdb654",
+            MaterialisedAt = DateTimeOffset.UtcNow.AddDays(-30),
+        }, default);
+
+        var cfg = new PluginConfiguration { EvictionEnabled = true, EvictionIdleDays = 7, PhantomRetentionDays = 7 };
+        var sweeper = new EvictionSweeper(
+            _lib.Object, _userManager.Object, _userDataManager.Object, _gostream.Object, _db,
+            stubs,
+            NullLogger<EvictionSweeper>.Instance, () => cfg, () => DateTimeOffset.UtcNow);
+
+        await sweeper.RunOnceAsync(CancellationToken.None);
+
+        // Rebind: CreateAsync(Series) called once; row.StubPath updated to the new series dir.
+        Assert.Single(stubs.Created, c => c.Kind == PhantomMediaKind.Series && c.Tmdb == 654);
+        var row = await _db.GetPhantomItemAsync(series.Id, default);
+        Assert.Equal(PhantomItemState.Virtual, row!.State);
+        var (expectedDir, _, _) = stubs.DeriveSeriesStubPaths("Reb Show", 654);
+        Assert.Equal(expectedDir, row.StubPath);
+        Assert.Equal(expectedDir, series.Path);
     }
 }

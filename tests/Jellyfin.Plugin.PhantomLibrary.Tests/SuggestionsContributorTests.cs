@@ -332,4 +332,97 @@ public class SuggestionsContributorTests : IDisposable
         // Substring rejected. New row CREATED for the real tmdb=12.
         Assert.Equal(1, createdCount);
     }
+
+    // ----- PLAN §M13: series stubs are per-series directories -----
+
+    [Fact]
+    public async Task MaterialiseHitsAsync_Series_AssignsSeriesDirAsPath()
+    {
+        var stubs = new SeriesAwareStubs();
+
+        _tmdb.Setup(t => t.GetTrendingMoviesAsync(It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Array.Empty<TmdbSearchHit>());
+        _tmdb.Setup(t => t.GetTrendingSeriesAsync(It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { Hit(2024, "Phantom Show") });
+
+        var created = new List<BaseItem>();
+        _lib.Setup(l => l.CreateItem(It.IsAny<BaseItem>(), It.IsAny<BaseItem>()))
+            .Callback<BaseItem, BaseItem>((i, _) => created.Add(i));
+
+        var reader = new CachedTmdbReader(_tmdb.Object, _db, NullLogger<CachedTmdbReader>.Instance);
+        var s = new SuggestionsContributor(
+            reader, _root, _lib.Object, _users.Object, _db, _hints, stubs,
+            NullLogger<SuggestionsContributor>.Instance);
+
+        var n = await s.RefreshTrendingAsync(CancellationToken.None);
+
+        Assert.Equal(1, n);
+        var series = created.OfType<Series>().Single();
+        Assert.False(string.IsNullOrEmpty(series.Path));
+        Assert.Equal(stubs.LastSeriesDir, series.Path);
+        Assert.Contains("__phantom_tmdb2024", series.Path!, StringComparison.Ordinal);
+        Assert.DoesNotContain("S01E01", series.Path!, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task MaterialiseHitsAsync_Series_WritesSeriesPhantomItemsRow()
+    {
+        var stubs = new SeriesAwareStubs();
+
+        _tmdb.Setup(t => t.GetTrendingMoviesAsync(It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Array.Empty<TmdbSearchHit>());
+        _tmdb.Setup(t => t.GetTrendingSeriesAsync(It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { Hit(909, "Another Show") });
+
+        Series? captured = null;
+        _lib.Setup(l => l.CreateItem(It.IsAny<BaseItem>(), It.IsAny<BaseItem>()))
+            .Callback<BaseItem, BaseItem>((i, _) => { if (i is Series s) captured = s; });
+
+        var reader = new CachedTmdbReader(_tmdb.Object, _db, NullLogger<CachedTmdbReader>.Instance);
+        var s = new SuggestionsContributor(
+            reader, _root, _lib.Object, _users.Object, _db, _hints, stubs,
+            NullLogger<SuggestionsContributor>.Instance);
+
+        await s.RefreshTrendingAsync(CancellationToken.None);
+
+        Assert.NotNull(captured);
+        var row = await _db.GetPhantomItemAsync(captured!.Id, default);
+        Assert.NotNull(row);
+        Assert.Equal("series", row!.Type);
+        Assert.Equal(909, row.TmdbId);
+        Assert.Equal(PhantomItemState.Virtual, row.State);
+    }
+
+    private sealed class SeriesAwareStubs : IPhantomStubManager
+    {
+        public bool IsReady => true;
+        public string? LastSeriesDir { get; private set; }
+
+        public Task BootstrapAsync(CancellationToken ct) => Task.CompletedTask;
+
+        public Task<string> CreateAsync(string title, int tmdbId, PhantomMediaKind kind, CancellationToken ct)
+        {
+            if (kind == PhantomMediaKind.Series)
+            {
+                var (dir, _, _) = DeriveSeriesStubPaths(title, tmdbId);
+                LastSeriesDir = dir;
+                return Task.FromResult(dir);
+            }
+            return Task.FromResult(
+                $"/var/lib/jellyfin/phantom-library/movies/{title.Replace(' ', '_')}__phantom_tmdb{tmdbId}.mp4");
+        }
+
+        public Task DeleteAsync(string symlinkPath, CancellationToken ct) => Task.CompletedTask;
+
+        public string DeriveFilename(string title, int tmdbId, PhantomMediaKind kind)
+            => $"{title.Replace(' ', '_')}__phantom_tmdb{tmdbId}.mp4";
+
+        public (string SeriesDir, string SeasonDir, string EpisodeFile) DeriveSeriesStubPaths(string title, int tmdbId)
+        {
+            var stem = $"{title.Replace(' ', '_')}__phantom_tmdb{tmdbId}";
+            var seriesDir = $"/var/lib/jellyfin/phantom-library/shows/{stem}";
+            var seasonDir = $"{seriesDir}/Season 01";
+            return (seriesDir, seasonDir, $"{seasonDir}/{stem} S01E01.mp4");
+        }
+    }
 }

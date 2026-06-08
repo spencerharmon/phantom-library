@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using System.IO;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -33,14 +34,35 @@ public interface IPhantomStubManager
     /// <summary>Verifies root dirs exist + are writable; extracts splash. Throws on operator-fixable failure.</summary>
     Task BootstrapAsync(CancellationToken ct);
 
-    /// <summary>Creates (or reuses) the symlink for one phantom. Returns absolute path.</summary>
+    /// <summary>
+    /// Creates (or reuses) the on-disk stub for one phantom and returns its
+    /// absolute path. For <see cref="PhantomMediaKind.Movie"/> this is the
+    /// loose-file symlink path under <c>movies/</c>. For
+    /// <see cref="PhantomMediaKind.Series"/> this is the **per-series
+    /// directory** under <c>shows/</c> (which contains
+    /// <c>Season 01/&lt;stem&gt; S01E01.&lt;ext&gt;</c>); callers persist that
+    /// directory as the Series BaseItem's Path. See PLAN §M13.
+    /// </summary>
     Task<string> CreateAsync(string title, int tmdbId, PhantomMediaKind kind, CancellationToken ct);
 
-    /// <summary>Deletes the symlink. Idempotent; swallows not-found.</summary>
+    /// <summary>
+    /// Deletes the stub. Idempotent; swallows not-found. For series stubs
+    /// (directories under <c>shows/</c> carrying the <c>__phantom_tmdb</c>
+    /// sentinel in the leaf name) the whole tree is removed recursively.
+    /// Refuses to recursively delete any directory that does NOT carry the
+    /// sentinel.
+    /// </summary>
     Task DeleteAsync(string symlinkPath, CancellationToken ct);
 
     /// <summary>Deterministic filename for a phantom. Pure / testable.</summary>
     string DeriveFilename(string title, int tmdbId, PhantomMediaKind kind);
+
+    /// <summary>
+    /// Deterministic per-series stub layout (PLAN §M13). Returns the
+    /// series directory, season directory, and the inner S01E01 symlink
+    /// file path. Pure / testable; does not touch disk.
+    /// </summary>
+    (string SeriesDir, string SeasonDir, string EpisodeFile) DeriveSeriesStubPaths(string title, int tmdbId);
 
     /// <summary>True once BootstrapAsync has completed successfully at least once.</summary>
     bool IsReady { get; }
@@ -146,44 +168,56 @@ public sealed class PhantomStubManager : IPhantomStubManager
             }
         }
 
+        if (kind == PhantomMediaKind.Series)
+        {
+            var (seriesDir, seasonDir, episodeFile) = DeriveSeriesStubPaths(title, tmdbId);
+            Directory.CreateDirectory(seasonDir);
+            EnsureSplashSymlink(episodeFile);
+            return seriesDir;
+        }
+
         var root = ResolveRoot();
-        var subdir = kind == PhantomMediaKind.Movie ? MoviesSubdir : ShowsSubdir;
-        var dir = Path.Combine(root, subdir);
+        var dir = Path.Combine(root, MoviesSubdir);
         Directory.CreateDirectory(dir);
 
         var filename = DeriveFilename(title, tmdbId, kind);
         var full = Path.Combine(dir, filename);
+        EnsureSplashSymlink(full);
+        return full;
+    }
 
+    private void EnsureSplashSymlink(string fullPath)
+    {
         // Idempotent: existing symlink that already points at our splash is fine.
         try
         {
-            var existingInfo = new FileInfo(full);
+            var existingInfo = new FileInfo(fullPath);
             if (existingInfo.Exists)
             {
                 var target = existingInfo.LinkTarget;
                 if (string.Equals(target, _splashPath, StringComparison.Ordinal)
                     || string.Equals(target, _splashPath, StringComparison.OrdinalIgnoreCase))
                 {
-                    return full;
+                    return;
                 }
 
                 // Existing entry points elsewhere (or is a real file we did not create).
-                // Replace only if it carries our sentinel; never clobber non-phantom files.
+                // Replace only if its filename carries our sentinel; never clobber non-phantom files.
+                var filename = Path.GetFileName(fullPath);
                 if (filename.Contains(Sentinel, StringComparison.Ordinal))
                 {
-                    File.Delete(full);
+                    File.Delete(fullPath);
                 }
                 else
                 {
-                    throw new IOException($"Refusing to overwrite non-phantom file at {full}");
+                    throw new IOException($"Refusing to overwrite non-phantom file at {fullPath}");
                 }
             }
         }
         catch (FileNotFoundException) { /* race: created+deleted; fall through to create */ }
         catch (DirectoryNotFoundException) { /* unlikely after CreateDirectory; fall through */ }
 
-        File.CreateSymbolicLink(full, _splashPath);
-        return full;
+        File.CreateSymbolicLink(fullPath, _splashPath!);
     }
 
     /// <inheritdoc />
@@ -196,7 +230,27 @@ public sealed class PhantomStubManager : IPhantomStubManager
 
         try
         {
-            File.Delete(symlinkPath);
+            // Series stubs are directories. Recursively remove only if the
+            // leaf carries our sentinel — refuse to nuke arbitrary dirs
+            // that happen to have been passed in.
+            if (Directory.Exists(symlinkPath) && !IsReparseSymlink(symlinkPath))
+            {
+                var leaf = Path.GetFileName(symlinkPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+                if (leaf.Contains(Sentinel, StringComparison.Ordinal))
+                {
+                    Directory.Delete(symlinkPath, recursive: true);
+                }
+                else
+                {
+                    _logger.LogWarning(
+                        "[PhantomStubManager] refusing to recursively delete directory without phantom sentinel: {Path}",
+                        symlinkPath);
+                }
+            }
+            else
+            {
+                File.Delete(symlinkPath);
+            }
         }
         catch (FileNotFoundException)
         {
@@ -214,6 +268,19 @@ public sealed class PhantomStubManager : IPhantomStubManager
         return Task.CompletedTask;
     }
 
+    private static bool IsReparseSymlink(string path)
+    {
+        try
+        {
+            var di = new DirectoryInfo(path);
+            return di.Exists && (di.Attributes & FileAttributes.ReparsePoint) == FileAttributes.ReparsePoint;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     /// <inheritdoc />
     public string DeriveFilename(string title, int tmdbId, PhantomMediaKind kind)
     {
@@ -225,8 +292,30 @@ public sealed class PhantomStubManager : IPhantomStubManager
 
         var ext = _splashExt ?? "mp4";
         var sb = new StringBuilder(safe.Length + 32);
-        sb.Append(safe).Append(Sentinel).Append(tmdbId).Append('.').Append(ext);
+        sb.Append(safe).Append(Sentinel).Append(tmdbId.ToString(CultureInfo.InvariantCulture)).Append('.').Append(ext);
         return sb.ToString();
+    }
+
+    /// <inheritdoc />
+    public (string SeriesDir, string SeasonDir, string EpisodeFile) DeriveSeriesStubPaths(string title, int tmdbId)
+    {
+        var safe = Sanitize(title);
+        if (string.IsNullOrEmpty(safe))
+        {
+            safe = "untitled";
+        }
+
+        var ext = _splashExt ?? "mp4";
+        var stem = safe + Sentinel + tmdbId.ToString(CultureInfo.InvariantCulture);
+        var root = ResolveRoot();
+        var seriesDir = Path.Combine(root, ShowsSubdir, stem);
+        // PLAN §M13: Season 01 is hardcoded; phantom series expose a
+        // single placeholder episode. Real episodes land under canonical
+        // Season NN paths under the gostream physical folder once the
+        // user plays the placeholder.
+        var seasonDir = Path.Combine(seriesDir, "Season 01");
+        var episodeFile = Path.Combine(seasonDir, stem + " S01E01." + ext);
+        return (seriesDir, seasonDir, episodeFile);
     }
 
     private static string Sanitize(string? title)
