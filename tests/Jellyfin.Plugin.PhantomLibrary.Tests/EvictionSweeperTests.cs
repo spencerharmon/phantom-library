@@ -232,7 +232,7 @@ public class EvictionSweeperTests : IDisposable
         await Build().RunOnceAsync(CancellationToken.None);
 
         Assert.Null(await _db.GetTmdbCacheAsync("stale", "h", "en", default));
-        Assert.False(await _db.IsMarkedUnavailableAsync(new UnavailableKey(5, null, "movie", null, null), default));
+        Assert.Null(await _db.IsMarkedUnavailableAsync(new UnavailableKey(5, null, "movie", null, null), default));
     }
 
     [Fact]

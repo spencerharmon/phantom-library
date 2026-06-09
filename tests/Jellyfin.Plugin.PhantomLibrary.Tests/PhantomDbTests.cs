@@ -52,10 +52,10 @@ public class PhantomDbTests : IDisposable
         var k = new UnavailableKey(7, null, "movie", null, null);
         await _db.MarkUnavailableAsync(k, TimeSpan.FromSeconds(-1), default);
         // retry_after in the past ⇒ no longer "marked".
-        Assert.False(await _db.IsMarkedUnavailableAsync(k, default));
+        Assert.Null(await _db.IsMarkedUnavailableAsync(k, default));
 
         await _db.MarkUnavailableAsync(k, TimeSpan.FromHours(24), default);
-        Assert.True(await _db.IsMarkedUnavailableAsync(k, default));
+        Assert.NotNull(await _db.IsMarkedUnavailableAsync(k, default));
     }
 
     [Fact]
@@ -75,6 +75,70 @@ public class PhantomDbTests : IDisposable
         }
 
         await Task.WhenAll(tasks);
+    }
+
+    [Fact]
+    public async Task GetStates_BulkLookup_OnlyReturnsKnownGuids()
+    {
+        var phantom = Guid.NewGuid();
+        var materialised = Guid.NewGuid();
+        var unavailable = Guid.NewGuid();
+        var unknown = Guid.NewGuid(); // never inserted; must be absent from result
+
+        var now = DateTimeOffset.UtcNow;
+        await _db.UpsertPhantomItemAsync(phantom, new PhantomItemRow
+        {
+            TmdbId = 10, Type = "movie", State = PhantomItemState.Phantom,
+            FirstSeen = now, LastTouched = now,
+        }, default);
+        await _db.UpsertPhantomItemAsync(materialised, new PhantomItemRow
+        {
+            TmdbId = 11, Type = "movie", State = PhantomItemState.Materialised,
+            FirstSeen = now, LastTouched = now,
+        }, default);
+        await _db.UpsertPhantomItemAsync(unavailable, new PhantomItemRow
+        {
+            TmdbId = 12, Type = "movie", State = PhantomItemState.Unavailable,
+            FirstSeen = now, LastTouched = now,
+        }, default);
+
+        var states = await _db.GetStatesAsync(
+            new[] { phantom, materialised, unavailable, unknown }, default);
+
+        Assert.Equal(3, states.Count);
+        Assert.Equal(PhantomItemState.Phantom, states[phantom]);
+        Assert.Equal(PhantomItemState.Materialised, states[materialised]);
+        Assert.Equal(PhantomItemState.Unavailable, states[unavailable]);
+        Assert.False(states.ContainsKey(unknown));
+    }
+
+    [Fact]
+    public async Task GetStates_Empty_ReturnsEmpty()
+    {
+        var states = await _db.GetStatesAsync(Array.Empty<Guid>(), default);
+        Assert.Empty(states);
+    }
+
+    [Fact]
+    public async Task GetStates_BatchesAcrossSmallBatchSize()
+    {
+        // Insert 7 rows; force batch size of 3 to exercise multi-batch path.
+        var ids = new Guid[7];
+        for (var i = 0; i < ids.Length; i++)
+        {
+            ids[i] = Guid.NewGuid();
+            await _db.UpsertPhantomItemAsync(ids[i], new PhantomItemRow
+            {
+                TmdbId = 1000 + i, Type = "movie", State = PhantomItemState.Phantom,
+                FirstSeen = DateTimeOffset.UtcNow, LastTouched = DateTimeOffset.UtcNow,
+            }, default);
+        }
+        var states = await _db.GetStatesAsync(ids, default, batchSize: 3);
+        Assert.Equal(ids.Length, states.Count);
+        foreach (var id in ids)
+        {
+            Assert.Equal(PhantomItemState.Phantom, states[id]);
+        }
     }
 
     [Fact]

@@ -401,7 +401,14 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
 
     // ---- unavailable_marker ----
 
-    public async Task<bool> IsMarkedUnavailableAsync(UnavailableKey key, CancellationToken ct)
+    /// <summary>
+    /// Returns the marker's <c>retry_after</c> instant if the key is
+    /// currently marked unavailable, or <c>null</c> if no live marker
+    /// exists. Returning the instant lets callers surface a concrete
+    /// "retry after &lt;time&gt;" message to the user instead of an
+    /// opaque "unavailable".
+    /// </summary>
+    public async Task<DateTimeOffset?> IsMarkedUnavailableAsync(UnavailableKey key, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(key);
         await using var conn = await OpenAsync(ct).ConfigureAwait(false);
@@ -417,11 +424,11 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
         var v = await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
         if (v is null || v is DBNull)
         {
-            return false;
+            return null;
         }
 
         var retryAfter = DateTimeOffset.FromUnixTimeSeconds(Convert.ToInt64(v, System.Globalization.CultureInfo.InvariantCulture));
-        return DateTimeOffset.UtcNow < retryAfter;
+        return DateTimeOffset.UtcNow < retryAfter ? retryAfter : null;
     }
 
     public async Task MarkUnavailableAsync(UnavailableKey key, TimeSpan retryAfter, CancellationToken ct)
@@ -637,6 +644,63 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
             MaterialisedAt = r.IsDBNull(10) ? (DateTimeOffset?)null
                 : DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(10)),
         };
+    }
+
+    /// <summary>
+    /// Bulk lookup of phantom states for the supplied Jellyfin item GUIDs.
+    /// Returns a dictionary mapping each GUID present in the phantom_items
+    /// table to its current <see cref="PhantomItemState"/>. GUIDs absent
+    /// from the table are omitted from the result (callers treat absent
+    /// as "not a phantom"). Splits the input into batches of
+    /// <paramref name="batchSize"/> to stay below SQLite's 999-parameter
+    /// statement limit.
+    /// </summary>
+    public async Task<IReadOnlyDictionary<Guid, PhantomItemState>> GetStatesAsync(
+        IReadOnlyCollection<Guid> jellyfinItemIds,
+        CancellationToken ct,
+        int batchSize = 500)
+    {
+        ArgumentNullException.ThrowIfNull(jellyfinItemIds);
+        var result = new Dictionary<Guid, PhantomItemState>(jellyfinItemIds.Count);
+        if (jellyfinItemIds.Count == 0)
+        {
+            return result;
+        }
+
+        if (batchSize < 1)
+        {
+            batchSize = 500;
+        }
+
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+
+        var ids = new List<Guid>(jellyfinItemIds);
+        for (var offset = 0; offset < ids.Count; offset += batchSize)
+        {
+            var take = Math.Min(batchSize, ids.Count - offset);
+            await using var cmd = conn.CreateCommand();
+            var sb = new System.Text.StringBuilder(
+                "SELECT item_guid, state FROM phantom_items WHERE item_guid IN (");
+            for (var i = 0; i < take; i++)
+            {
+                if (i > 0) sb.Append(',');
+                var p = "$g" + i.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                sb.Append(p);
+                cmd.Parameters.AddWithValue(p, ids[offset + i].ToString("N"));
+            }
+            sb.Append(");");
+            cmd.CommandText = sb.ToString();
+
+            await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+            while (await r.ReadAsync(ct).ConfigureAwait(false))
+            {
+                var guid = Guid.ParseExact(r.GetString(0), "N");
+                var state = Enum.Parse<PhantomItemState>(r.GetString(1));
+                result[guid] = state;
+            }
+        }
+
+        return result;
     }
 
     /// <summary>

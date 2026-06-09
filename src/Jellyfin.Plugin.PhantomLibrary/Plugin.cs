@@ -86,6 +86,20 @@ public class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
                     "{0}.Configuration.phantomKebab.js",
                     GetType().Namespace),
             },
+            // PhantomBadges: browser-side JS shim that decorates card /
+            // list-item DOM nodes with a small "Phantom" / "Materialised"
+            // / "Unavailable" badge so users can tell at a glance which
+            // items are virtual stubs vs. real files. Loaded via the
+            // same injection mechanism as PhantomKebab:
+            //   <script src="/Plugins/PhantomLibrary/badges.js" defer></script>
+            new PluginPageInfo
+            {
+                Name = "PhantomBadges",
+                EmbeddedResourcePath = string.Format(
+                    CultureInfo.InvariantCulture,
+                    "{0}.Configuration.phantomBadges.js",
+                    GetType().Namespace),
+            },
         };
     }
 }

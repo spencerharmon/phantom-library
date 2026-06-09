@@ -302,11 +302,14 @@ public sealed class Materialiser : IMaterialiser
 
             // Step 3: unavailable marker
             var unavailKey = new UnavailableKey(ids.Tmdb, ids.Imdb, ids.Type, ids.Season, ids.Episode);
-            if (await _db.IsMarkedUnavailableAsync(unavailKey, ct).ConfigureAwait(false))
+            var unavailUntil = await _db.IsMarkedUnavailableAsync(unavailKey, ct).ConfigureAwait(false);
+            if (unavailUntil is { } until)
             {
-                await LogAsync(sw, jellyfinItemId, trigger, "unavailable", null, indexerUsed, infoHashUsed, ct)
+                var reason = string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                    $"marked unavailable; retry after {until:u}");
+                await LogAsync(sw, jellyfinItemId, trigger, "unavailable", reason, indexerUsed, infoHashUsed, ct)
                     .ConfigureAwait(false);
-                return new MaterialisationOutcome { Status = MaterialisationStatus.Unavailable };
+                return new MaterialisationOutcome { Status = MaterialisationStatus.Unavailable, Error = reason };
             }
 
             // Step 4: magnet cache
@@ -377,9 +380,11 @@ public sealed class Materialiser : IMaterialiser
                 if (best is null)
                 {
                     await _db.MarkUnavailableAsync(unavailKey, UnavailableRetryAfter, ct).ConfigureAwait(false);
+                    var reason = string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                        $"no candidate passed quality floors (preset={cfg.QualityPreset}, min seeders={cfg.MinSeeders}, min 1080p={cfg.MinSizeGb1080p} GB, min 4K={cfg.MinSizeGb4K} GB); {candidates.Count} candidate(s) considered");
                     await LogAsync(sw, jellyfinItemId, trigger, "unavailable",
-                        "no candidate passed quality floors", indexerUsed, infoHashUsed, ct).ConfigureAwait(false);
-                    return new MaterialisationOutcome { Status = MaterialisationStatus.Unavailable };
+                        reason, indexerUsed, infoHashUsed, ct).ConfigureAwait(false);
+                    return new MaterialisationOutcome { Status = MaterialisationStatus.Unavailable, Error = reason };
                 }
 
                 magnet = best.Magnet;

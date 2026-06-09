@@ -164,6 +164,24 @@ public class MaterialiserTests : IDisposable
     }
 
     [Fact]
+    public async Task Unavailable_Marker_Hit_Populates_Error_With_Retry_Time()
+    {
+        // The kebab UI surfaces Outcome.Error to the user. Both the
+        // marker-hit short-circuit and the "no candidate" paths must
+        // populate Error with something more useful than a bare status.
+        var id = Guid.NewGuid();
+        _libMock.Setup(l => l.GetItemById(id)).Returns(BuildMovie(id));
+        await _db.MarkUnavailableAsync(new UnavailableKey(1, "tt1", "movie", null, null), TimeSpan.FromHours(1), default);
+
+        var m = BuildMaterialiser();
+        var r = await m.MaterialiseAsync(id, MaterialiseTrigger.Manual, CancellationToken.None);
+        Assert.Equal(MaterialisationStatus.Unavailable, r.Status);
+        Assert.NotNull(r.Error);
+        Assert.Contains("marked unavailable", r.Error!, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("retry after", r.Error!, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task PreResolve_Stops_After_Cache_Write_Never_Calls_Gostream()
     {
         var id = Guid.NewGuid();
@@ -196,7 +214,7 @@ public class MaterialiserTests : IDisposable
         var m = BuildMaterialiser();
         var r = await m.MaterialiseAsync(id, MaterialiseTrigger.Favourite, CancellationToken.None);
         Assert.Equal(MaterialisationStatus.Error, r.Status);
-        Assert.False(await _db.IsMarkedUnavailableAsync(new UnavailableKey(1, "tt1", "movie", null, null), default));
+        Assert.Null(await _db.IsMarkedUnavailableAsync(new UnavailableKey(1, "tt1", "movie", null, null), default));
     }
 
     [Fact]
@@ -212,7 +230,7 @@ public class MaterialiserTests : IDisposable
         var m = BuildMaterialiser();
         var r = await m.MaterialiseAsync(id, MaterialiseTrigger.Favourite, CancellationToken.None);
         Assert.Equal(MaterialisationStatus.Unavailable, r.Status);
-        Assert.True(await _db.IsMarkedUnavailableAsync(new UnavailableKey(1, "tt1", "movie", null, null), default));
+        Assert.NotNull(await _db.IsMarkedUnavailableAsync(new UnavailableKey(1, "tt1", "movie", null, null), default));
     }
 
     [Fact]
@@ -226,6 +244,8 @@ public class MaterialiserTests : IDisposable
         var m = BuildMaterialiser();
         var r = await m.MaterialiseAsync(id, MaterialiseTrigger.Favourite, CancellationToken.None);
         Assert.Equal(MaterialisationStatus.Unavailable, r.Status);
+        Assert.NotNull(r.Error);
+        Assert.Contains("no candidate passed quality floors", r.Error!, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

@@ -345,4 +345,29 @@ else
   fi
 fi
 
+# PhantomBadges: separate shim that decorates list/card DOM nodes with
+# a Phantom/Materialised/Unavailable badge. Injected as its own
+# <script> tag next to the kebab snippet, with the same idempotency
+# semantics. Sentinel comment <!--phantom-library-badges--> keeps the
+# patch easy to grep for and easy to remove on uninstall.
+if [ -z "$INDEX_PATH" ]; then
+  yellow "jellyfin-web index.html not found; skipping badges shim install."
+  yellow "To install manually, add this line before </body> in your jellyfin-web index.html:"
+  yellow '  <script src="/Plugins/PhantomLibrary/badges.js" defer></script>'
+elif $SUDO grep -q 'Plugins/PhantomLibrary/badges\.js' "$INDEX_PATH" 2>/dev/null; then
+  green "PhantomBadges shim present in $INDEX_PATH"
+else
+  bold "Injecting PhantomBadges shim into $INDEX_PATH"
+  if [ ! -f "${INDEX_PATH}.phantom-orig" ]; then
+    $SUDO cp "$INDEX_PATH" "${INDEX_PATH}.phantom-orig"
+  fi
+  BADGES_SNIPPET='<!--phantom-library-badges--><script src="/Plugins/PhantomLibrary/badges.js" defer></script>'
+  $SUDO sed -i "s|</body>|${BADGES_SNIPPET}</body>|" "$INDEX_PATH"
+  if $SUDO grep -q 'phantom-library-badges' "$INDEX_PATH"; then
+    green "  injected. (Backup at ${INDEX_PATH}.phantom-orig)"
+  else
+    red "  injection failed; index.html unchanged. Inspect manually."
+  fi
+fi
+
 green "Done."

@@ -67,6 +67,35 @@ public class QualityScorerTests
     }
 
     [Fact]
+    public void Untagged_SD_HDRip_Below_1080p_Floor_Is_Rejected()
+    {
+        // Steven Universe Movie regression: Torrentio's only candidate
+        // was "Steven.Universe.The.Movie.2019.HDRip.XviD.AC3-EVO" at
+        // ~1.09 GB, no 1080p/4K tag. Without the SD-band guard, the
+        // scorer passes it through and gostream rejects it with
+        // 422 no_valid_files, surfacing as a misleading materialise
+        // failure to the operator.
+        var cands = new List<IndexerCandidate>
+        {
+            C("Steven.Universe.The.Movie.2019.HDRip.XviD.AC3-EVO", 1170378588L, 31),
+        };
+        Assert.Null(New().PickBest(cands, QualityPreset.GostreamDefault, 5, 4, 20));
+    }
+
+    [Fact]
+    public void Untagged_Large_Release_Passes_When_Above_Floor()
+    {
+        // A release with no resolution tag but above the 1080p min size
+        // (e.g. a generic BluRay rip) must still be accepted — gostream's
+        // size band will accept it too.
+        var cands = new List<IndexerCandidate>
+        {
+            C("Movie.2019.BluRay.x264", 8 * GB, 100),
+        };
+        Assert.NotNull(New().PickBest(cands, QualityPreset.GostreamDefault, 5, 4, 20));
+    }
+
+    [Fact]
     public void BiggestMostSeeded_Picks_Biggest_Then_Seeders()
     {
         var cands = new List<IndexerCandidate>

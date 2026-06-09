@@ -68,6 +68,16 @@ public sealed class QualityScorer
             var is1080 = Re1080p.IsMatch(c.Title);
             if (is4K && c.Size > 0 && c.Size < min4K) return false;
             if (!is4K && is1080 && c.Size > 0 && c.Size < min1080p) return false;
+            // gostream's library.FilterVideoFiles only accepts the 1080p
+            // (4-20 GB) or 4K (10-60 GB) size bands. A release with no
+            // 1080p/4K tag whose size is below the 1080p floor is
+            // effectively SD (HDRip, XviD, DVDRip, 720p, etc.) and will
+            // be rejected downstream with no_valid_files after wasting a
+            // torrent add. Reject up front so the materialiser reports
+            // "no candidate passed quality floors" instead of the
+            // misleading 422 the operator sees when an SD-only release
+            // slips through.
+            if (!is4K && !is1080 && c.Size > 0 && c.Size < min1080p) return false;
             return true;
         }).ToList();
 

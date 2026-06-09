@@ -47,6 +47,38 @@
         return null;
     }
 
+    /* Try hard to pull a useful failure message out of the ajax error.
+     * Jellyfin's ApiClient.ajax rejects with an XHR-like object: we can
+     * see .responseJSON (if the runtime parsed it), .responseText (raw
+     * body), .status / .statusText. The plugin's MaterialisationOutcome
+     * is returned as the body on every non-2xx outcome that originated
+     * inside the materialiser (404/422/500), so we prefer body.Error
+     * over the HTTP statusText, which is generic and unhelpful ("Not
+     * Found", "Unprocessable Entity"). */
+    function extractErrorMessage(err) {
+        if (!err) { return 'unknown error'; }
+        var body = err.responseJSON;
+        if (!body && typeof err.responseText === 'string' && err.responseText.length > 0) {
+            try { body = JSON.parse(err.responseText); } catch (_) { /* not JSON */ }
+        }
+        if (body && typeof body === 'object') {
+            var status = body.Status || body.status;
+            var error = body.Error || body.error;
+            if (status && error) { return status + ': ' + error; }
+            if (error) { return error; }
+            if (status) { return status; }
+        }
+        if (typeof err.responseText === 'string' && err.responseText.length > 0
+            && err.responseText.length < 500) {
+            return err.responseText;
+        }
+        if (err.statusText) {
+            return 'HTTP ' + err.status + ' ' + err.statusText;
+        }
+        if (err.status) { return 'HTTP ' + err.status; }
+        return 'unknown error';
+    }
+
     function fireMaterialise(itemId) {
         var api = getApiClient();
         if (!api) {
@@ -64,11 +96,18 @@
             log('result', result);
             var status = (result && result.Status) || 'Unknown';
             var fuse = (result && result.FusePath) || '';
-            alert('Phantom Library: ' + status + (fuse ? '\n' + fuse : ''));
+            var err = (result && result.Error) || '';
+            // Success / Duplicate carry no Error; Unavailable / Error coming
+            // through the 2xx branch (shouldn't happen today, but harmless)
+            // would still surface their reason.
+            var msg = 'Phantom Library: ' + status;
+            if (err) { msg += '\n' + err; }
+            if (fuse) { msg += '\n' + fuse; }
+            alert(msg);
         }, function (err) {
             warn('materialise failed', err);
-            var msg = (err && err.statusText) || ('HTTP ' + (err && err.status));
-            alert('Phantom Library: materialise failed (' + msg + ')');
+            var msg = extractErrorMessage(err);
+            alert('Phantom Library: materialise failed\n' + msg);
         });
     }
 
