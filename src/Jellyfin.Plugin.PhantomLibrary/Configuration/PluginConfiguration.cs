@@ -59,6 +59,12 @@ public class PluginConfiguration : BasePluginConfiguration
         PhantomShowsLibraryName = "gostream-shows";
 
         SuggestionsCatalogueMaxItems = 5000;
+
+        DiscoveryRefreshIntervalHours = 6;
+        DiscoveryCacheTtlDays = 30;
+        DiscoveryLanguage = string.Empty;
+        GostreamMoviesRoot = "/var/gostream/gostream-mkv-virtual/movies";
+        GostreamShowsRoot = "/var/gostream/gostream-mkv-virtual/tv";
     }
 
     /// <summary>Gets or sets the TMDB v3 API key used by the plugin's TMDB client.</summary>
@@ -180,6 +186,40 @@ public class PluginConfiguration : BasePluginConfiguration
     /// Default 5000 → ~2500 of each kind across ~125 TMDB pages per kind.
     /// </summary>
     public int SuggestionsCatalogueMaxItems { get; set; }
+
+    /// <summary>
+    /// Interval (hours) between <c>DiscoveryRefreshTask</c> runs. Drives
+    /// trending + similar-of-favourites + tmdb_metadata warm passes.
+    /// </summary>
+    public int DiscoveryRefreshIntervalHours { get; set; }
+
+    /// <summary>
+    /// TTL (days) for rows in the <c>discovery_cache</c> table. Rows
+    /// not refreshed within this window are eligible for deletion at
+    /// the end of each DiscoveryRefreshTask run (unless they have a
+    /// matching materialised_state row, which acts as protection).
+    /// </summary>
+    public int DiscoveryCacheTtlDays { get; set; }
+
+    /// <summary>
+    /// TMDB language code passed to discovery calls. Empty means
+    /// TMDB default (en-US). Maps to the <c>language</c> query
+    /// parameter on /trending, /movie/{id}/similar, etc.
+    /// </summary>
+    public string DiscoveryLanguage { get; set; }
+
+    /// <summary>
+    /// Filesystem path to the gostream movies FUSE mount. The
+    /// movies channel walks this directory to enumerate orphan files
+    /// (gostream-served movies not surfaced by phantom discovery).
+    /// </summary>
+    public string GostreamMoviesRoot { get; set; }
+
+    /// <summary>
+    /// Filesystem path to the gostream shows FUSE mount. Walked by
+    /// the shows channel for orphan enumeration (Stage 5.1).
+    /// </summary>
+    public string GostreamShowsRoot { get; set; }
 }
 
 /// <summary>Quality-scoring preset chooser.</summary>

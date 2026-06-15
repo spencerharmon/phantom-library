@@ -5,11 +5,13 @@ using Jellyfin.Plugin.PhantomLibrary.Clients;
 using Jellyfin.Plugin.PhantomLibrary.Library;
 using Jellyfin.Plugin.PhantomLibrary.Materialisation;
 using Jellyfin.Plugin.PhantomLibrary.Playback;
+using Jellyfin.Plugin.PhantomLibrary.Scheduled;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Channels;
 using MediaBrowser.Controller.Plugins;
+using MediaBrowser.Model.Tasks;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Jellyfin.Plugin.PhantomLibrary;
@@ -93,8 +95,16 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         // pointing at it.
         serviceCollection.AddSingleton<SplashSourceProvider>();
 
+        // ChannelStateProvider — backs IChannel.DataVersion for each
+        // phantom channel and lets background tasks bump invalidation
+        // markers (persisted via plugin_meta so they survive restart).
+        serviceCollection.AddSingleton<ChannelStateProvider>();
+
         // Channels.
         serviceCollection.AddSingleton<IChannel, PhantomMoviesChannel>();
         serviceCollection.AddSingleton<IChannel, PhantomShowsChannel>();
+
+        // Scheduled tasks.
+        serviceCollection.AddSingleton<IScheduledTask, DiscoveryRefreshTask>();
     }
 }

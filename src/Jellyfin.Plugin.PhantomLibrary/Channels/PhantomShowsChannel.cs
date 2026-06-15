@@ -23,6 +23,13 @@ namespace Jellyfin.Plugin.PhantomLibrary.Channels;
 public sealed class PhantomShowsChannel
     : IChannel, IRequiresMediaInfoCallback, ISupportsLatestMedia, IChannelItemRefresh
 {
+    private readonly ChannelStateProvider _state;
+
+    public PhantomShowsChannel(ChannelStateProvider state)
+    {
+        _state = state ?? throw new ArgumentNullException(nameof(state));
+    }
+
     /// <inheritdoc />
     public string Name => ChannelIds.ShowsName;
 
@@ -30,7 +37,7 @@ public sealed class PhantomShowsChannel
     public string Description => "Phantom Library — TV discovery + on-demand materialise via gostream.";
 
     /// <inheritdoc />
-    public string DataVersion => "1";
+    public string DataVersion => _state.DataVersion(ChannelStateProvider.KindShows);
 
     /// <inheritdoc />
     public string HomePageUrl => string.Empty;
