@@ -173,7 +173,28 @@ if [ "$DO_BUILD" -eq 1 ]; then
   fi
 
   bold "Building plugin (Release)... [--build]"
+  echo
+  yellow "  NOTE: this plugin depends on PATCHED Jellyfin assemblies"
+  yellow "        (MediaBrowser.Controller + Jellyfin.LiveTv). The patches"
+  yellow "        add IChannelItemRefresh{,Manager} - used by the plugin"
+  yellow "        at runtime. The plugin DLL alone is NOT sufficient;"
+  yellow "        you must also deploy the patched Jellyfin DLLs to the"
+  yellow "        Jellyfin install dir (default /usr/lib/jellyfin/)."
+  yellow "        See docs/operator-deploy.md for the procedure - this"
+  yellow "        script will print the exact commands at the end."
+  echo
   dotnet build -c Release
+
+  # Also build the patched Jellyfin assemblies the plugin links against
+  # at runtime. Building Jellyfin.Server pulls in MediaBrowser.Controller
+  # and Jellyfin.LiveTv transitively. Output ends up in each project's
+  # bin/Release/net*/ - we re-locate the two we care about at the end.
+  bold "Building patched Jellyfin assemblies (Release)..."
+  jf_server_csproj="$REPO_ROOT/jellyfin/Jellyfin.Server/Jellyfin.Server.csproj"
+  if [ ! -f "$jf_server_csproj" ]; then
+    die "jellyfin/Jellyfin.Server/Jellyfin.Server.csproj missing; expected a release-10.11.z clone at $REPO_ROOT/jellyfin (base commit $(cat "$REPO_ROOT/scripts/jellyfin-patches/REBASE.md" 2>/dev/null | grep -oE '[0-9a-f]{10,}' | head -1 || echo 1fbd873929))"
+  fi
+  dotnet build -c Release "$jf_server_csproj"
   echo
 else
   yellow "Skipping build (pass --build to rebuild). Using existing artefacts."
@@ -196,6 +217,76 @@ if [ "$SRC_MD5" != "$DST_MD5" ]; then
   die "md5 mismatch after install: src=$SRC_MD5 dst=$DST_MD5. Aborting."
 fi
 green "  ${PLUGIN_NAME}.dll installed (md5 $SRC_MD5)"
+
+# ---------------------------------------------------------------- patched jellyfin assemblies (operator-deploy notice)
+# The plugin references IChannelItemRefreshManager (added by the
+# scripts/jellyfin-patches/ patch series). The operator's runtime
+# Jellyfin install (e.g. /usr/lib/jellyfin/) is the unpatched distro
+# package. Plugin load will fail with TypeLoadException unless the
+# matching patched DLLs are deployed alongside.
+#
+# install.sh does NOT auto-deploy these. Replacing system files is
+# destructive and a package-manager upgrade would silently clobber
+# them; the operator owns that decision. We print the exact commands
+# the operator should run, sourced from the build outputs we just
+# produced (when --build was passed).
+if [ "$DO_BUILD" -eq 1 ]; then
+  jf_controller_dll="$REPO_ROOT/jellyfin/MediaBrowser.Controller/bin/Release/net9.0/MediaBrowser.Controller.dll"
+  jf_livetv_dll="$REPO_ROOT/jellyfin/src/Jellyfin.LiveTv/bin/Release/net9.0/Jellyfin.LiveTv.dll"
+  # Detect the operator's Jellyfin install dir. /usr/lib/jellyfin/ on
+  # Arch + Debian distro packages. Skip the section quietly if neither
+  # patched DLL exists yet (build failed earlier).
+  if [ ! -f "$jf_controller_dll" ] || [ ! -f "$jf_livetv_dll" ]; then
+    yellow "Patched Jellyfin DLLs not found under jellyfin/.../bin/Release/net9.0/."
+    yellow "  expected: $jf_controller_dll"
+    yellow "            $jf_livetv_dll"
+    yellow "  Did 'dotnet build -c Release jellyfin/Jellyfin.Server/Jellyfin.Server.csproj' succeed?"
+  else
+    jf_install_dir=""
+    for cand in /usr/lib/jellyfin /usr/share/jellyfin/bin /opt/jellyfin; do
+      if [ -f "$cand/MediaBrowser.Controller.dll" ] && [ -f "$cand/Jellyfin.LiveTv.dll" ]; then
+        jf_install_dir="$cand"
+        break
+      fi
+    done
+    echo
+    bold "Patched Jellyfin assemblies ready for operator deploy:"
+    echo "  built artefacts:"
+    echo "    $jf_controller_dll"
+    echo "    $jf_livetv_dll"
+    if [ -n "$jf_install_dir" ]; then
+      echo
+      echo "  detected runtime Jellyfin install dir: $jf_install_dir"
+      yellow "  the plugin DLL just installed REFERENCES types added by the patches;"
+      yellow "  the plugin will fail to load against the unpatched DLLs currently"
+      yellow "  at $jf_install_dir/{MediaBrowser.Controller.dll,Jellyfin.LiveTv.dll}."
+      echo
+      bold "  Operator deploy procedure (run BEFORE restarting jellyfin):"
+      echo "    sudo systemctl stop jellyfin"
+      echo "    sudo cp -p $jf_install_dir/MediaBrowser.Controller.dll \\"
+      echo "            $jf_install_dir/MediaBrowser.Controller.dll.pre-phantom-bak"
+      echo "    sudo cp -p $jf_install_dir/Jellyfin.LiveTv.dll \\"
+      echo "            $jf_install_dir/Jellyfin.LiveTv.dll.pre-phantom-bak"
+      echo "    sudo install -m 644 $jf_controller_dll $jf_install_dir/"
+      echo "    sudo install -m 644 $jf_livetv_dll $jf_install_dir/"
+      echo "    sudo systemctl start jellyfin"
+      echo
+      yellow "  NOTE: a 'pacman -Syu' / 'apt upgrade' / etc. of the jellyfin-server"
+      yellow "        package will silently overwrite these DLLs and the plugin"
+      yellow "        will fail to load on the next jellyfin restart. To detect:"
+      echo   "          md5sum $jf_install_dir/MediaBrowser.Controller.dll \\"
+      echo   "                 $jf_install_dir/Jellyfin.LiveTv.dll"
+      yellow "        Compare against the md5 of the .pre-phantom-bak files. If"
+      yellow "        they match the .pre-phantom-bak, the patch was clobbered;"
+      yellow "        re-run ./install.sh --build then redo this deploy block."
+    else
+      yellow "  Could not auto-detect a Jellyfin install dir with the unpatched DLLs."
+      yellow "  Deploy these two DLLs to your Jellyfin install dir (the one containing"
+      yellow "  jellyfin.dll), back up the originals first. See docs/operator-deploy.md."
+    fi
+    echo
+  fi
+fi
 
 # ---------------------------------------------------------------- phantom stub tree (M10)
 bold "Creating phantom stub tree (M10)..."
