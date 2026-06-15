@@ -100,6 +100,11 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         // markers (persisted via plugin_meta so they survive restart).
         serviceCollection.AddSingleton<ChannelStateProvider>();
 
+        // GostreamFilesystemEnumerator — walks the gostream FUSE mount
+        // for orphan files the movies/shows channel surfaces alongside
+        // discovery + materialised items.
+        serviceCollection.AddSingleton<GostreamFilesystemEnumerator>();
+
         // Channels.
         serviceCollection.AddSingleton<IChannel, PhantomMoviesChannel>();
         serviceCollection.AddSingleton<IChannel, PhantomShowsChannel>();
