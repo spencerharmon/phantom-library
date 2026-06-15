@@ -3,8 +3,8 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+// TODO(stage-4.3): trim per plan §4.3 + 6.x
 using Jellyfin.Plugin.PhantomLibrary.Clients;
-using Jellyfin.Plugin.PhantomLibrary.Library;
 using Jellyfin.Plugin.PhantomLibrary.Materialisation;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Common.Configuration;
@@ -37,7 +37,6 @@ public sealed class PhantomLibraryController : ControllerBase
     private readonly IMaterialisationQueue _queue;
     private readonly IGostreamClient _gostream;
     private readonly IApplicationPaths _paths;
-    private readonly ISuggestionsContributor _suggestions;
     private readonly IUserManager _userManager;
     private readonly PhantomDb _db;
 
@@ -46,7 +45,6 @@ public sealed class PhantomLibraryController : ControllerBase
         IMaterialisationQueue queue,
         IGostreamClient gostream,
         IApplicationPaths paths,
-        ISuggestionsContributor suggestions,
         IUserManager userManager,
         PhantomDb db)
     {
@@ -54,7 +52,6 @@ public sealed class PhantomLibraryController : ControllerBase
         _queue = queue;
         _gostream = gostream;
         _paths = paths;
-        _suggestions = suggestions;
         _userManager = userManager;
         _db = db;
     }
@@ -136,15 +133,6 @@ public sealed class PhantomLibraryController : ControllerBase
             dbPath = System.IO.Path.Combine(_paths.PluginConfigurationsPath, "PhantomLibrary", "phantom.db"),
             gostreamReachable = reachable,
         });
-    }
-
-    /// <summary>Force a full TMDB suggestions refresh (Trending + per-user Recommended).</summary>
-    [HttpPost("Suggestions/Refresh")]
-    [ProducesResponseType(StatusCodes.Status200OK)]
-    public async Task<IActionResult> RefreshSuggestions(CancellationToken ct = default)
-    {
-        var count = await _suggestions.RefreshAllAsync(ct).ConfigureAwait(false);
-        return Ok(new { created = count });
     }
 
     /// <summary>Returns per-user preference rows for all Jellyfin users.</summary>
