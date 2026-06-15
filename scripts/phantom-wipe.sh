@@ -41,7 +41,22 @@
 #   JELLYFIN_DB         path to jellyfin.db   (default /var/lib/jellyfin/data/jellyfin.db)
 #   PHANTOM_DB          path to phantom.db    (default /var/lib/jellyfin/plugins/configurations/PhantomLibrary/phantom.db)
 #   STUB_ROOT           path to stub root     (default /var/lib/jellyfin/phantom-library)
+#   JF_ROOT_DEFAULT     path to Jellyfin virtual-library root
+#                                             (default /var/lib/jellyfin/root/default)
+#   GOSTREAM_ROOT       path to gostream mount root (real files)
+#                                             (default /var/gostream)
 #   --skip-service-check  bypass the jellyfin-must-be-stopped check
+#
+# CHANNEL-ARCH NOTE (v0.3.0+): the wipe now also drops:
+#   - the gostream-movies and gostream-shows CollectionFolders from jellyfin.db
+#     (channel arch replaces them; if left in place the library scanner
+#      would re-create them on next start)
+#   - the on-disk CollectionFolder marker dirs under JF_ROOT_DEFAULT
+#   - every BaseItem rooted under GOSTREAM_ROOT (real gostream content is
+#     re-exposed via the channel; the scanner-derived BaseItems must go
+#     so the channel owns the IDs)
+# The real video files at GOSTREAM_ROOT itself are NOT touched - those
+# belong to the gostream service, not to Jellyfin or to this plugin.
 #
 # Tested against a sandbox clone of the operator's live DBs at
 # /tmp/wipe-test/ before being handed to the operator.
@@ -53,6 +68,8 @@ set -euo pipefail
 JELLYFIN_DB="${JELLYFIN_DB:-/var/lib/jellyfin/data/jellyfin.db}"
 PHANTOM_DB="${PHANTOM_DB:-/var/lib/jellyfin/plugins/configurations/PhantomLibrary/phantom.db}"
 STUB_ROOT="${STUB_ROOT:-/var/lib/jellyfin/phantom-library}"
+JF_ROOT_DEFAULT="${JF_ROOT_DEFAULT:-/var/lib/jellyfin/root/default}"
+GOSTREAM_ROOT="${GOSTREAM_ROOT:-/var/gostream}"
 
 COMMIT=0
 SKIP_SERVICE_CHECK=0
@@ -68,7 +85,7 @@ Usage: phantom-wipe.sh [--commit] [--skip-service-check] [-h|--help]
   -h, --help            this help.
 
 Environment overrides (sandbox only):
-  JELLYFIN_DB   PHANTOM_DB   STUB_ROOT
+  JELLYFIN_DB   PHANTOM_DB   STUB_ROOT   JF_ROOT_DEFAULT   GOSTREAM_ROOT
 EOF
 }
 
@@ -189,10 +206,30 @@ if [[ ${#EXTRA_TABLES[@]} -gt 0 ]]; then
 fi
 
 # 6. Counts.
-PATH_LIKE="${STUB_ROOT%/}/%"
+#
+# Channel-arch wipe targets THREE path namespaces in BaseItems:
+#   1. STUB_ROOT/%               legacy phantom stub tree (file-on-disk arch)
+#   2. JF_ROOT_DEFAULT/gostream-% the two CollectionFolders backing the
+#                                old gostream-movies / gostream-shows libraries
+#   3. GOSTREAM_ROOT/%           real gostream content scanned via those
+#                                CollectionFolders (must clear so the new
+#                                IChannel implementation owns the IDs)
+# All three are joined as `Path LIKE p1 OR Path LIKE p2 OR Path LIKE p3`
+# in every count + delete query below.
+STUB_PATH_LIKE="${STUB_ROOT%/}/%"
+CF_PATH_LIKE="${JF_ROOT_DEFAULT%/}/gostream-%"
+GS_PATH_LIKE="${GOSTREAM_ROOT%/}/%"
+
+# Composable WHERE clause used by all phantom-target queries. We also
+# match BaseItems whose Path is EXACTLY the gostream CollectionFolder
+# dir (no trailing slash); the `/gostream-%` LIKE already covers them.
+PHANTOM_WHERE="Path LIKE '$STUB_PATH_LIKE' OR Path LIKE '$CF_PATH_LIKE' OR Path LIKE '$GS_PATH_LIKE'"
 
 TOTAL_BI="$(sqlite3 "$JF_RO_URI" "SELECT COUNT(*) FROM BaseItems;")"
-N_PHANTOM_BI="$(sqlite3 "$JF_RO_URI" "SELECT COUNT(*) FROM BaseItems WHERE Path LIKE '$PATH_LIKE';")"
+N_PHANTOM_BI="$(sqlite3 "$JF_RO_URI" "SELECT COUNT(*) FROM BaseItems WHERE $PHANTOM_WHERE;")"
+N_STUB_BI="$(sqlite3 "$JF_RO_URI" "SELECT COUNT(*) FROM BaseItems WHERE Path LIKE '$STUB_PATH_LIKE';")"
+N_CF_BI="$(sqlite3 "$JF_RO_URI" "SELECT COUNT(*) FROM BaseItems WHERE Path LIKE '$CF_PATH_LIKE';")"
+N_GS_BI="$(sqlite3 "$JF_RO_URI" "SELECT COUNT(*) FROM BaseItems WHERE Path LIKE '$GS_PATH_LIKE';")"
 
 if [[ -f "$PHANTOM_DB" ]]; then
     PH_RO_URI="file:${PHANTOM_DB}?mode=ro"
@@ -215,12 +252,15 @@ N_FILES_SHOWS="$(count_stubs shows)"
 N_FILES=$((N_FILES_MOVIES + N_FILES_SHOWS))
 
 bold "==> Counts"
-info "  total BaseItems              : $TOTAL_BI"
-info "  phantom BaseItems (to delete): $N_PHANTOM_BI"
-info "  phantom_items rows           : $N_PHANTOM_ROWS"
-info "  stub entries under movies/   : $N_FILES_MOVIES"
-info "  stub entries under shows/    : $N_FILES_SHOWS"
-info "  stub entries total           : $N_FILES"
+info "  total BaseItems                       : $TOTAL_BI"
+info "  phantom-target BaseItems (to delete)  : $N_PHANTOM_BI"
+info "    via STUB_ROOT ($STUB_ROOT/%)        : $N_STUB_BI"
+info "    via JF_ROOT_DEFAULT (gostream CFs)  : $N_CF_BI"
+info "    via GOSTREAM_ROOT ($GOSTREAM_ROOT/%): $N_GS_BI"
+info "  phantom_items rows                    : $N_PHANTOM_ROWS"
+info "  stub entries under movies/            : $N_FILES_MOVIES"
+info "  stub entries under shows/             : $N_FILES_SHOWS"
+info "  stub entries total                    : $N_FILES"
 
 # 7. Sanity bound: phantom BaseItems must be <= 50% of total.
 if [[ $TOTAL_BI -gt 0 ]]; then
@@ -287,7 +327,7 @@ SQL_FILE="/tmp/.phantom-wipe.${TS}.sql"
     echo "PRAGMA foreign_keys = ON;"
     echo "BEGIN TRANSACTION;"
     echo "CREATE TEMP TABLE _phantom_ids AS"
-    echo "  SELECT Id FROM BaseItems WHERE Path LIKE '$PATH_LIKE';"
+    echo "  SELECT Id FROM BaseItems WHERE $PHANTOM_WHERE;"
     for entry in "${FK_TABLES[@]}" "${EXTRA_TABLES[@]}"; do
         tbl="${entry%%:*}"
         cols="${entry#*:}"
@@ -299,13 +339,13 @@ SQL_FILE="/tmp/.phantom-wipe.${TS}.sql"
     echo "DELETE FROM BaseItems WHERE Id IN (SELECT Id FROM _phantom_ids);"
     # CHECK-constraint verification. Two rows, both must be 0.
     echo "CREATE TEMP TABLE _verify (x INTEGER NOT NULL CHECK (x=0));"
-    echo "INSERT INTO _verify VALUES ((SELECT COUNT(*) FROM BaseItems WHERE Path LIKE '$PATH_LIKE'));"
+    echo "INSERT INTO _verify VALUES ((SELECT COUNT(*) FROM BaseItems WHERE $PHANTOM_WHERE));"
     echo "INSERT INTO _verify VALUES ((SELECT COUNT(*) FROM BaseItems) - $EXPECTED);"
     echo "DROP TABLE _verify;"
     echo "DROP TABLE _phantom_ids;"
     echo "COMMIT;"
     echo "SELECT 'TOTAL_AFTER:'||(SELECT COUNT(*) FROM BaseItems);"
-    echo "SELECT 'PHANTOM_AFTER:'||(SELECT COUNT(*) FROM BaseItems WHERE Path LIKE '$PATH_LIKE');"
+    echo "SELECT 'PHANTOM_AFTER:'||(SELECT COUNT(*) FROM BaseItems WHERE $PHANTOM_WHERE);"
 } > "$SQL_FILE"
 
 set +e
@@ -381,10 +421,38 @@ wipe_subdir() {
 wipe_subdir movies
 wipe_subdir shows
 
+# Channel-arch additional cleanup: remove the on-disk CollectionFolder
+# marker dirs at JF_ROOT_DEFAULT/gostream-{movies,shows}. Jellyfin's
+# library scanner re-creates a CollectionFolder BaseItem on next start
+# for any subdir of /var/lib/jellyfin/root/default/, so leaving these
+# behind would undo the BaseItems delete on the very next scan tick.
+# We do NOT touch GOSTREAM_ROOT itself - those are real video files
+# owned by the gostream service.
+bold "==> Removing on-disk gostream CollectionFolder marker dirs"
+for sub in gostream-movies gostream-shows; do
+    cfdir="$JF_ROOT_DEFAULT/$sub"
+    if [[ -d "$cfdir" ]]; then
+        # Defensive: refuse if it contains anything that looks like a
+        # real video file. CollectionFolder marker dirs normally hold
+        # only .collection metadata + options.xml.
+        bad="$(find "$cfdir" -type f \
+               \( -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.m4v' \
+               -o -iname '*.avi' -o -iname '*.mov' -o -iname '*.ts' \
+               -o -iname '*.webm' \) -print -quit 2>/dev/null || true)"
+        if [[ -n "$bad" ]]; then
+            die "unexpected video file under CollectionFolder dir $cfdir ($bad); refusing to rm -rf. Inspect manually."
+        fi
+        rm -rf -- "$cfdir"
+        info "  removed: $cfdir"
+    else
+        info "  (skip) $cfdir does not exist"
+    fi
+done
+
 # ---- post-wipe verification ----------------------------------------------
 
 bold "==> Post-wipe verification"
-info "  phantom BaseItems              : $(sqlite3 "$JF_RO_URI" "SELECT COUNT(*) FROM BaseItems WHERE Path LIKE '$PATH_LIKE';")"
+info "  phantom-target BaseItems       : $(sqlite3 "$JF_RO_URI" "SELECT COUNT(*) FROM BaseItems WHERE $PHANTOM_WHERE;")"
 if [[ -f "$PHANTOM_DB" ]]; then
     info "  phantom_items rows           : $(sqlite3 "file:${PHANTOM_DB}?mode=ro" "SELECT COUNT(*) FROM phantom_items;" 2>/dev/null || echo '(unreadable)')"
 else
@@ -400,15 +468,22 @@ info "    $JF_BAK"
 
 bold "==> Next operator steps"
 cat <<'EOF'
-  1. sudo systemctl start jellyfin
-  2. Wait for Jellyfin to come up (web UI responsive).
-  3. Dashboard -> Scheduled Tasks -> run
-       "Phantom Library - refresh suggestions"
-     (this repopulates phantom stubs from TMDB Trending + per-user
-      Recommended; expect ~30s for first batch, ~6h for full natural
-      schedule if you don't trigger it manually).
-  4. (Optional) Dashboard -> Scheduled Tasks -> "Scan All Libraries"
-     if anything looks stale.
-  5. Keep the .bak.wipe.* backups until you've confirmed at least one
-     normal usage cycle. Then they can be removed.
+  1. Deploy the patched Jellyfin assemblies if you haven't already
+     (see docs/operator-deploy.md). The plugin DLL alone is not
+     enough - it references types added by the patches.
+  2. sudo systemctl start jellyfin
+  3. Wait for Jellyfin to come up (web UI responsive).
+  4. Dashboard -> Plugins -> Phantom Library -> Settings; confirm
+     gostream paths; click Save.
+  5. Dashboard -> Scheduled Tasks -> run
+       "Phantom Library: Discovery Refresh"
+     (populates the channel item lists from TMDB Trending +
+      per-user Recommended).
+  6. Refresh the browser; "Phantom Movies" and "Phantom Shows"
+     tiles should appear in your library nav.
+  7. Smoke-test: click a phantom item, play (splash plays),
+     kebab -> Materialise, wait for toast, play again -> real
+     file streams.
+  8. Keep the .bak.wipe.* backups until you've confirmed at
+     least one normal usage cycle. Then they can be removed.
 EOF
