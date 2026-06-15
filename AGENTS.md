@@ -1,5 +1,11 @@
 # AGENTS.md
 
+**⚠ ACTIVE IN-FLIGHT ARCHITECTURAL WORK:** if you're picking up this
+repo for new development, read
+`docs/plans/channel-handoff-onboarding.md` FIRST. It points you at the
+current execution plan and what state the codebase is in. Do not start
+work on the channel architecture without reading that doc.
+
 Guidance for AI coding agents working in this repo. Humans:
 read `README.md`, `PLAN.md`, `CHANGELOG.md` first — those are
 authoritative project docs. This file translates them into

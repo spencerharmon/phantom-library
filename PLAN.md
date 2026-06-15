@@ -42,7 +42,8 @@ Mascot: *Stygiomedusa gigantea*, the giant phantom jelly.
 | M11 — Post-M10 phantom UX polish               | ✅ | (unreleased, multiple commits) |
 | M12 — Dedupe-gap heal-on-rediscovery           | ✅ | (unreleased) |
 | M13 — Per-series subdir stub layout for TV phantoms | ✅ | (unreleased) |
-| Spike — Jellyfin-native `[tmdbid-<id>]` stub layout | 🚧 IN PROGRESS — operator re-validating after rollback | (unreleased) |
+| Spike — Jellyfin-native `[tmdbid-<id>]` stub layout | ✅ | merged into main as `a931379` (file-on-disk architecture; deployed to operator v0.2.0.0; **slated for replacement by M14**) |
+| M14 — IChannel migration + Jellyfin patch | 🚧 EXECUTION-READY, awaiting operator sign-off to begin | plan at `docs/plans/channel-handoff.md`; onboarding at `docs/plans/channel-handoff-onboarding.md` |
 
 ### Documented partials
 
