@@ -47,7 +47,7 @@ public class PhantomDbTests : IDisposable
     // ----------------------------------------------------------------
 
     [Fact]
-    public async Task FreshDb_CreatesSchemaV7_WithAllExpectedTables()
+    public async Task FreshDb_CreatesSchemaV9_WithAllExpectedTables()
     {
         using var db = await NewDbAsync();
 
@@ -66,7 +66,7 @@ public class PhantomDbTests : IDisposable
             version = Convert.ToInt32(await v.ExecuteScalarAsync());
         }
 
-        Assert.Equal(8, version);
+        Assert.Equal(9, version);
 
         var expectedTables = new[]
         {
@@ -76,6 +76,7 @@ public class PhantomDbTests : IDisposable
             "tmdb_external_ids",
             "tmdb_cache",
             "tmdb_metadata",
+            "tmdb_episode_cache",
             "magnet_cache",
             "unavailable_marker",
             "plugin_meta",
@@ -94,10 +95,11 @@ public class PhantomDbTests : IDisposable
     [Theory]
     [InlineData(5)]
     [InlineData(7)]
+    [InlineData(8)]
     public async Task HardRefuse_OldSchemaVersion_ThrowsWithWipePointer(int oldVersion)
     {
         // Pre-create a DB with an older user_version (v5 = pre-channel-arch,
-        // v7 = intermediate channel-arch schema without tmdb_metadata).
+        // v7/v8 = intermediate channel-arch schemas without tmdb_episode_cache).
         var cs = new SqliteConnectionStringBuilder { DataSource = _dbPath, Mode = SqliteOpenMode.ReadWriteCreate }.ToString();
         await using (var conn = new SqliteConnection(cs))
         {
@@ -113,7 +115,7 @@ public class PhantomDbTests : IDisposable
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => db.SetMetaAsync("test", "1", CancellationToken.None));
 
-        Assert.Contains("version 8", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("version 9", ex.Message, StringComparison.Ordinal);
         Assert.Contains("wipe", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -524,5 +526,110 @@ public class PhantomDbTests : IDisposable
         using var db = await NewDbAsync();
         var got = await db.GetTmdbMetadataAsync(404, "movie", CancellationToken.None);
         Assert.Null(got);
+    }
+
+    // ----------------------------------------------------------------
+    // tmdb_episode_cache
+    // ----------------------------------------------------------------
+
+    [Fact]
+    public async Task TmdbEpisodeCache_UpsertGet_RoundtripsAllFields()
+    {
+        using var db = await NewDbAsync();
+        var fetched = DateTimeOffset.FromUnixTimeSeconds(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        var row = new TmdbEpisodeRow(
+            SeriesTmdbId: 1399,
+            Season: 1,
+            Episode: 1,
+            Title: "Winter Is Coming",
+            Overview: "Pilot.",
+            StillUrl: "https://image.tmdb.org/t/p/w500/still.jpg",
+            AirDate: "2011-04-17",
+            RuntimeMinutes: 62,
+            FetchedAt: fetched);
+
+        await db.UpsertTmdbEpisodeAsync(row, CancellationToken.None);
+        var got = await db.GetTmdbEpisodeAsync(1399, 1, 1, CancellationToken.None);
+        Assert.NotNull(got);
+        Assert.Equal(1399, got!.SeriesTmdbId);
+        Assert.Equal(1, got.Season);
+        Assert.Equal(1, got.Episode);
+        Assert.Equal("Winter Is Coming", got.Title);
+        Assert.Equal("Pilot.", got.Overview);
+        Assert.Equal("https://image.tmdb.org/t/p/w500/still.jpg", got.StillUrl);
+        Assert.Equal("2011-04-17", got.AirDate);
+        Assert.Equal(62, got.RuntimeMinutes);
+        Assert.Equal(fetched, got.FetchedAt);
+    }
+
+    [Fact]
+    public async Task TmdbEpisodeCache_UpsertWithNullables_RoundtripsAsNull()
+    {
+        using var db = await NewDbAsync();
+        var row = new TmdbEpisodeRow(
+            SeriesTmdbId: 1,
+            Season: 1,
+            Episode: 1,
+            Title: "Bare",
+            Overview: null,
+            StillUrl: null,
+            AirDate: null,
+            RuntimeMinutes: null,
+            FetchedAt: DateTimeOffset.UtcNow);
+        await db.UpsertTmdbEpisodeAsync(row, CancellationToken.None);
+        var got = await db.GetTmdbEpisodeAsync(1, 1, 1, CancellationToken.None);
+        Assert.NotNull(got);
+        Assert.Equal("Bare", got!.Title);
+        Assert.Null(got.Overview);
+        Assert.Null(got.StillUrl);
+        Assert.Null(got.AirDate);
+        Assert.Null(got.RuntimeMinutes);
+    }
+
+    [Fact]
+    public async Task TmdbEpisodeCache_UpsertOverwritesPrevious()
+    {
+        using var db = await NewDbAsync();
+        await db.UpsertTmdbEpisodeAsync(new TmdbEpisodeRow(1, 1, 1, "Old", null, null, null, null, DateTimeOffset.UtcNow), CancellationToken.None);
+        await db.UpsertTmdbEpisodeAsync(new TmdbEpisodeRow(1, 1, 1, "New", "better", null, null, 45, DateTimeOffset.UtcNow), CancellationToken.None);
+        var got = await db.GetTmdbEpisodeAsync(1, 1, 1, CancellationToken.None);
+        Assert.Equal("New", got!.Title);
+        Assert.Equal("better", got.Overview);
+        Assert.Equal(45, got.RuntimeMinutes);
+    }
+
+    [Fact]
+    public async Task TmdbEpisodeCache_GetMissing_ReturnsNull()
+    {
+        using var db = await NewDbAsync();
+        var got = await db.GetTmdbEpisodeAsync(1, 1, 1, CancellationToken.None);
+        Assert.Null(got);
+    }
+
+    [Fact]
+    public async Task TmdbEpisodeCache_ListForSeason_OrdersByEpisodeAscending()
+    {
+        using var db = await NewDbAsync();
+        // Insert out of order.
+        await db.UpsertTmdbEpisodeAsync(new TmdbEpisodeRow(1399, 1, 3, "E3", null, null, null, null, DateTimeOffset.UtcNow), CancellationToken.None);
+        await db.UpsertTmdbEpisodeAsync(new TmdbEpisodeRow(1399, 1, 1, "E1", null, null, null, null, DateTimeOffset.UtcNow), CancellationToken.None);
+        await db.UpsertTmdbEpisodeAsync(new TmdbEpisodeRow(1399, 1, 2, "E2", null, null, null, null, DateTimeOffset.UtcNow), CancellationToken.None);
+        // Different season — must not appear.
+        await db.UpsertTmdbEpisodeAsync(new TmdbEpisodeRow(1399, 2, 1, "S2E1", null, null, null, null, DateTimeOffset.UtcNow), CancellationToken.None);
+
+        var got = await db.ListEpisodesForSeasonAsync(1399, 1, CancellationToken.None);
+        Assert.Equal(3, got.Count);
+        Assert.Equal(1, got[0].Episode);
+        Assert.Equal(2, got[1].Episode);
+        Assert.Equal(3, got[2].Episode);
+        Assert.All(got, r => Assert.Equal(1, r.Season));
+    }
+
+    [Fact]
+    public async Task TmdbEpisodeCache_ListForMissingSeason_ReturnsEmpty()
+    {
+        using var db = await NewDbAsync();
+        var got = await db.ListEpisodesForSeasonAsync(999, 1, CancellationToken.None);
+        Assert.Empty(got);
     }
 }

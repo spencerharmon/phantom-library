@@ -80,21 +80,40 @@ public sealed record TmdbMetadataRow(
     DateTimeOffset FetchedAt);
 
 /// <summary>
+/// Row of the <c>tmdb_episode_cache</c> table. Per-(series_tmdb_id,
+/// season, episode) cached title/overview/still/airdate/runtime warmed
+/// by the shows-channel browse path (Stage 5.1) so the
+/// IChannelItemRefresh path (post-flight materialise refresh) can
+/// rebuild the episode ChannelItemInfo without re-hitting TMDB.
+/// </summary>
+public sealed record TmdbEpisodeRow(
+    int SeriesTmdbId,
+    int Season,
+    int Episode,
+    string Title,
+    string? Overview,
+    string? StillUrl,
+    string? AirDate,
+    int? RuntimeMinutes,
+    DateTimeOffset FetchedAt);
+
+/// <summary>
 /// SQLite-backed persistence for the plugin's private state under the
 /// channel architecture (schema v8). Single writer, serialised via a
 /// process-wide <see cref="SemaphoreSlim"/>; concurrent readers
 /// permitted via separate short-lived connections.
 ///
-/// Schema v8 is a clean break from the v5 file-on-disk schema (v6/v7
+/// Schema v9 is a clean break from the v5 file-on-disk schema (v6/v7/v8
 /// were intermediate channel-arch revisions that never reached prod;
-/// v8 adds the <c>tmdb_metadata</c> table that v7 omitted). Per
+/// v9 adds the <c>tmdb_episode_cache</c> table the shows channel needs
+/// for per-episode display metadata at refresh time). Per
 /// AGENTS.md "No database migrations until v1.0", existing databases
-/// at any pre-v8 user_version are HARD-REFUSED and the operator must
+/// at any pre-v9 user_version are HARD-REFUSED and the operator must
 /// run <c>scripts/phantom-wipe.sh</c> before restart.
 /// </summary>
 public sealed class PhantomDb : IDisposable
 {
-    private const int CurrentSchemaVersion = 8;
+    private const int CurrentSchemaVersion = 9;
 
     private readonly string _connectionString;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
@@ -196,7 +215,7 @@ public sealed class PhantomDb : IDisposable
         using (var cmd = conn.CreateCommand())
         {
             cmd.Transaction = tx;
-            cmd.CommandText = SchemaV8Sql;
+            cmd.CommandText = SchemaV9Sql;
             cmd.ExecuteNonQuery();
         }
 
@@ -210,7 +229,7 @@ public sealed class PhantomDb : IDisposable
         tx.Commit();
     }
 
-    private const string SchemaV8Sql = @"
+    private const string SchemaV9Sql = @"
 -- Channel-arch discovery: trending + similar-of-favourited TMDB ids,
 -- one row per (tmdb_id, type). Synthesised into ChannelItemInfos by
 -- PhantomMoviesChannel / PhantomShowsChannel at browse time.
@@ -347,6 +366,26 @@ CREATE TABLE IF NOT EXISTS tmdb_metadata (
 );
 CREATE INDEX IF NOT EXISTS idx_tmdb_metadata_fetched_at
     ON tmdb_metadata(fetched_at);
+
+-- Channel-arch per-episode metadata cache. One row per
+-- (series_tmdb_id, season, episode). Warmed lazily by the shows
+-- channel browse path (Stage 5.1); read by BuildEpisodeItemAsync on
+-- the IChannelItemRefresh post-flight path so materialise post-flight
+-- doesn't re-hit TMDB to know the episode's title/overview/still.
+CREATE TABLE IF NOT EXISTS tmdb_episode_cache (
+    series_tmdb_id  INTEGER NOT NULL,
+    season          INTEGER NOT NULL,
+    episode         INTEGER NOT NULL,
+    title           TEXT NOT NULL,
+    overview        TEXT,
+    still_url       TEXT,
+    air_date        TEXT,
+    runtime_minutes INTEGER,
+    fetched_at      INTEGER NOT NULL,
+    PRIMARY KEY (series_tmdb_id, season, episode)
+);
+CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
+    ON tmdb_episode_cache(fetched_at);
 ";
 
     // ---- magnet_cache ----
@@ -1071,6 +1110,105 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_metadata_fetched_at
             r.IsDBNull(9) ? null : r.GetDouble(9),
             r.IsDBNull(10) ? null : r.GetString(10),
             DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(11)));
+    }
+
+    // ---- tmdb_episode_cache ----
+
+    /// <summary>
+    /// Upserts a (series_tmdb_id, season, episode) row. INSERT OR
+    /// REPLACE semantics so the latest fetch overwrites the prior cached
+    /// title/overview/still without throwing on conflict.
+    /// </summary>
+    public async Task UpsertTmdbEpisodeAsync(TmdbEpisodeRow row, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(row);
+        ArgumentException.ThrowIfNullOrWhiteSpace(row.Title);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"INSERT OR REPLACE INTO tmdb_episode_cache
+                (series_tmdb_id, season, episode, title, overview, still_url,
+                 air_date, runtime_minutes, fetched_at)
+                VALUES ($series, $season, $episode, $title, $overview, $still,
+                        $air, $runtime, $fetched);";
+            cmd.Parameters.AddWithValue("$series", row.SeriesTmdbId);
+            cmd.Parameters.AddWithValue("$season", row.Season);
+            cmd.Parameters.AddWithValue("$episode", row.Episode);
+            cmd.Parameters.AddWithValue("$title", row.Title);
+            cmd.Parameters.AddWithValue("$overview", (object?)row.Overview ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$still", (object?)row.StillUrl ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$air", (object?)row.AirDate ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$runtime", (object?)row.RuntimeMinutes ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$fetched", row.FetchedAt.ToUnixTimeSeconds());
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<TmdbEpisodeRow?> GetTmdbEpisodeAsync(int seriesTmdbId, int season, int episode, CancellationToken ct)
+    {
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT series_tmdb_id, season, episode, title, overview, still_url,
+                   air_date, runtime_minutes, fetched_at
+            FROM tmdb_episode_cache
+            WHERE series_tmdb_id=$series AND season=$season AND episode=$episode
+            LIMIT 1;";
+        cmd.Parameters.AddWithValue("$series", seriesTmdbId);
+        cmd.Parameters.AddWithValue("$season", season);
+        cmd.Parameters.AddWithValue("$episode", episode);
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (!await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            return null;
+        }
+
+        return ReadEpisodeRow(r);
+    }
+
+    /// <summary>
+    /// Lists all cached episodes for a season ordered by episode
+    /// number ascending. Empty list when the season has not been
+    /// warmed yet.
+    /// </summary>
+    public async Task<IReadOnlyList<TmdbEpisodeRow>> ListEpisodesForSeasonAsync(int seriesTmdbId, int season, CancellationToken ct)
+    {
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT series_tmdb_id, season, episode, title, overview, still_url,
+                   air_date, runtime_minutes, fetched_at
+            FROM tmdb_episode_cache
+            WHERE series_tmdb_id=$series AND season=$season
+            ORDER BY episode ASC;";
+        cmd.Parameters.AddWithValue("$series", seriesTmdbId);
+        cmd.Parameters.AddWithValue("$season", season);
+        var list = new List<TmdbEpisodeRow>();
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            list.Add(ReadEpisodeRow(r));
+        }
+
+        return list;
+    }
+
+    private static TmdbEpisodeRow ReadEpisodeRow(Microsoft.Data.Sqlite.SqliteDataReader r)
+    {
+        return new TmdbEpisodeRow(
+            r.GetInt32(0),
+            r.GetInt32(1),
+            r.GetInt32(2),
+            r.GetString(3),
+            r.IsDBNull(4) ? null : r.GetString(4),
+            r.IsDBNull(5) ? null : r.GetString(5),
+            r.IsDBNull(6) ? null : r.GetString(6),
+            r.IsDBNull(7) ? null : r.GetInt32(7),
+            DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(8)));
     }
 
     private static void BindKey(SqliteCommand cmd, MagnetCacheKey key)
