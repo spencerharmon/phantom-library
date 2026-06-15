@@ -6,6 +6,140 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### BREAKING — requires wipe + patched Jellyfin
+
+Phantom Library v0.3.0 replaces the file-on-disk phantom
+architecture with a Jellyfin `IChannel`-based design backed by a
+small additive patch to Jellyfin's `ChannelManager`. Phantom items
+are now exposed as `ChannelItemInfo` rows under two virtual
+channels ("Phantom Movies" and "Phantom Shows"); the per-stub
+file-on-disk tree under `/var/lib/jellyfin/phantom-library/` is
+retired. Materialise-on-demand still works: a kebab → Materialise
+click triggers gostream to register the underlying torrent, and a
+per-item channel refresh primitive (added by the patch) re-binds
+the ChannelItem to the now-real `BaseItem` produced by Jellyfin's
+scan of the gostream-served file.
+
+`phantom.db` schema bumped to v9 (was v5 in v0.2.0.0). The new
+schema captures channel-item registrations, per-item materialise
+state, and the additional bookkeeping the channel arch needs.
+Per `AGENTS.md` § "No database migrations until v1.0", the
+upgrade path is **wipe and rebuild**.
+
+Operator steps (in order):
+
+1. `sudo systemctl stop jellyfin`
+2. `sudo bash scripts/phantom-wipe.sh`            # dry-run; inspect counts
+3. `sudo bash scripts/phantom-wipe.sh --commit`   # type `WIPE` to proceed
+4. `./install.sh --build`
+   - applies the patches in `scripts/jellyfin-patches/` to
+     `jellyfin/` (idempotent),
+   - builds the patched Jellyfin assemblies
+     (MediaBrowser.Controller + Jellyfin.LiveTv),
+   - builds the plugin DLL,
+   - installs the plugin DLL into the operator's Jellyfin plugins
+     dir,
+   - prints the exact `sudo cp` commands to deploy the patched
+     Jellyfin DLLs into the runtime install dir.
+5. Deploy the patched Jellyfin DLLs per the commands printed at
+   the end of step 4. See `docs/operator-deploy.md` for context
+   and the package-manager-clobber detection procedure.
+6. `sudo systemctl start jellyfin`
+7. Dashboard → Plugins → Phantom Library → Settings; confirm
+   gostream paths; click **Save**.
+8. Dashboard → Scheduled Tasks → **"Phantom Library: Discovery
+   Refresh"** → **Run Now**.
+9. Refresh the browser. "Phantom Movies" and "Phantom Shows"
+   tiles appear in your library nav.
+10. Smoke-test: click a phantom item, **Play** (splash plays),
+    kebab → **Materialise**, wait for the toast, **Play** again —
+    the real file streams.
+
+Manual fallback (if `scripts/phantom-wipe.sh` is unavailable for
+any reason): inspect the script's source for the exact SQL
+delete + cascade pattern. Do NOT hand-craft a substitute SQL
+block; the script's CHECK-constraint verification + 50% sanity
+cap exists for good reasons (see `AGENTS.md` § "Production
+database safety").
+
+#### Known regressions (operator-accepted)
+
+- **Loss of `CollectionType.movies` Home rows** ("Latest Movies",
+  "Continue Watching Movies", "Suggestions") for gostream content.
+  Channels surface their own "Latest in Phantom Movies" /
+  "Latest in Phantom Shows" rows instead; the Movies-typed library
+  rows no longer include phantom content because phantom content
+  is no longer a Movies-typed library.
+- **UserData on the pre-v0.3.0 gostream-bound BaseItems is lost**
+  in the wipe. Favourites, watched state, and playback position
+  on gostream content created under v0.2.0.0 do not survive. Real
+  (non-gostream) library UserData is untouched.
+- **Pre-existing gostream files the plugin doesn't know about**
+  appear with raw filename Names in the channel listing until
+  materialised through the plugin. Operator can opt into the TMDB
+  title-search fallback (per plugin config:
+  `EnrichOrphanGostreamItemsViaTmdbSearch = true`) to back-fill
+  metadata for these orphans on first channel sync.
+- **Per-item channel refresh** requires the patched Jellyfin
+  assemblies. The plugin DLL alone will load but materialise-on-
+  demand will fail with a `TypeLoadException` for
+  `IChannelItemRefreshManager`. See `docs/operator-deploy.md`
+  for the patch deploy procedure.
+- **Package-manager upgrades** of the `jellyfin-server` package
+  silently clobber the deployed patched DLLs. `install.sh` and
+  `docs/operator-deploy.md` document the detection + remediation.
+
+### Added
+
+- **Channel architecture (M-channel).** Phantom Movies + Phantom
+  Shows IChannel implementations replacing the file-on-disk
+  stub-symlink layout. Per-channel item discovery, per-item
+  refresh, and materialise-on-demand wired through new
+  `IChannelItemRefresh` opt-in interface and
+  `IChannelItemRefreshManager` service (both purely additive to
+  Jellyfin core; see `scripts/jellyfin-patches/`).
+- **`scripts/jellyfin-patches/`** — three additive patches against
+  Jellyfin release-10.11.z (base SHA `1fbd873929`):
+  `0001-Add-IChannelItemRefresh-opt-in-interface...`,
+  `0002-Add-IChannelItemRefreshManager-service...`,
+  `0003-Add-tests-for-ChannelManager-per-item-refresh...`.
+  Applied by `install.sh --build` idempotently. See
+  `scripts/jellyfin-patches/REBASE.md` for rebase guidance on
+  Jellyfin upstream version bumps.
+- **`docs/operator-deploy.md`** — operator guide for deploying the
+  patched Jellyfin DLLs (`MediaBrowser.Controller.dll`,
+  `Jellyfin.LiveTv.dll`) alongside the plugin. Covers Model A
+  (in-place DLL swap; recommended) and Model B (run Jellyfin from
+  a self-built tree). Includes package-manager-clobber detection
+  via md5 compare against `.pre-phantom-bak` sidecars.
+- **`phantom.db` schema v9.** Channel-item registration + per-item
+  materialise-state bookkeeping. Wipe-and-rebuild upgrade path
+  per AGENTS.md.
+
+### Removed
+
+- **File-on-disk phantom stub tree** under `<jellyfin-data>/phantom-library/`.
+  Replaced by IChannel ChannelItemInfo rows. The wipe script
+  (`scripts/phantom-wipe.sh`) tears down the tree as part of the
+  upgrade.
+- **`gostream-movies` / `gostream-shows` CollectionFolders** in
+  jellyfin.db. The IChannel implementation owns the BaseItem IDs
+  for gostream-served content now. Wipe script drops them along
+  with the BaseItems they collected.
+
+### Notes
+
+- Plugin version bumped to `0.3.0.0`. `manifest.json`, `build.yaml`,
+  and the plugin csproj all match.
+- `install.sh --build` is the documented upgrade path. The plugin
+  DLL alone is insufficient; the patched Jellyfin DLLs must also
+  be deployed before the next `jellyfin.service` restart.
+- Phase 8 (upstream PR for the Jellyfin patches) is deferred and
+  operator-driven per Jellyfin's LLM/AI contribution policy. See
+  `docs/plans/channel-handoff.md` § Phase 8.
+
+## [0.2.0.0]
+
 ### Added
 
 - **Jellyfin-native stub-layout (`[tmdbid-<id>]` path tokens).**

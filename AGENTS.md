@@ -300,6 +300,40 @@ worry about. The plugin reads it on startup to decide whether to
 emit a "migration not yet run" warning, but does not perform the
 migration itself.
 
+## Jellyfin patch dependency
+
+This plugin depends on patches applied to Jellyfin core, stored at
+`scripts/jellyfin-patches/`. `install.sh --build` applies them at
+build time (idempotently — second run reports `already applied`)
+against the `jellyfin/` source clone at release-10.11.z (base SHA
+`1fbd873929`). The patches add `IChannelItemRefresh` (an opt-in
+channel-side interface) and `IChannelItemRefreshManager` (a new
+service sibling to `IChannelManager`) — both purely additive. No
+existing API is modified.
+
+The plugin DLL alone is **not sufficient** at runtime; the patched
+`MediaBrowser.Controller.dll` + `Jellyfin.LiveTv.dll` must also be
+deployed into the operator's Jellyfin install dir (default
+`/usr/lib/jellyfin/`). `install.sh --build` prints the exact
+`sudo cp` commands at the end of its output, pre-filled for the
+detected install dir. See `docs/operator-deploy.md` for the
+operator-facing companion guide (Model A in-place swap; Model B
+run-from-build-tree) and the package-manager-clobber detection
+procedure.
+
+On Jellyfin upstream updates, the patches may need rebasing.
+`install.sh --build` aborts with an actionable error if a patch
+fails to apply. Rebase by applying via `git am`, resolving
+conflicts, and re-exporting via `git format-patch`. See
+`scripts/jellyfin-patches/REBASE.md`.
+
+Phase 8 (deferred): upstream PR. Per Jellyfin's LLM/AI
+contribution policy, this PR must be operator-authored with the
+operator understanding and able to defend every line. See
+`docs/plans/channel-handoff.md` § Phase 8 for the upstream
+procedure. Agents do **not** author the Meta discussion, the PR
+body, or responses to review comments.
+
 ## Read first
 
 - `PLAN.md` — milestone tracker, design decisions, the

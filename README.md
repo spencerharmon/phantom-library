@@ -9,6 +9,21 @@ streamable Jellyfin library item.
 
 Mascot: *Stygiomedusa gigantea*, the giant phantom jelly.
 
+> ⚠ **Requires patched Jellyfin.** v0.3.0+ depends on a small
+> additive patch to Jellyfin core (adds `IChannelItemRefresh` +
+> `IChannelItemRefreshManager`). Patches live at
+> `scripts/jellyfin-patches/` and are applied automatically by
+> `./install.sh --build` against a `jellyfin/` source clone at
+> release-10.11.z (base SHA `1fbd873929`). The patches are purely
+> additive (no API mutation). After build, you must deploy two
+> patched DLLs (`MediaBrowser.Controller.dll`, `Jellyfin.LiveTv.dll`)
+> into your runtime Jellyfin install dir; `install.sh --build`
+> prints the exact `sudo cp` commands. See
+> [`docs/operator-deploy.md`](docs/operator-deploy.md) for the
+> deploy procedure and
+> [`docs/plans/channel-handoff.md`](docs/plans/channel-handoff.md)
+> for the architectural rationale.
+
 > **Status: pre-alpha**, v0.1.0 is the immediate target (all M1–M9
 > milestones complete; see [`PLAN.md`](PLAN.md#status-as-of-2026-06-04)).
 > Bumps to *Beta* once `v0.1.0` is tagged. Full design, milestone
