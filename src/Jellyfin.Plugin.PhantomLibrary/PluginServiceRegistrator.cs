@@ -70,6 +70,7 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         // Materialisation pipeline (Materialiser is a stage-2.1 stub;
         // rewritten in Stage 4.2).
         serviceCollection.AddSingleton<QualityScorer>();
+        serviceCollection.AddSingleton<TmdbExternalIdResolver>();
         serviceCollection.AddSingleton<IMaterialiser, Materialiser>();
         serviceCollection.AddSingleton<MaterialisationQueue>();
         serviceCollection.AddSingleton<IMaterialisationQueue>(sp => sp.GetRequiredService<MaterialisationQueue>());
