@@ -1,7 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Controller.Channels;
 using MediaBrowser.Controller.Drawing;
 using MediaBrowser.Controller.Providers;
@@ -9,35 +12,42 @@ using MediaBrowser.Model.Channels;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.MediaInfo;
+using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Plugin.PhantomLibrary.Channels;
 
 /// <summary>
-/// "Phantom Movies" channel. Stage 2.4 skeleton: returns an empty
-/// channel item list. Full implementation arrives in Stage 3.3
-/// (discovery + materialised + orphan-gostream union).
+/// "Phantom Movies" channel — flat channel that emits a union of:
+///   1. materialised_state movies (real FUSE-backed MediaSources),
+///   2. discovery_cache movies (phantom items, MediaSource = splash),
+///   3. orphan files on the gostream FUSE mount (raw filename).
 ///
-/// Implements:
-///   IChannel                       — required base contract
-///   IRequiresMediaInfoCallback     — channel emits MediaSources at
-///                                    browse time AND can answer a
-///                                    per-id callback on play
-///   ISupportsLatestMedia           — surfaces a "Latest in Phantom
-///                                    Movies" Home row
-///   IChannelItemRefresh            — opt-in for the patched
-///                                    IChannelItemRefreshManager so
-///                                    materialise-on-demand can
-///                                    refresh a single item by
-///                                    external id without paging.
+/// Dedup: materialised wins over phantom for the same tmdb_id.
+/// (Plan §3.3 + critic round 3 BLOCKER 1.) The id stays the same
+/// across the phantom → materialised transition so UserData
+/// (favourites, watched, playback position) is preserved.
 /// </summary>
 public sealed class PhantomMoviesChannel
     : IChannel, IRequiresMediaInfoCallback, ISupportsLatestMedia, IChannelItemRefresh
 {
+    private readonly PhantomDb _db;
+    private readonly GostreamFilesystemEnumerator _enumerator;
+    private readonly SplashSourceProvider _splashSource;
     private readonly ChannelStateProvider _state;
+    private readonly ILogger<PhantomMoviesChannel> _logger;
 
-    public PhantomMoviesChannel(ChannelStateProvider state)
+    public PhantomMoviesChannel(
+        PhantomDb db,
+        GostreamFilesystemEnumerator enumerator,
+        SplashSourceProvider splashSource,
+        ChannelStateProvider state,
+        ILogger<PhantomMoviesChannel> logger)
     {
+        _db = db ?? throw new ArgumentNullException(nameof(db));
+        _enumerator = enumerator ?? throw new ArgumentNullException(nameof(enumerator));
+        _splashSource = splashSource ?? throw new ArgumentNullException(nameof(splashSource));
         _state = state ?? throw new ArgumentNullException(nameof(state));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
     /// <inheritdoc />
@@ -69,25 +79,145 @@ public sealed class PhantomMoviesChannel
     public bool IsEnabledFor(string userId) => true;
 
     /// <inheritdoc />
-    public Task<ChannelItemResult> GetChannelItems(InternalChannelItemQuery query, CancellationToken cancellationToken)
+    public async Task<ChannelItemResult> GetChannelItems(InternalChannelItemQuery query, CancellationToken cancellationToken)
     {
-        return Task.FromResult(new ChannelItemResult
+        ArgumentNullException.ThrowIfNull(query);
+
+        // Movies channel is flat: no folder navigation.
+        if (!string.IsNullOrEmpty(query.FolderId))
         {
-            Items = Array.Empty<ChannelItemInfo>(),
-            TotalRecordCount = 0,
-        });
+            return new ChannelItemResult
+            {
+                Items = Array.Empty<ChannelItemInfo>(),
+                TotalRecordCount = 0,
+            };
+        }
+
+        var items = new List<ChannelItemInfo>();
+        var emittedTmdbs = new HashSet<int>();
+
+        // --- 1. Materialised movies (highest priority) ---
+        var materialised = await _db.ListMaterialisedStateAsync("movie", cancellationToken).ConfigureAwait(false);
+        foreach (var row in materialised)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var built = await BuildMovieItemAsync(row.TmdbId, row, cancellationToken).ConfigureAwait(false);
+            if (built is null)
+            {
+                continue;
+            }
+
+            items.Add(built);
+            emittedTmdbs.Add(row.TmdbId);
+        }
+
+        // --- 2. Discovery movies (skip any already emitted as materialised) ---
+        var discovery = await _db.ListDiscoveryCacheAsync("movie", cancellationToken).ConfigureAwait(false);
+        foreach (var row in discovery)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (emittedTmdbs.Contains(row.TmdbId))
+            {
+                continue;
+            }
+
+            var built = await BuildMovieItemAsync(row.TmdbId, materialised: null, cancellationToken).ConfigureAwait(false);
+            if (built is null)
+            {
+                // Cold-cache miss; DiscoveryRefreshTask warms next tick.
+                continue;
+            }
+
+            items.Add(built);
+            emittedTmdbs.Add(row.TmdbId);
+        }
+
+        // --- 3. Orphan gostream files ---
+        IReadOnlyList<GostreamFileEntry> orphans;
+        try
+        {
+            orphans = await _enumerator.EnumerateOrphanMoviesAsync(emittedTmdbs, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Orphan enumeration failed; skipping orphans this tick");
+            orphans = Array.Empty<GostreamFileEntry>();
+        }
+
+        foreach (var o in orphans)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            items.Add(BuildOrphanMovieItem(o));
+        }
+
+        return new ChannelItemResult
+        {
+            Items = items,
+            TotalRecordCount = items.Count,
+        };
     }
 
     /// <inheritdoc />
-    public Task<IEnumerable<MediaSourceInfo>> GetChannelItemMediaInfo(string id, CancellationToken cancellationToken)
+    public async Task<IEnumerable<MediaSourceInfo>> GetChannelItemMediaInfo(string id, CancellationToken cancellationToken)
     {
-        return Task.FromResult<IEnumerable<MediaSourceInfo>>(Array.Empty<MediaSourceInfo>());
+        ArgumentException.ThrowIfNullOrWhiteSpace(id);
+        if (!ChannelItemId.TryParse(id, out var parsed))
+        {
+            return Array.Empty<MediaSourceInfo>();
+        }
+
+        switch (parsed.Kind)
+        {
+            case ChannelItemId.KindMovie:
+                {
+                    var state = await _db.GetMaterialisedStateAsync(
+                        parsed.TmdbId!.Value, "movie", -1, -1, cancellationToken).ConfigureAwait(false);
+                    if (state is not null)
+                    {
+                        return new[] { FuseMediaSource(state.FusePath) };
+                    }
+
+                    return new[] { _splashSource.CreateMediaSource() };
+                }
+
+            case ChannelItemId.KindOrphan:
+                {
+                    var orphan = await _enumerator.LookupOrphanByHashAsync(
+                        parsed.OrphanHash!, cancellationToken).ConfigureAwait(false);
+                    if (orphan is null)
+                    {
+                        return Array.Empty<MediaSourceInfo>();
+                    }
+
+                    return new[] { FuseMediaSource(orphan.Path) };
+                }
+
+            default:
+                return Array.Empty<MediaSourceInfo>();
+        }
     }
 
     /// <inheritdoc />
-    public Task<IEnumerable<ChannelItemInfo>> GetLatestMedia(ChannelLatestMediaSearch request, CancellationToken cancellationToken)
+    public async Task<IEnumerable<ChannelItemInfo>> GetLatestMedia(ChannelLatestMediaSearch request, CancellationToken cancellationToken)
     {
-        return Task.FromResult<IEnumerable<ChannelItemInfo>>(Array.Empty<ChannelItemInfo>());
+        ArgumentNullException.ThrowIfNull(request);
+        // ChannelLatestMediaSearch (Jellyfin 10.11) carries UserId only;
+        // no Limit field. Default to 20 as the conventional "Latest" row size.
+        const int defaultLimit = 20;
+
+        var materialised = await _db.ListMaterialisedStateAsync("movie", cancellationToken).ConfigureAwait(false);
+        var items = new List<ChannelItemInfo>(Math.Min(materialised.Count, defaultLimit));
+        foreach (var row in materialised.OrderByDescending(r => r.MaterialisedAt).Take(defaultLimit))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var built = await BuildMovieItemAsync(row.TmdbId, row, cancellationToken).ConfigureAwait(false);
+            if (built is not null)
+            {
+                items.Add(built);
+            }
+        }
+
+        return items;
     }
 
     /// <inheritdoc />
@@ -100,11 +230,122 @@ public sealed class PhantomMoviesChannel
     public IEnumerable<ImageType> GetSupportedChannelImages() => Array.Empty<ImageType>();
 
     /// <inheritdoc />
-    public Task<ChannelItemInfo> GetChannelItemAsync(string channelItemExternalId, CancellationToken cancellationToken)
+    public async Task<ChannelItemInfo> GetChannelItemAsync(string channelItemExternalId, CancellationToken cancellationToken)
     {
-        // Stage 2.4 skeleton — channel emits no items yet so any
-        // refresh request is for an unknown id. Stage 3.3 wires this
-        // to the discovery + materialised state lookups.
-        return Task.FromResult<ChannelItemInfo>(null!);
+        if (!ChannelItemId.TryParse(channelItemExternalId, out var parsed))
+        {
+            return null!;
+        }
+
+        switch (parsed.Kind)
+        {
+            case ChannelItemId.KindMovie:
+                {
+                    var state = await _db.GetMaterialisedStateAsync(
+                        parsed.TmdbId!.Value, "movie", -1, -1, cancellationToken).ConfigureAwait(false);
+                    var built = await BuildMovieItemAsync(parsed.TmdbId!.Value, state, cancellationToken).ConfigureAwait(false);
+                    return built!;
+                }
+
+            case ChannelItemId.KindOrphan:
+                {
+                    var orphan = await _enumerator.LookupOrphanByHashAsync(
+                        parsed.OrphanHash!, cancellationToken).ConfigureAwait(false);
+                    return orphan is null ? null! : BuildOrphanMovieItem(orphan);
+                }
+
+            default:
+                return null!;
+        }
+    }
+
+    /// <summary>
+    /// Build a single movie ChannelItemInfo. <paramref name="materialised"/>
+    /// when non-null gives a real FUSE MediaSource; null produces a phantom
+    /// item with the splash MediaSource and Tags=["phantom"]. Returns null
+    /// if no <c>tmdb_metadata</c> row exists yet — the caller skips the item
+    /// for this tick and the next DiscoveryRefreshTask warms the metadata.
+    /// </summary>
+    private async Task<ChannelItemInfo?> BuildMovieItemAsync(int tmdb, MaterialisedStateRow? materialised, CancellationToken ct)
+    {
+        var meta = await _db.GetTmdbMetadataAsync(tmdb, "movie", ct).ConfigureAwait(false);
+        if (meta is null)
+        {
+            _logger.LogDebug("Skipping tmdb={Tmdb} (no metadata row yet)", tmdb);
+            return null;
+        }
+
+        var id = ChannelItemId.ForMovie(tmdb).Encode();
+        MediaSourceInfo source;
+        var tags = new List<string>();
+        if (materialised is not null)
+        {
+            source = FuseMediaSource(materialised.FusePath);
+        }
+        else
+        {
+            source = _splashSource.CreateMediaSource();
+            tags.Add("phantom");
+        }
+
+        var item = new ChannelItemInfo
+        {
+            Id = id,
+            Name = meta.Title,
+            OriginalTitle = meta.OriginalTitle,
+            Overview = meta.Overview,
+            Type = ChannelItemType.Media,
+            ContentType = ChannelMediaContentType.Movie,
+            MediaType = ChannelMediaType.Video,
+            ImageUrl = meta.PosterUrl,
+            ProductionYear = meta.Year,
+            PremiereDate = meta.Year is { } y ? new DateTime(y, 1, 1, 0, 0, 0, DateTimeKind.Utc) : null,
+            CommunityRating = meta.CommunityRating is { } cr ? (float)cr : null,
+            OfficialRating = meta.OfficialRating,
+            Tags = tags,
+            MediaSources = new List<MediaSourceInfo> { source },
+        };
+
+        if (meta.Genres is { Length: > 0 })
+        {
+            item.Genres = meta.Genres.ToList();
+        }
+
+        item.ProviderIds["Tmdb"] = tmdb.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        return item;
+    }
+
+    private static ChannelItemInfo BuildOrphanMovieItem(GostreamFileEntry o)
+    {
+        var id = ChannelItemId.ForOrphanPath(o.Path).Encode();
+        return new ChannelItemInfo
+        {
+            Id = id,
+            Name = Path.GetFileNameWithoutExtension(o.Path),
+            Type = ChannelItemType.Media,
+            ContentType = ChannelMediaContentType.Movie,
+            MediaType = ChannelMediaType.Video,
+            Tags = new List<string> { "orphan" },
+            MediaSources = new List<MediaSourceInfo> { FuseMediaSource(o.Path) },
+        };
+    }
+
+    private static MediaSourceInfo FuseMediaSource(string path)
+    {
+        var ext = Path.GetExtension(path).TrimStart('.');
+        // Container is a lowercased extension by Jellyfin convention.
+#pragma warning disable CA1308
+        var container = string.IsNullOrEmpty(ext) ? "mkv" : ext.ToLowerInvariant();
+#pragma warning restore CA1308
+        return new MediaSourceInfo
+        {
+            Path = path,
+            Container = container,
+            Protocol = MediaProtocol.File,
+            SupportsDirectPlay = true,
+            SupportsDirectStream = true,
+            IsRemote = false,
+            MediaStreams = new List<MediaStream>(),
+        };
     }
 }
