@@ -1,11 +1,14 @@
 using System;
 using System.IO;
+using Jellyfin.Plugin.PhantomLibrary.Channels;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
 using Jellyfin.Plugin.PhantomLibrary.Library;
 using Jellyfin.Plugin.PhantomLibrary.Materialisation;
+using Jellyfin.Plugin.PhantomLibrary.Playback;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller;
+using MediaBrowser.Controller.Channels;
 using MediaBrowser.Controller.Plugins;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -83,5 +86,15 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         // TMDB read-through cache (survives the rewrite; used by upcoming
         // channel + suggestions code).
         serviceCollection.AddSingleton<CachedTmdbReader>();
+
+        // SplashSourceProvider — lazily extracts the embedded splash.mp4
+        // on first CreateMediaSource() call (synchronous, idempotent),
+        // so it's on disk before any channel emits a MediaSourceInfo
+        // pointing at it.
+        serviceCollection.AddSingleton<SplashSourceProvider>();
+
+        // Channels.
+        serviceCollection.AddSingleton<IChannel, PhantomMoviesChannel>();
+        serviceCollection.AddSingleton<IChannel, PhantomShowsChannel>();
     }
 }

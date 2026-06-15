@@ -39,8 +39,18 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Jellyfin.Controller" Version="10.11.9" />
-    <PackageReference Include="Jellyfin.Model" Version="10.11.9" />
+    <!--
+      Plugin depends on patched Jellyfin assemblies (the additive
+      IChannelItemRefreshManager interface lives in MediaBrowser.Controller).
+      We reference the patched source-tree projects directly so the
+      types resolve at compile and the produced DLL binds against the
+      runtime jellyfin/ build delivered by install.sh.
+      install.sh applies scripts/jellyfin-patches/*.patch onto
+      jellyfin/ before invoking dotnet build, so this ProjectReference
+      always sees the patched MediaBrowser.Controller.
+    -->
+    <ProjectReference Include="..\..\jellyfin\MediaBrowser.Controller\MediaBrowser.Controller.csproj" />
+    <ProjectReference Include="..\..\jellyfin\MediaBrowser.Model\MediaBrowser.Model.csproj" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.0" />
     <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="9.0.0" />
     <PackageReference Include="NCrontab" Version="3.3.3" />

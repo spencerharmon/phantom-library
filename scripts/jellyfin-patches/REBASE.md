@@ -1,9 +1,26 @@
 # Rebasing the Jellyfin patches
 
 The patches in this directory apply against a specific commit of
-`jellyfin/jellyfin`. When that source tree drifts (you pulled
-upstream, or the operator's clone diverged), `install.sh --build`
-aborts with a "does not apply cleanly" error.
+`jellyfin/jellyfin` on the `release-10.11.z` branch (current base SHA:
+`1fbd873929`, "Bump version to 10.11.11"). When that source tree
+drifts (you pulled upstream, or the operator's clone diverged),
+`install.sh --build` aborts with a "does not apply cleanly" error.
+
+**Why release-10.11.z** rather than master: the operator's Jellyfin
+runs on net9.0 (10.11.x line). Master targets net10.0. The patched
+`MediaBrowser.Controller.dll` must match the operator's runtime TFM
+so the plugin's `IChannelItemRefreshManager` reference resolves. If
+the operator ever upgrades to a master-based build, rebase the
+patches against the corresponding master SHA and bump the plugin
+csproj's TargetFramework to match.
+
+Local SDK note: this project's `jellyfin/global.json` requires SDK
+9.0.0 with `rollForward: latestMinor`. If your machine only has the
+10.0.x SDK installed, temporarily overwrite `global.json` to use
+`rollForward: latestMajor` (do NOT commit that change to jellyfin/;
+it would land in the next exported patch). `install.sh --build`
+assumes the operator's box has the matching 9.x SDK from their
+Jellyfin install.
 
 To rebase:
 
@@ -18,7 +35,7 @@ To rebase:
    that nothing local matters first.
 
    ```bash
-   git -C jellyfin reset --hard origin/master   # or whatever upstream
+   git -C jellyfin reset --hard origin/release-10.11.z
    git -C jellyfin clean -fd
    ```
 

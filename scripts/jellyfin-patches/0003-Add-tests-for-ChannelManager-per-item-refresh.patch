@@ -1,6 +1,6 @@
-From 3dfc1353c464b31daa56f3c42e33a6530dd98461 Mon Sep 17 00:00:00 2001
+From 25817bdedfa4b4a48249ea04634b0abffde191a6 Mon Sep 17 00:00:00 2001
 From: spencer <the.spencer.harmon@gmail.com>
-Date: Sun, 14 Jun 2026 22:17:28 -0500
+Date: Mon, 15 Jun 2026 00:00:27 -0500
 Subject: [PATCH 3/3] Add tests for ChannelManager per-item refresh
 
 Covers dispatch logic for IChannelItemRefreshManager.RefreshChannelItemAsync:

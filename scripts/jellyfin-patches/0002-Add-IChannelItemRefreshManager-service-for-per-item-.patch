@@ -1,6 +1,6 @@
-From 877e9f8b110b771a5ef534d0bde692e4eeff9c5c Mon Sep 17 00:00:00 2001
+From e2be75ce47fb8b2d1582c83d8ce052f5c897d050 Mon Sep 17 00:00:00 2001
 From: spencer <the.spencer.harmon@gmail.com>
-Date: Sun, 14 Jun 2026 22:17:22 -0500
+Date: Mon, 15 Jun 2026 00:00:27 -0500
 Subject: [PATCH 2/3] Add IChannelItemRefreshManager service for per-item
  channel refresh
 
@@ -15,8 +15,7 @@ IChannelItemRefresh capability (falling back to paging GetChannelItems
 if not implemented), then applies any combination of:
 
   - ForceUpdate: persists path/MediaSources/etc. against the same
-    BaseItem.Id even when the item already exists (the legacy
-    GetChannelItemEntityAsync path only persisted on isNew).
+    BaseItem.Id even when the item already exists.
   - ForceProbe: triggers a full metadata refresh with
     EnableRemoteContentProbe = true so stream/codec info is
     re-detected for items whose backing media changed.
@@ -26,18 +25,18 @@ if not implemented), then applies any combination of:
 
 Implementation factors the existing GetChannelItemEntityAsync body
 into an inner overload accepting forceUpdateParam + forceProbe flags;
-the legacy call site retains its previous behaviour by routing
-through a thin wrapper that defaults both flags to false.
+the legacy call site retains its previous behaviour via a thin
+wrapper that defaults both flags to false.
 
 DI registration uses the two-forwarder pattern off a self-type
 ChannelManager registration so IChannelManager and
-IChannelItemRefreshManager resolve to the same singleton instance
-without a cast that would break under decoration.
+IChannelItemRefreshManager resolve to the same singleton without a
+cast that would break under decoration.
 ---
  .../Channels/IChannelItemRefreshManager.cs    |  76 +++++++++++++
- .../Channels/ChannelManager.cs                | 103 +++++++++++++++++-
+ .../Channels/ChannelManager.cs                | 102 ++++++++++++++++--
  .../LiveTvServiceCollectionExtensions.cs      |   4 +-
- 3 files changed, 176 insertions(+), 7 deletions(-)
+ 3 files changed, 175 insertions(+), 7 deletions(-)
  create mode 100644 MediaBrowser.Controller/Channels/IChannelItemRefreshManager.cs
 
 diff --git a/MediaBrowser.Controller/Channels/IChannelItemRefreshManager.cs b/MediaBrowser.Controller/Channels/IChannelItemRefreshManager.cs
@@ -123,7 +122,7 @@ index 0000000000..da35d05f51
 +    }
 +}
 diff --git a/src/Jellyfin.LiveTv/Channels/ChannelManager.cs b/src/Jellyfin.LiveTv/Channels/ChannelManager.cs
-index ed02fe6a1d..12b0e0fc35 100644
+index 8ee129a575..a564b5bcf9 100644
 --- a/src/Jellyfin.LiveTv/Channels/ChannelManager.cs
 +++ b/src/Jellyfin.LiveTv/Channels/ChannelManager.cs
 @@ -40,7 +40,7 @@ namespace Jellyfin.LiveTv.Channels
@@ -135,7 +134,7 @@ index ed02fe6a1d..12b0e0fc35 100644
      {
          private readonly IUserManager _userManager;
          private readonly IUserDataManager _userDataManager;
-@@ -954,13 +954,16 @@ namespace Jellyfin.LiveTv.Channels
+@@ -957,13 +957,16 @@ namespace Jellyfin.LiveTv.Channels
              return item;
          }
  
@@ -154,7 +153,7 @@ index ed02fe6a1d..12b0e0fc35 100644
  
              if (info.Type == ChannelItemType.Folder)
              {
-@@ -998,7 +1001,7 @@ namespace Jellyfin.LiveTv.Channels
+@@ -1001,7 +1004,7 @@ namespace Jellyfin.LiveTv.Channels
              {
                  item.RunTimeTicks = null;
              }
@@ -163,7 +162,7 @@ index ed02fe6a1d..12b0e0fc35 100644
              {
                  item.RunTimeTicks = info.RunTimeTicks;
              }
-@@ -1163,14 +1166,102 @@ namespace Jellyfin.LiveTv.Channels
+@@ -1166,14 +1169,101 @@ namespace Jellyfin.LiveTv.Channels
                  }
              }
  
@@ -258,9 +257,8 @@ index ed02fe6a1d..12b0e0fc35 100644
 +            if (options.InvalidateMediaInfoCache)
 +            {
 +                // GetChannelItemMediaSourcesInternal caches keyed on
-+                // item.ExternalId (see GetChannelItemMediaSourcesInternal,
-+                // ~line 408). ExternalId equals the ChannelItemInfo.Id we
-+                // have in hand.
++                // item.ExternalId. ExternalId equals the
++                // ChannelItemInfo.Id we have in hand.
 +                _memoryCache.Remove(channelItemExternalId);
 +            }
 +        }
@@ -269,7 +267,7 @@ index ed02fe6a1d..12b0e0fc35 100644
          {
              ArgumentNullException.ThrowIfNull(channel);
 diff --git a/src/Jellyfin.LiveTv/Extensions/LiveTvServiceCollectionExtensions.cs b/src/Jellyfin.LiveTv/Extensions/LiveTvServiceCollectionExtensions.cs
-index 0c2abe8beb..828b290334 100644
+index ed72badbc0..fed220030d 100644
 --- a/src/Jellyfin.LiveTv/Extensions/LiveTvServiceCollectionExtensions.cs
 +++ b/src/Jellyfin.LiveTv/Extensions/LiveTvServiceCollectionExtensions.cs
 @@ -30,7 +30,9 @@ public static class LiveTvServiceCollectionExtensions
