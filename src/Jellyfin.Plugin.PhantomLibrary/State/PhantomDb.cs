@@ -60,19 +60,41 @@ public sealed record MaterialisedStateRow(
 public sealed record TmdbExternalIdRow(string? ImdbId, DateTimeOffset FetchedAt);
 
 /// <summary>
+/// Row of the <c>tmdb_metadata</c> table. Per-(tmdb_id, type) cached
+/// metadata used to synthesise <c>ChannelItemInfo</c>s in the channel
+/// browse pipeline without re-hitting TMDB on every render. Warmed by
+/// <c>DiscoveryRefreshTask</c> for every (tmdb_id, type) it discovers.
+/// </summary>
+public sealed record TmdbMetadataRow(
+    int TmdbId,
+    string Type,
+    string Title,
+    int? Year,
+    string? Overview,
+    string? PosterUrl,
+    string? BackdropUrl,
+    string[]? Genres,
+    string? OfficialRating,
+    double? CommunityRating,
+    string? OriginalTitle,
+    DateTimeOffset FetchedAt);
+
+/// <summary>
 /// SQLite-backed persistence for the plugin's private state under the
-/// channel architecture (schema v7). Single writer, serialised via a
+/// channel architecture (schema v8). Single writer, serialised via a
 /// process-wide <see cref="SemaphoreSlim"/>; concurrent readers
 /// permitted via separate short-lived connections.
 ///
-/// Schema v7 is a clean break from the v5 file-on-disk schema. Per
+/// Schema v8 is a clean break from the v5 file-on-disk schema (v6/v7
+/// were intermediate channel-arch revisions that never reached prod;
+/// v8 adds the <c>tmdb_metadata</c> table that v7 omitted). Per
 /// AGENTS.md "No database migrations until v1.0", existing databases
-/// at any pre-v7 user_version are HARD-REFUSED and the operator must
+/// at any pre-v8 user_version are HARD-REFUSED and the operator must
 /// run <c>scripts/phantom-wipe.sh</c> before restart.
 /// </summary>
 public sealed class PhantomDb : IDisposable
 {
-    private const int CurrentSchemaVersion = 7;
+    private const int CurrentSchemaVersion = 8;
 
     private readonly string _connectionString;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
@@ -169,12 +191,12 @@ public sealed class PhantomDb : IDisposable
                 + $" version {CurrentSchemaVersion}. Downgrade is not supported. Wipe and rebuild.");
         }
 
-        // version == 0: fresh / never-initialised DB. Create the v7 schema.
+        // version == 0: fresh / never-initialised DB. Create the v8 schema.
         using var tx = conn.BeginTransaction();
         using (var cmd = conn.CreateCommand())
         {
             cmd.Transaction = tx;
-            cmd.CommandText = SchemaV7Sql;
+            cmd.CommandText = SchemaV8Sql;
             cmd.ExecuteNonQuery();
         }
 
@@ -188,7 +210,7 @@ public sealed class PhantomDb : IDisposable
         tx.Commit();
     }
 
-    private const string SchemaV7Sql = @"
+    private const string SchemaV8Sql = @"
 -- Channel-arch discovery: trending + similar-of-favourited TMDB ids,
 -- one row per (tmdb_id, type). Synthesised into ChannelItemInfos by
 -- PhantomMoviesChannel / PhantomShowsChannel at browse time.
@@ -301,6 +323,30 @@ CREATE TABLE IF NOT EXISTS plugin_meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- Channel-arch per-(tmdb_id, type) metadata cache. One row per
+-- discoverable item; the channel browse pipeline reads this to
+-- synthesise ChannelItemInfo without hitting TMDB on every render.
+-- Warmed by DiscoveryRefreshTask (Stage 3.1). Genres are stored as a
+-- JSON array of strings so we can round-trip them without a side
+-- table.
+CREATE TABLE IF NOT EXISTS tmdb_metadata (
+    tmdb_id          INTEGER NOT NULL,
+    type             TEXT NOT NULL,           -- 'movie' or 'series'
+    title            TEXT NOT NULL,
+    year             INTEGER,
+    overview         TEXT,
+    poster_url       TEXT,
+    backdrop_url     TEXT,
+    genres_json      TEXT,                    -- JSON array of strings
+    official_rating  TEXT,
+    community_rating REAL,
+    original_title   TEXT,
+    fetched_at       INTEGER NOT NULL,
+    PRIMARY KEY (tmdb_id, type)
+);
+CREATE INDEX IF NOT EXISTS idx_tmdb_metadata_fetched_at
+    ON tmdb_metadata(fetched_at);
 ";
 
     // ---- magnet_cache ----
@@ -935,6 +981,96 @@ CREATE TABLE IF NOT EXISTS plugin_meta (
         {
             _writeLock.Release();
         }
+    }
+
+    // ---- tmdb_metadata ----
+
+    /// <summary>
+    /// Upserts a (tmdb_id, type) metadata row. INSERT OR REPLACE
+    /// semantics: the latest fetch wins. <paramref name="row"/>'s
+    /// <see cref="TmdbMetadataRow.Genres"/> is serialised as a JSON
+    /// array; null is stored as SQL NULL.
+    /// </summary>
+    public async Task UpsertTmdbMetadataAsync(TmdbMetadataRow row, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(row);
+        ArgumentException.ThrowIfNullOrWhiteSpace(row.Type);
+        ArgumentException.ThrowIfNullOrWhiteSpace(row.Title);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"INSERT OR REPLACE INTO tmdb_metadata
+                (tmdb_id, type, title, year, overview, poster_url, backdrop_url,
+                 genres_json, official_rating, community_rating, original_title, fetched_at)
+                VALUES ($tmdb,$type,$title,$year,$overview,$poster,$backdrop,
+                        $genres,$rating,$community,$origtitle,$fetched);";
+            cmd.Parameters.AddWithValue("$tmdb", row.TmdbId);
+            cmd.Parameters.AddWithValue("$type", row.Type);
+            cmd.Parameters.AddWithValue("$title", row.Title);
+            cmd.Parameters.AddWithValue("$year", (object?)row.Year ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$overview", (object?)row.Overview ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$poster", (object?)row.PosterUrl ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$backdrop", (object?)row.BackdropUrl ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$genres",
+                row.Genres is null
+                    ? (object)DBNull.Value
+                    : System.Text.Json.JsonSerializer.Serialize(row.Genres));
+            cmd.Parameters.AddWithValue("$rating", (object?)row.OfficialRating ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$community", (object?)row.CommunityRating ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$origtitle", (object?)row.OriginalTitle ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$fetched", row.FetchedAt.ToUnixTimeSeconds());
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<TmdbMetadataRow?> GetTmdbMetadataAsync(int tmdbId, string type, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT tmdb_id, type, title, year, overview, poster_url, backdrop_url,
+                   genres_json, official_rating, community_rating, original_title, fetched_at
+            FROM tmdb_metadata WHERE tmdb_id=$tmdb AND type=$type LIMIT 1;";
+        cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+        cmd.Parameters.AddWithValue("$type", type);
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (!await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            return null;
+        }
+
+        string[]? genres = null;
+        if (!r.IsDBNull(7))
+        {
+            try
+            {
+                genres = System.Text.Json.JsonSerializer.Deserialize<string[]>(r.GetString(7));
+            }
+            catch (System.Text.Json.JsonException)
+            {
+                genres = null;
+            }
+        }
+
+        return new TmdbMetadataRow(
+            r.GetInt32(0),
+            r.GetString(1),
+            r.GetString(2),
+            r.IsDBNull(3) ? null : r.GetInt32(3),
+            r.IsDBNull(4) ? null : r.GetString(4),
+            r.IsDBNull(5) ? null : r.GetString(5),
+            r.IsDBNull(6) ? null : r.GetString(6),
+            genres,
+            r.IsDBNull(8) ? null : r.GetString(8),
+            r.IsDBNull(9) ? null : r.GetDouble(9),
+            r.IsDBNull(10) ? null : r.GetString(10),
+            DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(11)));
     }
 
     private static void BindKey(SqliteCommand cmd, MagnetCacheKey key)

@@ -66,7 +66,7 @@ public class PhantomDbTests : IDisposable
             version = Convert.ToInt32(await v.ExecuteScalarAsync());
         }
 
-        Assert.Equal(7, version);
+        Assert.Equal(8, version);
 
         var expectedTables = new[]
         {
@@ -75,6 +75,7 @@ public class PhantomDbTests : IDisposable
             "materialise_in_flight",
             "tmdb_external_ids",
             "tmdb_cache",
+            "tmdb_metadata",
             "magnet_cache",
             "unavailable_marker",
             "plugin_meta",
@@ -90,16 +91,19 @@ public class PhantomDbTests : IDisposable
         }
     }
 
-    [Fact]
-    public async Task HardRefuse_OldSchemaVersion_ThrowsWithWipePointer()
+    [Theory]
+    [InlineData(5)]
+    [InlineData(7)]
+    public async Task HardRefuse_OldSchemaVersion_ThrowsWithWipePointer(int oldVersion)
     {
-        // Pre-create a DB with user_version=5 (the pre-channel-arch schema).
+        // Pre-create a DB with an older user_version (v5 = pre-channel-arch,
+        // v7 = intermediate channel-arch schema without tmdb_metadata).
         var cs = new SqliteConnectionStringBuilder { DataSource = _dbPath, Mode = SqliteOpenMode.ReadWriteCreate }.ToString();
         await using (var conn = new SqliteConnection(cs))
         {
             await conn.OpenAsync();
             await using var cmd = conn.CreateCommand();
-            cmd.CommandText = "PRAGMA user_version = 5;";
+            cmd.CommandText = $"PRAGMA user_version = {oldVersion};";
             await cmd.ExecuteNonQueryAsync();
         }
 
@@ -109,7 +113,7 @@ public class PhantomDbTests : IDisposable
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => db.SetMetaAsync("test", "1", CancellationToken.None));
 
-        Assert.Contains("version 7", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("version 8", ex.Message, StringComparison.Ordinal);
         Assert.Contains("wipe", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -406,5 +410,119 @@ public class PhantomDbTests : IDisposable
         Assert.Equal("value1", await db.GetMetaAsync("key1", CancellationToken.None));
         await db.SetMetaAsync("key1", "value2", CancellationToken.None);
         Assert.Equal("value2", await db.GetMetaAsync("key1", CancellationToken.None));
+    }
+
+    // ----------------------------------------------------------------
+    // tmdb_metadata
+    // ----------------------------------------------------------------
+
+    [Fact]
+    public async Task TmdbMetadata_UpsertGet_RoundtripsAllFields()
+    {
+        using var db = await NewDbAsync();
+        var fetched = DateTimeOffset.FromUnixTimeSeconds(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        var row = new TmdbMetadataRow(
+            TmdbId: 42,
+            Type: "movie",
+            Title: "The Answer",
+            Year: 1979,
+            Overview: "A meditation on 42.",
+            PosterUrl: "https://image.tmdb.org/t/p/w500/poster.jpg",
+            BackdropUrl: "https://image.tmdb.org/t/p/w500/backdrop.jpg",
+            Genres: new[] { "Drama", "Sci-Fi" },
+            OfficialRating: "PG",
+            CommunityRating: 7.5,
+            OriginalTitle: "La Réponse",
+            FetchedAt: fetched);
+
+        await db.UpsertTmdbMetadataAsync(row, CancellationToken.None);
+        var got = await db.GetTmdbMetadataAsync(42, "movie", CancellationToken.None);
+        Assert.NotNull(got);
+        Assert.Equal(42, got!.TmdbId);
+        Assert.Equal("movie", got.Type);
+        Assert.Equal("The Answer", got.Title);
+        Assert.Equal(1979, got.Year);
+        Assert.Equal("A meditation on 42.", got.Overview);
+        Assert.Equal("https://image.tmdb.org/t/p/w500/poster.jpg", got.PosterUrl);
+        Assert.Equal("https://image.tmdb.org/t/p/w500/backdrop.jpg", got.BackdropUrl);
+        Assert.NotNull(got.Genres);
+        Assert.Equal(new[] { "Drama", "Sci-Fi" }, got.Genres);
+        Assert.Equal("PG", got.OfficialRating);
+        Assert.Equal(7.5, got.CommunityRating);
+        Assert.Equal("La Réponse", got.OriginalTitle);
+        Assert.Equal(fetched, got.FetchedAt);
+    }
+
+    [Fact]
+    public async Task TmdbMetadata_UpsertWithNullables_RoundtripsAsNull()
+    {
+        using var db = await NewDbAsync();
+        var row = new TmdbMetadataRow(
+            TmdbId: 99,
+            Type: "series",
+            Title: "Title Only",
+            Year: null,
+            Overview: null,
+            PosterUrl: null,
+            BackdropUrl: null,
+            Genres: null,
+            OfficialRating: null,
+            CommunityRating: null,
+            OriginalTitle: null,
+            FetchedAt: DateTimeOffset.UtcNow);
+
+        await db.UpsertTmdbMetadataAsync(row, CancellationToken.None);
+        var got = await db.GetTmdbMetadataAsync(99, "series", CancellationToken.None);
+        Assert.NotNull(got);
+        Assert.Equal("Title Only", got!.Title);
+        Assert.Null(got.Year);
+        Assert.Null(got.Overview);
+        Assert.Null(got.PosterUrl);
+        Assert.Null(got.BackdropUrl);
+        Assert.Null(got.Genres);
+        Assert.Null(got.OfficialRating);
+        Assert.Null(got.CommunityRating);
+        Assert.Null(got.OriginalTitle);
+    }
+
+    [Fact]
+    public async Task TmdbMetadata_TypeIsolation_MovieAndSeriesIndependent()
+    {
+        using var db = await NewDbAsync();
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(42, "movie", "Movie", null, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(42, "series", "Series", null, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+
+        var m = await db.GetTmdbMetadataAsync(42, "movie", CancellationToken.None);
+        var s = await db.GetTmdbMetadataAsync(42, "series", CancellationToken.None);
+
+        Assert.Equal("Movie", m!.Title);
+        Assert.Equal("Series", s!.Title);
+    }
+
+    [Fact]
+    public async Task TmdbMetadata_UpsertOverwritesPrevious()
+    {
+        using var db = await NewDbAsync();
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(42, "movie", "Old", 1970, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(42, "movie", "New", 1979, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        var got = await db.GetTmdbMetadataAsync(42, "movie", CancellationToken.None);
+        Assert.Equal("New", got!.Title);
+        Assert.Equal(1979, got.Year);
+    }
+
+    [Fact]
+    public async Task TmdbMetadata_GetMissing_ReturnsNull()
+    {
+        using var db = await NewDbAsync();
+        var got = await db.GetTmdbMetadataAsync(404, "movie", CancellationToken.None);
+        Assert.Null(got);
     }
 }
