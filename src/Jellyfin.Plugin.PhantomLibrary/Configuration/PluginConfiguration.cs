@@ -65,6 +65,14 @@ public class PluginConfiguration : BasePluginConfiguration
         DiscoveryLanguage = string.Empty;
         GostreamMoviesRoot = "/var/gostream/gostream-mkv-virtual/movies";
         GostreamShowsRoot = "/var/gostream/gostream-mkv-virtual/tv";
+
+        SourcePickerPreset = "gostream-default";
+        UnavailableRetryAfterHours = 24;
+        MagnetCacheTtlHours = 24 * 7;
+        MaterialiseInFlightStaleMinutes = 10;
+        GostreamMinQuality = string.Empty;
+        FusePathWaitTimeoutSeconds = 60;
+        FusePathPollIntervalMilliseconds = 500;
     }
 
     /// <summary>Gets or sets the TMDB v3 API key used by the plugin's TMDB client.</summary>
@@ -220,6 +228,54 @@ public class PluginConfiguration : BasePluginConfiguration
     /// the shows channel for orphan enumeration (Stage 5.1).
     /// </summary>
     public string GostreamShowsRoot { get; set; }
+
+    /// <summary>
+    /// Preset label embedded in <c>magnet_cache</c> rows. Lets the
+    /// operator invalidate a magnet cohort by changing the preset
+    /// string; defaults to <c>"gostream-default"</c>.
+    /// </summary>
+    public string SourcePickerPreset { get; set; }
+
+    /// <summary>
+    /// How long an <c>unavailable_marker</c> row keeps short-circuiting
+    /// repeated materialise attempts for the same (tmdb, type, season,
+    /// episode) tuple before the indexers are re-consulted.
+    /// </summary>
+    public int UnavailableRetryAfterHours { get; set; }
+
+    /// <summary>
+    /// Per-magnet cache TTL written into <c>magnet_cache</c> rows.
+    /// </summary>
+    public int MagnetCacheTtlHours { get; set; }
+
+    /// <summary>
+    /// Age threshold (minutes) above which a row in
+    /// <c>materialise_in_flight</c> is considered stale and swept on
+    /// startup. Tuned for the worst-case materialise wallclock; rows
+    /// younger than this are left alone so a long-running materialise
+    /// is not interrupted by the startup sweep racing it.
+    /// </summary>
+    public int MaterialiseInFlightStaleMinutes { get; set; }
+
+    /// <summary>
+    /// Optional <c>min_quality</c> hint forwarded to gostream's
+    /// <c>POST /api/library/add</c>. Empty (default) lets gostream pick.
+    /// </summary>
+    public string GostreamMinQuality { get; set; }
+
+    /// <summary>
+    /// Upper bound on how long the materialiser waits for the
+    /// gostream FUSE path to appear after a successful <c>add</c>
+    /// call. The wait is best-effort; a timeout does not roll the
+    /// materialise back, but the badge will reflect 'Materialised'
+    /// without a probe-driven MediaSource until the next browse.
+    /// </summary>
+    public int FusePathWaitTimeoutSeconds { get; set; }
+
+    /// <summary>
+    /// Polling interval for the FUSE-path wait loop.
+    /// </summary>
+    public int FusePathPollIntervalMilliseconds { get; set; }
 }
 
 /// <summary>Quality-scoring preset chooser.</summary>

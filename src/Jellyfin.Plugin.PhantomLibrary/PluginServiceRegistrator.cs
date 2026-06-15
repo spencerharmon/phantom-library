@@ -6,6 +6,7 @@ using Jellyfin.Plugin.PhantomLibrary.Library;
 using Jellyfin.Plugin.PhantomLibrary.Materialisation;
 using Jellyfin.Plugin.PhantomLibrary.Playback;
 using Jellyfin.Plugin.PhantomLibrary.Scheduled;
+using Jellyfin.Plugin.PhantomLibrary.Sources;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller;
@@ -67,16 +68,18 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         serviceCollection.AddTransient<IIndexerClient>(sp => sp.GetRequiredService<ProwlarrClient>());
         serviceCollection.AddTransient<IIndexerClient>(sp => sp.GetRequiredService<TorrentioClient>());
 
-        // Materialisation pipeline (Materialiser is a stage-2.1 stub;
-        // rewritten in Stage 4.2).
+        // Materialisation pipeline (Stage 4.2 rewrite — full tuple
+        // signature, MagnetSelector + TmdbExternalIdResolver,
+        // IChannelItemRefreshManager hand-off, in-flight sweeper).
         serviceCollection.AddSingleton<QualityScorer>();
-        serviceCollection.AddSingleton<TmdbExternalIdResolver>();
         serviceCollection.AddSingleton<IMaterialiser, Materialiser>();
         serviceCollection.AddSingleton<MaterialisationQueue>();
         serviceCollection.AddSingleton<IMaterialisationQueue>(sp => sp.GetRequiredService<MaterialisationQueue>());
         serviceCollection.AddHostedService(sp => sp.GetRequiredService<MaterialisationQueue>());
 
-        // Listeners + sweeper (all stage-2.1 stubs; rewritten in Stages 4 / 6.1).
+        // Channel-arch listeners. Heavy autopilot logic lands in
+        // Stage 5.2; the listeners wired here forward to ISeriesAutopilot
+        // and fire-and-forget materialise via IMaterialiser.
         serviceCollection.AddHostedService<UserDataSavedListener>();
         serviceCollection.AddHostedService<PlaybackTriggerListener>();
         serviceCollection.AddHostedService<EvictionSweeper>();

@@ -33,6 +33,9 @@ public class MaterialisationQueueTests
             if (_wait) await Gate.Task.WaitAsync(ct);
             return new MaterialisationOutcome { Status = MaterialisationStatus.Success };
         }
+
+        public Task<MaterialisationOutcome> MaterialiseAsync(int tmdbId, string type, int? season, int? episode, MaterialiseTrigger trigger, CancellationToken ct)
+            => Task.FromResult(new MaterialisationOutcome { Status = MaterialisationStatus.Success });
     }
 
     private static ServiceProvider BuildSp(IMaterialiser m)

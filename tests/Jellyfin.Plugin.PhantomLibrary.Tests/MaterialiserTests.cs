@@ -1,0 +1,454 @@
+using System;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
+using Jellyfin.Plugin.PhantomLibrary.Channels;
+using Jellyfin.Plugin.PhantomLibrary.Clients;
+using Jellyfin.Plugin.PhantomLibrary.Configuration;
+using Jellyfin.Plugin.PhantomLibrary.Materialisation;
+using Jellyfin.Plugin.PhantomLibrary.Sources;
+using Jellyfin.Plugin.PhantomLibrary.State;
+using MediaBrowser.Controller.Channels;
+using MediaBrowser.Controller.Library;
+using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.Logging.Abstractions;
+using Moq;
+using Xunit;
+
+namespace Jellyfin.Plugin.PhantomLibrary.Tests;
+
+public class MaterialiserTests : IDisposable
+{
+    private readonly string _dbPath;
+    private readonly string _fuseMount;
+
+    public MaterialiserTests()
+    {
+        _dbPath = Path.Combine(Path.GetTempPath(), "phantom-mat-" + Guid.NewGuid().ToString("N") + ".db");
+        _fuseMount = Path.Combine(Path.GetTempPath(), "phantom-fuse-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(_fuseMount);
+    }
+
+    public void Dispose()
+    {
+        try
+        {
+            SqliteConnection.ClearAllPools();
+            if (File.Exists(_dbPath)) File.Delete(_dbPath);
+            if (Directory.Exists(_fuseMount)) Directory.Delete(_fuseMount, recursive: true);
+        }
+        catch
+        {
+            // best-effort
+        }
+    }
+
+    private async Task<PhantomDb> NewDbAsync()
+    {
+        var db = new PhantomDb(_dbPath);
+        await db.SetMetaAsync("__init__", "1", CancellationToken.None);
+        return db;
+    }
+
+    private (Materialiser sut, Mock<IGostreamClient> gostream, Mock<IChannelItemRefreshManager> refresh, FakeIndexer indexer, PhantomDb db, PluginConfiguration cfg) BuildSut(
+        PhantomDb db,
+        string? imdb = "tt0000042",
+        string? fusePath = null,
+        Action<Mock<IGostreamClient>>? gostreamSetup = null,
+        MagnetCandidate? magnet = null,
+        bool magnetReturnsNull = false)
+    {
+        fusePath ??= Path.Combine(_fuseMount, "movie.mkv");
+        File.WriteAllText(fusePath, "x"); // pre-create so WaitForFusePathAsync returns immediately
+
+        var gostream = new Mock<IGostreamClient>(MockBehavior.Loose);
+        if (gostreamSetup is null)
+        {
+            gostream.Setup(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new GostreamAddResult
+                {
+                    StubPath = "/var/gostream/stubs/movie.mkv",
+                    FusePath = fusePath,
+                    Hash = "abc",
+                    Size = 100,
+                });
+        }
+        else
+        {
+            gostreamSetup(gostream);
+        }
+
+        var refresh = new Mock<IChannelItemRefreshManager>(MockBehavior.Loose);
+        refresh.Setup(r => r.RefreshChannelItemAsync(
+                It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<ChannelItemRefreshOptions>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        var indexer = new FakeIndexer(magnetReturnsNull ? null : (magnet ?? new MagnetCandidate("magnet:?xt=urn:btih:DEAD", "DEAD", 5L * 1024 * 1024 * 1024, 50, "test")));
+        var scorer = new QualityScorer(NullLogger<QualityScorer>.Instance);
+        var cfg = new PluginConfiguration
+        {
+            FusePathWaitTimeoutSeconds = 2,
+            FusePathPollIntervalMilliseconds = 50,
+            UnavailableRetryAfterHours = 24,
+            MagnetCacheTtlHours = 24,
+            MaterialiseInFlightStaleMinutes = 10,
+            SourcePickerPreset = "test",
+            MinSeeders = 1,
+            MinSizeGb1080p = 1,
+            MinSizeGb4K = 1,
+        };
+
+        var selector = new MagnetSelector(
+            new IIndexerClient[] { indexer },
+            scorer,
+            NullLogger<MagnetSelector>.Instance,
+            () => cfg);
+
+        // Pre-seed the external-id cache so the resolver returns the
+        // configured value without hitting TMDB. "movie" lookups are
+        // used for tmdbId 42-99; "series" lookups for 100+; we seed
+        // the lookup type that matches the test's intended call.
+        if (imdb is not null)
+        {
+            db.SetImdbIdAsync(42, "movie", imdb, CancellationToken.None).GetAwaiter().GetResult();
+            db.SetImdbIdAsync(99, "movie", imdb, CancellationToken.None).GetAwaiter().GetResult();
+            db.SetImdbIdAsync(50, "movie", imdb, CancellationToken.None).GetAwaiter().GetResult();
+            db.SetImdbIdAsync(60, "movie", imdb, CancellationToken.None).GetAwaiter().GetResult();
+            db.SetImdbIdAsync(70, "movie", imdb, CancellationToken.None).GetAwaiter().GetResult();
+            db.SetImdbIdAsync(80, "movie", imdb, CancellationToken.None).GetAwaiter().GetResult();
+            db.SetImdbIdAsync(90, "movie", imdb, CancellationToken.None).GetAwaiter().GetResult();
+            db.SetImdbIdAsync(300, "movie", imdb, CancellationToken.None).GetAwaiter().GetResult();
+            db.SetImdbIdAsync(200, "series", imdb, CancellationToken.None).GetAwaiter().GetResult();
+        }
+        else
+        {
+            // Negative cache seed for episodic test (series lookup).
+            db.SetImdbIdAsync(200, "series", null, CancellationToken.None).GetAwaiter().GetResult();
+        }
+
+        var tmdb = new Mock<ITmdbClient>(MockBehavior.Strict);
+        var externalIds = new TmdbExternalIdResolver(db, tmdb.Object, NullLogger<TmdbExternalIdResolver>.Instance);
+
+        var libMgr = new Mock<ILibraryManager>(MockBehavior.Loose);
+        var state = new ChannelStateProvider(db);
+
+        var sut = new Materialiser(
+            libMgr.Object,
+            db,
+            gostream.Object,
+            selector,
+            externalIds,
+            refresh.Object,
+            state,
+            NullLogger<Materialiser>.Instance,
+            () => cfg);
+
+        return (sut, gostream, refresh, indexer, db, cfg);
+    }
+
+    private sealed class FakeIndexer : IIndexerClient
+    {
+        private readonly MagnetCandidate? _magnet;
+        public FakeIndexer(MagnetCandidate? magnet) { _magnet = magnet; }
+        public string Name => "fake";
+        public bool IsEnabled => true;
+        public Task<System.Collections.Generic.IReadOnlyList<IndexerCandidate>> SearchAsync(IndexerQuery query, CancellationToken ct)
+        {
+            if (_magnet is null) return Task.FromResult<System.Collections.Generic.IReadOnlyList<IndexerCandidate>>(Array.Empty<IndexerCandidate>());
+            return Task.FromResult<System.Collections.Generic.IReadOnlyList<IndexerCandidate>>(new[]
+            {
+                new IndexerCandidate
+                {
+                    Title = "Test Movie 1080p",
+                    Magnet = _magnet.Magnet,
+                    InfoHash = _magnet.InfoHash,
+                    Size = _magnet.Size,
+                    Seeders = _magnet.Seeders,
+                    IndexerName = _magnet.Indexer,
+                }
+            });
+        }
+    }
+
+    private static async Task SeedMovieMetadataAsync(PhantomDb db, int tmdb, string title = "Test Movie", int year = 2020)
+    {
+        await db.UpsertTmdbMetadataAsync(new TmdbMetadataRow(
+            TmdbId: tmdb,
+            Type: "movie",
+            Title: title,
+            Year: year,
+            Overview: null, PosterUrl: null, BackdropUrl: null,
+            Genres: null, OfficialRating: null, CommunityRating: null,
+            OriginalTitle: null,
+            FetchedAt: DateTimeOffset.UtcNow), CancellationToken.None);
+    }
+
+    private static async Task SeedSeriesMetadataAsync(PhantomDb db, int tmdb, string title = "Test Show", int year = 2020)
+    {
+        await db.UpsertTmdbMetadataAsync(new TmdbMetadataRow(
+            TmdbId: tmdb,
+            Type: "series",
+            Title: title,
+            Year: year,
+            Overview: null, PosterUrl: null, BackdropUrl: null,
+            Genres: null, OfficialRating: null, CommunityRating: null,
+            OriginalTitle: null,
+            FetchedAt: DateTimeOffset.UtcNow), CancellationToken.None);
+    }
+
+    // ---- happy path ----
+
+    [Fact]
+    public async Task TupleMovie_HappyPath_WritesMaterialisedState_CallsRefreshTwice()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieMetadataAsync(db, 42);
+        var (sut, gostream, refresh, _, _, _) = BuildSut(db);
+
+        var outcome = await sut.MaterialiseAsync(42, "movie", null, null, MaterialiseTrigger.Manual, CancellationToken.None);
+
+        Assert.Equal(MaterialisationStatus.Success, outcome.Status);
+        var row = await db.GetMaterialisedStateAsync(42, "movie", -1, -1, CancellationToken.None);
+        Assert.NotNull(row);
+        Assert.False(await db.IsMaterialiseInFlightAsync(42, "movie", -1, -1, CancellationToken.None));
+        refresh.Verify(r => r.RefreshChannelItemAsync(
+            It.IsAny<Guid>(), It.IsAny<string>(),
+            It.Is<ChannelItemRefreshOptions>(o => o.ForceUpdate && !o.ForceProbe && o.InvalidateMediaInfoCache),
+            It.IsAny<CancellationToken>()), Times.Once);
+        refresh.Verify(r => r.RefreshChannelItemAsync(
+            It.IsAny<Guid>(), It.IsAny<string>(),
+            It.Is<ChannelItemRefreshOptions>(o => o.ForceUpdate && o.ForceProbe && o.InvalidateMediaInfoCache),
+            It.IsAny<CancellationToken>()), Times.Once);
+        gostream.Verify(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task SentinelDiscipline_MovieUsesMinusOnePair()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieMetadataAsync(db, 99);
+        var (sut, _, _, _, _, _) = BuildSut(db);
+
+        var outcome = await sut.MaterialiseAsync(99, "movie", null, null, MaterialiseTrigger.Manual, CancellationToken.None);
+        Assert.Equal(MaterialisationStatus.Success, outcome.Status);
+
+        // Verify the row is keyed on (-1, -1), not (NULL, NULL) or (0, 0).
+        var fetched = await db.GetMaterialisedStateAsync(99, "movie", -1, -1, CancellationToken.None);
+        Assert.NotNull(fetched);
+        Assert.Equal(-1, fetched!.Season);
+        Assert.Equal(-1, fetched.Episode);
+    }
+
+    // ---- idempotency ----
+
+    [Fact]
+    public async Task AlreadyMaterialised_ReturnsDuplicate_NoGostreamCall()
+    {
+        using var db = await NewDbAsync();
+        await db.InsertMaterialisedStateAsync(50, "movie", -1, -1, "/stub", "/fuse", CancellationToken.None);
+        var (sut, gostream, _, _, _, _) = BuildSut(db);
+
+        var outcome = await sut.MaterialiseAsync(50, "movie", null, null, MaterialiseTrigger.Manual, CancellationToken.None);
+
+        Assert.Equal(MaterialisationStatus.Duplicate, outcome.Status);
+        gostream.Verify(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task AlreadyInFlight_ReturnsAlreadyInProgress_NoGostreamCall()
+    {
+        using var db = await NewDbAsync();
+        await db.UpsertMaterialiseInFlightAsync(60, "movie", -1, -1, CancellationToken.None);
+        var (sut, gostream, _, _, _, _) = BuildSut(db);
+
+        var outcome = await sut.MaterialiseAsync(60, "movie", null, null, MaterialiseTrigger.Manual, CancellationToken.None);
+
+        Assert.Equal(MaterialisationStatus.AlreadyInProgress, outcome.Status);
+        gostream.Verify(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    // ---- failure paths ----
+
+    [Fact]
+    public async Task GostreamFails_NoMaterialisedRow_InFlightCleanedUp_ErrorReturned()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieMetadataAsync(db, 70);
+        var (sut, gostream, _, _, _, _) = BuildSut(db, gostreamSetup: g =>
+            g.Setup(x => x.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()))
+             .ThrowsAsync(new InvalidOperationException("gostream down")));
+
+        var outcome = await sut.MaterialiseAsync(70, "movie", null, null, MaterialiseTrigger.Manual, CancellationToken.None);
+
+        Assert.Equal(MaterialisationStatus.Error, outcome.Status);
+        Assert.Contains("gostream down", outcome.Error);
+        Assert.Null(await db.GetMaterialisedStateAsync(70, "movie", -1, -1, CancellationToken.None));
+        Assert.False(await db.IsMaterialiseInFlightAsync(70, "movie", -1, -1, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task PreFlightRefreshThrows_MaterialiseStillProceeds()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieMetadataAsync(db, 80);
+        var (sut, _, refresh, _, _, _) = BuildSut(db);
+        var callCount = 0;
+        refresh.Reset();
+        refresh.Setup(r => r.RefreshChannelItemAsync(
+                It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<ChannelItemRefreshOptions>(), It.IsAny<CancellationToken>()))
+            .Returns<Guid, string, ChannelItemRefreshOptions, CancellationToken>((_, _, opts, _) =>
+            {
+                callCount++;
+                if (callCount == 1) throw new InvalidOperationException("pre-flight failed");
+                return Task.CompletedTask;
+            });
+
+        var outcome = await sut.MaterialiseAsync(80, "movie", null, null, MaterialiseTrigger.Manual, CancellationToken.None);
+
+        Assert.Equal(MaterialisationStatus.Success, outcome.Status);
+        // post-flight refresh still happened
+        Assert.True(callCount >= 2);
+    }
+
+    [Fact]
+    public async Task MagnetSelectorReturnsNull_WritesUnavailableMarker_ReturnsError()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieMetadataAsync(db, 90);
+        var (sut, _, _, _, _, cfg) = BuildSut(db, magnetReturnsNull: true);
+
+        var outcome = await sut.MaterialiseAsync(90, "movie", null, null, MaterialiseTrigger.Manual, CancellationToken.None);
+
+        Assert.Equal(MaterialisationStatus.Error, outcome.Status);
+        var marker = await db.IsMarkedUnavailableAsync(
+            new UnavailableKey(TmdbId: 90, ImdbId: "tt0000042", Type: "movie", Season: null, Episode: null),
+            CancellationToken.None);
+        Assert.True(marker.HasValue);
+        Assert.False(await db.IsMaterialiseInFlightAsync(90, "movie", -1, -1, CancellationToken.None));
+    }
+
+    // ---- type rejects ----
+
+    [Fact]
+    public async Task SeriesType_Rejected()
+    {
+        using var db = await NewDbAsync();
+        var (sut, _, _, _, _, _) = BuildSut(db);
+        var outcome = await sut.MaterialiseAsync(1, "series", null, null, MaterialiseTrigger.Manual, CancellationToken.None);
+        Assert.Equal(MaterialisationStatus.Error, outcome.Status);
+        Assert.Contains("Series-level", outcome.Error);
+    }
+
+    [Fact]
+    public async Task EpisodeWithoutImdb_ReturnsError()
+    {
+        using var db = await NewDbAsync();
+        await SeedSeriesMetadataAsync(db, 200);
+        var (sut, _, _, _, _, _) = BuildSut(db, imdb: null);
+        var outcome = await sut.MaterialiseAsync(200, "episode", 1, 1, MaterialiseTrigger.Manual, CancellationToken.None);
+        Assert.Equal(MaterialisationStatus.Error, outcome.Status);
+        Assert.Contains("IMDB", outcome.Error);
+    }
+
+    [Fact]
+    public async Task EpisodeWithoutSeasonOrEpisode_ReturnsError()
+    {
+        using var db = await NewDbAsync();
+        var (sut, _, _, _, _, _) = BuildSut(db);
+        var outcome = await sut.MaterialiseAsync(1, "episode", null, null, MaterialiseTrigger.Manual, CancellationToken.None);
+        Assert.Equal(MaterialisationStatus.Error, outcome.Status);
+    }
+
+    [Fact]
+    public async Task UnsupportedType_ReturnsError()
+    {
+        using var db = await NewDbAsync();
+        var (sut, _, _, _, _, _) = BuildSut(db);
+        var outcome = await sut.MaterialiseAsync(1, "audio", null, null, MaterialiseTrigger.Manual, CancellationToken.None);
+        Assert.Equal(MaterialisationStatus.Error, outcome.Status);
+        Assert.Contains("Unsupported", outcome.Error);
+    }
+
+    [Fact]
+    public async Task LegacyGuidWrapper_RoutesMovieExternalIdToTuplePath()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieMetadataAsync(db, 42);
+
+        // Video.SourceType consults a static IRecordingsManager; stub it
+        // so it doesn't NRE.
+        var recordings = new Mock<MediaBrowser.Controller.LiveTv.IRecordingsManager>(MockBehavior.Loose);
+        recordings.Setup(r => r.GetActiveRecordingInfo(It.IsAny<string>())).Returns((MediaBrowser.Controller.LiveTv.ActiveRecordingInfo?)null);
+        MediaBrowser.Controller.Entities.Video.RecordingsManager = recordings.Object;
+
+        var jellyfinItemId = Guid.NewGuid();
+        var item = new MediaBrowser.Controller.Entities.Movies.Movie
+        {
+            Name = "x",
+            ExternalId = "movie_42",
+            ChannelId = ChannelIds.Movies,
+        };
+        var libMgr = new Mock<ILibraryManager>(MockBehavior.Loose);
+        libMgr.Setup(l => l.GetItemById(jellyfinItemId)).Returns(item);
+
+        var state = new ChannelStateProvider(db);
+        var tmdb = new Mock<ITmdbClient>(MockBehavior.Strict);
+        var externalIds = new TmdbExternalIdResolver(db, tmdb.Object, NullLogger<TmdbExternalIdResolver>.Instance);
+        await db.SetImdbIdAsync(42, "movie", "tt0000042", CancellationToken.None);
+        var gostream = new Mock<IGostreamClient>(MockBehavior.Loose);
+        var fusePath = Path.Combine(_fuseMount, "legacy.mkv");
+        File.WriteAllText(fusePath, "x");
+        gostream.Setup(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new GostreamAddResult { StubPath = "/stub", FusePath = fusePath, Hash = "h", Size = 1 });
+        var refresh = new Mock<IChannelItemRefreshManager>(MockBehavior.Loose);
+        refresh.Setup(r => r.RefreshChannelItemAsync(It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<ChannelItemRefreshOptions>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        var cfg = new PluginConfiguration { FusePathWaitTimeoutSeconds = 1, FusePathPollIntervalMilliseconds = 50, MinSeeders = 1, MinSizeGb1080p = 1, MinSizeGb4K = 1 };
+        var indexer = new FakeIndexer(new MagnetCandidate("magnet:?xt=urn:btih:DEAD", "DEAD", 5L * 1024 * 1024 * 1024, 10, "f"));
+        var selector = new MagnetSelector(new IIndexerClient[] { indexer }, new QualityScorer(NullLogger<QualityScorer>.Instance), NullLogger<MagnetSelector>.Instance, () => cfg);
+        var legacySut = new Materialiser(libMgr.Object, db, gostream.Object, selector, externalIds, refresh.Object, state, NullLogger<Materialiser>.Instance, () => cfg);
+
+        var outcome = await legacySut.MaterialiseAsync(jellyfinItemId, MaterialiseTrigger.Manual, CancellationToken.None);
+        Assert.Equal(MaterialisationStatus.Success, outcome.Status);
+        Assert.NotNull(await db.GetMaterialisedStateAsync(42, "movie", -1, -1, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task LegacyGuidWrapper_SeriesExternalIdRejected()
+    {
+        using var db = await NewDbAsync();
+        var jellyfinItemId = Guid.NewGuid();
+        var item = new MediaBrowser.Controller.Entities.TV.Series
+        {
+            Name = "x",
+            ExternalId = "series_99",
+            ChannelId = ChannelIds.Shows,
+        };
+        var libMgr = new Mock<ILibraryManager>(MockBehavior.Loose);
+        libMgr.Setup(l => l.GetItemById(jellyfinItemId)).Returns(item);
+        var state = new ChannelStateProvider(db);
+        var tmdb = new Mock<ITmdbClient>(MockBehavior.Strict);
+        var externalIds = new TmdbExternalIdResolver(db, tmdb.Object, NullLogger<TmdbExternalIdResolver>.Instance);
+        var cfg = new PluginConfiguration();
+        var selector = new MagnetSelector(Array.Empty<IIndexerClient>(), new QualityScorer(NullLogger<QualityScorer>.Instance), NullLogger<MagnetSelector>.Instance, () => cfg);
+        var refresh = new Mock<IChannelItemRefreshManager>(MockBehavior.Loose);
+        var gostream = new Mock<IGostreamClient>(MockBehavior.Loose);
+        var sut = new Materialiser(libMgr.Object, db, gostream.Object, selector, externalIds, refresh.Object, state, NullLogger<Materialiser>.Instance, () => cfg);
+
+        var outcome = await sut.MaterialiseAsync(jellyfinItemId, MaterialiseTrigger.Manual, CancellationToken.None);
+        Assert.Equal(MaterialisationStatus.Error, outcome.Status);
+        Assert.Contains("Series-level", outcome.Error);
+    }
+
+    [Fact]
+    public async Task TmdbMetadataMiss_RaisesErrorViaCatch()
+    {
+        using var db = await NewDbAsync();
+        // no SeedMovieMetadataAsync → tmdb_metadata miss
+        var (sut, _, _, _, _, _) = BuildSut(db);
+        var outcome = await sut.MaterialiseAsync(300, "movie", null, null, MaterialiseTrigger.Manual, CancellationToken.None);
+        Assert.Equal(MaterialisationStatus.Error, outcome.Status);
+        Assert.Contains("tmdb_metadata miss", outcome.Error);
+        Assert.False(await db.IsMaterialiseInFlightAsync(300, "movie", -1, -1, CancellationToken.None));
+    }
+}

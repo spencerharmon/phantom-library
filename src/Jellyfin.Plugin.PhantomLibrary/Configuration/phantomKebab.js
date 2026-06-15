@@ -35,6 +35,34 @@
         return m ? m[1] : null;
     }
 
+    /* Defence-in-depth (plan §4.2 "Kebab JS shim"): the server rejects
+     * series/season materialise but the UI shouldn't even offer it.
+     * Returns a Promise that resolves to true iff the item is a kind
+     * we accept (Movie or Episode). Resolves to true on lookup failure
+     * so we err on showing the button — the server-side reject is
+     * authoritative either way. */
+    function isMaterialisableKind(itemId) {
+        var api = getApiClient();
+        if (!api || typeof api.getItem !== 'function') {
+            return Promise.resolve(true);
+        }
+        var userId = (typeof api.getCurrentUserId === 'function') ? api.getCurrentUserId() : null;
+        if (!userId) {
+            return Promise.resolve(true);
+        }
+        try {
+            return api.getItem(userId, itemId).then(function (item) {
+                if (!item || !item.Type) { return true; }
+                if (item.Type === 'Series' || item.Type === 'Season') {
+                    return false;
+                }
+                return true;
+            }, function () { return true; });
+        } catch (_) {
+            return Promise.resolve(true);
+        }
+    }
+
     /* Find the SPA's ApiClient. Jellyfin-web exposes it on window. */
     function getApiClient() {
         if (window.ApiClient) {
@@ -130,6 +158,24 @@
         if (!itemId) {
             return;
         }
+
+        // Defer the actual injection until we've confirmed the item's
+        // Type is something we can materialise. Series/Season tiles get
+        // skipped here so the user can't even click Materialise on a
+        // folder — the server still rejects them, this is defence in
+        // depth.
+        isMaterialisableKind(itemId).then(function (ok) {
+            if (!ok) {
+                log('skip materialise inject for non-materialisable kind on item ' + itemId);
+                sheet.dataset.phantomInjected = '1';
+                return;
+            }
+            injectButton(sheet, content, itemId);
+        });
+    }
+
+    function injectButton(sheet, content, itemId) {
+        if (sheet.dataset.phantomInjected === '1') { return; }
 
         // Find an existing entry to clone for consistent styling.
         var template = content.querySelector('.listItem');
