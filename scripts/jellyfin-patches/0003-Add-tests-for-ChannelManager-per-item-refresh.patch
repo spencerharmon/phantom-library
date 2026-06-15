@@ -1,0 +1,334 @@
+From 3dfc1353c464b31daa56f3c42e33a6530dd98461 Mon Sep 17 00:00:00 2001
+From: spencer <the.spencer.harmon@gmail.com>
+Date: Sun, 14 Jun 2026 22:17:28 -0500
+Subject: [PATCH 3/3] Add tests for ChannelManager per-item refresh
+
+Covers dispatch logic for IChannelItemRefreshManager.RefreshChannelItemAsync:
+
+  - Argument validation (null + empty external id reject).
+  - Nonexistent channel throws InvalidOperationException.
+  - Targeted IChannelItemRefresh lookup is preferred over paging.
+  - Paging fallback when channel does not implement IChannelItemRefresh.
+  - Item-removed-from-channel logs and returns without invalidating cache.
+  - Cache invalidation fires when info found AND flag set.
+  - All-flags-false performs lookup only.
+
+The full BaseItem persistence path (item.UpdateToRepositoryAsync,
+SaveMediaSources, QueueRefresh with EnableRemoteContentProbe=true)
+depends on statically-wired BaseItem services and is exercised by
+plugin-side integration scenarios rather than this unit harness.
+---
+ .../Channels/ChannelManagerRefreshTests.cs    | 301 ++++++++++++++++++
+ 1 file changed, 301 insertions(+)
+ create mode 100644 tests/Jellyfin.LiveTv.Tests/Channels/ChannelManagerRefreshTests.cs
+
+diff --git a/tests/Jellyfin.LiveTv.Tests/Channels/ChannelManagerRefreshTests.cs b/tests/Jellyfin.LiveTv.Tests/Channels/ChannelManagerRefreshTests.cs
+new file mode 100644
+index 0000000000..4d9fa6de11
+--- /dev/null
++++ b/tests/Jellyfin.LiveTv.Tests/Channels/ChannelManagerRefreshTests.cs
+@@ -0,0 +1,301 @@
++using System;
++using System.Collections.Generic;
++using System.Threading;
++using System.Threading.Tasks;
++using Jellyfin.LiveTv.Channels;
++using MediaBrowser.Controller.Channels;
++using MediaBrowser.Controller.Configuration;
++using MediaBrowser.Controller.Dto;
++using MediaBrowser.Controller.Entities;
++using MediaBrowser.Controller.Library;
++using MediaBrowser.Controller.Providers;
++using MediaBrowser.Model.Channels;
++using MediaBrowser.Model.IO;
++using Microsoft.Extensions.Caching.Memory;
++using Microsoft.Extensions.Logging.Abstractions;
++using Moq;
++using Xunit;
++
++namespace Jellyfin.LiveTv.Tests.Channels;
++
++/// <summary>
++/// Tests for <see cref="ChannelManager"/>'s implementation of
++/// <see cref="IChannelItemRefreshManager"/>.
++///
++/// These tests cover dispatch logic, fallback behaviour, and cache
++/// invalidation. They do NOT cover end-to-end BaseItem.Path mutation
++/// or remote-content-probe wiring (test cases 5 and 6 in the
++/// channel-handoff plan), because those exercise the full
++/// GetChannelItemEntityAsync persistence chain (item.UpdateToRepositoryAsync
++/// + SaveMediaSources + ProviderManager.QueueRefresh) which depends on
++/// statically-wired BaseItem services. Those scenarios are covered by
++/// the rig integration scenario at tools/rig-scenarios/40-channel-refresh-patch.sh
++/// (Stage 1.5 of the plan).
++/// </summary>
++public class ChannelManagerRefreshTests
++{
++    private const string TargetedChannelName = "Targeted Test Channel";
++    private const string PagingChannelName = "Paging Test Channel";
++
++    private static (ChannelManager Mgr,
++                    Mock<ILibraryManager> LibMgr,
++                    Mock<IMemoryCache> MemCache,
++                    Mock<IChannel> PagingChannel,
++                    Mock<TargetedChannelBase> TargetedChannel,
++                    Guid TargetedChannelId,
++                    Guid PagingChannelId) Build()
++    {
++        var libMgr = new Mock<ILibraryManager>(MockBehavior.Loose);
++        var memCache = new Mock<IMemoryCache>(MockBehavior.Loose);
++
++        // GetNewItemId returns deterministic GUIDs based on the input
++        // string. The ChannelManager.GetInternalChannelId helper uses
++        // _libraryManager.GetNewItemId("Channel " + name, typeof(Channel)).
++        libMgr
++            .Setup(m => m.GetNewItemId(It.IsAny<string>(), It.IsAny<Type>()))
++            .Returns<string, Type>((key, _) => DeterministicGuid(key));
++
++        var targetedChannel = new Mock<TargetedChannelBase>(MockBehavior.Loose) { CallBase = true };
++        targetedChannel.SetupGet(c => c.Name).Returns(TargetedChannelName);
++        targetedChannel.SetupGet(c => c.Description).Returns(string.Empty);
++        targetedChannel.SetupGet(c => c.DataVersion).Returns("1");
++        targetedChannel.SetupGet(c => c.HomePageUrl).Returns(string.Empty);
++        targetedChannel.SetupGet(c => c.ParentalRating).Returns(ChannelParentalRating.GeneralAudience);
++
++        var pagingChannel = new Mock<IChannel>(MockBehavior.Loose);
++        pagingChannel.SetupGet(c => c.Name).Returns(PagingChannelName);
++        pagingChannel.SetupGet(c => c.Description).Returns(string.Empty);
++        pagingChannel.SetupGet(c => c.DataVersion).Returns("1");
++        pagingChannel.SetupGet(c => c.HomePageUrl).Returns(string.Empty);
++        pagingChannel.SetupGet(c => c.ParentalRating).Returns(ChannelParentalRating.GeneralAudience);
++
++        var targetedChannelId = DeterministicGuid("Channel " + TargetedChannelName);
++        var pagingChannelId = DeterministicGuid("Channel " + PagingChannelName);
++
++        // ILibraryManager.GetItemById(channelId) is called inside
++        // RefreshChannelItemAsync to retrieve the Channel BaseItem.
++        libMgr
++            .Setup(m => m.GetItemById(targetedChannelId))
++            .Returns(new Channel { Id = targetedChannelId, Name = TargetedChannelName });
++        libMgr
++            .Setup(m => m.GetItemById(pagingChannelId))
++            .Returns(new Channel { Id = pagingChannelId, Name = PagingChannelName });
++
++        var mgr = new ChannelManager(
++            userManager: Mock.Of<IUserManager>(),
++            dtoService: Mock.Of<IDtoService>(),
++            libraryManager: libMgr.Object,
++            logger: NullLogger<ChannelManager>.Instance,
++            config: Mock.Of<IServerConfigurationManager>(),
++            fileSystem: Mock.Of<IFileSystem>(),
++            userDataManager: Mock.Of<IUserDataManager>(),
++            providerManager: Mock.Of<IProviderManager>(),
++            memoryCache: memCache.Object,
++            channels: new IChannel[] { targetedChannel.Object, pagingChannel.Object });
++
++        return (mgr, libMgr, memCache, pagingChannel, targetedChannel, targetedChannelId, pagingChannelId);
++    }
++
++    private static Guid DeterministicGuid(string key)
++    {
++        // Stable, collision-free for the small set of strings used in
++        // these tests. Same algorithm shape isn't critical; what matters
++        // is that GetNewItemId(name, ...) returns the same guid each call
++        // for the same name, and that distinct names yield distinct ids.
++        using var md5 = System.Security.Cryptography.MD5.Create();
++        var bytes = md5.ComputeHash(System.Text.Encoding.UTF8.GetBytes(key));
++        return new Guid(bytes);
++    }
++
++    [Fact]
++    public async Task RefreshChannelItem_NullExternalId_Throws()
++    {
++        var (mgr, _, _, _, _, channelId, _) = Build();
++        await Assert.ThrowsAsync<ArgumentNullException>(
++            () => mgr.RefreshChannelItemAsync(channelId, null!, null, CancellationToken.None));
++    }
++
++    [Fact]
++    public async Task RefreshChannelItem_EmptyExternalId_Throws()
++    {
++        var (mgr, _, _, _, _, channelId, _) = Build();
++        await Assert.ThrowsAsync<ArgumentException>(
++            () => mgr.RefreshChannelItemAsync(channelId, string.Empty, null, CancellationToken.None));
++    }
++
++    [Fact]
++    public async Task RefreshChannelItem_NonexistentChannel_Throws()
++    {
++        var (mgr, libMgr, _, _, _, _, _) = Build();
++        var unknownChannelId = Guid.NewGuid();
++        libMgr.Setup(m => m.GetItemById(unknownChannelId)).Returns((BaseItem?)null);
++
++        await Assert.ThrowsAsync<InvalidOperationException>(
++            () => mgr.RefreshChannelItemAsync(unknownChannelId, "movie_42", null, CancellationToken.None));
++    }
++
++    [Fact]
++    public async Task RefreshChannelItem_TargetedLookup_PrefersIChannelItemRefresh()
++    {
++        var (mgr, _, _, _, targetedChannel, channelId, _) = Build();
++        targetedChannel
++            .Setup(c => c.GetChannelItemAsync("movie_42", It.IsAny<CancellationToken>()))
++            .Returns(Task.FromResult<ChannelItemInfo>(null!));
++
++        await mgr.RefreshChannelItemAsync(
++            channelId,
++            "movie_42",
++            new ChannelItemRefreshOptions { ForceUpdate = false, ForceProbe = false, InvalidateMediaInfoCache = false },
++            CancellationToken.None);
++
++        targetedChannel.Verify(
++            c => c.GetChannelItemAsync("movie_42", It.IsAny<CancellationToken>()),
++            Times.Once);
++        targetedChannel.Verify(
++            c => c.GetChannelItems(It.IsAny<InternalChannelItemQuery>(), It.IsAny<CancellationToken>()),
++            Times.Never);
++    }
++
++    [Fact]
++    public async Task RefreshChannelItem_NoTargetedLookup_FallsBackToPaging()
++    {
++        var (mgr, _, _, pagingChannel, _, _, pagingChannelId) = Build();
++        pagingChannel
++            .Setup(c => c.GetChannelItems(It.IsAny<InternalChannelItemQuery>(), It.IsAny<CancellationToken>()))
++            .ReturnsAsync(new ChannelItemResult { Items = new List<ChannelItemInfo>() });
++
++        await mgr.RefreshChannelItemAsync(
++            pagingChannelId,
++            "movie_42",
++            new ChannelItemRefreshOptions { ForceUpdate = false, ForceProbe = false, InvalidateMediaInfoCache = false },
++            CancellationToken.None);
++
++        pagingChannel.Verify(
++            c => c.GetChannelItems(It.IsAny<InternalChannelItemQuery>(), It.IsAny<CancellationToken>()),
++            Times.Once);
++    }
++
++    [Fact]
++    public async Task RefreshChannelItem_ItemRemovedFromChannel_LogsAndReturns()
++    {
++        var (mgr, libMgr, memCache, _, targetedChannel, channelId, _) = Build();
++        // GetChannelItemAsync returns null → item is gone; nothing to do.
++        targetedChannel
++            .Setup(c => c.GetChannelItemAsync("movie_42", It.IsAny<CancellationToken>()))
++            .Returns(Task.FromResult<ChannelItemInfo>(null!));
++
++        await mgr.RefreshChannelItemAsync(
++            channelId,
++            "movie_42",
++            new ChannelItemRefreshOptions { ForceUpdate = true, ForceProbe = true, InvalidateMediaInfoCache = true },
++            CancellationToken.None);
++
++        // Cache is not invalidated when there's no item to refresh.
++        memCache.Verify(c => c.Remove(It.IsAny<object>()), Times.Never);
++    }
++
++    [Fact]
++    public async Task RefreshChannelItem_InvalidatesMediaInfoCache_WhenInfoFoundAndFlagSet()
++    {
++        var (mgr, _, memCache, _, targetedChannel, channelId, _) = Build();
++        targetedChannel
++            .Setup(c => c.GetChannelItemAsync("movie_42", It.IsAny<CancellationToken>()))
++            .ReturnsAsync(new ChannelItemInfo
++            {
++                Id = "movie_42",
++                Name = "Test Movie",
++                Type = ChannelItemType.Media,
++                ContentType = ChannelMediaContentType.Movie,
++                MediaType = ChannelMediaType.Video,
++            });
++
++        await mgr.RefreshChannelItemAsync(
++            channelId,
++            "movie_42",
++            new ChannelItemRefreshOptions
++            {
++                // Skip ForceUpdate / ForceProbe to avoid going through
++                // GetChannelItemEntityAsync (which needs BaseItem statics).
++                ForceUpdate = false,
++                ForceProbe = false,
++                InvalidateMediaInfoCache = true,
++            },
++            CancellationToken.None);
++
++        // Cache key is the external id.
++        memCache.Verify(c => c.Remove((object)"movie_42"), Times.Once);
++    }
++
++    [Fact]
++    public async Task RefreshChannelItem_OptionsAllFalse_FetchesInfoButDoesNothingElse()
++    {
++        var (mgr, _, memCache, _, targetedChannel, channelId, _) = Build();
++        targetedChannel
++            .Setup(c => c.GetChannelItemAsync("movie_42", It.IsAny<CancellationToken>()))
++            .ReturnsAsync(new ChannelItemInfo
++            {
++                Id = "movie_42",
++                Name = "Test Movie",
++                Type = ChannelItemType.Media,
++                ContentType = ChannelMediaContentType.Movie,
++                MediaType = ChannelMediaType.Video,
++            });
++
++        await mgr.RefreshChannelItemAsync(
++            channelId,
++            "movie_42",
++            new ChannelItemRefreshOptions
++            {
++                ForceUpdate = false,
++                ForceProbe = false,
++                InvalidateMediaInfoCache = false,
++            },
++            CancellationToken.None);
++
++        memCache.Verify(c => c.Remove(It.IsAny<object>()), Times.Never);
++        // The targeted lookup did happen (we got info back), but nothing
++        // else fired. Verified by the absence of any cache mutation +
++        // the absence of any other call surface here.
++    }
++
++    /// <summary>
++    /// Abstract Moq-friendly base combining <see cref="IChannel"/> and
++    /// <see cref="IChannelItemRefresh"/>. Moq cannot directly mock two
++    /// interfaces at once via <c>new Mock&lt;T&gt;()</c>; sub-classing
++    /// is the standard workaround.
++    /// </summary>
++    public abstract class TargetedChannelBase : IChannel, IChannelItemRefresh
++    {
++        public abstract string Name { get; }
++
++        public abstract string Description { get; }
++
++        public abstract string DataVersion { get; }
++
++        public abstract string HomePageUrl { get; }
++
++        public abstract ChannelParentalRating ParentalRating { get; }
++
++        public virtual InternalChannelFeatures GetChannelFeatures()
++            => new InternalChannelFeatures();
++
++        public virtual bool IsEnabledFor(string userId) => true;
++
++        public virtual Task<ChannelItemResult> GetChannelItems(
++            InternalChannelItemQuery query,
++            CancellationToken cancellationToken)
++            => Task.FromResult(new ChannelItemResult { Items = new List<ChannelItemInfo>() });
++
++        public virtual Task<MediaBrowser.Controller.Providers.DynamicImageResponse> GetChannelImage(
++            MediaBrowser.Model.Entities.ImageType type,
++            CancellationToken cancellationToken)
++            => Task.FromResult(new MediaBrowser.Controller.Providers.DynamicImageResponse());
++
++        public virtual IEnumerable<MediaBrowser.Model.Entities.ImageType> GetSupportedChannelImages()
++            => Array.Empty<MediaBrowser.Model.Entities.ImageType>();
++
++        public abstract Task<ChannelItemInfo> GetChannelItemAsync(
++            string channelItemExternalId,
++            CancellationToken cancellationToken);
++    }
++}
+-- 
+2.54.0
+

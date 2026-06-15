@@ -140,6 +140,38 @@ if [ "$DO_BUILD" -eq 1 ]; then
   if ! command -v dotnet >/dev/null 2>&1; then
     die "'dotnet' not found in PATH. Install the .NET 9 SDK or drop --build."
   fi
+
+  # Apply Jellyfin source-tree patches BEFORE building the plugin. The
+  # plugin will start depending on patched APIs (IChannelItemRefreshManager)
+  # in Phase 2+; apply them now so plugin builds don't regress later.
+  patches_dir="$REPO_ROOT/scripts/jellyfin-patches"
+  if [ -d "$patches_dir" ] && ls "$patches_dir"/*.patch >/dev/null 2>&1; then
+    if [ ! -d "$REPO_ROOT/jellyfin/.git" ]; then
+      die "jellyfin/ source clone missing or not a git checkout; cannot apply patches"
+    fi
+    bold "Applying Jellyfin patches from scripts/jellyfin-patches/..."
+    (
+      cd "$REPO_ROOT/jellyfin"
+      for patch in "$patches_dir"/*.patch; do
+        name=$(basename "$patch")
+        # Idempotency: skip patches already applied (e.g. on rebuild
+        # without an intervening 'git reset --hard' of jellyfin/).
+        if git apply --check "$patch" 2>/dev/null; then
+          git apply "$patch"
+          echo "    applied: $name"
+        elif git apply --check -R "$patch" 2>/dev/null; then
+          echo "    already applied: $name"
+        else
+          red "ERROR: patch $name does not apply cleanly to jellyfin/ at $(git -C "$REPO_ROOT/jellyfin" rev-parse --short HEAD)."
+          red "       Likely cause: jellyfin/ source has drifted from the patch base."
+          red "       Resolution: rebase the patches. See scripts/jellyfin-patches/REBASE.md"
+          exit 1
+        fi
+      done
+    )
+    echo
+  fi
+
   bold "Building plugin (Release)... [--build]"
   dotnet build -c Release
   echo

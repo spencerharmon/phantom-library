@@ -1,0 +1,288 @@
+From 877e9f8b110b771a5ef534d0bde692e4eeff9c5c Mon Sep 17 00:00:00 2001
+From: spencer <the.spencer.harmon@gmail.com>
+Date: Sun, 14 Jun 2026 22:17:22 -0500
+Subject: [PATCH 2/3] Add IChannelItemRefreshManager service for per-item
+ channel refresh
+
+Adds IChannelItemRefreshManager (sibling interface to IChannelManager;
+NOT a member of it, preserving binary compatibility for existing
+plugin consumers of IChannelManager) and its single implementation on
+ChannelManager.
+
+RefreshChannelItemAsync resolves a fresh ChannelItemInfo for a given
+(channelId, externalId) tuple via the channel's optional
+IChannelItemRefresh capability (falling back to paging GetChannelItems
+if not implemented), then applies any combination of:
+
+  - ForceUpdate: persists path/MediaSources/etc. against the same
+    BaseItem.Id even when the item already exists (the legacy
+    GetChannelItemEntityAsync path only persisted on isNew).
+  - ForceProbe: triggers a full metadata refresh with
+    EnableRemoteContentProbe = true so stream/codec info is
+    re-detected for items whose backing media changed.
+  - InvalidateMediaInfoCache: drops the GetDynamicMediaSources cache
+    entry keyed on the external id so the next playback request
+    re-queries the channel.
+
+Implementation factors the existing GetChannelItemEntityAsync body
+into an inner overload accepting forceUpdateParam + forceProbe flags;
+the legacy call site retains its previous behaviour by routing
+through a thin wrapper that defaults both flags to false.
+
+DI registration uses the two-forwarder pattern off a self-type
+ChannelManager registration so IChannelManager and
+IChannelItemRefreshManager resolve to the same singleton instance
+without a cast that would break under decoration.
+---
+ .../Channels/IChannelItemRefreshManager.cs    |  76 +++++++++++++
+ .../Channels/ChannelManager.cs                | 103 +++++++++++++++++-
+ .../LiveTvServiceCollectionExtensions.cs      |   4 +-
+ 3 files changed, 176 insertions(+), 7 deletions(-)
+ create mode 100644 MediaBrowser.Controller/Channels/IChannelItemRefreshManager.cs
+
+diff --git a/MediaBrowser.Controller/Channels/IChannelItemRefreshManager.cs b/MediaBrowser.Controller/Channels/IChannelItemRefreshManager.cs
+new file mode 100644
+index 0000000000..da35d05f51
+--- /dev/null
++++ b/MediaBrowser.Controller/Channels/IChannelItemRefreshManager.cs
+@@ -0,0 +1,76 @@
++#nullable disable
++
++#pragma warning disable CS1591
++
++using System;
++using System.Threading;
++using System.Threading.Tasks;
++
++namespace MediaBrowser.Controller.Channels
++{
++    /// <summary>
++    /// Refreshes a single channel item's persisted state from its
++    /// providing <see cref="IChannel"/>. Used by plugins that mutate a
++    /// channel item's underlying media independently of the regular
++    /// channel scan (e.g. materialise-on-demand pipelines where a
++    /// placeholder MediaSource is replaced by a real file).
++    ///
++    /// Implemented by <c>ChannelManager</c>; registered as a sibling
++    /// service to <see cref="IChannelManager"/>. Adding this as a new
++    /// interface (rather than extending <see cref="IChannelManager"/>)
++    /// preserves binary compatibility for existing plugins.
++    /// </summary>
++    public interface IChannelItemRefreshManager
++    {
++        /// <summary>
++        /// Refresh a single channel item's persisted state.
++        /// </summary>
++        /// <param name="channelId">
++        /// The internal Jellyfin channel id (the <see cref="Channel"/>
++        /// BaseItem id, not the external channel-provider name).
++        /// </param>
++        /// <param name="channelItemExternalId">
++        /// The external id (<see cref="ChannelItemInfo.Id"/>) of the
++        /// item to refresh.
++        /// </param>
++        /// <param name="options">
++        /// Refresh options. If <c>null</c>, defaults to all flags true.
++        /// </param>
++        /// <param name="cancellationToken">Cancellation token.</param>
++        /// <returns>A task representing the operation.</returns>
++        Task RefreshChannelItemAsync(
++            Guid channelId,
++            string channelItemExternalId,
++            ChannelItemRefreshOptions options = null,
++            CancellationToken cancellationToken = default);
++    }
++
++    /// <summary>
++    /// Flags controlling <see cref="IChannelItemRefreshManager.RefreshChannelItemAsync"/>
++    /// behaviour.
++    /// </summary>
++    public sealed class ChannelItemRefreshOptions
++    {
++        /// <summary>
++        /// Gets or sets a value indicating whether to force the channel
++        /// item's persisted fields (Path, MediaSources, RunTimeTicks) to
++        /// be re-written from the refreshed <see cref="ChannelItemInfo"/>
++        /// even if the item already exists.
++        /// </summary>
++        public bool ForceUpdate { get; set; } = true;
++
++        /// <summary>
++        /// Gets or sets a value indicating whether to force a full
++        /// metadata refresh including remote content probe (codec/stream
++        /// re-detection) for the refreshed item.
++        /// </summary>
++        public bool ForceProbe { get; set; } = true;
++
++        /// <summary>
++        /// Gets or sets a value indicating whether to invalidate the
++        /// in-memory MediaSources cache so the next playback request
++        /// re-queries the channel.
++        /// </summary>
++        public bool InvalidateMediaInfoCache { get; set; } = true;
++    }
++}
+diff --git a/src/Jellyfin.LiveTv/Channels/ChannelManager.cs b/src/Jellyfin.LiveTv/Channels/ChannelManager.cs
+index ed02fe6a1d..12b0e0fc35 100644
+--- a/src/Jellyfin.LiveTv/Channels/ChannelManager.cs
++++ b/src/Jellyfin.LiveTv/Channels/ChannelManager.cs
+@@ -40,7 +40,7 @@ namespace Jellyfin.LiveTv.Channels
+     /// <summary>
+     /// The LiveTV channel manager.
+     /// </summary>
+-    public class ChannelManager : IChannelManager, IDisposable
++    public class ChannelManager : IChannelManager, IChannelItemRefreshManager, IDisposable
+     {
+         private readonly IUserManager _userManager;
+         private readonly IUserDataManager _userDataManager;
+@@ -954,13 +954,16 @@ namespace Jellyfin.LiveTv.Channels
+             return item;
+         }
+ 
+-        private async Task<BaseItem> GetChannelItemEntityAsync(ChannelItemInfo info, IChannel channelProvider, Guid internalChannelId, BaseItem parentFolder, CancellationToken cancellationToken)
++        private Task<BaseItem> GetChannelItemEntityAsync(ChannelItemInfo info, IChannel channelProvider, Guid internalChannelId, BaseItem parentFolder, CancellationToken cancellationToken)
++            => GetChannelItemEntityAsync(info, channelProvider, internalChannelId, parentFolder, forceUpdateParam: false, forceProbe: false, cancellationToken);
++
++        private async Task<BaseItem> GetChannelItemEntityAsync(ChannelItemInfo info, IChannel channelProvider, Guid internalChannelId, BaseItem parentFolder, bool forceUpdateParam, bool forceProbe, CancellationToken cancellationToken)
+         {
+             var parentFolderId = parentFolder.Id;
+ 
+             BaseItem item;
+             bool isNew;
+-            bool forceUpdate = false;
++            bool forceUpdate = forceUpdateParam;
+ 
+             if (info.Type == ChannelItemType.Folder)
+             {
+@@ -998,7 +1001,7 @@ namespace Jellyfin.LiveTv.Channels
+             {
+                 item.RunTimeTicks = null;
+             }
+-            else if (isNew || !enableMediaProbe)
++            else if (isNew || !enableMediaProbe || forceProbe)
+             {
+                 item.RunTimeTicks = info.RunTimeTicks;
+             }
+@@ -1163,14 +1166,102 @@ namespace Jellyfin.LiveTv.Channels
+                 }
+             }
+ 
+-            if (isNew || forceUpdate || item.DateLastRefreshed == DateTime.MinValue)
++            if (isNew || forceUpdate || forceProbe || item.DateLastRefreshed == DateTime.MinValue)
+             {
+-                _providerManager.QueueRefresh(item.Id, new MetadataRefreshOptions(new DirectoryService(_fileSystem)), RefreshPriority.Normal);
++                var refreshOptions = new MetadataRefreshOptions(new DirectoryService(_fileSystem));
++                if (forceProbe)
++                {
++                    refreshOptions.EnableRemoteContentProbe = true;
++                    refreshOptions.MetadataRefreshMode = MetadataRefreshMode.FullRefresh;
++                }
++
++                _providerManager.QueueRefresh(item.Id, refreshOptions, RefreshPriority.Normal);
+             }
+ 
+             return item;
+         }
+ 
++        /// <inheritdoc />
++        public async Task RefreshChannelItemAsync(
++            Guid channelId,
++            string channelItemExternalId,
++            ChannelItemRefreshOptions options = null,
++            CancellationToken cancellationToken = default)
++        {
++            ArgumentException.ThrowIfNullOrEmpty(channelItemExternalId);
++            options ??= new ChannelItemRefreshOptions();
++
++            var channelEntity = _libraryManager.GetItemById(channelId) as Channel
++                ?? throw new InvalidOperationException(
++                    $"Channel BaseItem {channelId} not found or wrong type");
++
++            var provider = GetChannelProvider(channelEntity)
++                ?? throw new InvalidOperationException(
++                    $"No IChannel provider registered for channel {channelId}");
++
++            // Resolve the fresh ChannelItemInfo. Prefer targeted lookup if
++            // the channel implements IChannelItemRefresh; otherwise page
++            // GetChannelItems at the root.
++            ChannelItemInfo info = null;
++            if (provider is IChannelItemRefresh targeted)
++            {
++                info = await targeted.GetChannelItemAsync(
++                    channelItemExternalId, cancellationToken).ConfigureAwait(false);
++            }
++            else
++            {
++                var query = new InternalChannelItemQuery
++                {
++                    FolderId = null,
++                    StartIndex = 0,
++                    Limit = int.MaxValue,
++                };
++                var result = await provider.GetChannelItems(query, cancellationToken)
++                    .ConfigureAwait(false);
++                if (result?.Items is { } items)
++                {
++                    foreach (var candidate in items)
++                    {
++                        if (string.Equals(candidate.Id, channelItemExternalId, StringComparison.Ordinal))
++                        {
++                            info = candidate;
++                            break;
++                        }
++                    }
++                }
++            }
++
++            if (info is null)
++            {
++                _logger.LogDebug(
++                    "RefreshChannelItemAsync: channel {ChannelId} no longer surfaces item {ExternalId}; nothing to refresh",
++                    channelId,
++                    channelItemExternalId);
++                return;
++            }
++
++            if (options.ForceUpdate || options.ForceProbe)
++            {
++                await GetChannelItemEntityAsync(
++                    info,
++                    provider,
++                    channelId,
++                    channelEntity,
++                    forceUpdateParam: options.ForceUpdate,
++                    forceProbe: options.ForceProbe,
++                    cancellationToken).ConfigureAwait(false);
++            }
++
++            if (options.InvalidateMediaInfoCache)
++            {
++                // GetChannelItemMediaSourcesInternal caches keyed on
++                // item.ExternalId (see GetChannelItemMediaSourcesInternal,
++                // ~line 408). ExternalId equals the ChannelItemInfo.Id we
++                // have in hand.
++                _memoryCache.Remove(channelItemExternalId);
++            }
++        }
++
+         internal IChannel GetChannelProvider(Channel channel)
+         {
+             ArgumentNullException.ThrowIfNull(channel);
+diff --git a/src/Jellyfin.LiveTv/Extensions/LiveTvServiceCollectionExtensions.cs b/src/Jellyfin.LiveTv/Extensions/LiveTvServiceCollectionExtensions.cs
+index 0c2abe8beb..828b290334 100644
+--- a/src/Jellyfin.LiveTv/Extensions/LiveTvServiceCollectionExtensions.cs
++++ b/src/Jellyfin.LiveTv/Extensions/LiveTvServiceCollectionExtensions.cs
+@@ -30,7 +30,9 @@ public static class LiveTvServiceCollectionExtensions
+         services.AddSingleton<RecordingsMetadataManager>();
+ 
+         services.AddSingleton<ILiveTvManager, LiveTvManager>();
+-        services.AddSingleton<IChannelManager, ChannelManager>();
++        services.AddSingleton<ChannelManager>();
++        services.AddSingleton<IChannelManager>(sp => sp.GetRequiredService<ChannelManager>());
++        services.AddSingleton<IChannelItemRefreshManager>(sp => sp.GetRequiredService<ChannelManager>());
+         services.AddSingleton<IStreamHelper, StreamHelper>();
+         services.AddSingleton<ITunerHostManager, TunerHostManager>();
+         services.AddSingleton<IListingsManager, ListingsManager>();
+-- 
+2.54.0
+
