@@ -36,6 +36,7 @@ public class PluginConfiguration : BasePluginConfiguration
         EvictionEnabled = true;
         EvictionIdleDays = 7;
         EvictionScheduleCron = "0 4 * * *";
+        ProtectFavourites = true;
 
         MaterialisationConcurrencyGlobal = 4;
         MaterialisationConcurrencyPerIndexer = 2;
@@ -128,6 +129,13 @@ public class PluginConfiguration : BasePluginConfiguration
 
     /// <summary>Gets or sets the cron schedule for the eviction sweeper hosted service.</summary>
     public string EvictionScheduleCron { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether materialised items with
+    /// at least one favouriting user are protected from idle eviction.
+    /// Defaults to true (Stage 6.1).
+    /// </summary>
+    public bool ProtectFavourites { get; set; }
 
     /// <summary>Gets or sets the total concurrent materialisations across all lanes.</summary>
     public int MaterialisationConcurrencyGlobal { get; set; }
