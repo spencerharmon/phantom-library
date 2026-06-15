@@ -7,14 +7,6 @@ using Microsoft.Data.Sqlite;
 
 namespace Jellyfin.Plugin.PhantomLibrary.State;
 
-public enum PhantomItemState
-{
-    Phantom,
-    Virtual,
-    Materialised,
-    Unavailable,
-}
-
 public sealed record MagnetCacheKey(int? TmdbId, string? ImdbId, string Type, int? Season, int? Episode, string Preset);
 
 public sealed record MagnetCacheEntry
@@ -31,69 +23,57 @@ public sealed record MagnetCacheEntry
 
 public sealed record UnavailableKey(int? TmdbId, string? ImdbId, string Type, int? Season, int? Episode);
 
-public sealed record MaterialisationLogEntry
-{
-    public required DateTimeOffset Timestamp { get; init; }
-    public Guid? ItemGuid { get; init; }
-    public required string Trigger { get; init; }
-    public required long DurationMs { get; init; }
-    public required string Outcome { get; init; }
-    public string? Error { get; init; }
-    public string? Indexer { get; init; }
-    public string? InfoHash { get; init; }
-}
-
-/// <summary>Per-user, per-series autopilot tracking row (autopilot_state table).</summary>
-public sealed record AutopilotStateRow
-{
-    public required Guid UserId { get; init; }
-    public required string SeriesImdb { get; init; }
-    public int? LastPlayedSeason { get; init; }
-    public int? LastPlayedEpisode { get; init; }
-    public int? NextMaterialisedSeason { get; init; }
-    public int? NextMaterialisedEpisode { get; init; }
-    public int? PrefetchCursorSeason { get; init; }
-    public int? PrefetchCursorEpisode { get; init; }
-    public required long UpdatedAt { get; init; }
-}
-
-public sealed record PhantomItemRow
-{
-    public Guid ItemGuid { get; init; }
-    public int? TmdbId { get; init; }
-    public string? ImdbId { get; init; }
-    public required string Type { get; init; }
-    public required PhantomItemState State { get; init; }
-    public required DateTimeOffset FirstSeen { get; init; }
-    public required DateTimeOffset LastTouched { get; init; }
-    public bool EvictionProtected { get; init; }
-    public string? OriginalOverview { get; init; }
-    public string? StubPath { get; init; }
-    public string? FusePath { get; init; }
-    public DateTimeOffset? MaterialisedAt { get; init; }
-}
-
-public sealed record UserPrefsRow
-{
-    public required bool ProtectFavourites { get; init; }
-    public required bool ShowPhantoms { get; init; }
-    public required bool AllowEager { get; init; }
-
-    public static UserPrefsRow Defaults { get; } = new()
-    {
-        ProtectFavourites = true,
-        ShowPhantoms = true,
-        AllowEager = true,
-    };
-}
+/// <summary>
+/// Row of the <c>discovery_cache</c> table. Movies and series only;
+/// season/episode level discovery is not tracked here (those come
+/// from TMDB on-demand during channel-folder browse).
+/// </summary>
+public sealed record DiscoveryCacheRow(
+    int TmdbId,
+    string Type,
+    DateTimeOffset DiscoveredAt,
+    DateTimeOffset LastRefreshed);
 
 /// <summary>
-/// SQLite-backed persistence for the plugin's private state. Single
-/// writer, serialised via a process-wide <see cref="SemaphoreSlim"/>;
-/// concurrent readers permitted via separate short-lived connections.
+/// Row of the <c>materialised_state</c> table. <c>Season</c> and
+/// <c>Episode</c> use the <c>-1</c> sentinel for movies (per critic v2
+/// BLOCKER 3 — SQLite treats NULL as distinct in UNIQUE/PK, so we use
+/// a real integer sentinel instead). Callers above the DB layer pass
+/// <c>null</c> for movies and the <see cref="ChannelItemId"/> codec
+/// converts at the boundary.
+/// </summary>
+public sealed record MaterialisedStateRow(
+    int TmdbId,
+    string Type,
+    int Season,
+    int Episode,
+    string StubPath,
+    string FusePath,
+    DateTimeOffset MaterialisedAt);
+
+/// <summary>
+/// Row of the <c>tmdb_external_ids</c> table. <see cref="ImdbId"/>
+/// nullable: a row with null ImdbId is a negative-cache entry (TMDB
+/// returned no external IMDb id) — the TTL window is interpreted by
+/// the resolver layer, not by the DB.
+/// </summary>
+public sealed record TmdbExternalIdRow(string? ImdbId, DateTimeOffset FetchedAt);
+
+/// <summary>
+/// SQLite-backed persistence for the plugin's private state under the
+/// channel architecture (schema v7). Single writer, serialised via a
+/// process-wide <see cref="SemaphoreSlim"/>; concurrent readers
+/// permitted via separate short-lived connections.
+///
+/// Schema v7 is a clean break from the v5 file-on-disk schema. Per
+/// AGENTS.md "No database migrations until v1.0", existing databases
+/// at any pre-v7 user_version are HARD-REFUSED and the operator must
+/// run <c>scripts/phantom-wipe.sh</c> before restart.
 /// </summary>
 public sealed class PhantomDb : IDisposable
 {
+    private const int CurrentSchemaVersion = 7;
+
     private readonly string _connectionString;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
     private int _schemaEnsured;
@@ -148,8 +128,6 @@ public sealed class PhantomDb : IDisposable
         return conn;
     }
 
-    private const int CurrentSchemaVersion = 5;
-
     private static void EnsureSchema(SqliteConnection conn)
     {
         using (var pragma = conn.CreateCommand())
@@ -162,86 +140,41 @@ public sealed class PhantomDb : IDisposable
         using (var v = conn.CreateCommand())
         {
             v.CommandText = "PRAGMA user_version;";
-            version = Convert.ToInt32(v.ExecuteScalar() ?? 0, System.Globalization.CultureInfo.InvariantCulture);
+            version = Convert.ToInt32(v.ExecuteScalar() ?? 0,
+                System.Globalization.CultureInfo.InvariantCulture);
         }
 
-        if (version >= CurrentSchemaVersion)
+        if (version == CurrentSchemaVersion)
         {
             return;
         }
 
+        if (version > 0 && version < CurrentSchemaVersion)
+        {
+            // HARD-REFUSE: pre-v1.0 the plugin does not ship migrations.
+            // Operator must wipe and rebuild. Per AGENTS.md
+            // "No database migrations until v1.0" + critic v2 BLOCKER 2.
+            throw new InvalidOperationException(
+                $"Phantom Library schema is at version {version}; this build requires" + Environment.NewLine
+                + $"version {CurrentSchemaVersion}. Pre-v1.0 the plugin does not ship migrations — see" + Environment.NewLine
+                + "AGENTS.md \"No database migrations until v1.0\". Stop Jellyfin, run" + Environment.NewLine
+                + "`sudo bash scripts/phantom-wipe.sh --commit`, then restart.");
+        }
+
+        if (version > CurrentSchemaVersion)
+        {
+            // Operator downgraded the plugin against a newer DB. Also unsafe.
+            throw new InvalidOperationException(
+                $"Phantom Library schema is at version {version}; this build only knows about"
+                + $" version {CurrentSchemaVersion}. Downgrade is not supported. Wipe and rebuild.");
+        }
+
+        // version == 0: fresh / never-initialised DB. Create the v7 schema.
         using var tx = conn.BeginTransaction();
-
-        if (version < 1)
+        using (var cmd = conn.CreateCommand())
         {
-            using var cmd = conn.CreateCommand();
             cmd.Transaction = tx;
-            cmd.CommandText = SchemaV1Sql;
-            cmd.ExecuteNonQuery();
-        }
-
-        if (version < 2)
-        {
-            // v2: add original_overview to phantom_items so PhantomStatusDecorator
-            // can round-trip the user-visible Overview after stamping its prefix.
-            using var cmd = conn.CreateCommand();
-            cmd.Transaction = tx;
-            cmd.CommandText = "ALTER TABLE phantom_items ADD COLUMN original_overview TEXT;";
-            cmd.ExecuteNonQuery();
-        }
-
-        if (version < 3)
-        {
-            // v3: tmdb_cache table for SuggestionsContributor (M6). Additive.
-            using var cmd = conn.CreateCommand();
-            cmd.Transaction = tx;
-            cmd.CommandText = SchemaV3Sql;
-            cmd.ExecuteNonQuery();
-        }
-
-        if (version < 4)
-        {
-            // v4: phantom_items gains stub_path, fuse_path, materialised_at
-            // (M7: needed by EvictionSweeper to call gostream RemoveAsync).
-            // ADD COLUMN IF NOT EXISTS is unavailable in older SQLite, so
-            // we PRAGMA table_info to check first.
-            var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            using (var info = conn.CreateCommand())
-            {
-                info.Transaction = tx;
-                info.CommandText = "PRAGMA table_info(phantom_items);";
-                using var rdr = info.ExecuteReader();
-                while (rdr.Read())
-                {
-                    existing.Add(rdr.GetString(1));
-                }
-            }
-
-            void AddColumnIfMissing(string col, string sqlType)
-            {
-                if (existing.Contains(col)) return;
-                using var cmd = conn.CreateCommand();
-                cmd.Transaction = tx;
-                cmd.CommandText = $"ALTER TABLE phantom_items ADD COLUMN {col} {sqlType};";
-                cmd.ExecuteNonQuery();
-            }
-
-            AddColumnIfMissing("stub_path", "TEXT");
-            AddColumnIfMissing("fuse_path", "TEXT");
-            AddColumnIfMissing("materialised_at", "INTEGER");
-        }
-
-        if (version < 5)
-        {
-            // v5: plugin_meta key/value table used by one-shot
-            // migrations (e.g. stub layout v1) to record completion
-            // markers so they do not re-run on every startup.
-            using var cmd = conn.CreateCommand();
-            cmd.Transaction = tx;
-            cmd.CommandText = @"CREATE TABLE IF NOT EXISTS plugin_meta (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);";
+            cmd.CommandText = SchemaV7Sql;
             cmd.ExecuteNonQuery();
         }
 
@@ -255,72 +188,118 @@ public sealed class PhantomDb : IDisposable
         tx.Commit();
     }
 
-    private const string SchemaV1Sql = @"
-CREATE TABLE IF NOT EXISTS phantom_items (
-    item_guid TEXT PRIMARY KEY,
-    tmdb_id INTEGER,
-    imdb_id TEXT,
-    type TEXT NOT NULL,
-    state TEXT NOT NULL,
-    first_seen INTEGER NOT NULL,
-    last_touched INTEGER NOT NULL,
-    eviction_protected INTEGER NOT NULL DEFAULT 0
+    private const string SchemaV7Sql = @"
+-- Channel-arch discovery: trending + similar-of-favourited TMDB ids,
+-- one row per (tmdb_id, type). Synthesised into ChannelItemInfos by
+-- PhantomMoviesChannel / PhantomShowsChannel at browse time.
+CREATE TABLE IF NOT EXISTS discovery_cache (
+    tmdb_id        INTEGER NOT NULL,
+    type           TEXT NOT NULL,        -- 'movie' or 'series'
+    discovered_at  INTEGER NOT NULL,
+    last_refreshed INTEGER NOT NULL,
+    PRIMARY KEY (tmdb_id, type)
 );
+CREATE INDEX IF NOT EXISTS idx_discovery_cache_last_refreshed
+    ON discovery_cache(last_refreshed);
+
+-- Channel-arch materialised state: one row per (tmdb_id, type, season,
+-- episode). Movies use sentinel season=-1, episode=-1; series episodes
+-- use the real season/episode integers. The sentinel scheme (per critic
+-- v2 BLOCKER 3) sidesteps SQLite's quirky UNIQUE-on-NULL semantics.
+CREATE TABLE IF NOT EXISTS materialised_state (
+    tmdb_id         INTEGER NOT NULL,
+    type            TEXT NOT NULL,        -- 'movie' or 'episode'
+    season          INTEGER NOT NULL DEFAULT -1,
+    episode         INTEGER NOT NULL DEFAULT -1,
+    stub_path       TEXT NOT NULL,
+    fuse_path       TEXT NOT NULL,
+    materialised_at INTEGER NOT NULL,
+    PRIMARY KEY (tmdb_id, type, season, episode)
+);
+CREATE INDEX IF NOT EXISTS idx_materialised_state_type
+    ON materialised_state(type);
+CREATE INDEX IF NOT EXISTS idx_materialised_state_materialised_at
+    ON materialised_state(materialised_at);
+
+-- Channel-arch in-flight tracking: a row exists for the duration of an
+-- in-progress Materialiser run. Same (tmdb_id, type, season, episode)
+-- shape + sentinel discipline as materialised_state. Deleted by the
+-- Materialiser's finally block; stale rows (process crashed mid-flight)
+-- are swept by Stage 4's startup sweep via
+-- PurgeStaleMaterialiseInFlightAsync.
+CREATE TABLE IF NOT EXISTS materialise_in_flight (
+    tmdb_id    INTEGER NOT NULL,
+    type       TEXT NOT NULL,
+    season     INTEGER NOT NULL DEFAULT -1,
+    episode    INTEGER NOT NULL DEFAULT -1,
+    started_at INTEGER NOT NULL,
+    PRIMARY KEY (tmdb_id, type, season, episode)
+);
+
+-- Channel-arch external-id cache: TMDB → IMDb lookup result, plus
+-- negative-cache rows (imdb_id NULL). TTL interpretation is the
+-- resolver layer's responsibility; this table just stores
+-- (key → optional value + fetched-at).
+CREATE TABLE IF NOT EXISTS tmdb_external_ids (
+    tmdb_id    INTEGER NOT NULL,
+    type       TEXT NOT NULL,    -- 'movie' or 'series'
+    imdb_id    TEXT,             -- NULL = negative-cache row
+    fetched_at INTEGER NOT NULL,
+    PRIMARY KEY (tmdb_id, type)
+);
+
+-- Surviving table from v3: cached TMDB endpoint responses. Reused by
+-- channel item synthesis.
+CREATE TABLE IF NOT EXISTS tmdb_cache (
+    endpoint     TEXT NOT NULL,
+    params_hash  TEXT NOT NULL,
+    language     TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    cached_at    INTEGER NOT NULL,
+    ttl_seconds  INTEGER NOT NULL,
+    PRIMARY KEY (endpoint, params_hash, language)
+);
+CREATE INDEX IF NOT EXISTS idx_tmdb_cache_expiry
+    ON tmdb_cache(cached_at, ttl_seconds);
+
+-- Surviving table from v1: per-source magnet cache.
 CREATE TABLE IF NOT EXISTS magnet_cache (
-    tmdb_id INTEGER NOT NULL DEFAULT 0,
-    imdb_id TEXT NOT NULL DEFAULT '',
-    type TEXT NOT NULL,
-    season INTEGER NOT NULL DEFAULT 0,
-    episode INTEGER NOT NULL DEFAULT 0,
-    preset TEXT NOT NULL DEFAULT '',
-    magnet TEXT NOT NULL,
-    info_hash TEXT NOT NULL,
-    size INTEGER NOT NULL,
-    seeders INTEGER NOT NULL,
-    indexer TEXT NOT NULL,
-    cached_at INTEGER NOT NULL,
+    tmdb_id     INTEGER NOT NULL DEFAULT 0,
+    imdb_id     TEXT NOT NULL DEFAULT '',
+    type        TEXT NOT NULL,
+    season      INTEGER NOT NULL DEFAULT 0,
+    episode     INTEGER NOT NULL DEFAULT 0,
+    preset      TEXT NOT NULL DEFAULT '',
+    magnet      TEXT NOT NULL,
+    info_hash   TEXT NOT NULL,
+    size        INTEGER NOT NULL,
+    seeders     INTEGER NOT NULL,
+    indexer     TEXT NOT NULL,
+    cached_at   INTEGER NOT NULL,
     ttl_seconds INTEGER NOT NULL,
-    source TEXT NOT NULL,
+    source      TEXT NOT NULL,
     PRIMARY KEY (tmdb_id, imdb_id, type, season, episode, preset)
 );
-CREATE TABLE IF NOT EXISTS materialisation_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts INTEGER NOT NULL,
-    item_guid TEXT,
-    trigger TEXT NOT NULL,
-    duration_ms INTEGER NOT NULL,
-    outcome TEXT NOT NULL,
-    error TEXT,
-    indexer TEXT,
-    info_hash TEXT
-);
+
+-- Surviving table from v1: indexers returned nothing for a key; back
+-- off until retry_after.
 CREATE TABLE IF NOT EXISTS unavailable_marker (
-    tmdb_id INTEGER NOT NULL DEFAULT 0,
-    imdb_id TEXT NOT NULL DEFAULT '',
-    type TEXT NOT NULL,
-    season INTEGER NOT NULL DEFAULT 0,
-    episode INTEGER NOT NULL DEFAULT 0,
-    marked_at INTEGER NOT NULL,
+    tmdb_id     INTEGER NOT NULL DEFAULT 0,
+    imdb_id     TEXT NOT NULL DEFAULT '',
+    type        TEXT NOT NULL,
+    season      INTEGER NOT NULL DEFAULT 0,
+    episode     INTEGER NOT NULL DEFAULT 0,
+    marked_at   INTEGER NOT NULL,
     retry_after INTEGER NOT NULL,
     PRIMARY KEY (tmdb_id, imdb_id, type, season, episode)
 );
-CREATE TABLE IF NOT EXISTS user_prefs (
-    user_id TEXT PRIMARY KEY,
-    protect_favourites INTEGER NOT NULL DEFAULT 1,
-    show_phantoms INTEGER NOT NULL DEFAULT 1,
-    allow_eager INTEGER NOT NULL DEFAULT 1
-);
-CREATE TABLE IF NOT EXISTS autopilot_state (
-    user_id TEXT NOT NULL,
-    series_imdb TEXT NOT NULL,
-    last_played_season INTEGER,
-    last_played_episode INTEGER,
-    next_materialised_season INTEGER,
-    next_materialised_episode INTEGER,
-    prefetch_cursor_season INTEGER,
-    prefetch_cursor_episode INTEGER,
-    updated_at INTEGER NOT NULL,
-    PRIMARY KEY (user_id, series_imdb)
+
+-- Surviving table from v5: key/value store for one-shot migration
+-- markers and similar small metadata that needs to outlive plugin
+-- restarts.
+CREATE TABLE IF NOT EXISTS plugin_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 ";
 
@@ -404,9 +383,7 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
     /// <summary>
     /// Returns the marker's <c>retry_after</c> instant if the key is
     /// currently marked unavailable, or <c>null</c> if no live marker
-    /// exists. Returning the instant lets callers surface a concrete
-    /// "retry after &lt;time&gt;" message to the user instead of an
-    /// opaque "unavailable".
+    /// exists.
     /// </summary>
     public async Task<DateTimeOffset?> IsMarkedUnavailableAsync(UnavailableKey key, CancellationToken ct)
     {
@@ -427,7 +404,8 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
             return null;
         }
 
-        var retryAfter = DateTimeOffset.FromUnixTimeSeconds(Convert.ToInt64(v, System.Globalization.CultureInfo.InvariantCulture));
+        var retryAfter = DateTimeOffset.FromUnixTimeSeconds(
+            Convert.ToInt64(v, System.Globalization.CultureInfo.InvariantCulture));
         return DateTimeOffset.UtcNow < retryAfter ? retryAfter : null;
     }
 
@@ -453,150 +431,6 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
         }
     }
 
-    // ---- materialisation_log ----
-
-    public async Task LogMaterialisationAsync(MaterialisationLogEntry entry, CancellationToken ct)
-    {
-        ArgumentNullException.ThrowIfNull(entry);
-        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
-        try
-        {
-            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
-            await using var cmd = conn.CreateCommand();
-            cmd.CommandText = @"INSERT INTO materialisation_log
-                (ts, item_guid, trigger, duration_ms, outcome, error, indexer, info_hash)
-                VALUES ($ts,$guid,$trigger,$dur,$outcome,$err,$idx,$hash);";
-            cmd.Parameters.AddWithValue("$ts", entry.Timestamp.ToUnixTimeSeconds());
-            cmd.Parameters.AddWithValue("$guid", (object?)entry.ItemGuid?.ToString("N") ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$trigger", entry.Trigger);
-            cmd.Parameters.AddWithValue("$dur", entry.DurationMs);
-            cmd.Parameters.AddWithValue("$outcome", entry.Outcome);
-            cmd.Parameters.AddWithValue("$err", (object?)entry.Error ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$idx", (object?)entry.Indexer ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$hash", (object?)entry.InfoHash ?? DBNull.Value);
-            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-        }
-        finally
-        {
-            _writeLock.Release();
-        }
-    }
-
-    // ---- phantom_items ----
-
-    public async Task UpsertPhantomItemAsync(Guid jellyfinItemId, PhantomItemRow row, CancellationToken ct)
-    {
-        ArgumentNullException.ThrowIfNull(row);
-        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
-        try
-        {
-            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
-            await using var cmd = conn.CreateCommand();
-            cmd.CommandText = @"INSERT INTO phantom_items
-                (item_guid, tmdb_id, imdb_id, type, state, first_seen, last_touched, eviction_protected, original_overview,
-                 stub_path, fuse_path, materialised_at)
-                VALUES ($guid,$tmdb,$imdb,$type,$state,$first,$last,$prot,$orig,$stub,$fuse,$mat)
-                ON CONFLICT(item_guid) DO UPDATE SET
-                    tmdb_id=excluded.tmdb_id,
-                    imdb_id=excluded.imdb_id,
-                    type=excluded.type,
-                    state=excluded.state,
-                    last_touched=excluded.last_touched,
-                    eviction_protected=excluded.eviction_protected,
-                    original_overview=excluded.original_overview,
-                    stub_path=excluded.stub_path,
-                    fuse_path=excluded.fuse_path,
-                    materialised_at=excluded.materialised_at;";
-            cmd.Parameters.AddWithValue("$guid", jellyfinItemId.ToString("N"));
-            cmd.Parameters.AddWithValue("$tmdb", (object?)row.TmdbId ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$imdb", (object?)row.ImdbId ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$type", row.Type);
-            cmd.Parameters.AddWithValue("$state", row.State.ToString());
-            cmd.Parameters.AddWithValue("$first", row.FirstSeen.ToUnixTimeSeconds());
-            cmd.Parameters.AddWithValue("$last", row.LastTouched.ToUnixTimeSeconds());
-            cmd.Parameters.AddWithValue("$prot", row.EvictionProtected ? 1 : 0);
-            cmd.Parameters.AddWithValue("$orig", (object?)row.OriginalOverview ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$stub", (object?)row.StubPath ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$fuse", (object?)row.FusePath ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$mat",
-                row.MaterialisedAt is null ? DBNull.Value : (object)row.MaterialisedAt.Value.ToUnixTimeSeconds());
-            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-        }
-        finally
-        {
-            _writeLock.Release();
-        }
-    }
-
-    public async Task<IReadOnlyList<PhantomItemRow>> ListItemsByStateAsync(string state, CancellationToken ct)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(state);
-        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
-        await using var cmd = conn.CreateCommand();
-        cmd.CommandText = @"SELECT item_guid, tmdb_id, imdb_id, type, state, first_seen, last_touched,
-                eviction_protected, original_overview, stub_path, fuse_path, materialised_at
-            FROM phantom_items WHERE state=$state;";
-        cmd.Parameters.AddWithValue("$state", state);
-        var list = new List<PhantomItemRow>();
-        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
-        while (await r.ReadAsync(ct).ConfigureAwait(false))
-        {
-            list.Add(new PhantomItemRow
-            {
-                ItemGuid = Guid.ParseExact(r.GetString(0), "N"),
-                TmdbId = r.IsDBNull(1) ? null : r.GetInt32(1),
-                ImdbId = r.IsDBNull(2) ? null : r.GetString(2),
-                Type = r.GetString(3),
-                State = Enum.Parse<PhantomItemState>(r.GetString(4)),
-                FirstSeen = DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(5)),
-                LastTouched = DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(6)),
-                EvictionProtected = r.GetInt32(7) != 0,
-                OriginalOverview = r.IsDBNull(8) ? null : r.GetString(8),
-                StubPath = r.IsDBNull(9) ? null : r.GetString(9),
-                FusePath = r.IsDBNull(10) ? null : r.GetString(10),
-                MaterialisedAt = r.IsDBNull(11) ? (DateTimeOffset?)null
-                    : DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(11)),
-            });
-        }
-
-        return list;
-    }
-
-    public async Task DeleteItemAsync(Guid jellyfinItemId, CancellationToken ct)
-    {
-        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
-        try
-        {
-            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
-            await using var cmd = conn.CreateCommand();
-            cmd.CommandText = "DELETE FROM phantom_items WHERE item_guid=$guid;";
-            cmd.Parameters.AddWithValue("$guid", jellyfinItemId.ToString("N"));
-            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-        }
-        finally
-        {
-            _writeLock.Release();
-        }
-    }
-
-    public async Task<int> PurgeExpiredPhantomsAsync(TimeSpan retention, CancellationToken ct)
-    {
-        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
-        try
-        {
-            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
-            await using var cmd = conn.CreateCommand();
-            cmd.CommandText = "DELETE FROM phantom_items WHERE state='Phantom' AND first_seen < $cutoff;";
-            cmd.Parameters.AddWithValue("$cutoff",
-                DateTimeOffset.UtcNow.Subtract(retention).ToUnixTimeSeconds());
-            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-        }
-        finally
-        {
-            _writeLock.Release();
-        }
-    }
-
     public async Task<int> PurgeExpiredUnavailableMarkersAsync(CancellationToken ct)
     {
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
@@ -614,347 +448,11 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
         }
     }
 
-    public async Task<PhantomItemRow?> GetPhantomItemAsync(Guid jellyfinItemId, CancellationToken ct)
-    {
-        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
-        await using var cmd = conn.CreateCommand();
-        cmd.CommandText = @"SELECT tmdb_id, imdb_id, type, state, first_seen, last_touched, eviction_protected, original_overview,
-            stub_path, fuse_path, materialised_at
-            FROM phantom_items WHERE item_guid=$guid LIMIT 1;";
-        cmd.Parameters.AddWithValue("$guid", jellyfinItemId.ToString("N"));
-        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
-        if (!await r.ReadAsync(ct).ConfigureAwait(false))
-        {
-            return null;
-        }
-
-        return new PhantomItemRow
-        {
-            ItemGuid = jellyfinItemId,
-            TmdbId = r.IsDBNull(0) ? null : r.GetInt32(0),
-            ImdbId = r.IsDBNull(1) ? null : r.GetString(1),
-            Type = r.GetString(2),
-            State = Enum.Parse<PhantomItemState>(r.GetString(3)),
-            FirstSeen = DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(4)),
-            LastTouched = DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(5)),
-            EvictionProtected = r.GetInt32(6) != 0,
-            OriginalOverview = r.IsDBNull(7) ? null : r.GetString(7),
-            StubPath = r.IsDBNull(8) ? null : r.GetString(8),
-            FusePath = r.IsDBNull(9) ? null : r.GetString(9),
-            MaterialisedAt = r.IsDBNull(10) ? (DateTimeOffset?)null
-                : DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(10)),
-        };
-    }
-
-    /// <summary>
-    /// Bulk lookup of phantom states for the supplied Jellyfin item GUIDs.
-    /// Returns a dictionary mapping each GUID present in the phantom_items
-    /// table to its current <see cref="PhantomItemState"/>. GUIDs absent
-    /// from the table are omitted from the result (callers treat absent
-    /// as "not a phantom"). Splits the input into batches of
-    /// <paramref name="batchSize"/> to stay below SQLite's 999-parameter
-    /// statement limit.
-    /// </summary>
-    public async Task<IReadOnlyDictionary<Guid, PhantomItemState>> GetStatesAsync(
-        IReadOnlyCollection<Guid> jellyfinItemIds,
-        CancellationToken ct,
-        int batchSize = 500)
-    {
-        ArgumentNullException.ThrowIfNull(jellyfinItemIds);
-        var result = new Dictionary<Guid, PhantomItemState>(jellyfinItemIds.Count);
-        if (jellyfinItemIds.Count == 0)
-        {
-            return result;
-        }
-
-        if (batchSize < 1)
-        {
-            batchSize = 500;
-        }
-
-        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
-
-        var ids = new List<Guid>(jellyfinItemIds);
-        for (var offset = 0; offset < ids.Count; offset += batchSize)
-        {
-            var take = Math.Min(batchSize, ids.Count - offset);
-            await using var cmd = conn.CreateCommand();
-            var sb = new System.Text.StringBuilder(
-                "SELECT item_guid, state FROM phantom_items WHERE item_guid IN (");
-            for (var i = 0; i < take; i++)
-            {
-                if (i > 0) sb.Append(',');
-                var p = "$g" + i.ToString(System.Globalization.CultureInfo.InvariantCulture);
-                sb.Append(p);
-                cmd.Parameters.AddWithValue(p, ids[offset + i].ToString("N"));
-            }
-            sb.Append(");");
-            cmd.CommandText = sb.ToString();
-
-            await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
-            while (await r.ReadAsync(ct).ConfigureAwait(false))
-            {
-                var guid = Guid.ParseExact(r.GetString(0), "N");
-                var state = Enum.Parse<PhantomItemState>(r.GetString(1));
-                result[guid] = state;
-            }
-        }
-
-        return result;
-    }
-
-    /// <summary>
-    /// Stores the unmodified Overview text for the item, leaving every
-    /// other column alone. Only writes on first call (when the existing
-    /// stored value is NULL) so that repeated invocations during the
-    /// materialising → ready transitions never overwrite the
-    /// genuinely-original copy with a previously-decorated one.
-    /// </summary>
-    public async Task<string?> RememberOriginalOverviewAsync(
-        Guid jellyfinItemId, string? overview, CancellationToken ct)
-    {
-        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
-        try
-        {
-            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
-            await using (var read = conn.CreateCommand())
-            {
-                read.CommandText = "SELECT original_overview FROM phantom_items WHERE item_guid=$guid LIMIT 1;";
-                read.Parameters.AddWithValue("$guid", jellyfinItemId.ToString("N"));
-                var existing = await read.ExecuteScalarAsync(ct).ConfigureAwait(false);
-                if (existing is not null && existing is not DBNull)
-                {
-                    return (string)existing;
-                }
-            }
-
-            // Either no row, or row with NULL original_overview. Upsert.
-            await using (var write = conn.CreateCommand())
-            {
-                write.CommandText = @"INSERT INTO phantom_items
-                    (item_guid, tmdb_id, imdb_id, type, state, first_seen, last_touched, eviction_protected, original_overview)
-                    VALUES ($guid, NULL, NULL, 'unknown', 'Virtual', $now, $now, 0, $orig)
-                    ON CONFLICT(item_guid) DO UPDATE SET
-                        original_overview = COALESCE(phantom_items.original_overview, excluded.original_overview);";
-                write.Parameters.AddWithValue("$guid", jellyfinItemId.ToString("N"));
-                write.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
-                write.Parameters.AddWithValue("$orig", (object?)overview ?? DBNull.Value);
-                await write.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-            }
-
-            return overview;
-        }
-        finally
-        {
-            _writeLock.Release();
-        }
-    }
-
-    /// <summary>
-    /// Returns the stored original overview (if any) and clears it from
-    /// the row in the same transaction — used when the decorator restores
-    /// the user-visible Overview after a Finished phase.
-    /// </summary>
-    public async Task<string?> TakeOriginalOverviewAsync(Guid jellyfinItemId, CancellationToken ct)
-    {
-        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
-        try
-        {
-            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
-            string? value;
-            await using (var read = conn.CreateCommand())
-            {
-                read.CommandText = "SELECT original_overview FROM phantom_items WHERE item_guid=$guid LIMIT 1;";
-                read.Parameters.AddWithValue("$guid", jellyfinItemId.ToString("N"));
-                var existing = await read.ExecuteScalarAsync(ct).ConfigureAwait(false);
-                value = existing is null or DBNull ? null : (string)existing;
-            }
-
-            if (value is not null)
-            {
-                await using var clear = conn.CreateCommand();
-                clear.CommandText = "UPDATE phantom_items SET original_overview = NULL WHERE item_guid=$guid;";
-                clear.Parameters.AddWithValue("$guid", jellyfinItemId.ToString("N"));
-                await clear.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-            }
-
-            return value;
-        }
-        finally
-        {
-            _writeLock.Release();
-        }
-    }
-
-    // ---- user_prefs / autopilot_state ----
-
-    /// <summary>Reads autopilot state for (user, series_imdb) or returns null if absent.</summary>
-    public async Task<AutopilotStateRow?> GetAutopilotStateAsync(Guid userId, string seriesImdb, CancellationToken ct)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(seriesImdb);
-        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
-        await using var cmd = conn.CreateCommand();
-        cmd.CommandText = @"SELECT last_played_season, last_played_episode,
-            next_materialised_season, next_materialised_episode,
-            prefetch_cursor_season, prefetch_cursor_episode, updated_at
-            FROM autopilot_state
-            WHERE user_id=$uid AND series_imdb=$imdb LIMIT 1;";
-        cmd.Parameters.AddWithValue("$uid", userId.ToString("N"));
-        cmd.Parameters.AddWithValue("$imdb", seriesImdb);
-        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
-        if (!await r.ReadAsync(ct).ConfigureAwait(false))
-        {
-            return null;
-        }
-
-        static int? NullableInt(Microsoft.Data.Sqlite.SqliteDataReader r, int ord) => r.IsDBNull(ord) ? null : r.GetInt32(ord);
-        return new AutopilotStateRow
-        {
-            UserId = userId,
-            SeriesImdb = seriesImdb,
-            LastPlayedSeason = NullableInt(r, 0),
-            LastPlayedEpisode = NullableInt(r, 1),
-            NextMaterialisedSeason = NullableInt(r, 2),
-            NextMaterialisedEpisode = NullableInt(r, 3),
-            PrefetchCursorSeason = NullableInt(r, 4),
-            PrefetchCursorEpisode = NullableInt(r, 5),
-            UpdatedAt = r.GetInt64(6),
-        };
-    }
-
-    /// <summary>Upserts an autopilot_state row.</summary>
-    public async Task UpsertAutopilotStateAsync(AutopilotStateRow row, CancellationToken ct)
-    {
-        ArgumentNullException.ThrowIfNull(row);
-        ArgumentException.ThrowIfNullOrWhiteSpace(row.SeriesImdb);
-        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
-        try
-        {
-            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
-            await using var cmd = conn.CreateCommand();
-            cmd.CommandText = @"INSERT INTO autopilot_state
-                (user_id, series_imdb, last_played_season, last_played_episode,
-                 next_materialised_season, next_materialised_episode,
-                 prefetch_cursor_season, prefetch_cursor_episode, updated_at)
-                VALUES ($uid,$imdb,$lps,$lpe,$nms,$nme,$pcs,$pce,$updated)
-                ON CONFLICT(user_id, series_imdb) DO UPDATE SET
-                    last_played_season=excluded.last_played_season,
-                    last_played_episode=excluded.last_played_episode,
-                    next_materialised_season=excluded.next_materialised_season,
-                    next_materialised_episode=excluded.next_materialised_episode,
-                    prefetch_cursor_season=excluded.prefetch_cursor_season,
-                    prefetch_cursor_episode=excluded.prefetch_cursor_episode,
-                    updated_at=excluded.updated_at;";
-            cmd.Parameters.AddWithValue("$uid", row.UserId.ToString("N"));
-            cmd.Parameters.AddWithValue("$imdb", row.SeriesImdb);
-            cmd.Parameters.AddWithValue("$lps", (object?)row.LastPlayedSeason ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$lpe", (object?)row.LastPlayedEpisode ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$nms", (object?)row.NextMaterialisedSeason ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$nme", (object?)row.NextMaterialisedEpisode ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$pcs", (object?)row.PrefetchCursorSeason ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$pce", (object?)row.PrefetchCursorEpisode ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$updated", row.UpdatedAt);
-            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-        }
-        finally
-        {
-            _writeLock.Release();
-        }
-    }
-
-    // ---- user_prefs (M7) ----
-
-    /// <summary>
-    /// Reads per-user preferences. Returns <see cref="UserPrefsRow.Defaults"/>
-    /// (ProtectFavourites=true, ShowPhantoms=true, AllowEager=true) if no row
-    /// exists for the user.
-    /// </summary>
-    public async Task<UserPrefsRow> GetUserPrefsAsync(Guid userId, CancellationToken ct)
-    {
-        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
-        await using var cmd = conn.CreateCommand();
-        cmd.CommandText = @"SELECT protect_favourites, show_phantoms, allow_eager
-            FROM user_prefs WHERE user_id=$uid LIMIT 1;";
-        cmd.Parameters.AddWithValue("$uid", userId.ToString("N"));
-        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
-        if (!await r.ReadAsync(ct).ConfigureAwait(false))
-        {
-            return UserPrefsRow.Defaults;
-        }
-
-        return new UserPrefsRow
-        {
-            ProtectFavourites = r.GetInt32(0) != 0,
-            ShowPhantoms = r.GetInt32(1) != 0,
-            AllowEager = r.GetInt32(2) != 0,
-        };
-    }
-
-    public async Task UpsertUserPrefsAsync(Guid userId, UserPrefsRow prefs, CancellationToken ct)
-    {
-        ArgumentNullException.ThrowIfNull(prefs);
-        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
-        try
-        {
-            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
-            await using var cmd = conn.CreateCommand();
-            cmd.CommandText = @"INSERT INTO user_prefs
-                (user_id, protect_favourites, show_phantoms, allow_eager)
-                VALUES ($uid,$pf,$sp,$ae)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    protect_favourites=excluded.protect_favourites,
-                    show_phantoms=excluded.show_phantoms,
-                    allow_eager=excluded.allow_eager;";
-            cmd.Parameters.AddWithValue("$uid", userId.ToString("N"));
-            cmd.Parameters.AddWithValue("$pf", prefs.ProtectFavourites ? 1 : 0);
-            cmd.Parameters.AddWithValue("$sp", prefs.ShowPhantoms ? 1 : 0);
-            cmd.Parameters.AddWithValue("$ae", prefs.AllowEager ? 1 : 0);
-            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-        }
-        finally
-        {
-            _writeLock.Release();
-        }
-    }
-
-    public async Task<IReadOnlyList<(Guid UserId, UserPrefsRow Prefs)>> ListAllUserPrefsAsync(CancellationToken ct)
-    {
-        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
-        await using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT user_id, protect_favourites, show_phantoms, allow_eager FROM user_prefs;";
-        var list = new List<(Guid, UserPrefsRow)>();
-        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
-        while (await r.ReadAsync(ct).ConfigureAwait(false))
-        {
-            var uid = Guid.ParseExact(r.GetString(0), "N");
-            list.Add((uid, new UserPrefsRow
-            {
-                ProtectFavourites = r.GetInt32(1) != 0,
-                ShowPhantoms = r.GetInt32(2) != 0,
-                AllowEager = r.GetInt32(3) != 0,
-            }));
-        }
-
-        return list;
-    }
-
-    private const string SchemaV3Sql = @"
-CREATE TABLE IF NOT EXISTS tmdb_cache (
-    endpoint TEXT NOT NULL,
-    params_hash TEXT NOT NULL,
-    language TEXT NOT NULL,
-    response_json TEXT NOT NULL,
-    cached_at INTEGER NOT NULL,
-    ttl_seconds INTEGER NOT NULL,
-    PRIMARY KEY (endpoint, params_hash, language)
-);
-CREATE INDEX IF NOT EXISTS idx_tmdb_cache_expiry ON tmdb_cache(cached_at, ttl_seconds);
-";
-
     // ---- tmdb_cache ----
 
     /// <summary>
-    /// Returns cached TMDB response JSON for (endpoint, paramsHash, language) if present and unexpired, else null.
+    /// Returns cached TMDB response JSON for (endpoint, paramsHash,
+    /// language) if present and unexpired, else null.
     /// </summary>
     public async Task<string?> GetTmdbCacheAsync(string endpoint, string paramsHash, string language, CancellationToken ct)
     {
@@ -985,7 +483,6 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_cache_expiry ON tmdb_cache(cached_at, ttl_se
         return json;
     }
 
-    /// <summary>Writes or replaces a cached TMDB response.</summary>
     public async Task PutTmdbCacheAsync(string endpoint, string paramsHash, string language, string responseJson, TimeSpan ttl, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(endpoint);
@@ -1014,7 +511,6 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_cache_expiry ON tmdb_cache(cached_at, ttl_se
         }
     }
 
-    /// <summary>Removes expired tmdb_cache rows. Returns count deleted.</summary>
     public async Task<int> PurgeExpiredTmdbCacheAsync(CancellationToken ct)
     {
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
@@ -1032,9 +528,8 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_cache_expiry ON tmdb_cache(cached_at, ttl_se
         }
     }
 
-    // ---- plugin_meta (one-shot migration markers) ----
+    // ---- plugin_meta (key/value store) ----
 
-    /// <summary>Reads a plugin_meta value by key, or null if absent.</summary>
     public async Task<string?> GetMetaAsync(string key, CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(key);
@@ -1046,7 +541,6 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_cache_expiry ON tmdb_cache(cached_at, ttl_se
         return v is null or DBNull ? null : (string)v;
     }
 
-    /// <summary>Upserts a plugin_meta key/value pair.</summary>
     public async Task SetMetaAsync(string key, string value, CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(key);
@@ -1060,6 +554,381 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_cache_expiry ON tmdb_cache(cached_at, ttl_se
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value;";
             cmd.Parameters.AddWithValue("$k", key);
             cmd.Parameters.AddWithValue("$v", value);
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    // ---- discovery_cache ----
+
+    /// <summary>
+    /// Upsert a (tmdb_id, type) row. On insert, sets both
+    /// <c>discovered_at</c> and <c>last_refreshed</c> to now; on
+    /// update, refreshes only <c>last_refreshed</c> (so the first-seen
+    /// timestamp is preserved for "newly discovered" UI surfacing).
+    /// </summary>
+    public async Task UpsertDiscoveryCacheAsync(int tmdbId, string type, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"INSERT INTO discovery_cache
+                (tmdb_id, type, discovered_at, last_refreshed)
+                VALUES ($tmdb, $type, $now, $now)
+                ON CONFLICT(tmdb_id, type) DO UPDATE SET
+                    last_refreshed = excluded.last_refreshed;";
+            cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+            cmd.Parameters.AddWithValue("$type", type);
+            cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<IReadOnlyList<DiscoveryCacheRow>> ListDiscoveryCacheAsync(string type, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT tmdb_id, type, discovered_at, last_refreshed
+            FROM discovery_cache WHERE type=$type
+            ORDER BY discovered_at DESC;";
+        cmd.Parameters.AddWithValue("$type", type);
+        var list = new List<DiscoveryCacheRow>();
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            list.Add(new DiscoveryCacheRow(
+                r.GetInt32(0),
+                r.GetString(1),
+                DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(2)),
+                DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(3))));
+        }
+
+        return list;
+    }
+
+    /// <summary>
+    /// TTL-only purge: deletes discovery_cache rows whose
+    /// <c>last_refreshed</c> is older than <paramref name="ttl"/>.
+    /// Returns the number of rows deleted.
+    ///
+    /// <para><paramref name="protectFavourited"/> is currently ignored
+    /// at this layer. The favourite-protection requirement (Stage 3.1
+    /// of the channel-handoff plan) needs an <c>ILibraryManager</c>
+    /// lookup, which doesn't belong inside the DB layer. Callers that
+    /// need favourite-protection should two-pass it:
+    /// <see cref="ListDiscoveryCacheAsync"/> → filter favourites in C#
+    /// → <see cref="DeleteDiscoveryCacheRowAsync"/> per kept row.</para>
+    /// </summary>
+    public async Task<int> PurgeStaleDiscoveryAsync(TimeSpan ttl, bool protectFavourited, CancellationToken ct)
+    {
+        _ = protectFavourited;
+        // TODO(stage-3.1): wire favourited-protection via ILibraryManager lookup
+        // in the DiscoveryRefreshTask (two-pass: list → filter → delete-per-row)
+        // rather than pushing the dependency into PhantomDb.
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "DELETE FROM discovery_cache WHERE last_refreshed < $cutoff;";
+            cmd.Parameters.AddWithValue("$cutoff",
+                DateTimeOffset.UtcNow.Subtract(ttl).ToUnixTimeSeconds());
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Per-row delete helper for the Stage 3.1 two-pass favourite-protected
+    /// purge. Provided so DiscoveryRefreshTask can call this in a loop
+    /// after filtering the listed rows in C# against ILibraryManager.
+    /// </summary>
+    public async Task DeleteDiscoveryCacheRowAsync(int tmdbId, string type, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "DELETE FROM discovery_cache WHERE tmdb_id=$tmdb AND type=$type;";
+            cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+            cmd.Parameters.AddWithValue("$type", type);
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    // ---- materialise_in_flight ----
+
+    public async Task UpsertMaterialiseInFlightAsync(int tmdbId, string type, int season, int episode, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"INSERT INTO materialise_in_flight
+                (tmdb_id, type, season, episode, started_at)
+                VALUES ($tmdb, $type, $season, $episode, $now)
+                ON CONFLICT(tmdb_id, type, season, episode) DO UPDATE SET
+                    started_at = excluded.started_at;";
+            cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+            cmd.Parameters.AddWithValue("$type", type);
+            cmd.Parameters.AddWithValue("$season", season);
+            cmd.Parameters.AddWithValue("$episode", episode);
+            cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task DeleteMaterialiseInFlightAsync(int tmdbId, string type, int season, int episode, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"DELETE FROM materialise_in_flight
+                WHERE tmdb_id=$tmdb AND type=$type AND season=$season AND episode=$episode;";
+            cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+            cmd.Parameters.AddWithValue("$type", type);
+            cmd.Parameters.AddWithValue("$season", season);
+            cmd.Parameters.AddWithValue("$episode", episode);
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<bool> IsMaterialiseInFlightAsync(int tmdbId, string type, int season, int episode, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT 1 FROM materialise_in_flight
+            WHERE tmdb_id=$tmdb AND type=$type AND season=$season AND episode=$episode
+            LIMIT 1;";
+        cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+        cmd.Parameters.AddWithValue("$type", type);
+        cmd.Parameters.AddWithValue("$season", season);
+        cmd.Parameters.AddWithValue("$episode", episode);
+        var v = await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
+        return v is not null and not DBNull;
+    }
+
+    /// <summary>
+    /// Purges materialise_in_flight rows older than
+    /// <paramref name="threshold"/>. Returns the count of rows deleted
+    /// so the Stage 4 startup sweeper can log it.
+    /// </summary>
+    public async Task<int> PurgeStaleMaterialiseInFlightAsync(TimeSpan threshold, CancellationToken ct)
+    {
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "DELETE FROM materialise_in_flight WHERE started_at < $cutoff;";
+            cmd.Parameters.AddWithValue("$cutoff",
+                DateTimeOffset.UtcNow.Subtract(threshold).ToUnixTimeSeconds());
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    // ---- materialised_state ----
+
+    /// <summary>
+    /// Inserts a materialised_state row. Uses INSERT OR REPLACE so a
+    /// re-materialise of the same (tmdb, type, season, episode) tuple
+    /// overwrites the previous path pair atomically rather than
+    /// throwing — re-materialise IS the expected upsert path (e.g.
+    /// gostream re-cached an evicted file under a new stub path).
+    /// </summary>
+    public async Task InsertMaterialisedStateAsync(int tmdbId, string type, int season, int episode, string stubPath, string fusePath, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        ArgumentException.ThrowIfNullOrWhiteSpace(stubPath);
+        ArgumentException.ThrowIfNullOrWhiteSpace(fusePath);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"INSERT OR REPLACE INTO materialised_state
+                (tmdb_id, type, season, episode, stub_path, fuse_path, materialised_at)
+                VALUES ($tmdb, $type, $season, $episode, $stub, $fuse, $now);";
+            cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+            cmd.Parameters.AddWithValue("$type", type);
+            cmd.Parameters.AddWithValue("$season", season);
+            cmd.Parameters.AddWithValue("$episode", episode);
+            cmd.Parameters.AddWithValue("$stub", stubPath);
+            cmd.Parameters.AddWithValue("$fuse", fusePath);
+            cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<MaterialisedStateRow?> GetMaterialisedStateAsync(int tmdbId, string type, int season, int episode, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT tmdb_id, type, season, episode, stub_path, fuse_path, materialised_at
+            FROM materialised_state
+            WHERE tmdb_id=$tmdb AND type=$type AND season=$season AND episode=$episode
+            LIMIT 1;";
+        cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+        cmd.Parameters.AddWithValue("$type", type);
+        cmd.Parameters.AddWithValue("$season", season);
+        cmd.Parameters.AddWithValue("$episode", episode);
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (!await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            return null;
+        }
+
+        return new MaterialisedStateRow(
+            r.GetInt32(0),
+            r.GetString(1),
+            r.GetInt32(2),
+            r.GetInt32(3),
+            r.GetString(4),
+            r.GetString(5),
+            DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(6)));
+    }
+
+    public async Task<IReadOnlyList<MaterialisedStateRow>> ListMaterialisedStateAsync(string type, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT tmdb_id, type, season, episode, stub_path, fuse_path, materialised_at
+            FROM materialised_state WHERE type=$type
+            ORDER BY materialised_at DESC;";
+        cmd.Parameters.AddWithValue("$type", type);
+        var list = new List<MaterialisedStateRow>();
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            list.Add(new MaterialisedStateRow(
+                r.GetInt32(0),
+                r.GetString(1),
+                r.GetInt32(2),
+                r.GetInt32(3),
+                r.GetString(4),
+                r.GetString(5),
+                DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(6))));
+        }
+
+        return list;
+    }
+
+    public async Task DeleteMaterialisedStateAsync(int tmdbId, string type, int season, int episode, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"DELETE FROM materialised_state
+                WHERE tmdb_id=$tmdb AND type=$type AND season=$season AND episode=$episode;";
+            cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+            cmd.Parameters.AddWithValue("$type", type);
+            cmd.Parameters.AddWithValue("$season", season);
+            cmd.Parameters.AddWithValue("$episode", episode);
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    // ---- tmdb_external_ids ----
+
+    /// <summary>
+    /// Reads the cached (tmdb_id, type) → imdb_id mapping. Returns
+    /// <c>null</c> if no row exists. A returned row with
+    /// <c>ImdbId == null</c> is a negative-cache entry; callers that
+    /// care about negative-cache TTL must inspect <c>FetchedAt</c>.
+    /// </summary>
+    public async Task<TmdbExternalIdRow?> GetImdbIdAsync(int tmdbId, string type, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT imdb_id, fetched_at FROM tmdb_external_ids
+            WHERE tmdb_id=$tmdb AND type=$type LIMIT 1;";
+        cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+        cmd.Parameters.AddWithValue("$type", type);
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (!await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            return null;
+        }
+
+        var imdbId = r.IsDBNull(0) ? null : r.GetString(0);
+        var fetchedAt = DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(1));
+        return new TmdbExternalIdRow(imdbId, fetchedAt);
+    }
+
+    /// <summary>
+    /// Upserts the (tmdb_id, type) → imdb_id mapping. A null
+    /// <paramref name="imdbId"/> writes a negative-cache row.
+    /// </summary>
+    public async Task SetImdbIdAsync(int tmdbId, string type, string? imdbId, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"INSERT INTO tmdb_external_ids
+                (tmdb_id, type, imdb_id, fetched_at)
+                VALUES ($tmdb, $type, $imdb, $now)
+                ON CONFLICT(tmdb_id, type) DO UPDATE SET
+                    imdb_id = excluded.imdb_id,
+                    fetched_at = excluded.fetched_at;";
+            cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+            cmd.Parameters.AddWithValue("$type", type);
+            cmd.Parameters.AddWithValue("$imdb", (object?)imdbId ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
             await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
         finally

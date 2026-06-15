@@ -1,9 +1,6 @@
 using System;
-using System.Collections.Generic;
-using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-// TODO(stage-4.3): trim per plan §4.3 + 6.x
 using Jellyfin.Plugin.PhantomLibrary.Clients;
 using Jellyfin.Plugin.PhantomLibrary.Materialisation;
 using Jellyfin.Plugin.PhantomLibrary.State;
@@ -15,18 +12,16 @@ using Microsoft.AspNetCore.Mvc;
 
 namespace Jellyfin.Plugin.PhantomLibrary.Api;
 
-/// <summary>Wire DTO for POST /Plugins/PhantomLibrary/UserPrefs/{userId}.</summary>
-public sealed class UserPrefsDto
-{
-    public bool ProtectFavourites { get; set; }
-    public bool ShowPhantoms { get; set; }
-    public bool AllowEager { get; set; }
-}
-
 /// <summary>
 /// Admin-only REST surface for debug / manual operations against the
 /// materialisation pipeline.
 /// </summary>
+/// <remarks>
+/// The per-user-preferences endpoints were removed in Stage 2.2; the
+/// underlying <c>user_prefs</c> table is gone with the file-on-disk
+/// architecture. Channel-arch may re-introduce per-user controls in a
+/// later stage.
+/// </remarks>
 [ApiController]
 [Authorize(Policy = "RequiresElevation")]
 [Route("Plugins/PhantomLibrary")]
@@ -59,9 +54,6 @@ public sealed class PhantomLibraryController : ControllerBase
     /// <summary>
     /// Serve the kebab-shim JS for browser injection. Public route
     /// (no auth) so the SPA can <script src="…"> it before login.
-    /// Returns text/javascript so Firefox+nosniff doesn't reject it
-    /// the way it does for application/javascript on the
-    /// /web/ConfigurationPage route.
     /// </summary>
     [HttpGet("kebab.js")]
     [AllowAnonymous]
@@ -116,6 +108,8 @@ public sealed class PhantomLibraryController : ControllerBase
     [ProducesResponseType(StatusCodes.Status200OK)]
     public async Task<IActionResult> Status(CancellationToken ct = default)
     {
+        _ = _userManager;
+        _ = _db;
         var reachable = false;
         try
         {
@@ -133,52 +127,5 @@ public sealed class PhantomLibraryController : ControllerBase
             dbPath = System.IO.Path.Combine(_paths.PluginConfigurationsPath, "PhantomLibrary", "phantom.db"),
             gostreamReachable = reachable,
         });
-    }
-
-    /// <summary>Returns per-user preference rows for all Jellyfin users.</summary>
-    [HttpGet("UserPrefs")]
-    [ProducesResponseType(StatusCodes.Status200OK)]
-    public async Task<IActionResult> ListUserPrefs(CancellationToken ct = default)
-    {
-        var stored = await _db.ListAllUserPrefsAsync(ct).ConfigureAwait(false);
-        var dict = stored.ToDictionary(t => t.UserId, t => t.Prefs);
-        var users = _userManager.GetUsers();
-        var result = new List<object>();
-        foreach (var u in users)
-        {
-            var prefs = dict.TryGetValue(u.Id, out var p) ? p : UserPrefsRow.Defaults;
-            result.Add(new
-            {
-                userId = u.Id.ToString("N"),
-                userName = u.Username,
-                protectFavourites = prefs.ProtectFavourites,
-                showPhantoms = prefs.ShowPhantoms,
-                allowEager = prefs.AllowEager,
-            });
-        }
-
-        return Ok(result);
-    }
-
-    /// <summary>Updates the per-user preference row for the given user.</summary>
-    [HttpPost("UserPrefs/{userId}")]
-    [ProducesResponseType(StatusCodes.Status204NoContent)]
-    [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public async Task<IActionResult> UpsertUserPrefs(
-        [FromRoute] Guid userId,
-        [FromBody] UserPrefsDto body,
-        CancellationToken ct = default)
-    {
-        ArgumentNullException.ThrowIfNull(body);
-        var user = _userManager.GetUserById(userId);
-        if (user is null) return NotFound();
-
-        await _db.UpsertUserPrefsAsync(userId, new UserPrefsRow
-        {
-            ProtectFavourites = body.ProtectFavourites,
-            ShowPhantoms = body.ShowPhantoms,
-            AllowEager = body.AllowEager,
-        }, ct).ConfigureAwait(false);
-        return NoContent();
     }
 }
