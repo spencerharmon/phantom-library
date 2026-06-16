@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Channels;
@@ -7,6 +8,8 @@ using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Model.Entities;
+using Episode = MediaBrowser.Controller.Entities.TV.Episode;
+using Movie = MediaBrowser.Controller.Entities.Movies.Movie;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
@@ -77,16 +80,46 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
             }
 
             var item = _libraryManager.GetItemById(guid);
-            if (item is null
-                || item.SourceType != SourceType.Channel
-                || !ChannelIds.IsPhantom(item.ChannelId))
+            if (item is null)
             {
-                continue;
+                var matches = _libraryManager.GetItemList(new InternalItemsQuery
+                {
+                    ItemIds = new[] { guid },
+                    SourceTypes = new[] { SourceType.Channel },
+                });
+                item = matches.Count > 0 ? matches[0] : null;
             }
 
-            if (!ChannelItemId.TryParse(item.ExternalId, out var parsed))
+            if (item is null)
             {
-                continue;
+                var phantomItems = _libraryManager.GetItemList(new InternalItemsQuery
+                {
+                    ChannelIds = new[] { ChannelIds.Movies, ChannelIds.Shows },
+                    SourceTypes = new[] { SourceType.Channel },
+                });
+                foreach (var candidate in phantomItems)
+                {
+                    if (candidate.Id == guid)
+                    {
+                        item = candidate;
+                        break;
+                    }
+                }
+            }
+            ChannelItemId parsed;
+            if (item is not null && ChannelIds.IsPhantom(item.ChannelId) && ChannelItemId.TryParse(item.ExternalId, out parsed))
+            {
+                // resolved through Jellyfin library manager
+            }
+            else
+            {
+                var computed = await TryResolveByComputedChannelIdAsync(guid, ct).ConfigureAwait(false);
+                if (computed is null)
+                {
+                    continue;
+                }
+
+                parsed = computed;
             }
 
             // Only movie/episode kinds carry materialise state. Series /
@@ -129,6 +162,46 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
 
         return Ok(result);
     }
+
+    private async Task<ChannelItemId?> TryResolveByComputedChannelIdAsync(Guid requestedId, CancellationToken ct)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var row in await _db.ListDiscoveryCacheAsync("movie", ct).ConfigureAwait(false))
+        {
+            var id = ChannelItemId.ForMovie(row.TmdbId);
+            if (seen.Add(id.Encode()) && ComputeMovieGuid(id) == requestedId)
+            {
+                return id;
+            }
+        }
+
+        foreach (var row in await _db.ListMaterialisedStateAsync("movie", ct).ConfigureAwait(false))
+        {
+            var id = ChannelItemId.ForMovie(row.TmdbId);
+            if (seen.Add(id.Encode()) && ComputeMovieGuid(id) == requestedId)
+            {
+                return id;
+            }
+        }
+
+        foreach (var row in await _db.ListMaterialisedStateAsync("episode", ct).ConfigureAwait(false))
+        {
+            var id = ChannelItemId.ForEpisode(row.TmdbId, row.Season, row.Episode);
+            if (seen.Add(id.Encode()) && ComputeEpisodeGuid(id) == requestedId)
+            {
+                return id;
+            }
+        }
+
+        return null;
+    }
+
+    private Guid ComputeMovieGuid(ChannelItemId id)
+        => _libraryManager.GetNewItemId(id.Encode() + ChannelIds.MoviesName + "16", typeof(Movie));
+
+    private Guid ComputeEpisodeGuid(ChannelItemId id)
+        => _libraryManager.GetNewItemId(id.Encode() + ChannelIds.ShowsName + "16", typeof(Episode));
 
     /// <summary>
     /// Serve the badge-overlay JS for browser injection. Public route
