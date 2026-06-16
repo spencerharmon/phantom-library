@@ -79,7 +79,10 @@ if [ ! -f build.yaml ]; then
 fi
 
 PLUGIN_VERSION="$(awk -F'"' '/^version:/ {print $2; exit}' build.yaml)"
+PLUGIN_GUID="$(awk -F'"' '/^guid:/ {print $2; exit}' build.yaml)"
+PLUGIN_TARGET_ABI="$(awk -F'"' '/^targetAbi:/ {print $2; exit}' build.yaml)"
 PLUGIN_NAME="Jellyfin.Plugin.PhantomLibrary"
+PLUGIN_DISPLAY_NAME="Phantom Library"
 PLUGIN_DIR_NAME="${PLUGIN_NAME}_${PLUGIN_VERSION}"
 DLL_OUT="src/${PLUGIN_NAME}/bin/Release/net9.0/${PLUGIN_NAME}.dll"
 
@@ -206,8 +209,47 @@ fi
 
 # ---------------------------------------------------------------- install dll
 bold "Installing plugin DLL..."
+
+# Jellyfin scans versioned plugin directories. Leaving an older
+# Jellyfin.Plugin.PhantomLibrary_<version>/ directory behind can keep the
+# old plugin active or make the dashboard show the wrong version. Move all
+# stale Phantom Library plugin dirs out of plugins/ before installing this
+# version.
+PLUGIN_BACKUP_DIR="$JELLYFIN_DATA/phantom-plugin-dir-backups/$(date -u +%Y%m%dT%H%M%SZ)"
+shopt -s nullglob
+for old_dir in "$JELLYFIN_DATA"/plugins/${PLUGIN_NAME}_*; do
+  if [ "$(basename "$old_dir")" != "$PLUGIN_DIR_NAME" ]; then
+    $SUDO mkdir -p "$PLUGIN_BACKUP_DIR"
+    yellow "  moving stale plugin dir out of plugins/: $old_dir"
+    $SUDO mv "$old_dir" "$PLUGIN_BACKUP_DIR/"
+  fi
+done
+shopt -u nullglob
+
 $SUDO mkdir -p "$PLUGINS_DIR"
 $SUDO install -m 644 "$DLL_OUT" "$PLUGINS_DIR/${PLUGIN_NAME}.dll"
+
+META_TMP="$(mktemp)"
+cat > "$META_TMP" <<EOF
+{
+  "category": "Metadata",
+  "changelog": "v0.3.0.0: IChannel-based Phantom Library architecture; requires patched Jellyfin and wipe.",
+  "description": "Makes the entire TMDB catalogue appear inside Jellyfin. Titles materialise on demand via gostream's FUSE-backed virtual MKV files.",
+  "guid": "$PLUGIN_GUID",
+  "name": "$PLUGIN_DISPLAY_NAME",
+  "overview": "Phantom Library: TMDB catalogue as Jellyfin channels, materialised on demand.",
+  "owner": "spencerharmon",
+  "targetAbi": "$PLUGIN_TARGET_ABI",
+  "timestamp": "0001-01-01T00:00:00.0000000Z",
+  "version": "$PLUGIN_VERSION",
+  "status": "Active",
+  "autoUpdate": false,
+  "assemblies": []
+}
+EOF
+$SUDO install -m 644 "$META_TMP" "$PLUGINS_DIR/meta.json"
+rm -f "$META_TMP"
+
 $SUDO chown -R "$JELLYFIN_USER:$JELLYFIN_GROUP" "$PLUGINS_DIR"
 
 # Verify md5 to catch the "I copied the stale build" footgun.
