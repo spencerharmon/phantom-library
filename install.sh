@@ -16,6 +16,8 @@
 # Usage:
 #   ./install.sh                              # install pre-built DLL + load gostream image
 #   ./install.sh --build                      # also (re)build the plugin first
+#   ./install.sh --build --deploy-jellyfin-dlls
+#                                               # build + deploy patched Jellyfin DLLs
 #   ./install.sh --jellyfin-data /custom/dir  # override data dir
 #   ./install.sh --jellyfin-user myuser       # override service user
 #   ./install.sh --no-restart                 # skip the systemctl prompt
@@ -52,6 +54,7 @@ JELLYFIN_DATA=""
 JELLYFIN_USER=""
 NO_RESTART=0
 DO_BUILD=0
+DEPLOY_JELLYFIN_DLLS=0
 DO_GOSTREAM=1
 GOSTREAM_IMAGE="docker.io/mrrobotogit/gostream:testing"
 GOSTREAM_TARBALL="/tmp/gostream-testing.tar"
@@ -62,11 +65,16 @@ while [ $# -gt 0 ]; do
     --jellyfin-user)  JELLYFIN_USER="$2"; shift 2 ;;
     --no-restart)     NO_RESTART=1; shift ;;
     --build)          DO_BUILD=1; shift ;;
+    --deploy-jellyfin-dlls) DEPLOY_JELLYFIN_DLLS=1; shift ;;
     --no-gostream)    DO_GOSTREAM=0; shift ;;
     -h|--help)        usage ;;
     *) die "Unknown option: $1 (try --help)" ;;
   esac
 done
+
+if [ "$DEPLOY_JELLYFIN_DLLS" -eq 1 ] && [ "$DO_BUILD" -ne 1 ]; then
+  die "--deploy-jellyfin-dlls requires --build so patched DLLs are rebuilt + version-checked first"
+fi
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
@@ -371,6 +379,30 @@ if [ "$DO_BUILD" -eq 1 ]; then
       echo "    strings $jf_install_dir/Jellyfin.LiveTv.dll | grep -q RefreshChannelItemAsync && echo OK_LIVETV_PATCHED"
       echo "    sudo systemctl start jellyfin"
       echo
+
+      if [ "$DEPLOY_JELLYFIN_DLLS" -eq 1 ]; then
+        bold "  Deploying patched Jellyfin DLLs now (--deploy-jellyfin-dlls)..."
+        if systemctl is-active --quiet jellyfin 2>/dev/null; then
+          die "jellyfin.service is active; stop it before deploying patched DLLs"
+        fi
+        if ! $SUDO test -f "$jf_install_dir/MediaBrowser.Controller.dll.pre-phantom-bak"; then
+          $SUDO cp -p "$jf_install_dir/MediaBrowser.Controller.dll" "$jf_install_dir/MediaBrowser.Controller.dll.pre-phantom-bak"
+        fi
+        if ! $SUDO test -f "$jf_install_dir/Jellyfin.LiveTv.dll.pre-phantom-bak"; then
+          $SUDO cp -p "$jf_install_dir/Jellyfin.LiveTv.dll" "$jf_install_dir/Jellyfin.LiveTv.dll.pre-phantom-bak"
+        fi
+        $SUDO install -m 644 "$jf_controller_dll" "$jf_install_dir/"
+        $SUDO install -m 644 "$jf_livetv_dll" "$jf_install_dir/"
+        strings "$jf_install_dir/MediaBrowser.Controller.dll" | grep -q "Version=$installed_version" \
+          || die "deployed MediaBrowser.Controller.dll does not reference Version=$installed_version"
+        strings "$jf_install_dir/MediaBrowser.Controller.dll" | grep -q IChannelItemRefreshManager \
+          || die "deployed MediaBrowser.Controller.dll lacks IChannelItemRefreshManager"
+        strings "$jf_install_dir/Jellyfin.LiveTv.dll" | grep -q RefreshChannelItemAsync \
+          || die "deployed Jellyfin.LiveTv.dll lacks RefreshChannelItemAsync"
+        green "  patched Jellyfin DLLs deployed + verified in $jf_install_dir"
+        echo
+      fi
+
       yellow "  NOTE: a 'pacman -Syu' / 'apt upgrade' / etc. of the jellyfin-server"
       yellow "        package will silently overwrite these DLLs and the plugin"
       yellow "        will fail to load on the next jellyfin restart. To detect:"
