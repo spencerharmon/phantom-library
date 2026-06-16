@@ -138,6 +138,28 @@ echo "  Plugin dest:        $PLUGINS_DIR"
 echo "  Phantom stub root:  $PHANTOM_STUB_ROOT"
 echo
 
+# ---------------------------------------------------------------- jellyfin version helpers
+installed_jellyfin_version() {
+  if command -v jellyfin >/dev/null 2>&1; then
+    jellyfin --version 2>/dev/null | awk '{print $2; exit}'
+    return 0
+  fi
+
+  for common in /usr/lib/jellyfin/MediaBrowser.Common.dll /usr/share/jellyfin/bin/MediaBrowser.Common.dll /opt/jellyfin/MediaBrowser.Common.dll; do
+    if [ -f "$common" ]; then
+      strings "$common" 2>/dev/null | grep -oE '10\.11\.[0-9]+\.0' | head -1
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+version_to_tag() {
+  # 10.11.9.0 -> v10.11.9
+  printf 'v%s\n' "${1%.0}"
+}
+
 # ---------------------------------------------------------------- build (opt-in)
 if [ "$DO_BUILD" -eq 1 ]; then
   if ! command -v dotnet >/dev/null 2>&1; then
@@ -145,13 +167,27 @@ if [ "$DO_BUILD" -eq 1 ]; then
   fi
 
   # Apply Jellyfin source-tree patches BEFORE building the plugin. The
-  # plugin will start depending on patched APIs (IChannelItemRefreshManager)
-  # in Phase 2+; apply them now so plugin builds don't regress later.
+  # plugin depends on patched APIs (IChannelItemRefreshManager). The
+  # source tag MUST match the installed Jellyfin runtime exactly; copying
+  # 10.11.11-built DLLs into a 10.11.9 runtime crashes at startup with
+  # assembly-load failures (MediaBrowser.Common version mismatch).
   patches_dir="$REPO_ROOT/scripts/jellyfin-patches"
   if [ -d "$patches_dir" ] && ls "$patches_dir"/*.patch >/dev/null 2>&1; then
     if [ ! -d "$REPO_ROOT/jellyfin/.git" ]; then
       die "jellyfin/ source clone missing or not a git checkout; cannot apply patches"
     fi
+
+    installed_version="$(installed_jellyfin_version || true)"
+    if [ -z "$installed_version" ]; then
+      die "Could not detect installed Jellyfin version. Refusing to build patched DLLs without exact runtime-version match."
+    fi
+    installed_tag="$(version_to_tag "$installed_version")"
+    source_tag="$(git -C "$REPO_ROOT/jellyfin" describe --tags --match 'v10.11*' --abbrev=0 2>/dev/null || true)"
+    if [ "$source_tag" != "$installed_tag" ]; then
+      die "Installed Jellyfin is $installed_version ($installed_tag), but jellyfin/ nearest 10.11 tag is ${source_tag:-unknown}. Reset source before building: git -C jellyfin reset --hard $installed_tag && git -C jellyfin clean -fd"
+    fi
+    green "  Jellyfin runtime/source version match: $installed_version ($installed_tag)"
+
     bold "Applying Jellyfin patches from scripts/jellyfin-patches/..."
     (
       cd "$REPO_ROOT/jellyfin"
@@ -198,6 +234,16 @@ if [ "$DO_BUILD" -eq 1 ]; then
     die "jellyfin/Jellyfin.Server/Jellyfin.Server.csproj missing; expected a v10.11.9 clone at $REPO_ROOT/jellyfin (base commit $(cat "$REPO_ROOT/scripts/jellyfin-patches/REBASE.md" 2>/dev/null | grep -oE '[0-9a-f]{10,}' | head -1 || echo e83a7e62f2))"
   fi
   dotnet build -c Release "$jf_server_csproj"
+
+  jf_controller_dll="$REPO_ROOT/jellyfin/MediaBrowser.Controller/bin/Release/net9.0/MediaBrowser.Controller.dll"
+  jf_livetv_dll="$REPO_ROOT/jellyfin/src/Jellyfin.LiveTv/bin/Release/net9.0/Jellyfin.LiveTv.dll"
+  if ! strings "$jf_controller_dll" | grep -q "Version=$installed_version"; then
+    die "Patched MediaBrowser.Controller.dll does not reference installed Jellyfin assembly version $installed_version. Refusing to deploy."
+  fi
+  if strings "$jf_controller_dll" | grep -q 'Version=10\.11\.11\.0' && [ "$installed_version" != "10.11.11.0" ]; then
+    die "Patched MediaBrowser.Controller.dll contains 10.11.11 refs but installed Jellyfin is $installed_version. Refusing to deploy."
+  fi
+  green "  patched Jellyfin DLLs match runtime assembly version $installed_version"
   echo
 else
   yellow "Skipping build (pass --build to rebuild). Using existing artefacts."
@@ -305,12 +351,15 @@ if [ "$DO_BUILD" -eq 1 ]; then
       echo
       bold "  Operator deploy procedure (run BEFORE restarting jellyfin):"
       echo "    sudo systemctl stop jellyfin"
-      echo "    sudo cp -p $jf_install_dir/MediaBrowser.Controller.dll \\"
+      echo "    test -f $jf_install_dir/MediaBrowser.Controller.dll.pre-phantom-bak || sudo cp -p $jf_install_dir/MediaBrowser.Controller.dll \\"
       echo "            $jf_install_dir/MediaBrowser.Controller.dll.pre-phantom-bak"
-      echo "    sudo cp -p $jf_install_dir/Jellyfin.LiveTv.dll \\"
+      echo "    test -f $jf_install_dir/Jellyfin.LiveTv.dll.pre-phantom-bak || sudo cp -p $jf_install_dir/Jellyfin.LiveTv.dll \\"
       echo "            $jf_install_dir/Jellyfin.LiveTv.dll.pre-phantom-bak"
       echo "    sudo install -m 644 $jf_controller_dll $jf_install_dir/"
       echo "    sudo install -m 644 $jf_livetv_dll $jf_install_dir/"
+      echo "    strings $jf_install_dir/MediaBrowser.Controller.dll | grep -q 'Version=$installed_version' && echo OK_VERSION_MATCH"
+      echo "    strings $jf_install_dir/MediaBrowser.Controller.dll | grep -q IChannelItemRefreshManager && echo OK_CONTROLLER_PATCHED"
+      echo "    strings $jf_install_dir/Jellyfin.LiveTv.dll | grep -q RefreshChannelItemAsync && echo OK_LIVETV_PATCHED"
       echo "    sudo systemctl start jellyfin"
       echo
       yellow "  NOTE: a 'pacman -Syu' / 'apt upgrade' / etc. of the jellyfin-server"
@@ -319,8 +368,10 @@ if [ "$DO_BUILD" -eq 1 ]; then
       echo   "          md5sum $jf_install_dir/MediaBrowser.Controller.dll \\"
       echo   "                 $jf_install_dir/Jellyfin.LiveTv.dll"
       yellow "        Compare against the md5 of the .pre-phantom-bak files. If"
-      yellow "        they match the .pre-phantom-bak, the patch was clobbered;"
+      yellow "        the live DLLs match the .pre-phantom-bak, the patch was clobbered;"
       yellow "        re-run ./install.sh --build then redo this deploy block."
+      yellow "        Backup commands use test -f guards so original .pre-phantom-bak"
+      yellow "        files are not overwritten by a bad patched build."
     else
       yellow "  Could not auto-detect a Jellyfin install dir with the unpatched DLLs."
       yellow "  Deploy these two DLLs to your Jellyfin install dir (the one containing"
