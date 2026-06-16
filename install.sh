@@ -140,15 +140,24 @@ echo
 
 # ---------------------------------------------------------------- jellyfin version helpers
 installed_jellyfin_version() {
+  local version=""
+
   if command -v jellyfin >/dev/null 2>&1; then
-    jellyfin --version 2>/dev/null | awk '{print $2; exit}'
-    return 0
+    # Some distro wrappers print --version to stderr, not stdout.
+    version="$(jellyfin --version 2>&1 | awk '{print $2; exit}' || true)"
+    if [ -n "$version" ]; then
+      printf '%s\n' "$version"
+      return 0
+    fi
   fi
 
   for common in /usr/lib/jellyfin/MediaBrowser.Common.dll /usr/share/jellyfin/bin/MediaBrowser.Common.dll /opt/jellyfin/MediaBrowser.Common.dll; do
     if [ -f "$common" ]; then
-      strings "$common" 2>/dev/null | grep -oE '10\.11\.[0-9]+\.0' | head -1
-      return 0
+      version="$(strings "$common" 2>/dev/null | grep -oE '10\.11\.[0-9]+\.0' | head -1 || true)"
+      if [ -n "$version" ]; then
+        printf '%s\n' "$version"
+        return 0
+      fi
     fi
   done
 
