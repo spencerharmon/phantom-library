@@ -1,18 +1,22 @@
 # Rebasing the Jellyfin patches
 
-The patches in this directory apply against a specific commit of
-`jellyfin/jellyfin` on the `release-10.11.z` branch (current base SHA:
-`1fbd873929`, "Bump version to 10.11.11"). When that source tree
-drifts (you pulled upstream, or the operator's clone diverged),
-`install.sh --build` aborts with a "does not apply cleanly" error.
+The patches in this directory apply against the exact Jellyfin version
+installed on the operator box: tag `v10.11.9` (base SHA `e83a7e62f2`,
+"Bump version to 10.11.9"). When that source tree drifts (you pulled
+upstream, or the operator's clone diverged), `install.sh --build`
+aborts with a "does not apply cleanly" error.
 
-**Why release-10.11.z** rather than master: the operator's Jellyfin
-runs on net9.0 (10.11.x line). Master targets net10.0. The patched
-`MediaBrowser.Controller.dll` must match the operator's runtime TFM
-so the plugin's `IChannelItemRefreshManager` reference resolves. If
-the operator ever upgrades to a master-based build, rebase the
-patches against the corresponding master SHA and bump the plugin
-csproj's TargetFramework to match.
+**Why v10.11.9 exactly** rather than release-10.11.z head or master:
+the operator's Jellyfin runtime is 10.11.9 on net9.0. A patch built
+from release-10.11.z head (currently 10.11.11) compiles but crashes at
+startup when copied into the 10.11.9 runtime because its assemblies
+reference `MediaBrowser.Common, Version=10.11.11.0`. Master targets
+net10.0 and is an even larger runtime mismatch. The patched
+`MediaBrowser.Controller.dll` and `Jellyfin.LiveTv.dll` must match the
+operator's installed runtime assembly version (`10.11.9.0`) so the
+plugin's `IChannelItemRefreshManager` reference resolves without
+assembly-load failure. If the operator upgrades Jellyfin, rebase the
+patches against the exact installed tag and rebuild all patched DLLs.
 
 Local SDK note: this project's `jellyfin/global.json` requires SDK
 9.0.0 with `rollForward: latestMinor`. If your machine only has the
@@ -35,7 +39,7 @@ To rebase:
    that nothing local matters first.
 
    ```bash
-   git -C jellyfin reset --hard origin/release-10.11.z
+   git -C jellyfin reset --hard v10.11.9
    git -C jellyfin clean -fd
    ```
 

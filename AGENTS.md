@@ -305,8 +305,8 @@ migration itself.
 This plugin depends on patches applied to Jellyfin core, stored at
 `scripts/jellyfin-patches/`. `install.sh --build` applies them at
 build time (idempotently — second run reports `already applied`)
-against the `jellyfin/` source clone at release-10.11.z (base SHA
-`1fbd873929`). The patches add `IChannelItemRefresh` (an opt-in
+against the `jellyfin/` source clone at exact tag v10.11.9 (base SHA
+`e83a7e62f2`). The patches add `IChannelItemRefresh` (an opt-in
 channel-side interface) and `IChannelItemRefreshManager` (a new
 service sibling to `IChannelManager`) — both purely additive. No
 existing API is modified.

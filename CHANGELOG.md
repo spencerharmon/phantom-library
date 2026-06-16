@@ -99,7 +99,7 @@ database safety").
   `IChannelItemRefreshManager` service (both purely additive to
   Jellyfin core; see `scripts/jellyfin-patches/`).
 - **`scripts/jellyfin-patches/`** — three additive patches against
-  Jellyfin release-10.11.z (base SHA `1fbd873929`):
+  Jellyfin exact tag v10.11.9 (base SHA `e83a7e62f2`):
   `0001-Add-IChannelItemRefresh-opt-in-interface...`,
   `0002-Add-IChannelItemRefreshManager-service...`,
   `0003-Add-tests-for-ChannelManager-per-item-refresh...`.

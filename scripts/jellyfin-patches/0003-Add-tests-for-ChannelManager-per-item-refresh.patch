@@ -1,22 +1,8 @@
-From 25817bdedfa4b4a48249ea04634b0abffde191a6 Mon Sep 17 00:00:00 2001
+From 72b460305358a6de6ffa5848b8dcb96166a77093 Mon Sep 17 00:00:00 2001
 From: spencer <the.spencer.harmon@gmail.com>
-Date: Mon, 15 Jun 2026 00:00:27 -0500
+Date: Tue, 16 Jun 2026 16:41:49 -0500
 Subject: [PATCH 3/3] Add tests for ChannelManager per-item refresh
 
-Covers dispatch logic for IChannelItemRefreshManager.RefreshChannelItemAsync:
-
-  - Argument validation (null + empty external id reject).
-  - Nonexistent channel throws InvalidOperationException.
-  - Targeted IChannelItemRefresh lookup is preferred over paging.
-  - Paging fallback when channel does not implement IChannelItemRefresh.
-  - Item-removed-from-channel logs and returns without invalidating cache.
-  - Cache invalidation fires when info found AND flag set.
-  - All-flags-false performs lookup only.
-
-The full BaseItem persistence path (item.UpdateToRepositoryAsync,
-SaveMediaSources, QueueRefresh with EnableRemoteContentProbe=true)
-depends on statically-wired BaseItem services and is exercised by
-plugin-side integration scenarios rather than this unit harness.
 ---
  .../Channels/ChannelManagerRefreshTests.cs    | 301 ++++++++++++++++++
  1 file changed, 301 insertions(+)

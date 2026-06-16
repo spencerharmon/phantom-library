@@ -195,7 +195,7 @@ if [ "$DO_BUILD" -eq 1 ]; then
   bold "Building patched Jellyfin assemblies (Release)..."
   jf_server_csproj="$REPO_ROOT/jellyfin/Jellyfin.Server/Jellyfin.Server.csproj"
   if [ ! -f "$jf_server_csproj" ]; then
-    die "jellyfin/Jellyfin.Server/Jellyfin.Server.csproj missing; expected a release-10.11.z clone at $REPO_ROOT/jellyfin (base commit $(cat "$REPO_ROOT/scripts/jellyfin-patches/REBASE.md" 2>/dev/null | grep -oE '[0-9a-f]{10,}' | head -1 || echo 1fbd873929))"
+    die "jellyfin/Jellyfin.Server/Jellyfin.Server.csproj missing; expected a v10.11.9 clone at $REPO_ROOT/jellyfin (base commit $(cat "$REPO_ROOT/scripts/jellyfin-patches/REBASE.md" 2>/dev/null | grep -oE '[0-9a-f]{10,}' | head -1 || echo e83a7e62f2))"
   fi
   dotnet build -c Release "$jf_server_csproj"
   echo

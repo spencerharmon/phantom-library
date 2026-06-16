@@ -1,37 +1,9 @@
-From e2be75ce47fb8b2d1582c83d8ce052f5c897d050 Mon Sep 17 00:00:00 2001
+From 2ad913abe9833589949966252dfc239ac2328962 Mon Sep 17 00:00:00 2001
 From: spencer <the.spencer.harmon@gmail.com>
-Date: Mon, 15 Jun 2026 00:00:27 -0500
+Date: Tue, 16 Jun 2026 16:41:49 -0500
 Subject: [PATCH 2/3] Add IChannelItemRefreshManager service for per-item
  channel refresh
 
-Adds IChannelItemRefreshManager (sibling interface to IChannelManager;
-NOT a member of it, preserving binary compatibility for existing
-plugin consumers of IChannelManager) and its single implementation on
-ChannelManager.
-
-RefreshChannelItemAsync resolves a fresh ChannelItemInfo for a given
-(channelId, externalId) tuple via the channel's optional
-IChannelItemRefresh capability (falling back to paging GetChannelItems
-if not implemented), then applies any combination of:
-
-  - ForceUpdate: persists path/MediaSources/etc. against the same
-    BaseItem.Id even when the item already exists.
-  - ForceProbe: triggers a full metadata refresh with
-    EnableRemoteContentProbe = true so stream/codec info is
-    re-detected for items whose backing media changed.
-  - InvalidateMediaInfoCache: drops the GetDynamicMediaSources cache
-    entry keyed on the external id so the next playback request
-    re-queries the channel.
-
-Implementation factors the existing GetChannelItemEntityAsync body
-into an inner overload accepting forceUpdateParam + forceProbe flags;
-the legacy call site retains its previous behaviour via a thin
-wrapper that defaults both flags to false.
-
-DI registration uses the two-forwarder pattern off a self-type
-ChannelManager registration so IChannelManager and
-IChannelItemRefreshManager resolve to the same singleton without a
-cast that would break under decoration.
 ---
  .../Channels/IChannelItemRefreshManager.cs    |  76 +++++++++++++
  .../Channels/ChannelManager.cs                | 102 ++++++++++++++++--

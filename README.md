@@ -14,7 +14,7 @@ Mascot: *Stygiomedusa gigantea*, the giant phantom jelly.
 > `IChannelItemRefreshManager`). Patches live at
 > `scripts/jellyfin-patches/` and are applied automatically by
 > `./install.sh --build` against a `jellyfin/` source clone at
-> release-10.11.z (base SHA `1fbd873929`). The patches are purely
+> exact Jellyfin tag v10.11.9 (base SHA `e83a7e62f2`). The patches are purely
 > additive (no API mutation). After build, you must deploy two
 > patched DLLs (`MediaBrowser.Controller.dll`, `Jellyfin.LiveTv.dll`)
 > into your runtime Jellyfin install dir; `install.sh --build`
