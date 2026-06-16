@@ -145,16 +145,37 @@ check_sqlite_header "$JELLYFIN_DB"
 check_sqlite_header "$PHANTOM_DB"
 info "  sqlite header: ok"
 
-# Read-only sqlite URI helper for jellyfin.db pre-flight reads.
-JF_RO_URI="file:${JELLYFIN_DB}?mode=ro"
+# SQLite read helper for jellyfin.db pre-flight reads. Use a plain path,
+# not a URI, because the operator host's sqlite3 may not support URI
+# filenames or table-valued PRAGMA functions consistently.
+JF_RO_URI="$JELLYFIN_DB"
+
+sqlite_col_type() {
+    local db="$1" table="$2" col="$3"
+    sqlite3 "$db" "PRAGMA table_info('$table');" 2>/dev/null \
+        | awk -F'|' -v c="$col" '$2 == c { print $3; exit }'
+}
+
+sqlite_cols_csv() {
+    local db="$1" table="$2"
+    sqlite3 "$db" "PRAGMA table_info('$table');" 2>/dev/null \
+        | awk -F'|' '{ print $2 }' \
+        | paste -sd, -
+}
+
+sqlite_has_col() {
+    local db="$1" table="$2" col="$3"
+    sqlite3 "$db" "PRAGMA table_info('$table');" 2>/dev/null \
+        | awk -F'|' -v c="$col" '$2 == c { print 1; exit }'
+}
 
 # 4. Schema probe: BaseItems.Id must be TEXT, BaseItemProviders must
 #    have (ItemId, ProviderId, ProviderValue).
-ID_TYPE="$(sqlite3 "$JF_RO_URI" "SELECT type FROM pragma_table_info('BaseItems') WHERE name='Id';" 2>/dev/null || true)"
+ID_TYPE="$(sqlite_col_type "$JF_RO_URI" "BaseItems" "Id")"
 [[ "$ID_TYPE" == "TEXT" ]] \
     || die "BaseItems.Id type is '$ID_TYPE', expected TEXT. Schema mismatch - refusing to continue."
 
-BIP_COLS="$(sqlite3 "$JF_RO_URI" "SELECT group_concat(name,',') FROM pragma_table_info('BaseItemProviders') ORDER BY cid;" 2>/dev/null || true)"
+BIP_COLS="$(sqlite_cols_csv "$JF_RO_URI" "BaseItemProviders")"
 case ",$BIP_COLS," in
     *,ItemId,*) : ;;
     *) die "BaseItemProviders table missing or lacks ItemId column (got: $BIP_COLS)" ;;
@@ -193,7 +214,7 @@ done
 # if they exist AND have an ItemId column.
 declare -a EXTRA_TABLES=()
 for t in MediaSegments TrickplayInfos; do
-    has_col="$(sqlite3 "$JF_RO_URI" "SELECT 1 FROM pragma_table_info('$t') WHERE name='ItemId' LIMIT 1;" 2>/dev/null || true)"
+    has_col="$(sqlite_has_col "$JF_RO_URI" "$t" "ItemId")"
     if [[ "$has_col" == "1" ]]; then
         EXTRA_TABLES+=("$t:ItemId")
     fi
