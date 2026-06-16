@@ -15,9 +15,9 @@
 #
 # Usage:
 #   ./install.sh                              # install pre-built DLL + load gostream image
-#   ./install.sh --build                      # also (re)build the plugin first
-#   ./install.sh --build --deploy-jellyfin-dlls
-#                                               # build + deploy patched Jellyfin DLLs
+#   ./install.sh --build                      # rebuild plugin + deploy patched Jellyfin DLLs
+#   ./install.sh --build --no-deploy-jellyfin-dlls
+#                                               # rebuild only; print deploy commands
 #   ./install.sh --jellyfin-data /custom/dir  # override data dir
 #   ./install.sh --jellyfin-user myuser       # override service user
 #   ./install.sh --no-restart                 # skip the systemctl prompt
@@ -54,7 +54,7 @@ JELLYFIN_DATA=""
 JELLYFIN_USER=""
 NO_RESTART=0
 DO_BUILD=0
-DEPLOY_JELLYFIN_DLLS=0
+DEPLOY_JELLYFIN_DLLS=1
 DO_GOSTREAM=1
 GOSTREAM_IMAGE="docker.io/mrrobotogit/gostream:testing"
 GOSTREAM_TARBALL="/tmp/gostream-testing.tar"
@@ -65,15 +65,19 @@ while [ $# -gt 0 ]; do
     --jellyfin-user)  JELLYFIN_USER="$2"; shift 2 ;;
     --no-restart)     NO_RESTART=1; shift ;;
     --build)          DO_BUILD=1; shift ;;
-    --deploy-jellyfin-dlls) DEPLOY_JELLYFIN_DLLS=1; shift ;;
+    --deploy-jellyfin-dlls) DEPLOY_JELLYFIN_DLLS=1; shift ;; # legacy no-op; deploy is default with --build
+    --no-deploy-jellyfin-dlls) DEPLOY_JELLYFIN_DLLS=0; shift ;;
     --no-gostream)    DO_GOSTREAM=0; shift ;;
     -h|--help)        usage ;;
     *) die "Unknown option: $1 (try --help)" ;;
   esac
 done
 
-if [ "$DEPLOY_JELLYFIN_DLLS" -eq 1 ] && [ "$DO_BUILD" -ne 1 ]; then
-  die "--deploy-jellyfin-dlls requires --build so patched DLLs are rebuilt + version-checked first"
+# Deploying patched Jellyfin DLLs only makes sense in the --build path,
+# where the artifacts are freshly rebuilt and version-checked. Plain
+# ./install.sh installs the already-built plugin DLL only.
+if [ "$DO_BUILD" -ne 1 ]; then
+  DEPLOY_JELLYFIN_DLLS=0
 fi
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -161,7 +165,7 @@ installed_jellyfin_version() {
 
   for common in /usr/lib/jellyfin/MediaBrowser.Common.dll /usr/share/jellyfin/bin/MediaBrowser.Common.dll /opt/jellyfin/MediaBrowser.Common.dll; do
     if [ -f "$common" ]; then
-      version="$(strings "$common" 2>/dev/null | grep -oE '10\.11\.[0-9]+\.0' | head -1 || true)"
+      version="$(grep -a -m1 -oE '10\.11\.[0-9]+\.0' "$common" 2>/dev/null || true)"
       if [ -n "$version" ]; then
         printf '%s\n' "$version"
         return 0
@@ -254,10 +258,10 @@ if [ "$DO_BUILD" -eq 1 ]; then
 
   jf_controller_dll="$REPO_ROOT/jellyfin/MediaBrowser.Controller/bin/Release/net9.0/MediaBrowser.Controller.dll"
   jf_livetv_dll="$REPO_ROOT/jellyfin/src/Jellyfin.LiveTv/bin/Release/net9.0/Jellyfin.LiveTv.dll"
-  if ! strings "$jf_controller_dll" | grep -q "Version=$installed_version"; then
+  if ! grep -a -q "Version=$installed_version" "$jf_controller_dll"; then
     die "Patched MediaBrowser.Controller.dll does not reference installed Jellyfin assembly version $installed_version. Refusing to deploy."
   fi
-  if strings "$jf_controller_dll" | grep -q 'Version=10\.11\.11\.0' && [ "$installed_version" != "10.11.11.0" ]; then
+  if grep -a -q 'Version=10\.11\.11\.0' "$jf_controller_dll" && [ "$installed_version" != "10.11.11.0" ]; then
     die "Patched MediaBrowser.Controller.dll contains 10.11.11 refs but installed Jellyfin is $installed_version. Refusing to deploy."
   fi
   green "  patched Jellyfin DLLs match runtime assembly version $installed_version"
@@ -374,9 +378,9 @@ if [ "$DO_BUILD" -eq 1 ]; then
       echo "            $jf_install_dir/Jellyfin.LiveTv.dll.pre-phantom-bak"
       echo "    sudo install -m 644 $jf_controller_dll $jf_install_dir/"
       echo "    sudo install -m 644 $jf_livetv_dll $jf_install_dir/"
-      echo "    strings $jf_install_dir/MediaBrowser.Controller.dll | grep -q 'Version=$installed_version' && echo OK_VERSION_MATCH"
-      echo "    strings $jf_install_dir/MediaBrowser.Controller.dll | grep -q IChannelItemRefreshManager && echo OK_CONTROLLER_PATCHED"
-      echo "    strings $jf_install_dir/Jellyfin.LiveTv.dll | grep -q RefreshChannelItemAsync && echo OK_LIVETV_PATCHED"
+      echo "    grep -a -q 'Version=$installed_version' $jf_install_dir/MediaBrowser.Controller.dll && echo OK_VERSION_MATCH"
+      echo "    grep -a -q IChannelItemRefreshManager $jf_install_dir/MediaBrowser.Controller.dll && echo OK_CONTROLLER_PATCHED"
+      echo "    grep -a -q RefreshChannelItemAsync $jf_install_dir/Jellyfin.LiveTv.dll && echo OK_LIVETV_PATCHED"
       echo "    sudo systemctl start jellyfin"
       echo
 
@@ -393,11 +397,11 @@ if [ "$DO_BUILD" -eq 1 ]; then
         fi
         $SUDO install -m 644 "$jf_controller_dll" "$jf_install_dir/"
         $SUDO install -m 644 "$jf_livetv_dll" "$jf_install_dir/"
-        strings "$jf_install_dir/MediaBrowser.Controller.dll" | grep -q "Version=$installed_version" \
+        grep -a -q "Version=$installed_version" "$jf_install_dir/MediaBrowser.Controller.dll" \
           || die "deployed MediaBrowser.Controller.dll does not reference Version=$installed_version"
-        strings "$jf_install_dir/MediaBrowser.Controller.dll" | grep -q IChannelItemRefreshManager \
+        grep -a -q IChannelItemRefreshManager "$jf_install_dir/MediaBrowser.Controller.dll" \
           || die "deployed MediaBrowser.Controller.dll lacks IChannelItemRefreshManager"
-        strings "$jf_install_dir/Jellyfin.LiveTv.dll" | grep -q RefreshChannelItemAsync \
+        grep -a -q RefreshChannelItemAsync "$jf_install_dir/Jellyfin.LiveTv.dll" \
           || die "deployed Jellyfin.LiveTv.dll lacks RefreshChannelItemAsync"
         green "  patched Jellyfin DLLs deployed + verified in $jf_install_dir"
         echo
