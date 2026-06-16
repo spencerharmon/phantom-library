@@ -72,7 +72,10 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         // signature, MagnetSelector + TmdbExternalIdResolver,
         // IChannelItemRefreshManager hand-off, in-flight sweeper).
         serviceCollection.AddSingleton<QualityScorer>();
+        serviceCollection.AddSingleton<MagnetSelector>();
+        serviceCollection.AddSingleton<TmdbExternalIdResolver>();
         serviceCollection.AddSingleton<IMaterialiser, Materialiser>();
+        serviceCollection.AddHostedService<MaterialiseInFlightSweeper>();
         serviceCollection.AddSingleton<MaterialisationQueue>();
         serviceCollection.AddSingleton<IMaterialisationQueue>(sp => sp.GetRequiredService<MaterialisationQueue>());
         serviceCollection.AddHostedService(sp => sp.GetRequiredService<MaterialisationQueue>());
