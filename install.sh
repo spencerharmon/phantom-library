@@ -140,6 +140,7 @@ fi
 
 PLUGINS_DIR="$JELLYFIN_DATA/plugins/${PLUGIN_DIR_NAME}"
 PHANTOM_STUB_ROOT="$JELLYFIN_DATA/phantom-library"
+PHANTOM_DB_PATH="$JELLYFIN_DATA/plugins/configurations/PhantomLibrary/phantom.db"
 
 bold "Phantom Library installer"
 echo "  Repo:               $REPO_ROOT"
@@ -148,7 +149,26 @@ echo "  Jellyfin data dir:  $JELLYFIN_DATA"
 echo "  Jellyfin user:grp:  $JELLYFIN_USER:$JELLYFIN_GROUP"
 echo "  Plugin dest:        $PLUGINS_DIR"
 echo "  Phantom stub root:  $PHANTOM_STUB_ROOT"
+echo "  Phantom DB:         $PHANTOM_DB_PATH"
 echo
+
+# Refuse to install over a pre-channel-arch phantom.db. The plugin will
+# HARD-REFUSE schema versions 1..8 at runtime; catching it here gives the
+# operator a clear action before restarting Jellyfin.
+if [ -f "$PHANTOM_DB_PATH" ] && command -v sqlite3 >/dev/null 2>&1; then
+  PHANTOM_SCHEMA="$($SUDO sqlite3 "$PHANTOM_DB_PATH" 'PRAGMA user_version;' 2>/dev/null || echo unknown)"
+  case "$PHANTOM_SCHEMA" in
+    ''|unknown)
+      yellow "Could not read phantom.db user_version at $PHANTOM_DB_PATH; runtime plugin will validate it."
+      ;;
+    0|9)
+      :
+      ;;
+    *)
+      die "phantom.db schema is v$PHANTOM_SCHEMA but Phantom Library $PLUGIN_VERSION requires v9. Stop Jellyfin and run: sudo bash scripts/phantom-wipe.sh --commit"
+      ;;
+  esac
+fi
 
 # ---------------------------------------------------------------- jellyfin version helpers
 installed_jellyfin_version() {
