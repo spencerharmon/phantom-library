@@ -321,7 +321,7 @@ $SUDO chown -R "$JELLYFIN_USER:$JELLYFIN_GROUP" "$PLUGINS_DIR"
 
 # Verify md5 to catch the "I copied the stale build" footgun.
 SRC_MD5="$(md5sum "$DLL_OUT" | awk '{print $1}')"
-DST_MD5="$(md5sum "$PLUGINS_DIR/${PLUGIN_NAME}.dll" | awk '{print $1}')"
+DST_MD5="$($SUDO md5sum "$PLUGINS_DIR/${PLUGIN_NAME}.dll" | awk '{print $1}')"
 if [ "$SRC_MD5" != "$DST_MD5" ]; then
   die "md5 mismatch after install: src=$SRC_MD5 dst=$DST_MD5. Aborting."
 fi
