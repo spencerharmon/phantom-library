@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loading UI while Phantom materialises, then start the real gostream
   file as soon as it is available.
 - Web badge overlays now poll visible Phantom/Materialising items and
-  update/remove themselves when materialisation completes.
+  update/remove themselves when materialisation completes. The detail-page
+  badge injection is idempotent to avoid a MutationObserver render loop.
 
 ### BREAKING — requires wipe + patched Jellyfin
 

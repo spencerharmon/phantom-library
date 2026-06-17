@@ -277,9 +277,20 @@
         }
     }
 
+    function detailBadgeMatches(strip, guid, state) {
+        if (strip.getAttribute(DETAIL_ATTR) !== guid) {
+            return false;
+        }
+
+        var badge = strip.querySelector(':scope > .phantom-badge--inline');
+        return !!badge && badge.getAttribute('data-phantom-state') === state;
+    }
+
     /* Place a single inline badge into the detail-page misc-info
      * strip for the given guid. Returns true on successful injection,
-     * false if the strip is not yet in the DOM. */
+     * false if the strip is not yet in the DOM. Idempotent by guid+state:
+     * the MutationObserver fires for our own badge insertion, so replacing
+     * an unchanged badge here creates an infinite render/mutation loop. */
     function placeDetailBadge(guid, state) {
         // Find a misc-info strip that is currently visible and tagged
         // for this guid (or untagged). Jellyfin keeps detail pages
@@ -294,6 +305,11 @@
                 || page.querySelector('.itemMiscInfo.itemMiscInfo-primary')
                 || page.querySelector('.itemMiscInfo');
             if (!strip) continue;
+
+            if (detailBadgeMatches(strip, guid, state)) {
+                found = true;
+                continue;
+            }
 
             // Wipe any prior badge on this strip (stale guid, stale state,
             // or Jellyfin re-render) before injecting.
@@ -482,12 +498,20 @@
     function pollWatched() {
         pollTimer = null;
         var now = Date.now();
+        var currentDetail = currentDetailItemId();
         var ids = Object.keys(watched).filter(function (guid) {
             if (now - watched[guid] > POLL_MAX_MS) {
                 delete watched[guid];
                 return false;
             }
-            return visibleElementsForGuid(guid).length > 0 || currentDetailItemId() === guid;
+            if (visibleElementsForGuid(guid).length > 0 || currentDetail === guid) {
+                return true;
+            }
+
+            // No visible owner remains. Drop watch; MutationObserver/process()
+            // will re-add if card/detail becomes visible again.
+            delete watched[guid];
+            return false;
         });
         if (ids.length === 0) return;
 
@@ -524,10 +548,18 @@
             for (var i = 0; i < mutations.length; i++) {
                 var m = mutations[i];
                 if (m.type === 'childList') {
-                    sawSubtreeChange = true;
                     var added = m.addedNodes;
+                    var relevant = false;
                     for (var j = 0; j < added.length; j++) {
+                        if (added[j].nodeType !== 1) continue;
+                        if (added[j].classList && added[j].classList.contains('phantom-badge')) {
+                            continue;
+                        }
+                        relevant = true;
                         collectCandidates(added[j], batch);
+                    }
+                    if (relevant) {
+                        sawSubtreeChange = true;
                     }
                 } else if (m.type === 'attributes' && m.attributeName === 'data-id') {
                     // data-id rewritten on an existing card (Jellyfin
