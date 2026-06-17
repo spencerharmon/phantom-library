@@ -370,7 +370,7 @@ public class MaterialiserTests : IDisposable
     }
 
     [Fact]
-    public async Task LegacyGuidWrapper_RoutesMovieExternalIdToTuplePath()
+    public async Task LegacyGuidWrapper_RoutesMovieExternalIdToTuplePath_EvenWhenRuntimeChannelIdDoesNotRoundTrip()
     {
         using var db = await NewDbAsync();
         await SeedMovieMetadataAsync(db, 42);
@@ -386,7 +386,7 @@ public class MaterialiserTests : IDisposable
         {
             Name = "x",
             ExternalId = "movie_42",
-            ChannelId = ChannelIds.Movies,
+            ChannelId = Guid.NewGuid(),
         };
         var libMgr = new Mock<ILibraryManager>(MockBehavior.Loose);
         libMgr.Setup(l => l.GetItemById(jellyfinItemId)).Returns(item);

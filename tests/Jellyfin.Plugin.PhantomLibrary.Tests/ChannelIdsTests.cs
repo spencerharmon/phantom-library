@@ -58,37 +58,11 @@ public class ChannelIdsTests
     public void IsPhantom_EmptyGuid_False()
         => Assert.False(ChannelIds.IsPhantom(Guid.Empty));
 
-    /// <summary>
-    /// Regression test for the algorithm match against Jellyfin's
-    /// <c>LibraryManager.GetNewItemId</c>. Computed independently here
-    /// against the exact expected MD5 of the canonical concatenation:
-    /// type FullName + lowercased "channel phantom movies".
-    /// </summary>
     [Fact]
-    public void Movies_Id_MatchesExpectedMd5()
-    {
-        // ChannelManager calls GetInternalChannelId("Phantom Movies")
-        //   → LibraryManager.GetNewItemId("Channel Phantom Movies", typeof(Channel))
-        //   → lowercased: "channel phantom movies"
-        //   → prepended with "MediaBrowser.Controller.Channels.Channel"
-        //   → final string: "MediaBrowser.Controller.Channels.Channelchannel phantom movies"
-        //   → MD5 of UTF-16 encoded bytes → Guid
-        var input = "MediaBrowser.Controller.Channels.Channelchannel phantom movies";
-#pragma warning disable CA5351
-        var bytes = System.Security.Cryptography.MD5.HashData(System.Text.Encoding.Unicode.GetBytes(input));
-#pragma warning restore CA5351
-        var expected = new Guid(bytes);
-        Assert.Equal(expected, ChannelIds.Movies);
-    }
+    public void Movies_Id_MatchesJellyfinRuntimeChannelId()
+        => Assert.Equal(Guid.Parse("80089d10-394f-b545-b5e4-d7d56a872393"), ChannelIds.Movies);
 
     [Fact]
-    public void Shows_Id_MatchesExpectedMd5()
-    {
-        var input = "MediaBrowser.Controller.Channels.Channelchannel phantom shows";
-#pragma warning disable CA5351
-        var bytes = System.Security.Cryptography.MD5.HashData(System.Text.Encoding.Unicode.GetBytes(input));
-#pragma warning restore CA5351
-        var expected = new Guid(bytes);
-        Assert.Equal(expected, ChannelIds.Shows);
-    }
+    public void Shows_Id_MatchesJellyfinRuntimeChannelId()
+        => Assert.Equal(Guid.Parse("40ab6e9a-f516-a84f-46dc-ea7140855d88"), ChannelIds.Shows);
 }

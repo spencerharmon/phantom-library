@@ -50,8 +50,13 @@ if len(sources) != 1:
     raise SystemExit(f'{label}: expected exactly one MediaSource, got {len(sources)}')
 s=sources[0]
 print('  source=', {k:s.get(k) for k in ['Id','Path','Protocol','Container','SupportsDirectPlay','SupportsDirectStream','SupportsTranscoding']})
+import uuid
 if not s.get('Id'):
     raise SystemExit(f'{label}: expected non-empty MediaSource.Id')
+try:
+    uuid.UUID(s.get('Id'))
+except ValueError as e:
+    raise SystemExit(f'{label}: expected Guid-shaped MediaSource.Id, got {s.get("Id")!r}') from e
 path=s.get('Path') or ''
 if expect not in path:
     raise SystemExit(f'{label}: expected path containing {expect!r}, got {path!r}')

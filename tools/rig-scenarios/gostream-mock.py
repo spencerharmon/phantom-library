@@ -61,20 +61,38 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(405, {"error": "method not allowed"})
         log(f"OPTIONS {self.path} -> 405")
 
+    def _read_body(self) -> bytes:
+        if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+            chunks = []
+            while True:
+                line = self.rfile.readline().strip()
+                if not line:
+                    continue
+                size = int(line.split(b";", 1)[0], 16)
+                if size == 0:
+                    self.rfile.readline()
+                    break
+                chunks.append(self.rfile.read(size))
+                self.rfile.read(2)
+            return b"".join(chunks)
+
+        length = int(self.headers.get("Content-Length", "0"))
+        return self.rfile.read(length) if length else b""
+
     def do_POST(self):
         if self.path != "/api/library/add":
             self._send_json(404, {"error": "not found"})
             log(f"POST {self.path} -> 404")
             return
-        length = int(self.headers.get("Content-Length", "0"))
-        body = json.loads(self.rfile.read(length) or b"{}")
-        title = body.get("title") or body.get("Title") or "Unknown"
-        year = body.get("year") or body.get("Year")
+        body = json.loads(self._read_body() or b"{}")
+        lower = {str(k).lower(): v for k, v in body.items()}
+        title = lower.get("title") or "Unknown"
+        year = lower.get("year")
         try:
             year = int(year) if year is not None else None
         except (TypeError, ValueError):
             year = None
-        tmdb = body.get("tmdb") or body.get("Tmdb") or 0
+        tmdb = lower.get("tmdb") or 0
         digest = hashlib.sha1(json.dumps(body, sort_keys=True).encode("utf-8")).hexdigest()[:8]
         file_name = safe_name(title, year, digest)
         fuse = MEDIA / file_name
@@ -89,7 +107,7 @@ class Handler(BaseHTTPRequestHandler):
             "size": fuse.stat().st_size,
         }
         self._send_json(200, resp)
-        log(f"POST /api/library/add tmdb={tmdb} title={title!r} -> 200 {fuse}")
+        log(f"POST /api/library/add body={body!r} tmdb={tmdb} title={title!r} -> 200 {fuse}")
 
 
 def main() -> None:

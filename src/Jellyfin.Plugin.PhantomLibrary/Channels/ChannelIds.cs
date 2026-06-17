@@ -1,6 +1,4 @@
 using System;
-using System.Security.Cryptography;
-using System.Text;
 
 namespace Jellyfin.Plugin.PhantomLibrary.Channels;
 
@@ -37,17 +35,19 @@ public static class ChannelIds
     public const string MoviesName = "Phantom Movies";
     public const string ShowsName = "Phantom Shows";
 
-    private const string ChannelTypeFullName = "MediaBrowser.Controller.Channels.Channel";
+    /// <summary>
+    /// Internal Guid for the "Phantom Movies" channel as emitted by Jellyfin
+    /// 10.11.9's ChannelManager for <see cref="MoviesName"/>. Verified
+    /// against /Channels in the real rig and production.
+    /// </summary>
+    public static Guid Movies { get; } = Guid.Parse("80089d10-394f-b545-b5e4-d7d56a872393");
 
     /// <summary>
-    /// Internal Guid for the "Phantom Movies" channel.
+    /// Internal Guid for the "Phantom Shows" channel as emitted by Jellyfin
+    /// 10.11.9's ChannelManager for <see cref="ShowsName"/>. Verified
+    /// against /Channels in the real rig and production.
     /// </summary>
-    public static Guid Movies { get; } = ComputeChannelId(MoviesName);
-
-    /// <summary>
-    /// Internal Guid for the "Phantom Shows" channel.
-    /// </summary>
-    public static Guid Shows { get; } = ComputeChannelId(ShowsName);
+    public static Guid Shows { get; } = Guid.Parse("40ab6e9a-f516-a84f-46dc-ea7140855d88");
 
     /// <summary>
     /// Resolve a kind tag ("movies" or "shows") to its channel id.
@@ -69,19 +69,4 @@ public static class ChannelIds
     public static bool IsPhantom(Guid channelId)
         => channelId == Movies || channelId == Shows;
 
-    private static Guid ComputeChannelId(string channelName)
-    {
-        // ChannelManager.GetInternalChannelId(name)
-        //   → LibraryManager.GetNewItemId("Channel " + name, typeof(Channel))
-        //   → key.ToLowerInvariant() (when EnableCaseSensitiveItemIds=false)
-        //   → type.FullName + key
-        //   → MD5(Unicode bytes)
-#pragma warning disable CA1308 // ToLower is correct: matches Jellyfin's own algorithm exactly
-        var key = ChannelTypeFullName + ("Channel " + channelName).ToLowerInvariant();
-#pragma warning restore CA1308
-#pragma warning disable CA5351 // MD5 here is identity-hash, not cryptography
-        var bytes = MD5.HashData(Encoding.Unicode.GetBytes(key));
-#pragma warning restore CA5351
-        return new Guid(bytes);
-    }
 }

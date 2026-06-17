@@ -104,15 +104,22 @@ public sealed class Materialiser : IMaterialiser
             return MaterialisationOutcome.ErrorResult("Item is not a channel item");
         }
 
-        if (!ChannelIds.IsPhantom(item.ChannelId))
-        {
-            return MaterialisationOutcome.ErrorResult("Item is not in a phantom-library channel");
-        }
-
         if (!ChannelItemId.TryParse(item.ExternalId, out var parsed))
         {
             return MaterialisationOutcome.ErrorResult(
                 $"Unparseable channel external id: {item.ExternalId}");
+        }
+
+        // Jellyfin's channel item DTO/DB row can carry the correct Phantom
+        // ChannelId while ILibraryManager.GetItemById returns a BaseItem whose
+        // ChannelId does not round-trip reliably. SourceType=Channel plus our
+        // stable ExternalId is the authoritative materialise contract.
+        if (!ChannelIds.IsPhantom(item.ChannelId))
+        {
+            _logger.LogDebug(
+                "Materialise accepting channel item {ExternalId} with non-phantom runtime ChannelId={ChannelId}; ExternalId parsed as Phantom item",
+                item.ExternalId,
+                item.ChannelId);
         }
 
         return parsed.Kind switch
@@ -266,16 +273,30 @@ public sealed class Materialiser : IMaterialiser
             // probe runs against the FUSE path. If this throws we still
             // wrote materialised_state — next browse picks up the new
             // path even without an immediate refresh.
-            await _refreshManager.RefreshChannelItemAsync(
-                channelId,
-                externalId,
-                new ChannelItemRefreshOptions
-                {
-                    ForceUpdate = true,
-                    ForceProbe = true,
-                    InvalidateMediaInfoCache = true,
-                },
-                ct).ConfigureAwait(false);
+            try
+            {
+                await _refreshManager.RefreshChannelItemAsync(
+                    channelId,
+                    externalId,
+                    new ChannelItemRefreshOptions
+                    {
+                        ForceUpdate = true,
+                        ForceProbe = true,
+                        InvalidateMediaInfoCache = true,
+                    },
+                    ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception refreshEx)
+            {
+                _logger.LogWarning(
+                    refreshEx,
+                    "Post-flight RefreshChannelItem failed for {External}; channel will refresh on next browse",
+                    externalId);
+            }
 
             _state.BumpDataVersion(channelKind);
 

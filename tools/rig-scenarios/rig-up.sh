@@ -7,7 +7,9 @@ JF_DATA=/tmp/jf-test/data
 JF_CFG=/tmp/jf-test/config
 JF_CACHE=/tmp/jf-test/cache
 JF_LOG=/tmp/jf-test/log
-DLL=/home/spencer/git-repos/spencerharmon/phantom-library/src/Jellyfin.Plugin.PhantomLibrary/bin/Release/net9.0/Jellyfin.Plugin.PhantomLibrary.dll
+REPO=/home/spencer/git-repos/spencerharmon/phantom-library
+DLL=$REPO/src/Jellyfin.Plugin.PhantomLibrary/bin/Release/net9.0/Jellyfin.Plugin.PhantomLibrary.dll
+JF_DLL=$REPO/jellyfin/Jellyfin.Server/bin/Release/net9.0/jellyfin.dll
 PLUGIN_VERSION=0.3.0.0
 PLUGIN_DIR=$JF_DATA/plugins/Jellyfin.Plugin.PhantomLibrary_$PLUGIN_VERSION
 PHANTOM_ROOT=$JF_DATA/phantom-library
@@ -38,13 +40,14 @@ RESET=0
 
 # ---------------------------------------------------------------- pre-flight
 [ -f "$DLL" ] || { echo "DLL not built: $DLL" >&2; echo "Run: dotnet build -c Release" >&2; exit 1; }
+[ -f "$JF_DLL" ] || { echo "patched Jellyfin not built: $JF_DLL" >&2; echo "Run: dotnet build jellyfin/Jellyfin.Server/Jellyfin.Server.csproj -c Release" >&2; exit 1; }
 
 log "stopping any existing rig units"
 stop_units
 
 # ---------------------------------------------------------------- rig dirs
 mkdir -p $ROOT/{bin,scenarios,logs,fixtures/tmdb,state,gostream/movies,gostream/stubs}
-cp /home/spencer/git-repos/spencerharmon/phantom-library/tools/rig-scenarios/*.{py,sh} $ROOT/bin/ 2>/dev/null || true
+cp $REPO/tools/rig-scenarios/*.{py,sh} $ROOT/bin/ 2>/dev/null || true
 chmod +x $ROOT/bin/*.py $ROOT/bin/*.sh 2>/dev/null || true
 
 # ---------------------------------------------------------------- jellyfin rig (rebuild from prod)
@@ -60,26 +63,28 @@ if [ $RESET -eq 1 ] || [ ! -f "$JF_DATA/data/jellyfin.db" ]; then
   cp -r /var/lib/jellyfin/root/default/*      $JF_DATA/root/default/ 2>/dev/null || true
   rm -f $JF_DATA/plugins/configurations/PhantomLibrary/phantom.db
 
-  # Wipe all Phantom Virtual rows; we want deterministic from-scratch behaviour.
+  # Wipe all Phantom channel rows from the CLONED rig DB; we want deterministic
+  # from-scratch channel behaviour, not prod-cloned channel cache rows.
   sqlite3 $JF_DATA/data/jellyfin.db <<'SQL' || true
-DELETE FROM BaseItemProviders WHERE ItemId IN (
-  SELECT Id FROM BaseItems WHERE Path LIKE '%__phantom_tmdb%' OR (Path IS NULL OR Path='')
-);
-DELETE FROM BaseItemImageInfos WHERE ItemId IN (
-  SELECT Id FROM BaseItems WHERE Path LIKE '%__phantom_tmdb%' OR (Path IS NULL OR Path='')
-);
-DELETE FROM BaseItemMetadataFields WHERE ItemId IN (
-  SELECT Id FROM BaseItems WHERE Path LIKE '%__phantom_tmdb%' OR (Path IS NULL OR Path='')
-);
-DELETE FROM UserData WHERE ItemId IN (
-  SELECT Id FROM BaseItems WHERE Path LIKE '%__phantom_tmdb%' OR (Path IS NULL OR Path='')
-);
-DELETE FROM BaseItems
-WHERE Path LIKE '%__phantom_tmdb%'
+CREATE TEMP TABLE phantom_delete_ids AS
+SELECT Id FROM BaseItems
+WHERE upper(ChannelId) IN ('80089D10-394F-B545-B5E4-D7D56A872393','40AB6E9A-F516-A84F-46DC-EA7140855D88')
+   OR ExternalId LIKE 'movie_%'
+   OR ExternalId LIKE 'series_%'
+   OR ExternalId LIKE 'season_%'
+   OR ExternalId LIKE 'episode_%'
+   OR ExternalId LIKE 'orphan_%'
+   OR Path LIKE '%__phantom_tmdb%'
    OR (Type IN ('MediaBrowser.Controller.Entities.Movies.Movie',
                 'MediaBrowser.Controller.Entities.TV.Series',
                 'MediaBrowser.Controller.Entities.TV.Episode')
        AND (Path IS NULL OR Path=''));
+DELETE FROM BaseItemProviders WHERE ItemId IN (SELECT Id FROM phantom_delete_ids);
+DELETE FROM BaseItemImageInfos WHERE ItemId IN (SELECT Id FROM phantom_delete_ids);
+DELETE FROM BaseItemMetadataFields WHERE ItemId IN (SELECT Id FROM phantom_delete_ids);
+DELETE FROM UserData WHERE ItemId IN (SELECT Id FROM phantom_delete_ids);
+DELETE FROM BaseItems WHERE Id IN (SELECT Id FROM phantom_delete_ids);
+DROP TABLE phantom_delete_ids;
 DELETE FROM BaseItemProviders WHERE ItemId NOT IN (SELECT Id FROM BaseItems);
 SQL
 
@@ -195,7 +200,7 @@ systemd-run --user --unit=rig-jellyfin \
   --description='Phantom rig Jellyfin' \
   --working-directory=$JF_DATA \
   --setenv=TMPDIR=/tmp/jf-test/tmp \
-  -- /usr/bin/dotnet /usr/lib/jellyfin/jellyfin.dll \
+  -- /usr/bin/dotnet $JF_DLL \
        --datadir $JF_DATA --configdir $JF_CFG \
        --cachedir $JF_CACHE --logdir $JF_LOG \
        --webdir /usr/share/jellyfin/web \
