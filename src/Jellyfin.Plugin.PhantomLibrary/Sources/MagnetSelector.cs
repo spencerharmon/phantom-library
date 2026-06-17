@@ -152,7 +152,10 @@ public sealed class MagnetSelector
             cfg.QualityPreset,
             cfg.MinSeeders,
             cfg.MinSizeGb1080p,
-            cfg.MinSizeGb4K);
+            cfg.MinSizeGb4K,
+            cfg.ResolutionFallbackOrder,
+            cfg.SeederWeight,
+            cfg.PreferredResolution);
 
         if (picked is null)
         {

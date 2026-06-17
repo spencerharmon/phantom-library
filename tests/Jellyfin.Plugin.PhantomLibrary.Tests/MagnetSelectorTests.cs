@@ -49,6 +49,7 @@ public class MagnetSelectorTests
 
         var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
         var cfg = TestConfig();
+        cfg.QualityPreset = QualityPreset.GostreamDefault;
         var sel = new MagnetSelector(
             new[] { ix1.Object, ix2.Object },
             scorer,

@@ -28,7 +28,10 @@ public class PluginConfiguration : BasePluginConfiguration
         ProwlarrApiKey = string.Empty;
         TorrentioBaseUrl = "https://torrentio.strem.fun";
 
-        QualityPreset = QualityPreset.GostreamDefault;
+        QualityPreset = QualityPreset.ResolutionSeeders;
+        PreferredResolution = "1080p";
+        ResolutionFallbackOrder = "1080p,720p,480p,2160p,4k,unknown";
+        SeederWeight = 3;
         MinSeeders = 5;
         MinSizeGb1080p = 4;
         MinSizeGb4K = 20;
@@ -111,6 +114,25 @@ public class PluginConfiguration : BasePluginConfiguration
 
     /// <summary>Gets or sets the quality scoring preset.</summary>
     public QualityPreset QualityPreset { get; set; }
+
+    /// <summary>
+    /// Gets or sets the preferred materialise resolution token for the
+    /// ResolutionSeeders quality preset (for example <c>1080p</c>).
+    /// </summary>
+    public string PreferredResolution { get; set; }
+
+    /// <summary>
+    /// Gets or sets comma-separated resolution preference order for the
+    /// ResolutionSeeders quality preset. Unknown/untagged releases are
+    /// matched by the <c>unknown</c> token.
+    /// </summary>
+    public string ResolutionFallbackOrder { get; set; }
+
+    /// <summary>
+    /// Gets or sets score weight per seeder for the ResolutionSeeders
+    /// quality preset. Higher values make seed count dominate more.
+    /// </summary>
+    public int SeederWeight { get; set; }
 
     /// <summary>Gets or sets the minimum acceptable seeder count.</summary>
     public int MinSeeders { get; set; }
@@ -295,8 +317,11 @@ public enum QualityPreset
     /// <summary>Simple preset: biggest .mkv with most seeders.</summary>
     BiggestMostSeeded = 1,
 
+    /// <summary>Prefer configured resolution order, then seeders. Default order prefers 1080p, allows lower resolutions, and de-prioritises 4K.</summary>
+    ResolutionSeeders = 2,
+
     /// <summary>Operator supplies a custom scorer-weight blob in advanced config.</summary>
-    Custom = 2,
+    Custom = 3,
 }
 
 /// <summary>Visibility policy for the "phantom" badge surfaced on Virtual items.</summary>

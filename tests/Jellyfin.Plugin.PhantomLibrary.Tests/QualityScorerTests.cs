@@ -109,6 +109,65 @@ public class QualityScorerTests
     }
 
     [Fact]
+    public void ResolutionSeeders_Prefers_1080p_Over_4K_ByDefault()
+    {
+        var cands = new List<IndexerCandidate>
+        {
+            C("Movie 2160p DV Atmos", 30 * GB, 50),
+            C("Movie 1080p", 5 * GB, 50),
+        };
+
+        var b = New().PickBest(cands, QualityPreset.ResolutionSeeders, 5, 4, 20,
+            "1080p,720p,480p,2160p,4k,unknown", 3, "1080p");
+
+        Assert.Equal("Movie 1080p", b!.Title);
+    }
+
+    [Fact]
+    public void ResolutionSeeders_SeederWeight_Can_Outrank_Within_FallbackPolicy()
+    {
+        var cands = new List<IndexerCandidate>
+        {
+            C("Movie 1080p", 5 * GB, 10),
+            C("Movie 720p", 5 * GB, 500),
+        };
+
+        var b = New().PickBest(cands, QualityPreset.ResolutionSeeders, 5, 0, 20,
+            "1080p,720p,480p,2160p,4k,unknown", 3, "1080p");
+
+        Assert.Equal("Movie 720p", b!.Title);
+    }
+
+    [Fact]
+    public void ResolutionSeeders_Allows_Lower_Resolution_When_Only_Candidate()
+    {
+        var cands = new List<IndexerCandidate>
+        {
+            C("Movie 720p", 2 * GB, 50),
+        };
+
+        var b = New().PickBest(cands, QualityPreset.ResolutionSeeders, 5, 4, 20,
+            "1080p,720p,480p,2160p,4k,unknown", 3, "1080p");
+
+        Assert.Equal("Movie 720p", b!.Title);
+    }
+
+    [Fact]
+    public void ResolutionSeeders_PreferredResolution_Moves_Preferred_To_Front()
+    {
+        var cands = new List<IndexerCandidate>
+        {
+            C("Movie 1080p", 5 * GB, 50),
+            C("Movie 720p", 5 * GB, 50),
+        };
+
+        var b = New().PickBest(cands, QualityPreset.ResolutionSeeders, 5, 0, 20,
+            "1080p,720p,480p,2160p,4k,unknown", 3, "720p");
+
+        Assert.Equal("Movie 720p", b!.Title);
+    }
+
+    [Fact]
     public void Custom_Falls_Back_To_Default()
     {
         var cands = new List<IndexerCandidate>

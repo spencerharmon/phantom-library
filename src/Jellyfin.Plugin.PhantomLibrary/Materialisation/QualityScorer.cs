@@ -29,6 +29,7 @@ public sealed class QualityScorer
     private static readonly Regex ReStereo = new(@"(?i)(stereo|aac|mp3|2\.0)", RegexOptions.Compiled);
     private static readonly Regex ReBluRay = new(@"(?i)(bluray|blu.?ray|bdrip|bdremux|remux)", RegexOptions.Compiled);
     private static readonly Regex ReRemux = new(@"(?i)\b(remux|bdremux)\b", RegexOptions.Compiled);
+    private static readonly string[] DefaultResolutionOrder = { "1080p", "720p", "480p", "2160p", "4k", "unknown" };
 
     private readonly ILogger<QualityScorer> _logger;
 
@@ -43,7 +44,10 @@ public sealed class QualityScorer
         QualityPreset preset,
         int minSeeders,
         int minSizeGb1080p,
-        int minSizeGb4K)
+        int minSizeGb4K,
+        string? resolutionFallbackOrder = null,
+        int seederWeight = 0,
+        string? preferredResolution = null)
     {
         ArgumentNullException.ThrowIfNull(candidates);
         if (candidates.Count == 0)
@@ -77,7 +81,7 @@ public sealed class QualityScorer
             // "no candidate passed quality floors" instead of the
             // misleading 422 the operator sees when an SD-only release
             // slips through.
-            if (!is4K && !is1080 && c.Size > 0 && c.Size < min1080p) return false;
+            if (effective != QualityPreset.ResolutionSeeders && !is4K && !is1080 && c.Size > 0 && c.Size < min1080p) return false;
             return true;
         }).ToList();
 
@@ -92,12 +96,92 @@ public sealed class QualityScorer
                 .OrderByDescending(c => c.Size)
                 .ThenByDescending(c => c.Seeders)
                 .First(),
+            QualityPreset.ResolutionSeeders => filtered
+                .OrderByDescending(c => ScoreResolutionSeeders(c, resolutionFallbackOrder, seederWeight, preferredResolution))
+                .ThenByDescending(c => c.Seeders)
+                .ThenByDescending(c => c.Size)
+                .First(),
             _ => filtered
                 .OrderByDescending(ScoreGostream)
                 .ThenByDescending(c => c.Seeders)
                 .ThenByDescending(c => c.Size)
                 .First(),
         };
+    }
+
+    public static int ScoreResolutionSeeders(IndexerCandidate c, string? resolutionFallbackOrder, int seederWeight, string? preferredResolution = null)
+    {
+        ArgumentNullException.ThrowIfNull(c);
+        var order = ParseResolutionOrder(resolutionFallbackOrder, preferredResolution);
+        var resolution = DetectResolution(c.Title);
+        var index = order.FindIndex(token => string.Equals(token, resolution, StringComparison.OrdinalIgnoreCase));
+        if (index < 0)
+        {
+            index = order.FindIndex(token => string.Equals(token, "unknown", StringComparison.OrdinalIgnoreCase));
+        }
+
+        var score = Math.Max(0, order.Count - Math.Max(index, 0)) * 1000;
+        score += Math.Max(0, c.Seeders) * Math.Max(0, seederWeight);
+        if (ReRemux.IsMatch(c.Title)) score += 25;
+        if (ReAtmos.IsMatch(c.Title)) score += 10;
+        if (Re51.IsMatch(c.Title)) score += 5;
+        return score;
+    }
+
+    private static List<string> ParseResolutionOrder(string? value, string? preferredResolution)
+    {
+        var tokens = (value ?? string.Empty)
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(NormalizeResolutionToken)
+            .Where(s => !string.IsNullOrWhiteSpace(s))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var preferred = string.IsNullOrWhiteSpace(preferredResolution) ? string.Empty : NormalizeResolutionToken(preferredResolution);
+        if (!string.IsNullOrWhiteSpace(preferred))
+        {
+            tokens.RemoveAll(token => string.Equals(token, preferred, StringComparison.OrdinalIgnoreCase));
+            tokens.Insert(0, preferred);
+        }
+
+        if (tokens.Count == 0)
+        {
+            tokens.AddRange(DefaultResolutionOrder);
+        }
+
+        if (!tokens.Contains("unknown", StringComparer.OrdinalIgnoreCase))
+        {
+            tokens.Add("unknown");
+        }
+
+        return tokens;
+    }
+
+    private static string NormalizeResolutionToken(string value)
+    {
+#pragma warning disable CA1308 // Lowercase tokens are operator-facing config values, not identifiers used for round-trip display.
+        var token = value.Trim().ToLowerInvariant();
+#pragma warning restore CA1308
+        return token switch
+        {
+            "uhd" => "2160p",
+            "4k" => "4k",
+            "2160" => "2160p",
+            "1080" => "1080p",
+            "720" => "720p",
+            "480" => "480p",
+            "sd" => "480p",
+            _ => token,
+        };
+    }
+
+    private static string DetectResolution(string title)
+    {
+        if (Regex.IsMatch(title, @"(?i)\b(4k|uhd|2160p)\b")) return title.Contains("4k", StringComparison.OrdinalIgnoreCase) ? "4k" : "2160p";
+        if (Regex.IsMatch(title, @"(?i)\b1080p\b")) return "1080p";
+        if (Regex.IsMatch(title, @"(?i)\b720p\b")) return "720p";
+        if (Regex.IsMatch(title, @"(?i)\b(480p|dvdrip|xvid)\b")) return "480p";
+        return "unknown";
     }
 
     /// <summary>

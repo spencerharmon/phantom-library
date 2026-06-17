@@ -67,8 +67,23 @@
                             <select id="QualityPreset" name="QualityPreset" is="emby-select">
                                 <option value="GostreamDefault">gostream default (4K DV &gt; HDR10+ &gt; HDR &gt; 4K &gt; 1080p REMUX &gt; 1080p)</option>
                                 <option value="BiggestMostSeeded">Biggest .mkv, most seeders</option>
+                                <option value="ResolutionSeeders">Resolution order + seeders</option>
                                 <option value="Custom">Custom</option>
                             </select>
+                        </div>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="PreferredResolution">Preferred resolution</label>
+                            <input id="PreferredResolution" name="PreferredResolution" type="text" is="emby-input" />
+                            <div class="fieldDescription">Used by ResolutionSeeders. Example: 1080p.</div>
+                        </div>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="ResolutionFallbackOrder">Resolution fallback order</label>
+                            <input id="ResolutionFallbackOrder" name="ResolutionFallbackOrder" type="text" is="emby-input" />
+                            <div class="fieldDescription">Comma-separated. Example: 1080p,720p,480p,2160p,4k,unknown.</div>
+                        </div>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="SeederWeight">Seeder score weight</label>
+                            <input id="SeederWeight" name="SeederWeight" type="number" min="0" is="emby-input" />
                         </div>
                         <div class="inputContainer">
                             <label class="inputLabel inputLabelUnfocused" for="MinSeeders">Minimum seeders</label>
@@ -222,7 +237,10 @@
                             document.querySelector('#ProwlarrBaseUrl').value = cfg.ProwlarrBaseUrl || '';
                             document.querySelector('#ProwlarrApiKey').value = cfg.ProwlarrApiKey || '';
                             document.querySelector('#TorrentioBaseUrl').value = cfg.TorrentioBaseUrl || '';
-                            document.querySelector('#QualityPreset').value = cfg.QualityPreset || 'GostreamDefault';
+                            document.querySelector('#QualityPreset').value = cfg.QualityPreset || 'ResolutionSeeders';
+                            document.querySelector('#PreferredResolution').value = cfg.PreferredResolution || '1080p';
+                            document.querySelector('#ResolutionFallbackOrder').value = cfg.ResolutionFallbackOrder || '1080p,720p,480p,2160p,4k,unknown';
+                            document.querySelector('#SeederWeight').value = cfg.SeederWeight || 3;
                             document.querySelector('#MinSeeders').value = cfg.MinSeeders;
                             document.querySelector('#MinSizeGb1080p').value = cfg.MinSizeGb1080p;
                             document.querySelector('#MinSizeGb4K').value = cfg.MinSizeGb4K;
@@ -259,6 +277,9 @@
                             cfg.ProwlarrApiKey = document.querySelector('#ProwlarrApiKey').value;
                             cfg.TorrentioBaseUrl = document.querySelector('#TorrentioBaseUrl').value;
                             cfg.QualityPreset = document.querySelector('#QualityPreset').value;
+                            cfg.PreferredResolution = document.querySelector('#PreferredResolution').value;
+                            cfg.ResolutionFallbackOrder = document.querySelector('#ResolutionFallbackOrder').value;
+                            cfg.SeederWeight = parseInt(document.querySelector('#SeederWeight').value, 10);
                             cfg.MinSeeders = parseInt(document.querySelector('#MinSeeders').value, 10);
                             cfg.MinSizeGb1080p = parseInt(document.querySelector('#MinSizeGb1080p').value, 10);
                             cfg.MinSizeGb4K = parseInt(document.querySelector('#MinSizeGb4K').value, 10);
