@@ -612,6 +612,7 @@ public sealed class PhantomShowsChannel
 #pragma warning restore CA1308
         return new MediaSourceInfo
         {
+            Id = MediaSourceIds.ForFilePath(path),
             Path = path,
             Container = container,
             Protocol = MediaProtocol.File,

@@ -8,14 +8,16 @@ JF_CFG=/tmp/jf-test/config
 JF_CACHE=/tmp/jf-test/cache
 JF_LOG=/tmp/jf-test/log
 DLL=/home/spencer/git-repos/spencerharmon/phantom-library/src/Jellyfin.Plugin.PhantomLibrary/bin/Release/net9.0/Jellyfin.Plugin.PhantomLibrary.dll
-PLUGIN_DIR=$JF_DATA/plugins/Jellyfin.Plugin.PhantomLibrary_0.2.0.0
+PLUGIN_VERSION=0.3.0.0
+PLUGIN_DIR=$JF_DATA/plugins/Jellyfin.Plugin.PhantomLibrary_$PLUGIN_VERSION
 PHANTOM_ROOT=$JF_DATA/phantom-library
+GOSTREAM_ROOT=$ROOT/gostream
 
 # ---------------------------------------------------------------- helpers
 log() { printf '\033[1m[rig-up]\033[0m %s\n' "$*"; }
 
 stop_units() {
-  for u in rig-jellyfin rig-tmdb-mock rig-observer; do
+  for u in rig-jellyfin rig-tmdb-mock rig-gostream-mock rig-observer; do
     if systemctl --user is-active --quiet "$u.scope" 2>/dev/null; then
       systemctl --user stop "$u.scope" || true
     fi
@@ -26,6 +28,7 @@ stop_units() {
   # belt + braces against pgroup-orphans
   pkill -u "$USER" -9 -f "dotnet.*jellyfin.dll.*jf-test" 2>/dev/null || true
   pkill -u "$USER" -9 -f "tmdb-mock.py" 2>/dev/null || true
+  pkill -u "$USER" -9 -f "gostream-mock.py" 2>/dev/null || true
   sleep 1
 }
 
@@ -40,21 +43,22 @@ log "stopping any existing rig units"
 stop_units
 
 # ---------------------------------------------------------------- rig dirs
-mkdir -p $ROOT/{bin,scenarios,logs,fixtures/tmdb,state}
+mkdir -p $ROOT/{bin,scenarios,logs,fixtures/tmdb,state,gostream/movies,gostream/stubs}
+cp /home/spencer/git-repos/spencerharmon/phantom-library/tools/rig-scenarios/*.{py,sh} $ROOT/bin/ 2>/dev/null || true
+chmod +x $ROOT/bin/*.py $ROOT/bin/*.sh 2>/dev/null || true
 
 # ---------------------------------------------------------------- jellyfin rig (rebuild from prod)
 if [ $RESET -eq 1 ] || [ ! -f "$JF_DATA/data/jellyfin.db" ]; then
   log "reseed jellyfin rig from prod"
   rm -rf /tmp/jf-test
   mkdir -p $JF_DATA/{data,plugins/configurations/PhantomLibrary,root/default} \
-           $JF_DATA/plugins/Jellyfin.Plugin.PhantomLibrary_0.2.0.0 \
+           $PLUGIN_DIR \
            $JF_CFG $JF_CACHE $JF_LOG
   cp /var/lib/jellyfin/data/jellyfin.db       $JF_DATA/data/jellyfin.db
   cp /var/lib/jellyfin/data/jellyfin.db-wal   $JF_DATA/data/jellyfin.db-wal 2>/dev/null || true
   cp /var/lib/jellyfin/data/jellyfin.db-shm   $JF_DATA/data/jellyfin.db-shm 2>/dev/null || true
   cp -r /var/lib/jellyfin/root/default/*      $JF_DATA/root/default/ 2>/dev/null || true
-  cp /var/lib/jellyfin/plugins/configurations/PhantomLibrary/phantom.db \
-     $JF_DATA/plugins/configurations/PhantomLibrary/phantom.db 2>/dev/null || true
+  rm -f $JF_DATA/plugins/configurations/PhantomLibrary/phantom.db
 
   # Wipe all Phantom Virtual rows; we want deterministic from-scratch behaviour.
   sqlite3 $JF_DATA/data/jellyfin.db <<'SQL' || true
@@ -79,8 +83,8 @@ WHERE Path LIKE '%__phantom_tmdb%'
 DELETE FROM BaseItemProviders WHERE ItemId NOT IN (SELECT Id FROM BaseItems);
 SQL
 
-  sqlite3 $JF_DATA/plugins/configurations/PhantomLibrary/phantom.db \
-    "DELETE FROM phantom_items; DELETE FROM tmdb_cache;" || true
+  rm -rf $JF_DATA/plugins/Jellyfin.Plugin.PhantomLibrary_0.1.0.0 \
+         $JF_DATA/plugins/Jellyfin.Plugin.PhantomLibrary_0.2.0.0
 
   # Rig-scoped phantom-stub dir
   rm -rf $PHANTOM_ROOT
@@ -89,7 +93,11 @@ fi
 
 # Always drop the fresh DLL.
 log "drop fresh DLL"
+mkdir -p "$PLUGIN_DIR"
 cp "$DLL" "$PLUGIN_DIR/Jellyfin.Plugin.PhantomLibrary.dll"
+cat > "$PLUGIN_DIR/meta.json" <<META
+{"category":"Metadata","changelog":"integration","description":"integration","guid":"9e7a1f4c-2b5d-4e8f-9a3b-7c1d2e5f6a8b","name":"Phantom Library","overview":"integration","owner":"spencerharmon","targetAbi":"10.11.0.0","timestamp":"0001-01-01T00:00:00.0000000Z","version":"$PLUGIN_VERSION","status":"Active","autoUpdate":false,"assemblies":[]}
+META
 md5sum "$DLL" "$PLUGIN_DIR/Jellyfin.Plugin.PhantomLibrary.dll" | awk '{print "  "$0}'
 
 # ---------------------------------------------------------------- plugin config
@@ -99,8 +107,8 @@ cat > $JF_DATA/plugins/configurations/Jellyfin.Plugin.PhantomLibrary.xml <<EOF
 <PluginConfiguration>
   <TmdbApiKey>rig-test-key</TmdbApiKey>
   <TmdbApiBaseUrl>http://127.0.0.1:18099/3</TmdbApiBaseUrl>
-  <GostreamBaseUrl>http://127.0.0.1:9080</GostreamBaseUrl>
-  <GostreamDiagnosticsBaseUrl>http://127.0.0.1:8090</GostreamDiagnosticsBaseUrl>
+  <GostreamBaseUrl>http://127.0.0.1:19080</GostreamBaseUrl>
+  <GostreamDiagnosticsBaseUrl>http://127.0.0.1:19080</GostreamDiagnosticsBaseUrl>
   <ProwlarrBaseUrl></ProwlarrBaseUrl>
   <ProwlarrApiKey></ProwlarrApiKey>
   <TorrentioBaseUrl>https://torrentio.strem.fun</TorrentioBaseUrl>
@@ -122,6 +130,9 @@ cat > $JF_DATA/plugins/configurations/Jellyfin.Plugin.PhantomLibrary.xml <<EOF
   <SplashLoopAssetPath></SplashLoopAssetPath>
   <PhantomTargetLibraryId></PhantomTargetLibraryId>
   <PhantomStubRoot>$PHANTOM_ROOT</PhantomStubRoot>
+  <GostreamMoviesRoot>$GOSTREAM_ROOT/movies</GostreamMoviesRoot>
+  <GostreamShowsRoot>$GOSTREAM_ROOT/tv</GostreamShowsRoot>
+  <SourcePickerPreset>gostream-default</SourcePickerPreset>
   <PhantomMoviesLibraryName>gostream-movies</PhantomMoviesLibraryName>
   <PhantomShowsLibraryName>gostream-shows</PhantomShowsLibraryName>
   <SuggestionsCatalogueMaxItems>10</SuggestionsCatalogueMaxItems>
@@ -161,6 +172,22 @@ for i in {1..20}; do
   sleep 0.2
 done
 
+# ---------------------------------------------------------------- launch gostream-mock under user systemd
+log "start rig-gostream-mock.service"
+systemd-run --user --unit=rig-gostream-mock \
+  --description='Phantom rig gostream mock' \
+  --setenv=JF_RIG_ROOT=$ROOT \
+  --setenv=GOSTREAM_MOCK_PORT=19080 \
+  -- /usr/bin/python3 $ROOT/bin/gostream-mock.py >/dev/null
+
+for i in {1..20}; do
+  if curl -s -o /dev/null -w '%{http_code}' -X OPTIONS http://127.0.0.1:19080/api/library/add | grep -q 405; then
+    log "gostream-mock up"
+    break
+  fi
+  sleep 0.2
+done
+
 # ---------------------------------------------------------------- launch jellyfin under user systemd
 log "start rig-jellyfin.service"
 mkdir -p /tmp/jf-test/tmp
@@ -192,7 +219,9 @@ echo
 echo "Endpoints:"
 echo "  jellyfin: http://localhost:18096 (token: testtoken00000000000000000000000)"
 echo "  tmdb-mock: http://127.0.0.1:18099"
+echo "  gostream-mock: http://127.0.0.1:19080"
 echo
 echo "Logs:"
 echo "  jellyfin: journalctl --user -u rig-jellyfin -f"
 echo "  tmdb-mock: tail -f $ROOT/logs/tmdb-mock.log"
+echo "  gostream-mock: tail -f $ROOT/logs/gostream-mock.log"

@@ -62,6 +62,7 @@ public sealed class SplashSourceProvider
         var path = ResolveSplashPath();
         return new MediaSourceInfo
         {
+            Id = MediaSourceIds.ForSplashPath(path),
             Path = path,
             Container = "mp4",
             Protocol = MediaProtocol.File,

@@ -118,28 +118,8 @@ public sealed class PhantomMoviesChannel
             emittedTmdbs.Add(row.TmdbId);
         }
 
-        // --- 2. Discovery movies (skip any already emitted as materialised) ---
-        var discovery = await _db.ListDiscoveryCacheAsync("movie", cancellationToken).ConfigureAwait(false);
-        foreach (var row in discovery)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (emittedTmdbs.Contains(row.TmdbId))
-            {
-                continue;
-            }
-
-            var built = await BuildMovieItemAsync(row.TmdbId, materialised: null, cancellationToken).ConfigureAwait(false);
-            if (built is null)
-            {
-                // Cold-cache miss; DiscoveryRefreshTask warms next tick.
-                continue;
-            }
-
-            items.Add(built);
-            emittedTmdbs.Add(row.TmdbId);
-        }
-
-        // --- 3. Orphan gostream files ---
+        // --- 2. Gostream files with TMDB hits (real media; outrank discovery phantoms) ---
+        var unresolvedOrphans = new List<GostreamFileEntry>();
         IReadOnlyList<GostreamFileEntry> orphans;
         try
         {
@@ -169,8 +149,36 @@ public sealed class PhantomMoviesChannel
             }
             else
             {
-                items.Add(BuildOrphanMovieItem(o));
+                unresolvedOrphans.Add(o);
             }
+        }
+
+        // --- 3. Discovery movies (skip materialised + enriched gostream) ---
+        var discovery = await _db.ListDiscoveryCacheAsync("movie", cancellationToken).ConfigureAwait(false);
+        foreach (var row in discovery)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (emittedTmdbs.Contains(row.TmdbId))
+            {
+                continue;
+            }
+
+            var built = await BuildMovieItemAsync(row.TmdbId, materialised: null, cancellationToken).ConfigureAwait(false);
+            if (built is null)
+            {
+                // Cold-cache miss; DiscoveryRefreshTask warms next tick.
+                continue;
+            }
+
+            items.Add(built);
+            emittedTmdbs.Add(row.TmdbId);
+        }
+
+        // --- 4. Raw orphan fallback for files that could not be enriched ---
+        foreach (var o in unresolvedOrphans)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            items.Add(BuildOrphanMovieItem(o));
         }
 
         return new ChannelItemResult
@@ -474,6 +482,7 @@ public sealed class PhantomMoviesChannel
 #pragma warning restore CA1308
         return new MediaSourceInfo
         {
+            Id = MediaSourceIds.ForFilePath(path),
             Path = path,
             Container = container,
             Protocol = MediaProtocol.File,

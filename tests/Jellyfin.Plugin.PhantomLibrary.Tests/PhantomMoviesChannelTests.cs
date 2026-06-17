@@ -98,6 +98,7 @@ public class PhantomMoviesChannelTests : IDisposable
         Assert.Contains("phantom", item.Tags);
         var src = Assert.Single(item.MediaSources);
         Assert.Equal(_splash.ResolveSplashPath(), src.Path);
+        Assert.False(string.IsNullOrWhiteSpace(src.Id));
     }
 
     [Fact]
@@ -113,6 +114,7 @@ public class PhantomMoviesChannelTests : IDisposable
         Assert.Equal("movie_202", item.Id);
         Assert.DoesNotContain("phantom", item.Tags);
         Assert.Equal("/fuse/x.mkv", item.MediaSources[0].Path);
+        Assert.False(string.IsNullOrWhiteSpace(item.MediaSources[0].Id));
         Assert.Equal("202", item.ProviderIds["Tmdb"]);
     }
 
@@ -180,7 +182,30 @@ public class PhantomMoviesChannelTests : IDisposable
         Assert.DoesNotContain("phantom", item.Tags);
         Assert.Equal("4242", item.ProviderIds["Tmdb"]);
         Assert.Equal(path, item.MediaSources[0].Path);
+        Assert.False(string.IsNullOrWhiteSpace(item.MediaSources[0].Id));
         Assert.Equal(2026, item.ProductionYear);
+    }
+
+    [Fact]
+    public async Task GetChannelItems_GostreamFileWithSameTmdbAsDiscovery_GostreamRealSourceWins()
+    {
+        await SeedMetaAsync(4243, "Discovery Copy");
+        await _db.UpsertDiscoveryCacheAsync(4243, "movie", CancellationToken.None);
+        var path = Path.Combine(_moviesRoot, "Discovery_Copy_2020_1080p_abcd1234.mkv");
+        File.WriteAllText(path, string.Empty);
+        _tmdb.Setup(t => t.SearchMoviesAsync("Discovery Copy", 2020, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[]
+            {
+                new TmdbSearchHit(4243, "Discovery Copy", "Discovery Copy", "hit", null, null, "2020-01-01", 8.1, 10),
+            });
+
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+
+        var item = Assert.Single(result.Items, i => i.Id == "movie_4243");
+        Assert.Equal(path, item.MediaSources[0].Path);
+        Assert.False(string.IsNullOrWhiteSpace(item.MediaSources[0].Id));
+        Assert.DoesNotContain("phantom", item.Tags);
+        Assert.DoesNotContain("orphan", item.Tags);
     }
 
     [Fact]
@@ -198,6 +223,7 @@ public class PhantomMoviesChannelTests : IDisposable
         Assert.Equal("Some Unknown Movie", item.Name);
         Assert.Contains("orphan", item.Tags);
         Assert.Equal(orphanPath, item.MediaSources[0].Path);
+        Assert.False(string.IsNullOrWhiteSpace(item.MediaSources[0].Id));
     }
 
     [Fact]
@@ -234,6 +260,7 @@ public class PhantomMoviesChannelTests : IDisposable
         var got = await _channel.GetChannelItemMediaInfo("movie_50", CancellationToken.None);
         var src = Assert.Single(got);
         Assert.Equal("/fuse/50.mkv", src.Path);
+        Assert.False(string.IsNullOrWhiteSpace(src.Id));
     }
 
     [Fact]
@@ -242,6 +269,7 @@ public class PhantomMoviesChannelTests : IDisposable
         var got = await _channel.GetChannelItemMediaInfo("movie_60", CancellationToken.None);
         var src = Assert.Single(got);
         Assert.Equal(_splash.ResolveSplashPath(), src.Path);
+        Assert.False(string.IsNullOrWhiteSpace(src.Id));
     }
 
     [Fact]

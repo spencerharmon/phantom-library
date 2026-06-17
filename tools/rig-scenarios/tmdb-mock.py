@@ -94,6 +94,20 @@ def _disc_t(q):
     items = [_series(i) for i in range(len(FIXTURES["series"]))] if page == 1 else []
     return 200, {"page": page, "results": items, "total_pages": 1, "total_results": len(items)}
 
+@route("/3/search/movie")
+def _search_m(q):
+    query = (q.get("query") or "").casefold()
+    year = q.get("year") or q.get("primary_release_year")
+    results = []
+    for i in range(len(FIXTURES["movies"])):
+        movie = _movie(i)
+        if query and query not in movie["title"].casefold():
+            continue
+        if year and not movie.get("release_date", "").startswith(str(year)):
+            continue
+        results.append(movie)
+    return 200, {"page": 1, "results": results, "total_pages": 1, "total_results": len(results)}
+
 @route("/3/trending/movie/day")
 @route("/3/trending/movie/week")
 def _trend_m(q):
