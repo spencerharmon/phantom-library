@@ -226,7 +226,7 @@ path=(x.get('MediaSources') or [{}])[0].get('Path') or ''
 if 'splash.mp4' not in path:
     raise SystemExit(f'Alpha should start on splash, got {path}')
 PY
-assert_playback_info "$ALPHA_ID" 'splash.mp4' 'phantom-alpha'
+assert_playback_info "$ALPHA_ID" 'splash.mp4' 'phantom-alpha' 1
 assert_stream_opens "$ALPHA_ID" 'mp4' 'phantom-alpha'
 
 echo '[6] materialise Alpha end-to-end'
