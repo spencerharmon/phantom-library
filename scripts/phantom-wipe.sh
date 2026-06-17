@@ -292,12 +292,14 @@ if [[ $TOTAL_BI -gt 0 ]]; then
 fi
 
 # 8. Already-clean detection -> no-op exit.
-if [[ $N_PHANTOM_BI -eq 0 && $N_PHANTOM_ROWS -eq 0 && $N_FILES -eq 0 ]]; then
+# Even when there are 0 BaseItems / 0 phantom_items / 0 stubs, an
+# existing phantom.db must still be moved aside so the v0.3 plugin can
+# recreate schema v9. This is the common post-wipe-retry case: old v5
+# phantom.db remains but all old rows were already removed.
+if [[ $N_PHANTOM_BI -eq 0 && $N_PHANTOM_ROWS -eq 0 && $N_FILES -eq 0 && ! -f "$PHANTOM_DB" ]]; then
     bold "==> Nothing to do"
-    info "  phantom state is already empty (0 BaseItems, 0 phantom_items, 0 stubs)."
-    if [[ ! -f "$PHANTOM_DB" ]]; then
-        info "  phantom.db not present; plugin will recreate on next start."
-    fi
+    info "  phantom state is already empty (0 BaseItems, 0 phantom_items, 0 stubs, no phantom.db)."
+    info "  phantom.db not present; plugin will recreate on next start."
     exit 0
 fi
 
