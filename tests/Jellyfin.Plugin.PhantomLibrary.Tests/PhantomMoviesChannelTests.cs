@@ -187,6 +187,57 @@ public class PhantomMoviesChannelTests : IDisposable
     }
 
     [Fact]
+    public async Task GetChannelItems_GostreamVariantsWithSameTmdb_EmitOneMovieWithBestSource_NoOrphans()
+    {
+        var dv = Path.Combine(_moviesRoot, "Apex_2026_2160p_DV_Atmos_7cf0a865.mkv");
+        var hdr = Path.Combine(_moviesRoot, "Apex_2026_2160p_HDR_26bcf71f.mkv");
+        File.WriteAllText(dv, string.Empty);
+        File.WriteAllText(hdr, string.Empty);
+        _tmdb.Setup(t => t.SearchMoviesAsync("Apex", 2026, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[]
+            {
+                new TmdbSearchHit(1318447, "Apex", "Apex", "hit", null, null, "2026-01-01", 8.1, 10),
+            });
+        _tmdb.Setup(t => t.GetMovieAsync(1318447, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new TmdbMovieDetails(1318447, "Apex", "Apex", "overview", "/poster.jpg", null,
+                "2026-01-01", 8.1, 10, 100, new[] { "Action" }, "Released", null, "tt1318447", null, null));
+
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+
+        var item = Assert.Single(result.Items);
+        Assert.Equal("movie_1318447", item.Id);
+        Assert.Equal("Apex", item.Name);
+        Assert.DoesNotContain("orphan", item.Tags);
+        var source = Assert.Single(item.MediaSources);
+        Assert.Equal(dv, source.Path);
+    }
+
+    [Fact]
+    public async Task GetChannelItems_MaterialisedAndGostreamVariantsForSameTmdb_EmitsOneMovie_MaterialisedSourceWins()
+    {
+        await SeedMetaAsync(1318447, "Apex");
+        var materialised = Path.Combine(_moviesRoot, "Apex_2026_2160p_DV_Atmos_7cf0a865.mkv");
+        var hdr = Path.Combine(_moviesRoot, "Apex_2026_2160p_HDR_26bcf71f.mkv");
+        File.WriteAllText(materialised, string.Empty);
+        File.WriteAllText(hdr, string.Empty);
+        await _db.InsertMaterialisedStateAsync(1318447, "movie", -1, -1, "/stub", materialised, CancellationToken.None);
+        _tmdb.Setup(t => t.SearchMoviesAsync("Apex", 2026, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[]
+            {
+                new TmdbSearchHit(1318447, "Apex", "Apex", "hit", null, null, "2026-01-01", 8.1, 10),
+            });
+
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+
+        var item = Assert.Single(result.Items);
+        Assert.Equal("movie_1318447", item.Id);
+        var source = Assert.Single(item.MediaSources);
+        Assert.Equal(materialised, source.Path);
+        Assert.DoesNotContain("orphan", item.Tags);
+        Assert.DoesNotContain("phantom", item.Tags);
+    }
+
+    [Fact]
     public async Task GetChannelItems_GostreamFileWithSameTmdbAsDiscovery_GostreamRealSourceWins()
     {
         await SeedMetaAsync(4243, "Discovery Copy");

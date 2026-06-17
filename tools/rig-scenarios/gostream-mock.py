@@ -117,6 +117,7 @@ def main() -> None:
     LOG.write_text(f"# gostream-mock started {time.strftime('%Y-%m-%d %H:%M:%S')} on port {PORT}\n")
     MEDIA.mkdir(parents=True, exist_ok=True)
     ensure_fixture(MEDIA / "Phantom_Rig_Bravo_2024_1080p_deadbeef.mkv")
+    ensure_fixture(MEDIA / "Phantom_Rig_Bravo_2024_2160p_HDR_cafebabe.mkv")
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"gostream-mock listening on 127.0.0.1:{PORT}", flush=True)
     srv.serve_forever()

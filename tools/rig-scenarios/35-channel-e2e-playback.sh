@@ -205,9 +205,12 @@ j=json.load(open('/tmp/movies.json'))
 x=next(i for i in j['Items'] if i['Id']==id)
 if 'orphan' in (x.get('Tags') or []) or 'phantom' in (x.get('Tags') or []):
     raise SystemExit(f'Bravo should be real gostream item, tags={x.get("Tags")}')
+items=[i for i in j['Items'] if 'Phantom_Rig_Bravo' in (i.get('Name') or '')]
+if items:
+    raise SystemExit(f'Bravo variants should not surface as raw orphans: {items}')
 path=(x.get('MediaSources') or [{}])[0].get('Path') or ''
-if '/tmp/jf-rig/gostream/movies/' not in path:
-    raise SystemExit(f'Bravo path should be gostream mock, got {path}')
+if path != '/tmp/jf-rig/gostream/movies/Phantom_Rig_Bravo_2024_2160p_HDR_cafebabe.mkv':
+    raise SystemExit(f'Bravo should select best variant, got {path}')
 if x.get('Name') != 'Phantom Rig Bravo':
     raise SystemExit(f'Bravo should use TMDB name, got {x.get("Name")}')
 PY

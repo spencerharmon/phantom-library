@@ -103,23 +103,6 @@ public sealed class PhantomMoviesChannel
         var items = new List<ChannelItemInfo>();
         var emittedTmdbs = new HashSet<int>();
 
-        // --- 1. Materialised movies (highest priority) ---
-        var materialised = await _db.ListMaterialisedStateAsync("movie", cancellationToken).ConfigureAwait(false);
-        foreach (var row in materialised)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var built = await BuildMovieItemAsync(row.TmdbId, row, cancellationToken).ConfigureAwait(false);
-            if (built is null)
-            {
-                continue;
-            }
-
-            items.Add(built);
-            emittedTmdbs.Add(row.TmdbId);
-        }
-
-        // --- 2. Gostream files with TMDB hits (real media; outrank discovery phantoms) ---
-        var unresolvedOrphans = new List<GostreamFileEntry>();
         IReadOnlyList<GostreamFileEntry> orphans;
         try
         {
@@ -131,29 +114,63 @@ public sealed class PhantomMoviesChannel
             orphans = Array.Empty<GostreamFileEntry>();
         }
 
+        var unresolvedOrphans = new List<GostreamFileEntry>();
+        var variantsByTmdb = new Dictionary<int, List<MediaSourceInfo>>();
+        var metadataByTmdb = new Dictionary<int, TmdbMetadataRow>();
         foreach (var o in orphans)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var enriched = await TryBuildEnrichedGostreamMovieAsync(o.Path, cancellationToken).ConfigureAwait(false);
-            if (enriched is not null)
-            {
-                if (ChannelItemId.TryParse(enriched.Id, out var parsed) && parsed.TmdbId.HasValue)
-                {
-                    if (!emittedTmdbs.Add(parsed.TmdbId.Value))
-                    {
-                        continue;
-                    }
-                }
-
-                items.Add(enriched);
-            }
-            else
+            var enriched = await TryResolveEnrichedGostreamMovieAsync(o.Path, cancellationToken).ConfigureAwait(false);
+            if (enriched is null)
             {
                 unresolvedOrphans.Add(o);
+                continue;
+            }
+
+            if (!variantsByTmdb.TryGetValue(enriched.TmdbId, out var sources))
+            {
+                sources = new List<MediaSourceInfo>();
+                variantsByTmdb[enriched.TmdbId] = sources;
+                metadataByTmdb[enriched.TmdbId] = enriched.Metadata;
+            }
+
+            if (!sources.Any(s => string.Equals(s.Path, enriched.Source.Path, StringComparison.Ordinal)))
+            {
+                sources.Add(enriched.Source);
             }
         }
 
-        // --- 3. Discovery movies (skip materialised + enriched gostream) ---
+        // --- 1. Materialised movies (highest priority/default source), with any existing gostream variants attached. ---
+        var materialised = await _db.ListMaterialisedStateAsync("movie", cancellationToken).ConfigureAwait(false);
+        foreach (var row in materialised)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            variantsByTmdb.TryGetValue(row.TmdbId, out var variants);
+            var built = await BuildMovieItemAsync(row.TmdbId, row, variants, cancellationToken).ConfigureAwait(false);
+            if (built is null)
+            {
+                continue;
+            }
+
+            items.Add(built);
+            emittedTmdbs.Add(row.TmdbId);
+        }
+
+        // --- 2. Gostream files with TMDB hits (real media; outrank discovery phantoms). Group variants by TMDB. ---
+        foreach (var kvp in variantsByTmdb.OrderBy(k => metadataByTmdb[k.Key].Title, StringComparer.OrdinalIgnoreCase))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (emittedTmdbs.Contains(kvp.Key))
+            {
+                continue;
+            }
+
+            var item = BuildMovieItemFromMetadata(metadataByTmdb[kvp.Key], new[] { SelectDefaultVariant(kvp.Value) }, tags: new List<string>());
+            items.Add(item);
+            emittedTmdbs.Add(kvp.Key);
+        }
+
+        // --- 3. Discovery movies (skip materialised + enriched gostream). ---
         var discovery = await _db.ListDiscoveryCacheAsync("movie", cancellationToken).ConfigureAwait(false);
         foreach (var row in discovery)
         {
@@ -163,7 +180,7 @@ public sealed class PhantomMoviesChannel
                 continue;
             }
 
-            var built = await BuildMovieItemAsync(row.TmdbId, materialised: null, cancellationToken).ConfigureAwait(false);
+            var built = await BuildMovieItemAsync(row.TmdbId, materialised: null, variants: null, cancellationToken).ConfigureAwait(false);
             if (built is null)
             {
                 // Cold-cache miss; DiscoveryRefreshTask warms next tick.
@@ -174,7 +191,7 @@ public sealed class PhantomMoviesChannel
             emittedTmdbs.Add(row.TmdbId);
         }
 
-        // --- 4. Raw orphan fallback for files that could not be enriched ---
+        // --- 4. Raw orphan fallback for files that could not be enriched. ---
         foreach (var o in unresolvedOrphans)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -241,7 +258,7 @@ public sealed class PhantomMoviesChannel
         foreach (var row in materialised.OrderByDescending(r => r.MaterialisedAt).Take(defaultLimit))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var built = await BuildMovieItemAsync(row.TmdbId, row, cancellationToken).ConfigureAwait(false);
+            var built = await BuildMovieItemAsync(row.TmdbId, row, variants: null, cancellationToken).ConfigureAwait(false);
             if (built is not null)
             {
                 items.Add(built);
@@ -274,7 +291,7 @@ public sealed class PhantomMoviesChannel
                 {
                     var state = await _db.GetMaterialisedStateAsync(
                         parsed.TmdbId!.Value, "movie", -1, -1, cancellationToken).ConfigureAwait(false);
-                    var built = await BuildMovieItemAsync(parsed.TmdbId!.Value, state, cancellationToken).ConfigureAwait(false);
+                    var built = await BuildMovieItemAsync(parsed.TmdbId!.Value, state, variants: null, cancellationToken).ConfigureAwait(false);
                     return built!;
                 }
 
@@ -297,7 +314,7 @@ public sealed class PhantomMoviesChannel
     /// if no <c>tmdb_metadata</c> row exists yet — the caller skips the item
     /// for this tick and the next DiscoveryRefreshTask warms the metadata.
     /// </summary>
-    private async Task<ChannelItemInfo?> BuildMovieItemAsync(int tmdb, MaterialisedStateRow? materialised, CancellationToken ct)
+    private async Task<ChannelItemInfo?> BuildMovieItemAsync(int tmdb, MaterialisedStateRow? materialised, IReadOnlyList<MediaSourceInfo>? variants, CancellationToken ct)
     {
         var meta = await _db.GetTmdbMetadataAsync(tmdb, "movie", ct).ConfigureAwait(false);
         if (meta is null)
@@ -307,22 +324,29 @@ public sealed class PhantomMoviesChannel
         }
 
         var id = ChannelItemId.ForMovie(tmdb).Encode();
-        MediaSourceInfo source;
+        var sources = new List<MediaSourceInfo>();
         var tags = new List<string>();
         if (materialised is not null)
         {
-            source = FuseMediaSource(GostreamPathResolver.ResolveMoviePath(materialised.FusePath));
+            var materialisedPath = GostreamPathResolver.ResolveMoviePath(materialised.FusePath);
+            sources.Add(FuseMediaSource(materialisedPath));
+        }
+        else if (variants is { Count: > 0 })
+        {
+            sources.Add(SelectDefaultVariant(variants));
         }
         else
         {
-            source = _splashSource.CreateMediaSource();
+            sources.Add(_splashSource.CreateMediaSource());
             tags.Add("phantom");
         }
 
-        return BuildMovieItemFromMetadata(meta, source, tags);
+        return BuildMovieItemFromMetadata(meta, sources, tags);
     }
 
-    private async Task<ChannelItemInfo?> TryBuildEnrichedGostreamMovieAsync(string path, CancellationToken ct)
+    private sealed record EnrichedGostreamMovie(int TmdbId, TmdbMetadataRow Metadata, MediaSourceInfo Source);
+
+    private async Task<EnrichedGostreamMovie?> TryResolveEnrichedGostreamMovieAsync(string path, CancellationToken ct)
     {
         if (!TryParseGostreamMovieName(path, out var title, out var year))
         {
@@ -381,10 +405,30 @@ public sealed class PhantomMoviesChannel
             }
         }
 
-        return BuildMovieItemFromMetadata(details, FuseMediaSource(path), tags: new List<string>());
+        return new EnrichedGostreamMovie(details.TmdbId, details, FuseMediaSource(path));
     }
 
-    private static ChannelItemInfo BuildMovieItemFromMetadata(TmdbMetadataRow meta, MediaSourceInfo source, List<string> tags)
+    private static MediaSourceInfo SelectDefaultVariant(IReadOnlyList<MediaSourceInfo> sources)
+        => sources
+            .OrderByDescending(s => ScoreVariantPath(s.Path ?? string.Empty))
+            .ThenBy(s => s.Path, StringComparer.Ordinal)
+            .First();
+
+    private static int ScoreVariantPath(string path)
+    {
+        var name = Path.GetFileNameWithoutExtension(path);
+        var score = 0;
+        if (name.Contains("2160p", StringComparison.OrdinalIgnoreCase) || name.Contains("4k", StringComparison.OrdinalIgnoreCase)) score += 100;
+        if (name.Contains("1080p", StringComparison.OrdinalIgnoreCase)) score += 50;
+        if (name.Contains("remux", StringComparison.OrdinalIgnoreCase)) score += 30;
+        if (name.Contains("dv", StringComparison.OrdinalIgnoreCase)) score += 12;
+        if (name.Contains("hdr", StringComparison.OrdinalIgnoreCase)) score += 8;
+        if (name.Contains("atmos", StringComparison.OrdinalIgnoreCase)) score += 6;
+        if (name.Contains("5.1", StringComparison.OrdinalIgnoreCase)) score += 3;
+        return score;
+    }
+
+    private static ChannelItemInfo BuildMovieItemFromMetadata(TmdbMetadataRow meta, IReadOnlyList<MediaSourceInfo> sources, List<string> tags)
     {
         var item = new ChannelItemInfo
         {
@@ -401,7 +445,7 @@ public sealed class PhantomMoviesChannel
             CommunityRating = meta.CommunityRating is { } cr ? (float)cr : null,
             OfficialRating = meta.OfficialRating,
             Tags = tags,
-            MediaSources = new List<MediaSourceInfo> { source },
+            MediaSources = sources.ToList(),
         };
 
         if (meta.Genres is { Length: > 0 })
