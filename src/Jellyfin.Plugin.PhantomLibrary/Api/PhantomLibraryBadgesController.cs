@@ -148,6 +148,10 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
             {
                 state = StateMaterialised;
             }
+            else if (IsRealGostreamChannelItem(item))
+            {
+                state = StateMaterialised;
+            }
             else if (await _db.IsMaterialiseInFlightAsync(tmdbId.Value, type, sSentinel, eSentinel, ct).ConfigureAwait(false))
             {
                 state = StateMaterialising;
@@ -161,6 +165,28 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
         }
 
         return Ok(result);
+    }
+
+    private static bool IsRealGostreamChannelItem(BaseItem? item)
+    {
+        if (item is null)
+        {
+            return false;
+        }
+
+        if (item.Tags.Contains("phantom", StringComparer.OrdinalIgnoreCase)
+            || item.Tags.Contains("orphan", StringComparer.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var path = item.Path ?? string.Empty;
+        return path.Contains("/gostream", StringComparison.OrdinalIgnoreCase)
+            && (path.EndsWith(".mkv", StringComparison.OrdinalIgnoreCase)
+                || path.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase)
+                || path.EndsWith(".m4v", StringComparison.OrdinalIgnoreCase)
+                || path.EndsWith(".mov", StringComparison.OrdinalIgnoreCase)
+                || path.EndsWith(".webm", StringComparison.OrdinalIgnoreCase));
     }
 
     private async Task<ChannelItemId?> TryResolveByComputedChannelIdAsync(Guid requestedId, CancellationToken ct)

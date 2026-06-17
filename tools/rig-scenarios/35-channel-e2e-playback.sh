@@ -34,13 +34,24 @@ PY
 }
 
 assert_playback_info() {
-  local id=$1 expect_path_sub=$2 label=$3
+  local id=$1 expect_path_sub=$2 label=$3 min_streams=${4:-0}
   echo "[playback-info] $label id=$id"
-  api "$API/Items/$id/PlaybackInfo" -o /tmp/pb.json || fail "$label PlaybackInfo HTTP error"
-  python3 - "$expect_path_sub" "$label" <<'PY'
+  for _ in $(seq 1 30); do
+    api "$API/Items/$id/PlaybackInfo" -o /tmp/pb.json || fail "$label PlaybackInfo HTTP error"
+    streams=$(python3 - <<'PY2'
+import json
+j=json.load(open('/tmp/pb.json'))
+print(len((j.get('MediaSources') or [{}])[0].get('MediaStreams') or []))
+PY2
+)
+    [ "$streams" -ge "$min_streams" ] && break
+    sleep 1
+  done
+  python3 - "$expect_path_sub" "$label" "$min_streams" <<'PY'
 import json,sys
 expect=sys.argv[1]
 label=sys.argv[2]
+min_streams=int(sys.argv[3])
 j=json.load(open('/tmp/pb.json'))
 if j.get('ErrorCode'):
     raise SystemExit(f'{label}: PlaybackInfo ErrorCode={j.get("ErrorCode")}')
@@ -62,6 +73,9 @@ if expect not in path:
     raise SystemExit(f'{label}: expected path containing {expect!r}, got {path!r}')
 if s.get('Protocol') != 'File':
     raise SystemExit(f'{label}: expected File protocol')
+streams=s.get('MediaStreams') or []
+if len(streams) < min_streams:
+    raise SystemExit(f'{label}: expected at least {min_streams} MediaStreams, got {len(streams)}')
 PY
 }
 
@@ -197,7 +211,7 @@ if '/tmp/jf-rig/gostream/movies/' not in path:
 if x.get('Name') != 'Phantom Rig Bravo':
     raise SystemExit(f'Bravo should use TMDB name, got {x.get("Name")}')
 PY
-assert_playback_info "$BRAVO_ID" '/tmp/jf-rig/gostream/movies/' 'existing-gostream-bravo'
+assert_playback_info "$BRAVO_ID" '/tmp/jf-rig/gostream/movies/' 'existing-gostream-bravo' 1
 assert_stream_opens "$BRAVO_ID" 'mkv' 'existing-gostream-bravo'
 
 echo '[5] assert Alpha starts as phantom and splash plays'
@@ -257,7 +271,7 @@ path=(x.get('MediaSources') or [{}])[0].get('Path') or ''
 if '/tmp/jf-rig/gostream/movies/' not in path:
     raise SystemExit(f'Alpha source not refreshed to gostream: {path}')
 PY
-assert_playback_info "$ALPHA_ID" '/tmp/jf-rig/gostream/movies/' 'materialised-alpha'
+assert_playback_info "$ALPHA_ID" '/tmp/jf-rig/gostream/movies/' 'materialised-alpha' 1
 assert_stream_opens "$ALPHA_ID" 'mkv' 'materialised-alpha'
 
 echo '[7] DB sanity: channel item persisted with movie external id + gostream path'

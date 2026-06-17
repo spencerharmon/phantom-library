@@ -31,7 +31,7 @@ namespace Jellyfin.Plugin.PhantomLibrary.Channels;
 /// (favourites, watched, playback position) is preserved.
 /// </summary>
 public sealed class PhantomMoviesChannel
-    : IChannel, ISupportsLatestMedia, IChannelItemRefresh
+    : IChannel, ISupportsLatestMedia, IChannelItemRefresh, ISupportsMediaProbe
 {
     private readonly PhantomDb _db;
     private readonly GostreamFilesystemEnumerator _enumerator;
