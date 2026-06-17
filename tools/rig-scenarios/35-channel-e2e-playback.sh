@@ -3,8 +3,8 @@
 # Starts patched rig, uses TMDB + gostream mocks, then verifies:
 # - discovery task warms channel metadata
 # - existing gostream movie enriches and plays as real movie_<tmdb>
-# - phantom movie PlaybackInfo + stream open succeed
-# - manual materialise completes through gostream mock
+# - phantom movie PlaybackInfo exposes RequiresOpening native-open source
+# - POST PlaybackInfo AutoOpenLiveStream materialises through gostream mock and returns real file
 # - refreshed channel item points at real FUSE path
 # - materialised movie PlaybackInfo + stream open succeed
 set -euo pipefail
@@ -73,6 +73,76 @@ if expect not in path:
     raise SystemExit(f'{label}: expected path containing {expect!r}, got {path!r}')
 if s.get('Protocol') != 'File':
     raise SystemExit(f'{label}: expected File protocol')
+streams=s.get('MediaStreams') or []
+if len(streams) < min_streams:
+    raise SystemExit(f'{label}: expected at least {min_streams} MediaStreams, got {len(streams)}')
+PY
+}
+
+assert_opening_playback_info() {
+  local id=$1 label=$2
+  echo "[opening-playback-info] $label id=$id"
+  api "$API/Items/$id/PlaybackInfo" -o /tmp/pb-open.json || fail "$label PlaybackInfo HTTP error"
+  python3 - "$label" <<'PY'
+import json,sys,uuid
+label=sys.argv[1]
+j=json.load(open('/tmp/pb-open.json'))
+if j.get('ErrorCode'):
+    raise SystemExit(f'{label}: PlaybackInfo ErrorCode={j.get("ErrorCode")}')
+sources=j.get('MediaSources') or []
+print('  source_count=', len(sources))
+if len(sources) != 1:
+    raise SystemExit(f'{label}: expected exactly one MediaSource, got {len(sources)}')
+s=sources[0]
+print('  source=', {k:s.get(k) for k in ['Id','Path','RequiresOpening','OpenToken','Protocol','Container']})
+if not s.get('RequiresOpening'):
+    raise SystemExit(f'{label}: expected RequiresOpening source')
+if not (s.get('OpenToken') or '').endswith('_phantom:movie_99000001'):
+    raise SystemExit(f'{label}: expected Phantom open token, got {s.get("OpenToken")!r}')
+if s.get('Path') not in (None, ''):
+    raise SystemExit(f'{label}: expected no splash path, got {s.get("Path")!r}')
+try:
+    uuid.UUID(s.get('Id'))
+except ValueError as e:
+    raise SystemExit(f'{label}: expected Guid-shaped MediaSource.Id, got {s.get("Id")!r}') from e
+PY
+}
+
+assert_auto_open_materialises() {
+  local id=$1 expect_path_sub=$2 label=$3 min_streams=${4:-1}
+  local gid
+  gid=$(hyphen "$id")
+  echo "[auto-open-playback-info] $label guid=$gid"
+  curl -sS --fail -X POST -H "X-Emby-Token: $TOK" -H 'Content-Type: application/json' \
+    -d '{"AutoOpenLiveStream":true}' \
+    "$API/Items/$gid/PlaybackInfo?AutoOpenLiveStream=true" -o /tmp/pb-auto-open.json \
+    || fail "$label auto-open PlaybackInfo HTTP error"
+  cp /tmp/pb-auto-open.json /tmp/pb.json
+  python3 - "$expect_path_sub" "$label" "$min_streams" <<'PY'
+import json,sys,uuid
+expect=sys.argv[1]
+label=sys.argv[2]
+min_streams=int(sys.argv[3])
+j=json.load(open('/tmp/pb-auto-open.json'))
+if j.get('ErrorCode'):
+    raise SystemExit(f'{label}: PlaybackInfo ErrorCode={j.get("ErrorCode")}')
+sources=j.get('MediaSources') or []
+print('  source_count=', len(sources))
+if len(sources) != 1:
+    raise SystemExit(f'{label}: expected exactly one MediaSource, got {len(sources)}')
+s=sources[0]
+print('  source=', {k:s.get(k) for k in ['Id','Path','RequiresOpening','LiveStreamId','Protocol','Container']})
+if s.get('RequiresOpening'):
+    raise SystemExit(f'{label}: auto-open should return final real source')
+path=s.get('Path') or ''
+if expect not in path:
+    raise SystemExit(f'{label}: expected path containing {expect!r}, got {path!r}')
+if s.get('Protocol') != 'File':
+    raise SystemExit(f'{label}: expected File protocol')
+try:
+    uuid.UUID(s.get('Id'))
+except ValueError as e:
+    raise SystemExit(f'{label}: expected Guid-shaped MediaSource.Id, got {s.get("Id")!r}') from e
 streams=s.get('MediaStreams') or []
 if len(streams) < min_streams:
     raise SystemExit(f'{label}: expected at least {min_streams} MediaStreams, got {len(streams)}')
@@ -217,7 +287,7 @@ PY
 assert_playback_info "$BRAVO_ID" '/tmp/jf-rig/gostream/movies/' 'existing-gostream-bravo' 1
 assert_stream_opens "$BRAVO_ID" 'mkv' 'existing-gostream-bravo'
 
-echo '[5] assert Alpha starts as phantom and splash plays'
+echo '[5] assert Alpha starts as phantom with native opening source, then auto-open materialises'
 python3 - "$ALPHA_ID" <<'PY'
 import json,sys
 id=sys.argv[1]
@@ -225,26 +295,16 @@ j=json.load(open('/tmp/movies.json'))
 x=next(i for i in j['Items'] if i['Id']==id)
 if 'phantom' not in (x.get('Tags') or []):
     raise SystemExit(f'Alpha should start phantom, tags={x.get("Tags")}')
-path=(x.get('MediaSources') or [{}])[0].get('Path') or ''
-if 'splash.mp4' not in path:
-    raise SystemExit(f'Alpha should start on splash, got {path}')
+src=(x.get('MediaSources') or [{}])[0]
+if not src.get('RequiresOpening'):
+    raise SystemExit(f'Alpha should start with RequiresOpening source, got {src}')
+if src.get('Path') not in (None, ''):
+    raise SystemExit(f'Alpha should not start on splash, got {src.get("Path")!r}')
 PY
-assert_playback_info "$ALPHA_ID" 'splash.mp4' 'phantom-alpha' 1
-assert_stream_opens "$ALPHA_ID" 'mp4' 'phantom-alpha'
+assert_opening_playback_info "$ALPHA_ID" 'phantom-alpha'
+assert_auto_open_materialises "$ALPHA_ID" '/tmp/jf-rig/gostream/movies/' 'phantom-alpha-auto-open' 1
 
-echo '[6] materialise Alpha end-to-end'
-ALPHA_GUID=$(hyphen "$ALPHA_ID")
-api_post "$API/Plugins/PhantomLibrary/Materialise/$ALPHA_GUID?trigger=Manual" -o /tmp/materialise.json || fail 'materialise HTTP failed'
-python3 - <<'PY'
-import json
-j=json.load(open('/tmp/materialise.json'))
-print('MATERIALISE=', j)
-if j.get('Status') not in ('Success','Duplicate') and j.get('status') not in ('Success','Duplicate'):
-    raise SystemExit(f'materialise did not succeed: {j}')
-fp=j.get('FusePath') or j.get('fusePath') or ''
-if '/tmp/jf-rig/gostream/movies/' not in fp:
-    raise SystemExit(f'materialise FusePath wrong: {fp}')
-PY
+echo '[6] assert Alpha materialised after native auto-open'
 state_count=$(sqlite3 "$PHDB" "SELECT COUNT(*) FROM materialised_state WHERE tmdb_id=$ALPHA AND type='movie';")
 [ "$state_count" = "1" ] || fail "materialised_state missing for Alpha"
 

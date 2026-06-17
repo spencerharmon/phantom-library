@@ -22,7 +22,7 @@ namespace Jellyfin.Plugin.PhantomLibrary.Channels;
 /// <summary>
 /// "Phantom Movies" channel — flat channel that emits a union of:
 ///   1. materialised_state movies (real FUSE-backed MediaSources),
-///   2. discovery_cache movies (phantom items, MediaSource = splash),
+///   2. discovery_cache movies (phantom items, MediaSource = native opening source),
 ///   3. orphan files on the gostream FUSE mount (raw filename).
 ///
 /// Dedup: materialised wins over phantom for the same tmdb_id.
@@ -225,7 +225,7 @@ public sealed class PhantomMoviesChannel
                         return new[] { FuseMediaSource(GostreamPathResolver.ResolveMoviePath(state.FusePath)) };
                     }
 
-                    return new[] { _splashSource.CreateMediaSource() };
+                    return Array.Empty<MediaSourceInfo>();
                 }
 
             case ChannelItemId.KindOrphan:
@@ -310,7 +310,7 @@ public sealed class PhantomMoviesChannel
     /// <summary>
     /// Build a single movie ChannelItemInfo. <paramref name="materialised"/>
     /// when non-null gives a real FUSE MediaSource; null produces a phantom
-    /// item with the splash MediaSource and Tags=["phantom"]. Returns null
+    /// item with a native opening MediaSource and Tags=["phantom"]. Returns null
     /// if no <c>tmdb_metadata</c> row exists yet — the caller skips the item
     /// for this tick and the next DiscoveryRefreshTask warms the metadata.
     /// </summary>
@@ -337,7 +337,7 @@ public sealed class PhantomMoviesChannel
         }
         else
         {
-            sources.Add(_splashSource.CreateMediaSource());
+            sources.Add(PhantomMaterialisingMediaSourceProvider.CreateOpeningMediaSource(ChannelItemId.ForMovie(tmdb), prefixedToken: true));
             tags.Add("phantom");
         }
 

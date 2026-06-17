@@ -11,6 +11,7 @@ using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.Channels;
 using MediaBrowser.Model.Channels;
+using MediaBrowser.Model.Dto;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
@@ -51,6 +52,14 @@ public class PhantomShowsChannelTests : IDisposable
         SqliteConnection.ClearAllPools();
         try { if (File.Exists(_dbPath)) File.Delete(_dbPath); } catch { }
         try { if (Directory.Exists(_splashHome)) Directory.Delete(_splashHome, true); } catch { }
+    }
+
+    private static void AssertOpeningSource(MediaSourceInfo src, string externalId)
+    {
+        Assert.Equal(string.Empty, src.Path);
+        Assert.True(src.RequiresOpening);
+        Assert.StartsWith(PhantomMaterialisingMediaSourceProvider.ProviderPrefix + "phantom:" + externalId, src.OpenToken, StringComparison.Ordinal);
+        Assert.True(Guid.TryParse(src.Id, out _));
     }
 
     private async Task SeedSeriesMetaAsync(int tmdb, string title, int year = 2011, int? communityRating = null)
@@ -224,7 +233,7 @@ public class PhantomShowsChannelTests : IDisposable
     // ----------------------------------------------------------------
 
     [Fact]
-    public async Task GetChannelItems_SeasonFolder_EmitsPhantomEpisodesWithSplash()
+    public async Task GetChannelItems_SeasonFolder_EmitsPhantomEpisodesWithOpeningSources()
     {
         await SeedSeriesMetaAsync(1399, "Game of Thrones");
         _tmdb.Setup(t => t.GetSeasonAsync(1399, 1, null, It.IsAny<CancellationToken>()))
@@ -242,7 +251,7 @@ public class PhantomShowsChannelTests : IDisposable
             Assert.Equal(ChannelItemType.Media, i.Type);
             Assert.Equal(ChannelMediaContentType.Episode, i.ContentType);
             Assert.Contains("phantom", i.Tags);
-            Assert.Equal(_splash.ResolveSplashPath(), i.MediaSources[0].Path);
+            AssertOpeningSource(i.MediaSources[0], i.Id);
             Assert.Equal("Game of Thrones", i.SeriesName);
             Assert.Equal(1, i.ParentIndexNumber);
         });
@@ -335,7 +344,7 @@ public class PhantomShowsChannelTests : IDisposable
     }
 
     [Fact]
-    public async Task GetChannelItemAsync_Episode_BeforeMaterialise_ReturnsSplashWithPhantomTag()
+    public async Task GetChannelItemAsync_Episode_BeforeMaterialise_ReturnsOpeningSourceWithPhantomTag()
     {
         // Cold tmdb_episode_cache → channel falls back to TMDB warm.
         _tmdb.Setup(t => t.GetSeasonAsync(1399, 1, null, It.IsAny<CancellationToken>()))
@@ -345,7 +354,7 @@ public class PhantomShowsChannelTests : IDisposable
         Assert.NotNull(got);
         Assert.Equal("episode_1399_s01e01", got.Id);
         Assert.Contains("phantom", got.Tags);
-        Assert.Equal(_splash.ResolveSplashPath(), got.MediaSources[0].Path);
+        AssertOpeningSource(got.MediaSources[0], "episode_1399_s01e01");
     }
 
     [Fact]
@@ -401,11 +410,10 @@ public class PhantomShowsChannelTests : IDisposable
     // ----------------------------------------------------------------
 
     [Fact]
-    public async Task GetChannelItemMediaInfo_PhantomEpisode_ReturnsSplash()
+    public async Task GetChannelItemMediaInfo_PhantomEpisode_ReturnsEmpty()
     {
         var got = await _channel.GetChannelItemMediaInfo("episode_1399_s01e01", CancellationToken.None);
-        var src = Assert.Single(got);
-        Assert.Equal(_splash.ResolveSplashPath(), src.Path);
+        Assert.Empty(got);
     }
 
     [Fact]

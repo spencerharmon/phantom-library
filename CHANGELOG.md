@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Phantom channel playback now uses Jellyfin's native `RequiresOpening`
+  media-source flow instead of the finite splash video. TV/mobile/web
+  clients that auto-open live media sources should show their native
+  loading UI while Phantom materialises, then start the real gostream
+  file as soon as it is available.
+- Web badge overlays now poll visible Phantom/Materialising items and
+  update/remove themselves when materialisation completes.
+
 ### BREAKING — requires wipe + patched Jellyfin
 
 Phantom Library v0.3.0 replaces the file-on-disk phantom
@@ -51,9 +61,9 @@ Operator steps (in order):
    Refresh"** → **Run Now**.
 9. Refresh the browser. "Phantom Movies" and "Phantom Shows"
    tiles appear in your library nav.
-10. Smoke-test: click a phantom item, **Play** (splash plays),
-    kebab → **Materialise**, wait for the toast, **Play** again —
-    the real file streams.
+10. Smoke-test: click a phantom item, **Play**. Jellyfin should show
+    its native loading UI while Phantom materialises the item, then
+    start the real gostream file automatically.
 
 Manual fallback (if `scripts/phantom-wipe.sh` is unavailable for
 any reason): inspect the script's source for the exact SQL

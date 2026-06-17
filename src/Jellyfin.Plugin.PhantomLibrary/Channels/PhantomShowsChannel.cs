@@ -27,7 +27,7 @@ namespace Jellyfin.Plugin.PhantomLibrary.Channels;
 ///   2. ITmdbClient.GetSeriesAsync for season counts,
 ///   3. ITmdbClient.GetSeasonAsync + tmdb_episode_cache for the
 ///      per-episode display metadata,
-///   4. materialised_state for FUSE-path resolution vs splash.
+///   4. materialised_state for FUSE-path resolution vs native opening source.
 ///
 /// Same single-id-per-logical-item discipline as PhantomMoviesChannel
 /// (plan §3.3 + critic round 3 BLOCKER 1): series_&lt;tmdb&gt; folders,
@@ -149,7 +149,7 @@ public sealed class PhantomShowsChannel
 
         return state is not null
             ? new[] { FuseMediaSource(GostreamPathResolver.ResolveEpisodePath(state.FusePath)) }
-            : new[] { _splashSource.CreateMediaSource() };
+            : Array.Empty<MediaSourceInfo>();
     }
 
     /// <inheritdoc />
@@ -429,7 +429,7 @@ public sealed class PhantomShowsChannel
     /// <summary>
     /// Build an episode ChannelItemInfo. <paramref name="materialised"/>
     /// when non-null gives a real FUSE MediaSource; null produces a
-    /// splash MediaSource and a <c>phantom</c> tag. The episode row is
+    /// native opening MediaSource and a <c>phantom</c> tag. The episode row is
     /// fetched from <c>tmdb_episode_cache</c>; if the cache is cold,
     /// the per-season TMDB call warms the cache for this and all
     /// sibling episodes before retrying the read.
@@ -477,7 +477,9 @@ public sealed class PhantomShowsChannel
         }
         else
         {
-            source = _splashSource.CreateMediaSource();
+            source = PhantomMaterialisingMediaSourceProvider.CreateOpeningMediaSource(
+                ChannelItemId.ForEpisode(row.SeriesTmdbId, row.Season, row.Episode),
+                prefixedToken: true);
             tags.Add("phantom");
         }
 

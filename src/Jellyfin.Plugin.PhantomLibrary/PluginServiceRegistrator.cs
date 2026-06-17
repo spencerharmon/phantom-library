@@ -11,6 +11,7 @@ using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Channels;
+using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Plugins;
 using MediaBrowser.Model.Tasks;
 using Microsoft.Extensions.DependencyInjection;
@@ -111,6 +112,12 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         // for orphan files the movies/shows channel surfaces alongside
         // discovery + materialised items.
         serviceCollection.AddSingleton<GostreamFilesystemEnumerator>();
+
+        // Native-client phantom playback opener. Emits/opens RequiresOpening
+        // sources so TV/mobile clients show native loading while materialise
+        // completes, then start the real gostream file.
+        serviceCollection.AddSingleton<PhantomMaterialisingMediaSourceProvider>();
+        serviceCollection.AddSingleton<IMediaSourceProvider>(sp => sp.GetRequiredService<PhantomMaterialisingMediaSourceProvider>());
 
         // Channels.
         serviceCollection.AddSingleton<IChannel, PhantomMoviesChannel>();

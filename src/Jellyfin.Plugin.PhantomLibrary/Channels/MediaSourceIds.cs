@@ -10,6 +10,8 @@ internal static class MediaSourceIds
 
     public static string ForFilePath(string path) => GuidFromPath("file", path);
 
+    public static string ForPhantomOpenToken(string token) => GuidFromPath("phantom-open", token);
+
     private static string GuidFromPath(string kind, string path)
     {
         var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(kind + ":" + path));

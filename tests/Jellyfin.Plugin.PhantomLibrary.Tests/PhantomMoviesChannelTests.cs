@@ -10,6 +10,7 @@ using Jellyfin.Plugin.PhantomLibrary.Clients.Models;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.Channels;
+using MediaBrowser.Model.Dto;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
@@ -65,6 +66,14 @@ public class PhantomMoviesChannelTests : IDisposable
         try { if (Directory.Exists(_splashHome)) Directory.Delete(_splashHome, true); } catch { }
     }
 
+    private static void AssertOpeningSource(MediaSourceInfo src, string externalId)
+    {
+        Assert.Equal(string.Empty, src.Path);
+        Assert.True(src.RequiresOpening);
+        Assert.StartsWith(PhantomMaterialisingMediaSourceProvider.ProviderPrefix + "phantom:" + externalId, src.OpenToken, StringComparison.Ordinal);
+        Assert.True(Guid.TryParse(src.Id, out _));
+    }
+
     private async Task SeedMetaAsync(int tmdb, string title)
     {
         await _db.UpsertTmdbMetadataAsync(
@@ -84,7 +93,7 @@ public class PhantomMoviesChannelTests : IDisposable
     }
 
     [Fact]
-    public async Task GetChannelItems_DiscoveryOnly_EmitsAsPhantomWithSplash()
+    public async Task GetChannelItems_DiscoveryOnly_EmitsAsPhantomWithOpeningSource()
     {
         await SeedMetaAsync(101, "Discovery Movie");
         await _db.UpsertDiscoveryCacheAsync(101, "movie", CancellationToken.None);
@@ -97,8 +106,7 @@ public class PhantomMoviesChannelTests : IDisposable
         Assert.Equal("Discovery Movie", item.Name);
         Assert.Contains("phantom", item.Tags);
         var src = Assert.Single(item.MediaSources);
-        Assert.Equal(_splash.ResolveSplashPath(), src.Path);
-        Assert.True(Guid.TryParse(src.Id, out _));
+        AssertOpeningSource(src, "movie_101");
     }
 
     [Fact]
@@ -315,12 +323,10 @@ public class PhantomMoviesChannelTests : IDisposable
     }
 
     [Fact]
-    public async Task GetChannelItemMediaInfo_Phantom_ReturnsSplash()
+    public async Task GetChannelItemMediaInfo_Phantom_ReturnsEmpty()
     {
         var got = await _channel.GetChannelItemMediaInfo("movie_60", CancellationToken.None);
-        var src = Assert.Single(got);
-        Assert.Equal(_splash.ResolveSplashPath(), src.Path);
-        Assert.True(Guid.TryParse(src.Id, out _));
+        Assert.Empty(got);
     }
 
     [Fact]

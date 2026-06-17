@@ -27,6 +27,8 @@ public sealed class ChannelStateProvider
     public const string KindMovies = "movies";
     public const string KindShows = "shows";
 
+    private const string DataVersionSalt = "native-open-v1";
+
     private static readonly string[] AllKinds = { KindMovies, KindShows };
 
     private readonly PhantomDb _db;
@@ -50,7 +52,8 @@ public sealed class ChannelStateProvider
         EnsureHydrated();
         lock (_gate)
         {
-            return _versions.TryGetValue(kind, out var v) ? v : "1";
+            var stored = _versions.TryGetValue(kind, out var v) ? v : "1";
+            return stored + ":" + DataVersionSalt;
         }
     }
 
