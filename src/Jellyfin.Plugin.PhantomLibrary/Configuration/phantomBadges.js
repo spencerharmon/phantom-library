@@ -53,6 +53,8 @@
     var DECORATED_ATTR = 'data-phantom-badge';        // value = state once applied
     var DETAIL_ATTR = 'data-phantom-detail-badge';    // misc-info strip marker (value = guid32)
     var DEBOUNCE_MS = 120;
+    var POLL_MS = 3000;
+    var POLL_MAX_MS = 10 * 60 * 1000;
     var BATCH_LIMIT = 400;                            // server splits at 500; keep margin
     var GUID_RE = /^[0-9a-fA-F]{32}$|^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
@@ -64,6 +66,10 @@
     /* Pending DOM elements awaiting decoration, keyed by guid. */
     var pending = Object.create(null);
     var pendingTimer = null;
+
+    /* States that can change while visible. guid → first poll timestamp. */
+    var watched = Object.create(null);
+    var pollTimer = null;
 
     /* Pending detail-page injections: guid → true when we still need
      * to decorate the misc-info strip for that detail page. */
@@ -134,6 +140,9 @@
             '.phantom-badge.phantom-state-Materialised {' +
             '  background: rgba(16, 185, 129, 0.92);' + /* emerald */
             '}' +
+            '.phantom-badge.phantom-state-Materialising {' +
+            '  background: rgba(245, 158, 11, 0.94);' + /* amber */
+            '}' +
             '.phantom-badge.phantom-state-Unavailable {' +
             '  background: rgba(107, 114, 128, 0.92);' + /* slate-gray */
             '}' +
@@ -160,6 +169,8 @@
         switch (state) {
             case 'Materialised':
                 return 'Materialised';
+            case 'Materialising':
+                return 'Materialising';
             case 'Unavailable':
                 return 'Unavailable';
             case 'Phantom':
@@ -169,13 +180,42 @@
         }
     }
 
+    function isTransitionState(state) {
+        return state === 'Phantom' || state === 'Virtual' || state === 'Materialising';
+    }
+
+    function watchGuid(guid, state) {
+        if (!guid || !isTransitionState(state)) {
+            return;
+        }
+
+        if (!watched[guid]) {
+            watched[guid] = Date.now();
+        }
+
+        schedulePoll();
+    }
+
+    function unwatchGuid(guid) {
+        if (guid && watched[guid]) {
+            delete watched[guid];
+        }
+    }
+
     function makeBadge(state, inline) {
         var badge = document.createElement('span');
+        badge.setAttribute('data-phantom-state', state);
         badge.className = 'phantom-badge phantom-state-' + state +
             (inline ? ' phantom-badge--inline' : '');
         badge.textContent = labelFor(state);
         badge.title = 'Phantom Library: ' + labelFor(state);
         return badge;
+    }
+
+    function removeBadge(el) {
+        var stale = el.querySelectorAll(':scope .phantom-badge');
+        for (var i = 0; i < stale.length; i++) stale[i].remove();
+        el.removeAttribute(DECORATED_ATTR);
     }
 
     /* Place a corner badge on a card or list-item element. */
@@ -186,8 +226,7 @@
 
         // Remove any stale badge before reinserting (handles state
         // transitions, e.g. Phantom → Materialised after install).
-        var stale = el.querySelectorAll(':scope .phantom-badge');
-        for (var i = 0; i < stale.length; i++) stale[i].remove();
+        removeBadge(el);
 
         var host = null;
         if (el.classList && el.classList.contains('card')) {
@@ -214,6 +253,7 @@
             // No suitable host — record the lookup result so we don't
             // re-evaluate this element repeatedly, but don't draw.
             el.setAttribute(DECORATED_ATTR, state);
+            watchGuid(normaliseGuid(el.getAttribute('data-id')), state);
             return;
         }
 
@@ -224,6 +264,17 @@
         }
         host.appendChild(makeBadge(state, /*inline*/ false));
         el.setAttribute(DECORATED_ATTR, state);
+        var guid = normaliseGuid(el.getAttribute('data-id'));
+        watchGuid(guid, state);
+    }
+
+    function removeDetailBadge(guid) {
+        var strips = document.querySelectorAll('[' + DETAIL_ATTR + '="' + guid + '"]');
+        for (var i = 0; i < strips.length; i++) {
+            var prior = strips[i].querySelectorAll(':scope > .phantom-badge--inline');
+            for (var j = 0; j < prior.length; j++) prior[j].remove();
+            strips[i].removeAttribute(DETAIL_ATTR);
+        }
     }
 
     /* Place a single inline badge into the detail-page misc-info
@@ -244,23 +295,14 @@
                 || page.querySelector('.itemMiscInfo');
             if (!strip) continue;
 
-            // Already decorated this strip for this guid?
-            if (strip.getAttribute(DETAIL_ATTR) === guid) {
-                // Confirm the badge actually exists; if the strip was
-                // re-rendered Jellyfin may have wiped our child.
-                if (strip.querySelector(':scope > .phantom-badge--inline')) {
-                    found = true;
-                    continue;
-                }
-            }
-
-            // Wipe any prior badge on this strip (stale guid or
-            // re-render) before injecting.
+            // Wipe any prior badge on this strip (stale guid, stale state,
+            // or Jellyfin re-render) before injecting.
             var prior = strip.querySelectorAll(':scope > .phantom-badge--inline');
             for (var q = 0; q < prior.length; q++) prior[q].remove();
 
             strip.appendChild(makeBadge(state, /*inline*/ true));
             strip.setAttribute(DETAIL_ATTR, guid);
+            watchGuid(guid, state);
             found = true;
         }
         return found;
@@ -301,9 +343,7 @@
                 } else if (!cached && existing) {
                     // Was decorated, but state is now "no phantom" —
                     // strip it. (Rare; cache resets on reload.)
-                    var old = el.querySelectorAll(':scope .phantom-badge');
-                    for (var k = 0; k < old.length; k++) old[k].remove();
-                    el.removeAttribute(DECORATED_ATTR);
+                    removeBadge(el);
                 }
                 continue;
             }
@@ -356,6 +396,49 @@
         pending = Object.create(null);
     }
 
+    function visibleElementsForGuid(guid) {
+        var result = [];
+        var nodes = document.querySelectorAll('.card[data-id], .listItem[data-id]');
+        for (var i = 0; i < nodes.length; i++) {
+            if (normaliseGuid(nodes[i].getAttribute('data-id')) === guid) {
+                result.push(nodes[i]);
+            }
+        }
+        return result;
+    }
+
+    function applyState(guid, state, els) {
+        stateCache[guid] = state;
+        if (isTransitionState(state)) {
+            watchGuid(guid, state);
+        } else {
+            unwatchGuid(guid);
+        }
+
+        var targets = els || visibleElementsForGuid(guid);
+        for (var j = 0; j < targets.length; j++) {
+            if (!targets[j].isConnected) continue;
+            if (state) {
+                placeBadge(targets[j], state);
+            } else {
+                removeBadge(targets[j]);
+            }
+        }
+
+        if (state) {
+            if (pendingDetail[guid]) {
+                if (placeDetailBadge(guid, state)) {
+                    delete pendingDetail[guid];
+                }
+            } else if (currentDetailItemId() === guid) {
+                placeDetailBadge(guid, state);
+            }
+        } else {
+            removeDetailBadge(guid);
+            delete pendingDetail[guid];
+        }
+    }
+
     function sendBatch(api, chunk) {
         // Snapshot the pending element lists per id before clearing.
         var snapshot = Object.create(null);
@@ -363,6 +446,12 @@
             snapshot[chunk[i]] = (pending[chunk[i]] || []).slice();
         }
 
+        requestStates(api, chunk, function (g, state) {
+            applyState(g, state, snapshot[g] || []);
+        });
+    }
+
+    function requestStates(api, chunk, onState) {
         var url = api.getUrl('Plugins/PhantomLibrary/States');
         api.ajax({
             type: 'POST',
@@ -378,27 +467,45 @@
             for (var i = 0; i < chunk.length; i++) {
                 var g = chunk[i];
                 var state = Object.prototype.hasOwnProperty.call(result, g) ? result[g] : null;
-                stateCache[g] = state;
-                if (state) {
-                    var els = snapshot[g] || [];
-                    for (var j = 0; j < els.length; j++) {
-                        if (els[j].isConnected) {
-                            placeBadge(els[j], state);
-                        }
-                    }
-                    if (pendingDetail[g]) {
-                        // Try to inject into detail page; if the strip
-                        // isn't in the DOM yet, leave the flag so the
-                        // mutation observer retries on next render.
-                        if (placeDetailBadge(g, state)) {
-                            delete pendingDetail[g];
-                        }
-                    }
-                }
+                onState(g, state);
             }
         }, function (err) {
             warn('states lookup failed', err);
         });
+    }
+
+    function schedulePoll() {
+        if (pollTimer) return;
+        pollTimer = setTimeout(pollWatched, POLL_MS);
+    }
+
+    function pollWatched() {
+        pollTimer = null;
+        var now = Date.now();
+        var ids = Object.keys(watched).filter(function (guid) {
+            if (now - watched[guid] > POLL_MAX_MS) {
+                delete watched[guid];
+                return false;
+            }
+            return visibleElementsForGuid(guid).length > 0 || currentDetailItemId() === guid;
+        });
+        if (ids.length === 0) return;
+
+        var api = getApiClient();
+        if (!api) {
+            schedulePoll();
+            return;
+        }
+
+        for (var i = 0; i < ids.length; i += BATCH_LIMIT) {
+            requestStates(api, ids.slice(i, i + BATCH_LIMIT), function (g, state) {
+                applyState(g, state, visibleElementsForGuid(g));
+            });
+        }
+
+        if (Object.keys(watched).length > 0) {
+            schedulePoll();
+        }
     }
 
     /* Initial sweep + body-wide MutationObserver for new cards as the
