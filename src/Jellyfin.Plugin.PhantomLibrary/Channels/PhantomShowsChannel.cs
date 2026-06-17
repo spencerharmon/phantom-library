@@ -148,7 +148,7 @@ public sealed class PhantomShowsChannel
             cancellationToken).ConfigureAwait(false);
 
         return state is not null
-            ? new[] { FuseMediaSource(state.FusePath) }
+            ? new[] { FuseMediaSource(GostreamPathResolver.ResolveEpisodePath(state.FusePath)) }
             : new[] { _splashSource.CreateMediaSource() };
     }
 
@@ -473,7 +473,7 @@ public sealed class PhantomShowsChannel
         var tags = new List<string>();
         if (materialised is not null)
         {
-            source = FuseMediaSource(materialised.FusePath);
+            source = FuseMediaSource(GostreamPathResolver.ResolveEpisodePath(materialised.FusePath));
         }
         else
         {

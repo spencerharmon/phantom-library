@@ -261,12 +261,15 @@ public sealed class Materialiser : IMaterialiser
             var addRequest = await BuildGostreamRequestAsync(
                 tmdbId, type, season, episode, imdb, unavailKey, ct).ConfigureAwait(false);
             var addResult = await _gostream.AddAsync(addRequest, ct).ConfigureAwait(false);
-            await WaitForFusePathAsync(addResult.FusePath, ct).ConfigureAwait(false);
+            var fusePath = type == "movie"
+                ? GostreamPathResolver.ResolveMoviePath(addResult.FusePath)
+                : GostreamPathResolver.ResolveEpisodePath(addResult.FusePath);
+            await WaitForFusePathAsync(fusePath, ct).ConfigureAwait(false);
 
             await _db.InsertMaterialisedStateAsync(
                 tmdbId, type, sSentinel, eSentinel,
                 stubPath: addResult.StubPath,
-                fusePath: addResult.FusePath,
+                fusePath: fusePath,
                 ct).ConfigureAwait(false);
 
             // Post-flight refresh: channel now emits real MediaSource;
@@ -300,7 +303,7 @@ public sealed class Materialiser : IMaterialiser
 
             _state.BumpDataVersion(channelKind);
 
-            var outcome = MaterialisationOutcome.Success(addResult.FusePath, addResult.StubPath);
+            var outcome = MaterialisationOutcome.Success(fusePath, addResult.StubPath);
             LifecycleChanged?.Invoke(this, new MaterialisationLifecycleEvent(
                 Guid.Empty, MaterialisationLifecyclePhase.Finished, outcome));
             _ = trigger; // kept for symmetry with the legacy ctor and for future logging hooks

@@ -90,7 +90,7 @@ public sealed class GostreamFilesystemEnumerator
 
         // Build the "this is a materialised file, not an orphan" exclusion set.
         var materialisedFusePaths = (await _db.ListMaterialisedStateAsync("movie", ct).ConfigureAwait(false))
-            .Select(r => r.FusePath)
+            .Select(r => GostreamPathResolver.ResolvePath(r.FusePath, root))
             .ToHashSet(StringComparer.Ordinal);
 
         var results = new List<GostreamFileEntry>();
@@ -232,7 +232,7 @@ public sealed class GostreamFilesystemEnumerator
         // Build the same exclusion set as the orphan enumeration so we
         // don't return a path that's actually a materialised item.
         var materialisedFusePaths = (await _db.ListMaterialisedStateAsync("movie", ct).ConfigureAwait(false))
-            .Select(r => r.FusePath)
+            .Select(r => GostreamPathResolver.ResolvePath(r.FusePath, root))
             .ToHashSet(StringComparer.Ordinal);
 
         IEnumerable<string> files;

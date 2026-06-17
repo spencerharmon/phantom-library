@@ -91,9 +91,9 @@ SQL
   rm -rf $JF_DATA/plugins/Jellyfin.Plugin.PhantomLibrary_0.1.0.0 \
          $JF_DATA/plugins/Jellyfin.Plugin.PhantomLibrary_0.2.0.0
 
-  # Rig-scoped phantom-stub dir
-  rm -rf $PHANTOM_ROOT
-  mkdir -p $PHANTOM_ROOT/movies $PHANTOM_ROOT/shows
+  # Rig-scoped phantom-stub + gostream mock dirs.
+  rm -rf $PHANTOM_ROOT $GOSTREAM_ROOT
+  mkdir -p $PHANTOM_ROOT/movies $PHANTOM_ROOT/shows $GOSTREAM_ROOT/movies $GOSTREAM_ROOT/stubs $GOSTREAM_ROOT/tv
 fi
 
 # Always drop the fresh DLL.
@@ -183,6 +183,7 @@ systemd-run --user --unit=rig-gostream-mock \
   --description='Phantom rig gostream mock' \
   --setenv=JF_RIG_ROOT=$ROOT \
   --setenv=GOSTREAM_MOCK_PORT=19080 \
+  --setenv=GOSTREAM_MOCK_RESPONSE_MOVIES_ROOT=/mnt/gostream-mkv-virtual/movies \
   -- /usr/bin/python3 $ROOT/bin/gostream-mock.py >/dev/null
 
 for i in {1..20}; do

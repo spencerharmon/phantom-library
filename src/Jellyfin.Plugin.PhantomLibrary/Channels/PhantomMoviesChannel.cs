@@ -205,7 +205,7 @@ public sealed class PhantomMoviesChannel
                         parsed.TmdbId!.Value, "movie", -1, -1, cancellationToken).ConfigureAwait(false);
                     if (state is not null)
                     {
-                        return new[] { FuseMediaSource(state.FusePath) };
+                        return new[] { FuseMediaSource(GostreamPathResolver.ResolveMoviePath(state.FusePath)) };
                     }
 
                     return new[] { _splashSource.CreateMediaSource() };
@@ -311,7 +311,7 @@ public sealed class PhantomMoviesChannel
         var tags = new List<string>();
         if (materialised is not null)
         {
-            source = FuseMediaSource(materialised.FusePath);
+            source = FuseMediaSource(GostreamPathResolver.ResolveMoviePath(materialised.FusePath));
         }
         else
         {

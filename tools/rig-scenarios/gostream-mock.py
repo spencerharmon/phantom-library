@@ -11,6 +11,7 @@ from pathlib import Path
 
 ROOT = Path(os.environ.get("JF_RIG_ROOT", "/tmp/jf-rig"))
 PORT = int(os.environ.get("GOSTREAM_MOCK_PORT", "19080"))
+RESPONSE_MOVIES_ROOT = os.environ.get("GOSTREAM_MOCK_RESPONSE_MOVIES_ROOT", "")
 LOG = ROOT / "logs" / "gostream-mock.log"
 MEDIA = ROOT / "gostream" / "movies"
 STUBS = ROOT / "gostream" / "stubs"
@@ -100,14 +101,15 @@ class Handler(BaseHTTPRequestHandler):
         stub = STUBS / file_name
         stub.parent.mkdir(parents=True, exist_ok=True)
         stub.write_text(str(fuse))
+        response_fuse = str(Path(RESPONSE_MOVIES_ROOT) / file_name) if RESPONSE_MOVIES_ROOT else str(fuse)
         resp = {
             "stub_path": str(stub),
-            "fuse_path": str(fuse),
+            "fuse_path": response_fuse,
             "hash": digest,
             "size": fuse.stat().st_size,
         }
         self._send_json(200, resp)
-        log(f"POST /api/library/add body={body!r} tmdb={tmdb} title={title!r} -> 200 {fuse}")
+        log(f"POST /api/library/add body={body!r} tmdb={tmdb} title={title!r} -> 200 real={fuse} response_fuse={response_fuse}")
 
 
 def main() -> None:
