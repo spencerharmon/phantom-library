@@ -117,6 +117,25 @@ sudo systemctl restart jellyfin
 
 Then configure as in step 4 of the repository flow above.
 
+### Channel access (v0.3.0+)
+
+`Phantom Movies` and `Phantom Shows` are Jellyfin **channels**, not
+normal libraries. Jellyfin controls channel visibility per user via
+user policy, separate from library-folder access.
+
+After installing v0.3.0+:
+
+1. Dashboard → Users.
+2. Select each user who should see Phantom Library.
+3. Open **Access**.
+4. In **Channels**, enable either:
+   - **All channels**, or
+   - specifically **Phantom Movies** and **Phantom Shows**.
+5. Save, then hard-refresh the client/browser.
+
+If a user can see normal libraries but cannot see Phantom Movies / Phantom
+Shows, check this channel-access setting first.
+
 ## Configuration
 
 All settings live in the admin dashboard. See PLAN.md §Configuration

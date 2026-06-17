@@ -4,6 +4,9 @@ using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Text.RegularExpressions;
+using Jellyfin.Plugin.PhantomLibrary.Clients;
+using Jellyfin.Plugin.PhantomLibrary.Clients.Models;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Controller.Channels;
 using MediaBrowser.Controller.Drawing;
@@ -28,25 +31,29 @@ namespace Jellyfin.Plugin.PhantomLibrary.Channels;
 /// (favourites, watched, playback position) is preserved.
 /// </summary>
 public sealed class PhantomMoviesChannel
-    : IChannel, IRequiresMediaInfoCallback, ISupportsLatestMedia, IChannelItemRefresh
+    : IChannel, ISupportsLatestMedia, IChannelItemRefresh
 {
     private readonly PhantomDb _db;
     private readonly GostreamFilesystemEnumerator _enumerator;
     private readonly SplashSourceProvider _splashSource;
     private readonly ChannelStateProvider _state;
+    private readonly ITmdbClient _tmdbClient;
     private readonly ILogger<PhantomMoviesChannel> _logger;
+    private readonly Dictionary<string, int> _gostreamMovieTmdbByPath = new(StringComparer.Ordinal);
 
     public PhantomMoviesChannel(
         PhantomDb db,
         GostreamFilesystemEnumerator enumerator,
         SplashSourceProvider splashSource,
         ChannelStateProvider state,
+        ITmdbClient tmdbClient,
         ILogger<PhantomMoviesChannel> logger)
     {
         _db = db ?? throw new ArgumentNullException(nameof(db));
         _enumerator = enumerator ?? throw new ArgumentNullException(nameof(enumerator));
         _splashSource = splashSource ?? throw new ArgumentNullException(nameof(splashSource));
         _state = state ?? throw new ArgumentNullException(nameof(state));
+        _tmdbClient = tmdbClient ?? throw new ArgumentNullException(nameof(tmdbClient));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
@@ -147,7 +154,23 @@ public sealed class PhantomMoviesChannel
         foreach (var o in orphans)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            items.Add(BuildOrphanMovieItem(o));
+            var enriched = await TryBuildEnrichedGostreamMovieAsync(o.Path, cancellationToken).ConfigureAwait(false);
+            if (enriched is not null)
+            {
+                if (ChannelItemId.TryParse(enriched.Id, out var parsed) && parsed.TmdbId.HasValue)
+                {
+                    if (!emittedTmdbs.Add(parsed.TmdbId.Value))
+                    {
+                        continue;
+                    }
+                }
+
+                items.Add(enriched);
+            }
+            else
+            {
+                items.Add(BuildOrphanMovieItem(o));
+            }
         }
 
         return new ChannelItemResult
@@ -288,9 +311,76 @@ public sealed class PhantomMoviesChannel
             tags.Add("phantom");
         }
 
+        return BuildMovieItemFromMetadata(meta, source, tags);
+    }
+
+    private async Task<ChannelItemInfo?> TryBuildEnrichedGostreamMovieAsync(string path, CancellationToken ct)
+    {
+        if (!TryParseGostreamMovieName(path, out var title, out var year))
+        {
+            return null;
+        }
+
+        int tmdbId;
+        lock (_gostreamMovieTmdbByPath)
+        {
+            _gostreamMovieTmdbByPath.TryGetValue(path, out tmdbId);
+        }
+
+        if (tmdbId == 0)
+        {
+            IReadOnlyList<TmdbSearchHit> hits;
+            try
+            {
+                hits = await _tmdbClient.SearchMoviesAsync(title, year, null, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "TMDB search failed for gostream file {Path}", path);
+                return null;
+            }
+
+            if (hits.Count == 0)
+            {
+                return null;
+            }
+
+            tmdbId = hits[0].Id;
+            lock (_gostreamMovieTmdbByPath)
+            {
+                _gostreamMovieTmdbByPath[path] = tmdbId;
+            }
+        }
+
+        var details = await _db.GetTmdbMetadataAsync(tmdbId, "movie", ct).ConfigureAwait(false);
+        if (details is null)
+        {
+            try
+            {
+                var movie = await _tmdbClient.GetMovieAsync(tmdbId, null, ct).ConfigureAwait(false);
+                if (movie is null)
+                {
+                    return null;
+                }
+
+                details = MapMovieDetails(movie);
+                await _db.UpsertTmdbMetadataAsync(details, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "TMDB details fetch failed for gostream file {Path} tmdb={Tmdb}", path, tmdbId);
+                return null;
+            }
+        }
+
+        return BuildMovieItemFromMetadata(details, FuseMediaSource(path), tags: new List<string>());
+    }
+
+    private static ChannelItemInfo BuildMovieItemFromMetadata(TmdbMetadataRow meta, MediaSourceInfo source, List<string> tags)
+    {
         var item = new ChannelItemInfo
         {
-            Id = id,
+            Id = ChannelItemId.ForMovie(meta.TmdbId).Encode(),
             Name = meta.Title,
             OriginalTitle = meta.OriginalTitle,
             Overview = meta.Overview,
@@ -311,9 +401,54 @@ public sealed class PhantomMoviesChannel
             item.Genres = meta.Genres.ToList();
         }
 
-        item.ProviderIds["Tmdb"] = tmdb.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        item.ProviderIds["Tmdb"] = meta.TmdbId.ToString(System.Globalization.CultureInfo.InvariantCulture);
         return item;
     }
+
+    private static TmdbMetadataRow MapMovieDetails(TmdbMovieDetails movie)
+    {
+        var title = !string.IsNullOrWhiteSpace(movie.Title) ? movie.Title! : (movie.OriginalTitle ?? string.Empty);
+        var year = ParseYear(movie.ReleaseDate);
+        return new TmdbMetadataRow(
+            movie.Id,
+            "movie",
+            title,
+            year,
+            movie.Overview,
+            BuildPosterUrl(movie.PosterPath),
+            BuildPosterUrl(movie.BackdropPath),
+            movie.Genres,
+            null,
+            movie.VoteAverage,
+            movie.OriginalTitle,
+            DateTimeOffset.UtcNow);
+    }
+
+    private static bool TryParseGostreamMovieName(string path, out string title, out int? year)
+    {
+        var stem = Path.GetFileNameWithoutExtension(path).Replace('_', ' ');
+        stem = Regex.Replace(stem, @"\b(480p|720p|1080p|2160p|4k|hdr|dv|atmos|remux|x264|x265|h264|h265|hevc|aac|5\.1|7\.1)\b", string.Empty, RegexOptions.IgnoreCase).Trim();
+        stem = Regex.Replace(stem, @"\b[a-f0-9]{8}\b$", string.Empty, RegexOptions.IgnoreCase).Trim();
+        var m = Regex.Match(stem, @"^(?<title>.+?)\s+(?<year>(19|20)\d{2})(\b|$)");
+        if (m.Success)
+        {
+            title = Regex.Replace(m.Groups["title"].Value, @"\s+", " ").Trim();
+            year = int.Parse(m.Groups["year"].Value, System.Globalization.CultureInfo.InvariantCulture);
+        }
+        else
+        {
+            title = Regex.Replace(stem, @"\s+", " ").Trim();
+            year = null;
+        }
+
+        return !string.IsNullOrWhiteSpace(title);
+    }
+
+    private static int? ParseYear(string? date)
+        => !string.IsNullOrWhiteSpace(date) && date.Length >= 4 && int.TryParse(date[..4], out var y) ? y : null;
+
+    private static string? BuildPosterUrl(string? path)
+        => string.IsNullOrWhiteSpace(path) ? null : "https://image.tmdb.org/t/p/w500" + path;
 
     private static ChannelItemInfo BuildOrphanMovieItem(GostreamFileEntry o)
     {

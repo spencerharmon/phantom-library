@@ -38,7 +38,7 @@ namespace Jellyfin.Plugin.PhantomLibrary.Channels;
 /// Stage 5.1 implementation per <c>docs/plans/channel-handoff.md</c>.
 /// </summary>
 public sealed class PhantomShowsChannel
-    : IChannel, IRequiresMediaInfoCallback, ISupportsLatestMedia, IChannelItemRefresh
+    : IChannel, ISupportsLatestMedia, IChannelItemRefresh
 {
     private readonly PhantomDb _db;
     private readonly ITmdbClient _tmdb;

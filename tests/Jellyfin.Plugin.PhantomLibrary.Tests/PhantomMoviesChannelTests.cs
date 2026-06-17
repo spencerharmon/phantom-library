@@ -5,6 +5,8 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Channels;
+using Jellyfin.Plugin.PhantomLibrary.Clients;
+using Jellyfin.Plugin.PhantomLibrary.Clients.Models;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.Channels;
@@ -25,6 +27,7 @@ public class PhantomMoviesChannelTests : IDisposable
     private readonly ChannelStateProvider _state;
     private readonly GostreamFilesystemEnumerator _enumerator;
     private readonly SplashSourceProvider _splash;
+    private readonly Mock<ITmdbClient> _tmdb;
     private readonly PhantomMoviesChannel _channel;
 
     public PhantomMoviesChannelTests()
@@ -46,8 +49,9 @@ public class PhantomMoviesChannelTests : IDisposable
             ShowsRootOverride = _showsRoot,
         };
         _splash = new SplashSourceProvider(MockPaths(_splashHome));
+        _tmdb = new Mock<ITmdbClient>(MockBehavior.Loose);
         _channel = new PhantomMoviesChannel(
-            _db, _enumerator, _splash, _state,
+            _db, _enumerator, _splash, _state, _tmdb.Object,
             NullLogger<PhantomMoviesChannel>.Instance);
     }
 
@@ -154,10 +158,38 @@ public class PhantomMoviesChannelTests : IDisposable
     }
 
     [Fact]
-    public async Task GetChannelItems_OrphanFile_EmitsAsOrphanWithRawFilename()
+    public async Task GetChannelItems_GostreamFileWithTmdbSearchHit_EmitsAsMaterialisedMovieWithMetadata()
+    {
+        var path = Path.Combine(_moviesRoot, "Some_Movie_2026_1080p_abcd1234.mkv");
+        File.WriteAllText(path, string.Empty);
+        _tmdb.Setup(t => t.SearchMoviesAsync("Some Movie", 2026, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[]
+            {
+                new TmdbSearchHit(4242, "Some Movie", "Some Movie", "hit", null, null, "2026-01-01", 8.1, 10),
+            });
+        _tmdb.Setup(t => t.GetMovieAsync(4242, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new TmdbMovieDetails(4242, "Some Movie", "Some Movie", "overview", "/poster.jpg", null,
+                "2026-01-01", 8.1, 10, 100, new[] { "Drama" }, "Released", null, "tt4242", null, null));
+
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+
+        var item = Assert.Single(result.Items);
+        Assert.Equal("movie_4242", item.Id);
+        Assert.Equal("Some Movie", item.Name);
+        Assert.DoesNotContain("orphan", item.Tags);
+        Assert.DoesNotContain("phantom", item.Tags);
+        Assert.Equal("4242", item.ProviderIds["Tmdb"]);
+        Assert.Equal(path, item.MediaSources[0].Path);
+        Assert.Equal(2026, item.ProductionYear);
+    }
+
+    [Fact]
+    public async Task GetChannelItems_UnresolvableGostreamFile_FallsBackToOrphanWithRawFilename()
     {
         var orphanPath = Path.Combine(_moviesRoot, "Some Unknown Movie.mkv");
         File.WriteAllText(orphanPath, string.Empty);
+        _tmdb.Setup(t => t.SearchMoviesAsync("Some Unknown Movie", null, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Array.Empty<TmdbSearchHit>());
 
         var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
 
