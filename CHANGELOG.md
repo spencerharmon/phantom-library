@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Discovery refresh now walks paginated TMDB Discover results up to
   `SuggestionsCatalogueMaxItems`, so Phantom Movies/Shows get thousands
   of catalogue rows instead of only the tiny weekly-trending surface.
+- Discovery refresh now stops at TMDB's page-500 Discover limit and writes
+  TMDB hit metadata before exposing discovery rows, avoiding cold-row channel
+  sweeps during long catalogue refreshes.
 - Phantom channel playback now uses Jellyfin's native `RequiresOpening`
   media-source flow instead of the finite splash video. TV/mobile/web
   clients that auto-open live media sources should show their native

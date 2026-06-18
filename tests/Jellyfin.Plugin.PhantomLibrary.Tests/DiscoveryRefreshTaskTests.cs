@@ -219,8 +219,24 @@ public class DiscoveryRefreshTaskTests : IDisposable
 
         var movies = await _db.ListDiscoveryCacheAsync("movie", CancellationToken.None);
         Assert.Equal(new[] { 101, 102 }, movies.Select(r => r.TmdbId).OrderBy(id => id));
-        Assert.Equal(1, tmdb.MovieDetailCalls.Count(id => id == 101));
-        Assert.Equal(1, tmdb.MovieDetailCalls.Count(id => id == 102));
+        Assert.Empty(tmdb.MovieDetailCalls);
+        var meta101 = await _db.GetTmdbMetadataAsync(101, "movie", CancellationToken.None);
+        var meta102 = await _db.GetTmdbMetadataAsync(102, "movie", CancellationToken.None);
+        Assert.NotNull(meta101);
+        Assert.NotNull(meta102);
+    }
+
+    [Fact]
+    public async Task Execute_DiscoverWalkStopsAtTmdbPageLimit()
+    {
+        var tmdb = new StubTmdbClient { GeneratedDiscoverMoviePages = 600 };
+        var task = NewTask(tmdb, new PluginConfiguration { SuggestionsCatalogueMaxItems = 2000 });
+
+        await task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
+
+        Assert.Equal(500, tmdb.DiscoverMoviePageCalls.Count);
+        Assert.Equal(500, tmdb.DiscoverMoviePageCalls.Max());
+        Assert.DoesNotContain(501, tmdb.DiscoverMoviePageCalls);
     }
 
     [Fact]
@@ -294,23 +310,24 @@ public class DiscoveryRefreshTaskTests : IDisposable
     }
 
     [Fact]
-    public async Task Execute_TmdbFetchFailure_DoesNotPropagateAndContinues()
+    public async Task Execute_DetailsFetchFailure_DoesNotMatterForDiscoveryHitMetadata()
     {
         var tmdb = new StubTmdbClient
         {
             TrendingMovies = new[] { Hit(1, "OK") },
-            // simulate per-id details fetch failing for tmdb=1
+            // Discovery refresh now warms tmdb_metadata from the TMDB hit
+            // itself, so per-id details failures must not leave cold rows.
             DetailsThrowFor = new HashSet<int> { 1 },
         };
         var task = NewTask(tmdb);
 
-        // Should not throw; discovery_cache still upserted, metadata absent.
         await task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
 
         var rows = await _db.ListDiscoveryCacheAsync("movie", CancellationToken.None);
         Assert.Single(rows);
         var meta = await _db.GetTmdbMetadataAsync(1, "movie", CancellationToken.None);
-        Assert.Null(meta);
+        Assert.NotNull(meta);
+        Assert.Equal("OK", meta!.Title);
     }
 
     private static TmdbSearchHit Hit(int id, string title)
@@ -334,6 +351,7 @@ internal sealed class StubTmdbClient : ITmdbClient
     public IReadOnlyList<TmdbSearchHit> TrendingSeries { get; set; } = Array.Empty<TmdbSearchHit>();
     public Dictionary<int, IReadOnlyList<TmdbSearchHit>> DiscoverMoviePages { get; } = new();
     public Dictionary<int, IReadOnlyList<TmdbSearchHit>> DiscoverSeriesPages { get; } = new();
+    public int GeneratedDiscoverMoviePages { get; set; }
     public List<int> DiscoverMoviePageCalls { get; } = new();
     public List<int> DiscoverSeriesPageCalls { get; } = new();
     public HashSet<int> DiscoverMoviePagesCancel { get; } = new();
@@ -458,7 +476,29 @@ internal sealed class StubTmdbClient : ITmdbClient
             throw new OperationCanceledException(ct);
         }
 
-        return Task.FromResult(DiscoverMoviePages.GetValueOrDefault(page, Array.Empty<TmdbSearchHit>()));
+        if (DiscoverMoviePages.TryGetValue(page, out var hits))
+        {
+            return Task.FromResult(hits);
+        }
+
+        if (page <= GeneratedDiscoverMoviePages)
+        {
+            return Task.FromResult<IReadOnlyList<TmdbSearchHit>>(new[]
+            {
+                new TmdbSearchHit(
+                    Id: 300000 + page,
+                    Title: "Generated Movie " + page,
+                    OriginalTitle: "Generated Movie " + page,
+                    Overview: "generated",
+                    PosterPath: "/generated" + page + ".jpg",
+                    BackdropPath: null,
+                    ReleaseDate: "2024-01-01",
+                    VoteAverage: 6.5,
+                    VoteCount: 10),
+            });
+        }
+
+        return Task.FromResult<IReadOnlyList<TmdbSearchHit>>(Array.Empty<TmdbSearchHit>());
     }
 
     public Task<IReadOnlyList<TmdbSearchHit>> DiscoverSeriesAsync(int page, string? languageCode, CancellationToken ct)
