@@ -69,6 +69,32 @@ def _series(i):
             "number_of_seasons": 1, "number_of_episodes": 8,
             "origin_country": ["US"], "imdb_id": f"tt9910000{i+1}"}
 
+
+def _season(series_tmdb_id: int, season: int):
+    series = next((s for s in FIXTURES["series"] if s["id"] == series_tmdb_id), None)
+    if series is None or season != 1:
+        return None
+    title = series["name"]
+    return {
+        "id": series_tmdb_id + season,
+        "name": "Season 1",
+        "season_number": season,
+        "episodes": [
+            {
+                "id": series_tmdb_id + (season * 100) + e,
+                "name": f"{title} Episode {e}",
+                "overview": f"Deterministic test episode {e} for {title}.",
+                "episode_number": e,
+                "season_number": season,
+                "air_date": f"2024-04-{e:02d}",
+                "still_path": f"/{series_tmdb_id}-s{season:02d}e{e:02d}.jpg",
+                "runtime": 42,
+                "vote_average": 7.0,
+            }
+            for e in range(1, 9)
+        ],
+    }
+
 ROUTES = {}
 
 def route(path):
@@ -166,10 +192,22 @@ class H(BaseHTTPRequestHandler):
         if len(parts) == 3 and parts[0] == "3" and parts[1] == "tv":
             try: return _series_by_id(int(parts[2]), q)
             except ValueError: pass
-        # /3/movie/{id}/external_ids
+        # /3/tv/{id}/season/{season}
+        if len(parts) == 5 and parts[0] == "3" and parts[1] == "tv" and parts[3] == "season":
+            try:
+                season = _season(int(parts[2]), int(parts[4]))
+                if season is not None:
+                    return 200, season
+                return 404, {"status_code": 34, "status_message": "not found"}
+            except ValueError: pass
+        # /3/movie/{id}/external_ids, /3/tv/{id}/external_ids
         if len(parts) == 4 and parts[0] == "3" and parts[3] == "external_ids":
             try:
                 tid = int(parts[2])
+                if parts[1] == "tv":
+                    for i, s in enumerate(FIXTURES["series"]):
+                        if s["id"] == tid:
+                            return 200, {"imdb_id": f"tt9910000{i+1}"}
                 return 200, {"imdb_id": f"tt9900000{tid % 10}"}
             except ValueError: pass
         # Movie/Series similar/recommendations -> empty

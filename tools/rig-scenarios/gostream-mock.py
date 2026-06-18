@@ -13,7 +13,8 @@ ROOT = Path(os.environ.get("JF_RIG_ROOT", "/tmp/jf-rig"))
 PORT = int(os.environ.get("GOSTREAM_MOCK_PORT", "19080"))
 RESPONSE_MOVIES_ROOT = os.environ.get("GOSTREAM_MOCK_RESPONSE_MOVIES_ROOT", "")
 LOG = ROOT / "logs" / "gostream-mock.log"
-MEDIA = ROOT / "gostream" / "movies"
+MOVIES = ROOT / "gostream" / "movies"
+SHOWS = ROOT / "gostream" / "tv"
 STUBS = ROOT / "gostream" / "stubs"
 
 
@@ -94,14 +95,26 @@ class Handler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             year = None
         tmdb = lower.get("tmdb") or 0
+        media_type = str(lower.get("type") or "movie").lower()
+        season = lower.get("season")
+        episode = lower.get("episode")
         digest = hashlib.sha1(json.dumps(body, sort_keys=True).encode("utf-8")).hexdigest()[:8]
         file_name = safe_name(title, year, digest)
-        fuse = MEDIA / file_name
+        if media_type == "episode":
+            try:
+                season_i = int(season)
+                episode_i = int(episode)
+            except (TypeError, ValueError):
+                season_i = 1
+                episode_i = 1
+            fuse = SHOWS / title / f"Season {season_i:02d}" / file_name.replace(".mkv", f"_S{season_i:02d}E{episode_i:02d}.mkv")
+        else:
+            fuse = MOVIES / file_name
         ensure_fixture(fuse)
         stub = STUBS / file_name
         stub.parent.mkdir(parents=True, exist_ok=True)
         stub.write_text(str(fuse))
-        response_fuse = str(Path(RESPONSE_MOVIES_ROOT) / file_name) if RESPONSE_MOVIES_ROOT else str(fuse)
+        response_fuse = str(Path(RESPONSE_MOVIES_ROOT) / file_name) if RESPONSE_MOVIES_ROOT and media_type != "episode" else str(fuse)
         resp = {
             "stub_path": str(stub),
             "fuse_path": response_fuse,
@@ -115,9 +128,10 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     LOG.parent.mkdir(parents=True, exist_ok=True)
     LOG.write_text(f"# gostream-mock started {time.strftime('%Y-%m-%d %H:%M:%S')} on port {PORT}\n")
-    MEDIA.mkdir(parents=True, exist_ok=True)
-    ensure_fixture(MEDIA / "Phantom_Rig_Bravo_2024_1080p_deadbeef.mkv")
-    ensure_fixture(MEDIA / "Phantom_Rig_Bravo_2024_2160p_HDR_cafebabe.mkv")
+    MOVIES.mkdir(parents=True, exist_ok=True)
+    SHOWS.mkdir(parents=True, exist_ok=True)
+    ensure_fixture(MOVIES / "Phantom_Rig_Bravo_2024_1080p_deadbeef.mkv")
+    ensure_fixture(MOVIES / "Phantom_Rig_Bravo_2024_2160p_HDR_cafebabe.mkv")
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"gostream-mock listening on 127.0.0.1:{PORT}", flush=True)
     srv.serve_forever()

@@ -60,6 +60,15 @@ public class PhantomLibraryBadgesControllerTests : IDisposable
             ChannelId = ChannelIds.Movies,
         };
 
+    private static Movie MakePhantomShowItem(Guid id, string externalId)
+        => new()
+        {
+            Id = id,
+            Name = "Test",
+            ExternalId = externalId,
+            ChannelId = ChannelIds.Shows,
+        };
+
     private static Dictionary<string, string> Cast(IActionResult r)
     {
         var ok = Assert.IsType<OkObjectResult>(r);
@@ -149,6 +158,30 @@ public class PhantomLibraryBadgesControllerTests : IDisposable
         var ctrl = new PhantomLibraryBadgesController(lib.Object, db);
         var res = await ctrl.States(new PhantomLibraryStatesRequest { Ids = new() { id.ToString() } }, CancellationToken.None);
         Assert.Equal("Materialised", Cast(res)[id.ToString()]);
+    }
+
+    [Fact]
+    public async Task ShowSeriesAndSeasonFolders_Omitted_ButEpisodeReturned()
+    {
+        using var db = await NewDbAsync();
+        var seriesId = Guid.NewGuid();
+        var seasonId = Guid.NewGuid();
+        var episodeId = Guid.NewGuid();
+        var lib = new Mock<ILibraryManager>(MockBehavior.Loose);
+        lib.Setup(l => l.GetItemById(seriesId)).Returns(MakePhantomShowItem(seriesId, "series_99100001"));
+        lib.Setup(l => l.GetItemById(seasonId)).Returns(MakePhantomShowItem(seasonId, "season_99100001_s01"));
+        lib.Setup(l => l.GetItemById(episodeId)).Returns(MakePhantomShowItem(episodeId, "episode_99100001_s01e01"));
+
+        var ctrl = new PhantomLibraryBadgesController(lib.Object, db);
+        var res = await ctrl.States(new PhantomLibraryStatesRequest
+        {
+            Ids = new() { seriesId.ToString(), seasonId.ToString(), episodeId.ToString() },
+        }, CancellationToken.None);
+
+        var dict = Cast(res);
+        Assert.False(dict.ContainsKey(seriesId.ToString()));
+        Assert.False(dict.ContainsKey(seasonId.ToString()));
+        Assert.Equal("Phantom", dict[episodeId.ToString()]);
     }
 
     [Fact]

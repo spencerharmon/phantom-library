@@ -15,7 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file as soon as it is available.
 - Web badge overlays now poll visible Phantom/Materialising items and
   update/remove themselves when materialisation completes. The detail-page
-  badge injection is idempotent to avoid a MutationObserver render loop.
+  badge injection is idempotent to avoid a MutationObserver render loop;
+  series/season folder thumbnails are omitted from badge state so only
+  playable movies/episodes get Phantom badges.
+- Added TV episode channel integration coverage for series → season →
+  episode browse, native-open materialise, real gostream TV playback,
+  and badge state separation between series folders and episodes.
 
 ### BREAKING — requires wipe + patched Jellyfin
 

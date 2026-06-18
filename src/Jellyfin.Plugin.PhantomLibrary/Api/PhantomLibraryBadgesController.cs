@@ -123,8 +123,9 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
             }
 
             // Only movie/episode kinds carry materialise state. Series /
-            // season folders are always "Phantom" (the folder itself
-            // isn't materialised; its episodes are).
+            // season folders are navigation containers; omit them so the
+            // browser badge overlay never stamps a badge onto a series or
+            // season thumbnail.
             int? tmdbId = parsed.TmdbId;
             string? type = parsed.Kind switch
             {
@@ -135,10 +136,6 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
 
             if (tmdbId is null || type is null)
             {
-                // Series/season/orphan/unknown — surface as Phantom so
-                // the UI's badge-applier doesn't error, even though the
-                // badge is mostly meaningless on these.
-                result[raw] = StatePhantom;
                 continue;
             }
 
