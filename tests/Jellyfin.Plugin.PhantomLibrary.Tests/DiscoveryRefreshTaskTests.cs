@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Channels;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
 using Jellyfin.Plugin.PhantomLibrary.Clients.Models;
+using Jellyfin.Plugin.PhantomLibrary.Configuration;
 using Jellyfin.Plugin.PhantomLibrary.Library;
 using Jellyfin.Plugin.PhantomLibrary.Scheduled;
 using Jellyfin.Plugin.PhantomLibrary.State;
@@ -46,7 +47,7 @@ public class DiscoveryRefreshTaskTests : IDisposable
         }
     }
 
-    private DiscoveryRefreshTask NewTask(StubTmdbClient tmdb)
+    private DiscoveryRefreshTask NewTask(StubTmdbClient tmdb, PluginConfiguration? config = null)
     {
         var cached = new CachedTmdbReader(tmdb, _db, NullLogger<CachedTmdbReader>.Instance);
         return new DiscoveryRefreshTask(
@@ -54,7 +55,22 @@ public class DiscoveryRefreshTaskTests : IDisposable
             tmdb,
             _db,
             _state,
-            NullLogger<DiscoveryRefreshTask>.Instance);
+            NullLogger<DiscoveryRefreshTask>.Instance,
+            () => config);
+    }
+
+    private async Task SetDiscoveryLastRefreshedAsync(int tmdbId, string type, DateTimeOffset lastRefreshed)
+    {
+        await using var conn = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"UPDATE discovery_cache
+            SET last_refreshed=$lastRefreshed
+            WHERE tmdb_id=$tmdb AND type=$type;";
+        cmd.Parameters.AddWithValue("$lastRefreshed", lastRefreshed.ToUnixTimeSeconds());
+        cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+        cmd.Parameters.AddWithValue("$type", type);
+        await cmd.ExecuteNonQueryAsync(CancellationToken.None);
     }
 
     [Fact]
@@ -113,28 +129,118 @@ public class DiscoveryRefreshTaskTests : IDisposable
     }
 
     [Fact]
+    public async Task Execute_PopulatesDiscoveryCache_FromDiscoverWalkRespectingConfiguredSplitCap()
+    {
+        var tmdb = new StubTmdbClient();
+        tmdb.DiscoverMoviePages[1] = new[] { Hit(301, "Movie 301"), Hit(302, "Movie 302") };
+        tmdb.DiscoverMoviePages[2] = new[] { Hit(303, "Movie 303"), Hit(304, "Movie 304") };
+        tmdb.DiscoverSeriesPages[1] = new[] { Hit(401, "Series 401"), Hit(402, "Series 402"), Hit(403, "Series 403") };
+
+        var task = NewTask(tmdb, new PluginConfiguration { SuggestionsCatalogueMaxItems = 5 });
+
+        await task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
+
+        var movies = await _db.ListDiscoveryCacheAsync("movie", CancellationToken.None);
+        var series = await _db.ListDiscoveryCacheAsync("series", CancellationToken.None);
+
+        Assert.Equal(new[] { 301, 302, 303 }, movies.Select(r => r.TmdbId).OrderBy(id => id));
+        Assert.Equal(new[] { 401, 402 }, series.Select(r => r.TmdbId).OrderBy(id => id));
+        Assert.DoesNotContain(movies, r => r.TmdbId == 304);
+        Assert.DoesNotContain(series, r => r.TmdbId == 403);
+        Assert.Equal(new[] { 1, 2 }, tmdb.DiscoverMoviePageCalls);
+        Assert.Equal(new[] { 1 }, tmdb.DiscoverSeriesPageCalls);
+    }
+
+    [Fact]
+    public async Task Execute_WarmsTmdbMetadata_ForDiscoverRows()
+    {
+        var tmdb = new StubTmdbClient();
+        tmdb.DiscoverMoviePages[1] = new[] { Hit(301, "Movie 301") };
+        tmdb.DiscoverSeriesPages[1] = new[] { Hit(401, "Series 401") };
+
+        var task = NewTask(tmdb, new PluginConfiguration { SuggestionsCatalogueMaxItems = 2 });
+
+        await task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
+
+        var movie = await _db.GetTmdbMetadataAsync(301, "movie", CancellationToken.None);
+        var series = await _db.GetTmdbMetadataAsync(401, "series", CancellationToken.None);
+
+        Assert.NotNull(movie);
+        Assert.Equal("Movie 301", movie!.Title);
+        Assert.NotNull(series);
+        Assert.Equal("Series 401", series!.Title);
+    }
+
+    [Fact]
+    public async Task Execute_DiscoverWalkStopsAtEmptyPage()
+    {
+        var tmdb = new StubTmdbClient();
+        tmdb.DiscoverMoviePages[1] = new[] { Hit(301, "Movie 301") };
+        tmdb.DiscoverMoviePages[2] = Array.Empty<TmdbSearchHit>();
+        tmdb.DiscoverSeriesPages[1] = Array.Empty<TmdbSearchHit>();
+
+        var task = NewTask(tmdb, new PluginConfiguration { SuggestionsCatalogueMaxItems = 10 });
+
+        await task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
+
+        var movies = await _db.ListDiscoveryCacheAsync("movie", CancellationToken.None);
+        var series = await _db.ListDiscoveryCacheAsync("series", CancellationToken.None);
+
+        Assert.Single(movies);
+        Assert.Equal(301, movies[0].TmdbId);
+        Assert.Empty(series);
+        Assert.Equal(new[] { 1, 2 }, tmdb.DiscoverMoviePageCalls);
+        Assert.Equal(new[] { 1 }, tmdb.DiscoverSeriesPageCalls);
+    }
+
+    [Fact]
+    public async Task Execute_DiscoverCancellationPropagates()
+    {
+        var tmdb = new StubTmdbClient();
+        tmdb.DiscoverMoviePagesCancel.Add(1);
+        var task = NewTask(tmdb, new PluginConfiguration { SuggestionsCatalogueMaxItems = 2 });
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() =>
+            task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Execute_DiscoverWalkDeduplicatesTrendingRowsBeforeMetadataWarm()
+    {
+        var tmdb = new StubTmdbClient
+        {
+            TrendingMovies = new[] { Hit(101, "Movie 101") },
+        };
+        tmdb.DiscoverMoviePages[1] = new[] { Hit(101, "Movie 101"), Hit(102, "Movie 102") };
+
+        var task = NewTask(tmdb, new PluginConfiguration { SuggestionsCatalogueMaxItems = 3 });
+
+        await task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
+
+        var movies = await _db.ListDiscoveryCacheAsync("movie", CancellationToken.None);
+        Assert.Equal(new[] { 101, 102 }, movies.Select(r => r.TmdbId).OrderBy(id => id));
+        Assert.Equal(1, tmdb.MovieDetailCalls.Count(id => id == 101));
+        Assert.Equal(1, tmdb.MovieDetailCalls.Count(id => id == 102));
+    }
+
+    [Fact]
     public async Task Execute_TtlEviction_RemovesStaleKeepsFresh()
     {
-        // Seed: one stale row + one fresh row in discovery_cache; no
+        // Seed one stale row + one fresh row in discovery_cache; no
         // materialised_state, so neither is protected by materialise.
         await _db.UpsertDiscoveryCacheAsync(900, "movie", CancellationToken.None);
-        await Task.Delay(2500);
+        await SetDiscoveryLastRefreshedAsync(900, "movie", DateTimeOffset.UtcNow.AddDays(-2));
         await _db.UpsertDiscoveryCacheAsync(901, "movie", CancellationToken.None);
 
-        var tmdb = new StubTmdbClient(); // empty trending → no new discoveries
-        var task = NewTask(tmdb);
+        var tmdb = new StubTmdbClient();
+        var task = NewTask(tmdb, new PluginConfiguration
+        {
+            DiscoveryCacheTtlDays = 1,
+            SuggestionsCatalogueMaxItems = 0,
+        });
 
-        // Set TTL = 0 days at config — but the config default is 30 and we
-        // can't easily reach Plugin.Instance from a unit test. Instead we
-        // bypass the config path by sleeping ≥ default; that's not practical.
-        // Workaround: assert behaviour via PhantomDb.PurgeStaleDiscoveryAsync
-        // directly with the TTL we want — this is what the task delegates to.
-        var purged = await _db.PurgeStaleDiscoveryAsync(TimeSpan.FromSeconds(1), false, CancellationToken.None);
-        Assert.Equal(1, purged);
-
-        // After the manual prune, run the task; the remaining row should stay
-        // (fresh) and trending population should not crash on an empty stub.
         await task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
+
         var remaining = await _db.ListDiscoveryCacheAsync("movie", CancellationToken.None);
         Assert.Contains(remaining, r => r.TmdbId == 901);
         Assert.DoesNotContain(remaining, r => r.TmdbId == 900);
@@ -143,35 +249,25 @@ public class DiscoveryRefreshTaskTests : IDisposable
     [Fact]
     public async Task Execute_TtlEviction_ProtectsMaterialisedDiscoveryRows()
     {
-        // Seed: stale discovery row for tmdb=500, with a matching
-        // materialised_state row. The task's two-pass eviction should NOT
-        // delete this row because materialise protects it. We exercise the
-        // task's own logic by writing a stale discovery_cache row directly
-        // (last_refreshed in the past), then running ExecuteAsync with an
-        // empty trending response (so it doesn't get re-bumped) and a config
-        // path that prunes anything > 0s old.
-        //
-        // Because the task reads TTL days from Plugin.Instance?.Configuration,
-        // which is null in tests, it falls back to 30 days. To exercise the
-        // protection logic deterministically we manually drive the
-        // protected-vs-not list-then-delete loop the same way the task does.
+        // Seed two stale discovery rows. The matching materialised_state row
+        // protects tmdb=500; unprotected tmdb=501 should be pruned by the task.
         await _db.UpsertDiscoveryCacheAsync(500, "movie", CancellationToken.None);
+        await SetDiscoveryLastRefreshedAsync(500, "movie", DateTimeOffset.UtcNow.AddDays(-2));
         await _db.InsertMaterialisedStateAsync(500, "movie", -1, -1, "/stub", "/fuse", CancellationToken.None);
-
-        // The protection logic: ListMaterialisedState → ListDiscoveryCache →
-        // filter stale ∧ ¬protected → DeleteDiscoveryCacheRow. We re-run that
-        // same algorithm here as the assertion target, then run the task and
-        // verify it leaves the row in place too.
-        var materialised = await _db.ListMaterialisedStateAsync("movie", CancellationToken.None);
-        var protectedTmdbs = materialised.Select(r => r.TmdbId).ToHashSet();
-        Assert.Contains(500, protectedTmdbs);
+        await _db.UpsertDiscoveryCacheAsync(501, "movie", CancellationToken.None);
+        await SetDiscoveryLastRefreshedAsync(501, "movie", DateTimeOffset.UtcNow.AddDays(-2));
 
         var tmdb = new StubTmdbClient();
-        var task = NewTask(tmdb);
+        var task = NewTask(tmdb, new PluginConfiguration
+        {
+            DiscoveryCacheTtlDays = 1,
+            SuggestionsCatalogueMaxItems = 0,
+        });
         await task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
 
         var rows = await _db.ListDiscoveryCacheAsync("movie", CancellationToken.None);
         Assert.Contains(rows, r => r.TmdbId == 500);
+        Assert.DoesNotContain(rows, r => r.TmdbId == 501);
     }
 
     [Fact]
@@ -236,6 +332,13 @@ internal sealed class StubTmdbClient : ITmdbClient
 {
     public IReadOnlyList<TmdbSearchHit> TrendingMovies { get; set; } = Array.Empty<TmdbSearchHit>();
     public IReadOnlyList<TmdbSearchHit> TrendingSeries { get; set; } = Array.Empty<TmdbSearchHit>();
+    public Dictionary<int, IReadOnlyList<TmdbSearchHit>> DiscoverMoviePages { get; } = new();
+    public Dictionary<int, IReadOnlyList<TmdbSearchHit>> DiscoverSeriesPages { get; } = new();
+    public List<int> DiscoverMoviePageCalls { get; } = new();
+    public List<int> DiscoverSeriesPageCalls { get; } = new();
+    public HashSet<int> DiscoverMoviePagesCancel { get; } = new();
+    public List<int> MovieDetailCalls { get; } = new();
+    public List<int> SeriesDetailCalls { get; } = new();
     public HashSet<int> DetailsThrowFor { get; set; } = new();
 
     public Task<IReadOnlyList<TmdbSearchHit>> GetTrendingMoviesAsync(string window, string? languageCode, CancellationToken ct)
@@ -246,12 +349,13 @@ internal sealed class StubTmdbClient : ITmdbClient
 
     public Task<TmdbMovieDetails?> GetMovieAsync(int tmdbId, string? languageCode, CancellationToken ct)
     {
+        MovieDetailCalls.Add(tmdbId);
         if (DetailsThrowFor.Contains(tmdbId))
         {
             throw new InvalidOperationException("simulated failure for tmdb=" + tmdbId);
         }
 
-        var hit = FindHit(TrendingMovies, tmdbId);
+        var hit = FindHit(AllMovieHits(), tmdbId);
         if (hit is null)
         {
             return Task.FromResult<TmdbMovieDetails?>(null);
@@ -278,12 +382,13 @@ internal sealed class StubTmdbClient : ITmdbClient
 
     public Task<TmdbSeriesDetails?> GetSeriesAsync(int tmdbId, string? languageCode, CancellationToken ct)
     {
+        SeriesDetailCalls.Add(tmdbId);
         if (DetailsThrowFor.Contains(tmdbId))
         {
             throw new InvalidOperationException("simulated failure for tmdb=" + tmdbId);
         }
 
-        var hit = FindHit(TrendingSeries, tmdbId);
+        var hit = FindHit(AllSeriesHits(), tmdbId);
         if (hit is null)
         {
             return Task.FromResult<TmdbSeriesDetails?>(null);
@@ -306,6 +411,12 @@ internal sealed class StubTmdbClient : ITmdbClient
             OriginCountry: new[] { "US" },
             ImdbId: null));
     }
+
+    private IReadOnlyList<TmdbSearchHit> AllMovieHits()
+        => TrendingMovies.Concat(DiscoverMoviePages.Values.SelectMany(page => page)).ToArray();
+
+    private IReadOnlyList<TmdbSearchHit> AllSeriesHits()
+        => TrendingSeries.Concat(DiscoverSeriesPages.Values.SelectMany(page => page)).ToArray();
 
     private static TmdbSearchHit? FindHit(IReadOnlyList<TmdbSearchHit> source, int id)
     {
@@ -340,10 +451,21 @@ internal sealed class StubTmdbClient : ITmdbClient
     public Task<string?> GetImdbIdForSeriesAsync(int tmdbId, CancellationToken ct) => Task.FromResult<string?>(null);
 
     public Task<IReadOnlyList<TmdbSearchHit>> DiscoverMoviesAsync(int page, string? languageCode, CancellationToken ct)
-        => Task.FromResult<IReadOnlyList<TmdbSearchHit>>(Array.Empty<TmdbSearchHit>());
+    {
+        DiscoverMoviePageCalls.Add(page);
+        if (DiscoverMoviePagesCancel.Contains(page))
+        {
+            throw new OperationCanceledException(ct);
+        }
+
+        return Task.FromResult(DiscoverMoviePages.GetValueOrDefault(page, Array.Empty<TmdbSearchHit>()));
+    }
 
     public Task<IReadOnlyList<TmdbSearchHit>> DiscoverSeriesAsync(int page, string? languageCode, CancellationToken ct)
-        => Task.FromResult<IReadOnlyList<TmdbSearchHit>>(Array.Empty<TmdbSearchHit>());
+    {
+        DiscoverSeriesPageCalls.Add(page);
+        return Task.FromResult(DiscoverSeriesPages.GetValueOrDefault(page, Array.Empty<TmdbSearchHit>()));
+    }
 
     public Task<IReadOnlyList<TmdbSearchHit>> GetSimilarMoviesAsync(int tmdbId, string? languageCode, CancellationToken ct)
         => Task.FromResult<IReadOnlyList<TmdbSearchHit>>(Array.Empty<TmdbSearchHit>());
