@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Channels;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
 using Jellyfin.Plugin.PhantomLibrary.Clients.Models;
+using Jellyfin.Plugin.PhantomLibrary.Configuration;
 using Jellyfin.Plugin.PhantomLibrary.Library;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Model.Tasks;
@@ -22,17 +23,20 @@ namespace Jellyfin.Plugin.PhantomLibrary.Scheduled;
 ///   1. Pull /trending/movie/week and /trending/tv/week via
 ///      <see cref="CachedTmdbReader"/> (which round-trips through the
 ///      tmdb_cache table for cheap idempotency).
-///   2. Upsert each (tmdb_id, type) into <c>discovery_cache</c>.
-///   3. Warm <c>tmdb_metadata</c> for every (tmdb_id, type) just
+///   2. Walk /discover/movie and /discover/tv up to the configured
+///      <see cref="PluginConfiguration.SuggestionsCatalogueMaxItems"/>
+///      cap so the channel surface is catalogue-sized, not just trending.
+///   3. Upsert each (tmdb_id, type) into <c>discovery_cache</c>.
+///   4. Warm <c>tmdb_metadata</c> for every (tmdb_id, type) just
 ///      discovered, so the channel browse pipeline can synthesise
 ///      ChannelItemInfos without TMDB on the hot path. (Plan §3.1
 ///      IMPORTANT 4 fix.)
-///   4. Stale-prune discovery_cache rows older than
+///   5. Stale-prune discovery_cache rows older than
 ///      <see cref="PluginConfiguration.DiscoveryCacheTtlDays"/>, but
 ///      preserve rows that have a matching materialised_state row
 ///      (we want to keep the discovery surface alive for items the
 ///      operator has already bothered to materialise).
-///   5. Bump the movies + shows channel DataVersion so the next browse
+///   6. Bump the movies + shows channel DataVersion so the next browse
 ///      sees the new contents.
 ///
 /// Replaces the deleted M11-era SuggestionsRefreshTask. Same role,
@@ -43,11 +47,16 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
     /// <summary>Stable key used by Dashboard scheduled-tasks endpoints.</summary>
     public const string TaskKey = "PhantomLibrary.DiscoveryRefresh";
 
+    private const int DefaultDiscoveryRefreshIntervalHours = 6;
+    private const int DefaultDiscoveryCacheTtlDays = 30;
+    private const int DefaultCatalogueMaxItems = 5000;
+
     private readonly CachedTmdbReader _tmdb;
     private readonly ITmdbClient _tmdbClient;
     private readonly PhantomDb _db;
     private readonly ChannelStateProvider _state;
     private readonly ILogger<DiscoveryRefreshTask> _logger;
+    private readonly Func<PluginConfiguration?> _configurationProvider;
 
     public DiscoveryRefreshTask(
         CachedTmdbReader tmdb,
@@ -55,12 +64,25 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
         PhantomDb db,
         ChannelStateProvider state,
         ILogger<DiscoveryRefreshTask> logger)
+        : this(tmdb, tmdbClient, db, state, logger, () => Plugin.Instance?.Configuration)
+    {
+    }
+
+    internal DiscoveryRefreshTask(
+        CachedTmdbReader tmdb,
+        ITmdbClient tmdbClient,
+        PhantomDb db,
+        ChannelStateProvider state,
+        ILogger<DiscoveryRefreshTask> logger,
+        Func<PluginConfiguration?> configurationProvider)
     {
         _tmdb = tmdb;
         _tmdbClient = tmdbClient;
         _db = db;
         _state = state;
         _logger = logger;
+        ArgumentNullException.ThrowIfNull(configurationProvider);
+        _configurationProvider = configurationProvider;
     }
 
     /// <inheritdoc />
@@ -71,7 +93,7 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
 
     /// <inheritdoc />
     public string Description =>
-        "Refreshes the phantom-channel discovery cache from TMDB trending + favourite-similar.";
+        "Refreshes the phantom-channel discovery cache from TMDB trending and Discover.";
 
     /// <inheritdoc />
     public string Category => "Phantom Library";
@@ -79,10 +101,10 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
     /// <inheritdoc />
     public IEnumerable<TaskTriggerInfo> GetDefaultTriggers()
     {
-        var hours = Plugin.Instance?.Configuration.DiscoveryRefreshIntervalHours ?? 6;
+        var hours = _configurationProvider()?.DiscoveryRefreshIntervalHours ?? DefaultDiscoveryRefreshIntervalHours;
         if (hours <= 0)
         {
-            hours = 6;
+            hours = DefaultDiscoveryRefreshIntervalHours;
         }
 
         return new[]
@@ -99,12 +121,22 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
     public async Task ExecuteAsync(IProgress<double> progress, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(progress);
-        var language = NormaliseLanguage(Plugin.Instance?.Configuration.DiscoveryLanguage);
-        var ttlDays = Plugin.Instance?.Configuration.DiscoveryCacheTtlDays ?? 30;
+        var config = _configurationProvider();
+        var language = NormaliseLanguage(config?.DiscoveryLanguage);
+        var ttlDays = config?.DiscoveryCacheTtlDays ?? DefaultDiscoveryCacheTtlDays;
         if (ttlDays <= 0)
         {
-            ttlDays = 30;
+            ttlDays = DefaultDiscoveryCacheTtlDays;
         }
+
+        var catalogueMaxItems = config?.SuggestionsCatalogueMaxItems ?? DefaultCatalogueMaxItems;
+        if (catalogueMaxItems < 0)
+        {
+            catalogueMaxItems = 0;
+        }
+
+        var discoverMovieCap = (catalogueMaxItems / 2) + (catalogueMaxItems % 2);
+        var discoverSeriesCap = catalogueMaxItems / 2;
 
         var discovered = new HashSet<(int Tmdb, string Type)>();
 
@@ -120,6 +152,10 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
             }
 
             _logger.LogInformation("Trending movies: {Count} hits (cached={Cached})", movies.Count, fromCacheM);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -138,6 +174,10 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
 
             _logger.LogInformation("Trending series: {Count} hits (cached={Cached})", series.Count, fromCacheS);
         }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Trending series fetch failed; continuing");
@@ -145,22 +185,39 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
 
         progress.Report(30);
 
-        // --- Phase 2: favourite-similar enrichment --------------------------
+        // --- Phase 2: paginated TMDB Discover catalogue walk ----------------
+        await WalkDiscoverAsync(
+            kind: "movie",
+            maxItems: discoverMovieCap,
+            discovered: discovered,
+            fetchPage: (page, ct) => _tmdb.GetDiscoverMoviesAsync(page, language, ct),
+            cancellationToken).ConfigureAwait(false);
+        progress.Report(37.5);
+
+        await WalkDiscoverAsync(
+            kind: "series",
+            maxItems: discoverSeriesCap,
+            discovered: discovered,
+            fetchPage: (page, ct) => _tmdb.GetDiscoverSeriesAsync(page, language, ct),
+            cancellationToken).ConfigureAwait(false);
+        progress.Report(45);
+
+        // --- Phase 3: favourite-similar enrichment --------------------------
         // TODO(stage-future): wire favourite-similar enrichment per plan §3.1.
         // Needs IUserManager + ILibraryManager.GetItemList(IsFavorite=true,
         // user=...) joined against ProviderIds["Tmdb"], then
         // SimilarMoviesAsync / SimilarSeriesAsync per favourited id, with
         // the results upserted into discovery_cache. Deferred for v0.3.0:
-        // trending alone is sufficient to demonstrate the channel pipeline
-        // end-to-end, and wiring the ILibraryManager / favourite query
-        // without producing BaseItem-load churn deserves its own design
-        // pass. To re-enable, inject IUserManager + ILibraryManager here
-        // and walk users → favourites → SimilarMoviesAsync/SimilarSeriesAsync
+        // TMDB Discover now supplies the bulk catalogue surface, and wiring
+        // the ILibraryManager / favourite query without producing BaseItem-load
+        // churn deserves its own design pass. To re-enable, inject IUserManager
+        // + ILibraryManager here and walk users → favourites →
+        // SimilarMoviesAsync/SimilarSeriesAsync
         // → UpsertDiscoveryCacheAsync.
 
-        progress.Report(45);
+        progress.Report(50);
 
-        // --- Phase 3: warm tmdb_metadata for everything just discovered ----
+        // --- Phase 4: warm tmdb_metadata for everything just discovered ----
         var warmed = 0;
         var warmFailed = 0;
         var idx = 0;
@@ -172,6 +229,10 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
                 await WarmMetadataAsync(tmdb, type, language, cancellationToken).ConfigureAwait(false);
                 warmed++;
             }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
             catch (Exception ex)
             {
                 warmFailed++;
@@ -181,13 +242,13 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
             idx++;
             if (discovered.Count > 0)
             {
-                progress.Report(45 + (idx * 40.0 / discovered.Count));
+                progress.Report(50 + (idx * 35.0 / discovered.Count));
             }
         }
 
         _logger.LogInformation("tmdb_metadata warm: {Warmed} ok, {Failed} failed", warmed, warmFailed);
 
-        // --- Phase 4: TTL eviction with materialise protection --------------
+        // --- Phase 5: TTL eviction with materialise protection --------------
         progress.Report(90);
         var cutoff = DateTimeOffset.UtcNow.Subtract(TimeSpan.FromDays(ttlDays));
         var totalEvicted = 0;
@@ -237,10 +298,87 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
         _logger.LogInformation("Discovery refresh complete. Discovered={Disc} EvictedTotal={Ev}",
             discovered.Count, totalEvicted);
 
-        // --- Phase 5: bump DataVersions so channels re-query ---------------
+        // --- Phase 6: bump DataVersions so channels re-query ---------------
         _state.BumpDataVersion(ChannelStateProvider.KindMovies);
         _state.BumpDataVersion(ChannelStateProvider.KindShows);
         progress.Report(100);
+    }
+
+    private async Task WalkDiscoverAsync(
+        string kind,
+        int maxItems,
+        HashSet<(int Tmdb, string Type)> discovered,
+        Func<int, CancellationToken, Task<(IReadOnlyList<TmdbSearchHit> Hits, bool FromCache)>> fetchPage,
+        CancellationToken cancellationToken)
+    {
+        if (maxItems <= 0)
+        {
+            _logger.LogInformation("Discover {Kind}: disabled by catalogue cap", kind);
+            return;
+        }
+
+        var page = 1;
+        var processed = 0;
+        var uniqueDiscovered = 0;
+        var cachedPages = 0;
+        while (processed < maxItems)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            IReadOnlyList<TmdbSearchHit> hits;
+            bool fromCache;
+            try
+            {
+                (hits, fromCache) = await fetchPage(page, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Discover {Kind}: page {Page} fetch failed; stopping discover walk for this kind", kind, page);
+                break;
+            }
+
+            if (fromCache)
+            {
+                cachedPages++;
+            }
+
+            if (hits.Count == 0)
+            {
+                _logger.LogInformation("Discover {Kind}: page {Page} returned no hits; stopping", kind, page);
+                break;
+            }
+
+            foreach (var hit in hits)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (processed >= maxItems)
+                {
+                    break;
+                }
+
+                await _db.UpsertDiscoveryCacheAsync(hit.Id, kind, cancellationToken).ConfigureAwait(false);
+                if (discovered.Add((hit.Id, kind)))
+                {
+                    uniqueDiscovered++;
+                }
+
+                processed++;
+            }
+
+            page++;
+        }
+
+        _logger.LogInformation(
+            "Discover {Kind}: processed={Processed} unique={Unique} pages={Pages} cachedPages={CachedPages} cap={Cap}",
+            kind,
+            processed,
+            uniqueDiscovered,
+            page - 1,
+            cachedPages,
+            maxItems);
     }
 
     private async Task WarmMetadataAsync(int tmdb, string type, string? language, CancellationToken ct)

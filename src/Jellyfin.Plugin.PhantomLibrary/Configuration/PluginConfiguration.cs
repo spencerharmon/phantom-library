@@ -227,7 +227,7 @@ public class PluginConfiguration : BasePluginConfiguration
 
     /// <summary>
     /// Interval (hours) between <c>DiscoveryRefreshTask</c> runs. Drives
-    /// trending + similar-of-favourites + tmdb_metadata warm passes.
+    /// trending + Discover + tmdb_metadata warm passes.
     /// </summary>
     public int DiscoveryRefreshIntervalHours { get; set; }
 
