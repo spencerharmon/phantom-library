@@ -47,7 +47,7 @@ public class PhantomDbTests : IDisposable
     // ----------------------------------------------------------------
 
     [Fact]
-    public async Task FreshDb_CreatesSchemaV9_WithAllExpectedTables()
+    public async Task FreshDb_CreatesSchemaV10_WithAllExpectedTables()
     {
         using var db = await NewDbAsync();
 
@@ -66,7 +66,7 @@ public class PhantomDbTests : IDisposable
             version = Convert.ToInt32(await v.ExecuteScalarAsync());
         }
 
-        Assert.Equal(9, version);
+        Assert.Equal(10, version);
 
         var expectedTables = new[]
         {
@@ -78,6 +78,7 @@ public class PhantomDbTests : IDisposable
             "tmdb_metadata",
             "tmdb_episode_cache",
             "magnet_cache",
+            "magnet_failure_cache",
             "unavailable_marker",
             "plugin_meta",
         };
@@ -96,6 +97,7 @@ public class PhantomDbTests : IDisposable
     [InlineData(5)]
     [InlineData(7)]
     [InlineData(8)]
+    [InlineData(9)]
     public async Task HardRefuse_OldSchemaVersion_ThrowsWithWipePointer(int oldVersion)
     {
         // Pre-create a DB with an older user_version (v5 = pre-channel-arch,
@@ -115,7 +117,7 @@ public class PhantomDbTests : IDisposable
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => db.SetMetaAsync("test", "1", CancellationToken.None));
 
-        Assert.Contains("version 9", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("version 10", ex.Message, StringComparison.Ordinal);
         Assert.Contains("wipe", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -388,6 +390,28 @@ public class PhantomDbTests : IDisposable
         Assert.NotNull(got);
         Assert.Equal("magnet:?xt=urn:btih:abc", got!.Magnet);
         Assert.Equal(99, got.Seeders);
+    }
+
+    [Fact]
+    public async Task MagnetFailure_MarkGetPurge_Roundtrips()
+    {
+        using var db = await NewDbAsync();
+        var key = new MagnetFailureKey(42, "tt0000042", "episode", 1, 2, "preset-A", "magnet:?xt=urn:btih:bad");
+        var now = DateTimeOffset.UtcNow;
+        await db.MarkMagnetFailedAsync(key, new MagnetFailureEntry
+        {
+            InfoHash = "bad",
+            Reason = "target_episode_not_found",
+            FailedAt = now,
+            RetryAfter = now.AddHours(1),
+        }, CancellationToken.None);
+
+        var got = await db.GetMagnetFailureAsync(key, CancellationToken.None);
+        Assert.NotNull(got);
+        Assert.Equal("target_episode_not_found", got!.Reason);
+
+        var purged = await db.PurgeExpiredMagnetFailuresAsync(CancellationToken.None);
+        Assert.Equal(0, purged);
     }
 
     [Fact]

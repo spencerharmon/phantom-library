@@ -77,6 +77,26 @@ public sealed class MagnetSelector
         int? year,
         CancellationToken ct)
     {
+        var ranked = await SelectRankedAsync(tmdbId, imdbId, type, season, episode, title, year, ct)
+            .ConfigureAwait(false);
+        return ranked.Count > 0 ? ranked[0] : null;
+    }
+
+    /// <summary>
+    /// Returns all acceptable magnets in preference order. Errors from
+    /// individual indexers are logged and skipped; the remaining indexers'
+    /// results are still scored.
+    /// </summary>
+    public async Task<IReadOnlyList<MagnetCandidate>> SelectRankedAsync(
+        int tmdbId,
+        string? imdbId,
+        string type,
+        int? season,
+        int? episode,
+        string title,
+        int? year,
+        CancellationToken ct)
+    {
         ArgumentException.ThrowIfNullOrWhiteSpace(type);
         ArgumentException.ThrowIfNullOrWhiteSpace(title);
 
@@ -143,11 +163,11 @@ public sealed class MagnetSelector
                 tmdbId,
                 season,
                 episode);
-            return null;
+            return Array.Empty<MagnetCandidate>();
         }
 
         var cfg = _configProvider();
-        var picked = _scorer.PickBest(
+        var ranked = _scorer.RankCandidates(
             aggregated,
             cfg.QualityPreset,
             cfg.MinSeeders,
@@ -157,25 +177,28 @@ public sealed class MagnetSelector
             cfg.SeederWeight,
             cfg.PreferredResolution);
 
-        if (picked is null)
+        if (ranked.Count == 0)
         {
             _logger.LogInformation(
                 "Scorer rejected all {N} candidates for {Type}/{Tmdb}",
                 aggregated.Count,
                 type,
                 tmdbId);
-            return null;
+            return Array.Empty<MagnetCandidate>();
         }
 
-        var indexerLabel = !string.IsNullOrWhiteSpace(picked.IndexerName)
-            ? picked.IndexerName!
-            : (_indexers.FirstOrDefault()?.Name ?? "unknown");
+        return ranked.Select(picked =>
+        {
+            var indexerLabel = !string.IsNullOrWhiteSpace(picked.IndexerName)
+                ? picked.IndexerName!
+                : (_indexers.FirstOrDefault()?.Name ?? "unknown");
 
-        return new MagnetCandidate(
-            picked.Magnet,
-            picked.InfoHash,
-            picked.Size,
-            picked.Seeders,
-            indexerLabel);
+            return new MagnetCandidate(
+                picked.Magnet,
+                picked.InfoHash,
+                picked.Size,
+                picked.Seeders,
+                indexerLabel);
+        }).ToList();
     }
 }

@@ -49,10 +49,38 @@ public sealed class QualityScorer
         int seederWeight = 0,
         string? preferredResolution = null)
     {
+        var ranked = RankCandidates(
+            candidates,
+            preset,
+            minSeeders,
+            minSizeGb1080p,
+            minSizeGb4K,
+            resolutionFallbackOrder,
+            seederWeight,
+            preferredResolution);
+        return ranked.Count > 0 ? ranked[0] : null;
+    }
+
+    /// <summary>
+    /// Returns all acceptable candidates sorted from most to least preferred
+    /// under the requested preset. Applies the same floors as
+    /// <see cref="PickBest"/> so retry-over-candidates preserves existing
+    /// quality semantics instead of inventing a separate fallback order.
+    /// </summary>
+    public IReadOnlyList<IndexerCandidate> RankCandidates(
+        IReadOnlyList<IndexerCandidate> candidates,
+        QualityPreset preset,
+        int minSeeders,
+        int minSizeGb1080p,
+        int minSizeGb4K,
+        string? resolutionFallbackOrder = null,
+        int seederWeight = 0,
+        string? preferredResolution = null)
+    {
         ArgumentNullException.ThrowIfNull(candidates);
         if (candidates.Count == 0)
         {
-            return null;
+            return Array.Empty<IndexerCandidate>();
         }
 
         var effective = preset;
@@ -87,7 +115,7 @@ public sealed class QualityScorer
 
         if (filtered.Count == 0)
         {
-            return null;
+            return Array.Empty<IndexerCandidate>();
         }
 
         return effective switch
@@ -95,17 +123,17 @@ public sealed class QualityScorer
             QualityPreset.BiggestMostSeeded => filtered
                 .OrderByDescending(c => c.Size)
                 .ThenByDescending(c => c.Seeders)
-                .First(),
+                .ToList(),
             QualityPreset.ResolutionSeeders => filtered
                 .OrderByDescending(c => ScoreResolutionSeeders(c, resolutionFallbackOrder, seederWeight, preferredResolution))
                 .ThenByDescending(c => c.Seeders)
                 .ThenByDescending(c => c.Size)
-                .First(),
+                .ToList(),
             _ => filtered
                 .OrderByDescending(ScoreGostream)
                 .ThenByDescending(c => c.Seeders)
                 .ThenByDescending(c => c.Size)
-                .First(),
+                .ToList(),
         };
     }
 

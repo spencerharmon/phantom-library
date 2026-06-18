@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Channels;
@@ -51,6 +52,8 @@ public sealed class Materialiser : IMaterialiser
     private readonly ChannelStateProvider _state;
     private readonly Func<PluginConfiguration> _configProvider;
     private readonly ILogger<Materialiser> _logger;
+
+    private sealed record CandidateAddRequest(GostreamAddRequest Request, MagnetCandidate Magnet, bool FromCache);
 
     public Materialiser(
         ILibraryManager libraryManager,
@@ -258,9 +261,10 @@ public sealed class Materialiser : IMaterialiser
                     externalId);
             }
 
-            var addRequest = await BuildGostreamRequestAsync(
+            var candidates = await BuildGostreamRequestsAsync(
                 tmdbId, type, season, episode, imdb, unavailKey, ct).ConfigureAwait(false);
-            var addResult = await _gostream.AddAsync(addRequest, ct).ConfigureAwait(false);
+            var addResult = await AddWithCandidateRetryAsync(
+                candidates, tmdbId, type, season, episode, imdb, unavailKey, ct).ConfigureAwait(false);
             var fusePath = type == "movie"
                 ? GostreamPathResolver.ResolveMoviePath(addResult.FusePath)
                 : GostreamPathResolver.ResolveEpisodePath(addResult.FusePath);
@@ -328,7 +332,7 @@ public sealed class Materialiser : IMaterialiser
         {
             try
             {
-                await _db.DeleteMaterialiseInFlightAsync(tmdbId, type, sSentinel, eSentinel, ct)
+                await _db.DeleteMaterialiseInFlightAsync(tmdbId, type, sSentinel, eSentinel, CancellationToken.None)
                     .ConfigureAwait(false);
             }
             catch (Exception ex)
@@ -342,15 +346,14 @@ public sealed class Materialiser : IMaterialiser
     }
 
     /// <summary>
-    /// Builds the gostream add request. Sources Title/Year from
+    /// Builds candidate gostream add requests. Sources Title/Year from
     /// <c>tmdb_metadata</c> (the channel-arch ground truth; never from
-    /// a BaseItem). Picks the magnet from <c>magnet_cache</c> if present
-    /// and unexpired, otherwise via <see cref="MagnetSelector"/>; writes
-    /// an <c>unavailable_marker</c> row + throws when no magnet is
-    /// available so future attempts within the configured retry window
-    /// short-circuit at the gate above (BLOCKER 2 fix).
+    /// a BaseItem). Tries an unfailed cached magnet first, then ranked
+    /// indexer candidates, skipping live candidate-level failures. Writes
+    /// an item-level <c>unavailable_marker</c> only when no candidate is
+    /// available.
     /// </summary>
-    private async Task<GostreamAddRequest> BuildGostreamRequestAsync(
+    private async Task<IReadOnlyList<CandidateAddRequest>> BuildGostreamRequestsAsync(
         int tmdbId,
         string type,
         int? season,
@@ -388,61 +391,216 @@ public sealed class Materialiser : IMaterialiser
             Episode: episode,
             Preset: cfg.SourcePickerPreset);
 
-        var cachedMagnet = await _db.GetCachedMagnetAsync(magnetKey, ct).ConfigureAwait(false);
-        MagnetCandidate? magnet = cachedMagnet is not null
-            ? new MagnetCandidate(
-                cachedMagnet.Magnet,
-                cachedMagnet.InfoHash,
-                cachedMagnet.Size,
-                cachedMagnet.Seeders,
-                cachedMagnet.Indexer)
-            : await _magnetSelector.SelectAsync(
-                tmdbId, imdb, type, season, episode,
-                meta.Title, meta.Year,
-                ct).ConfigureAwait(false);
+        var candidates = new List<CandidateAddRequest>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var cached = await _db.GetCachedMagnetAsync(magnetKey, ct).ConfigureAwait(false);
+        if (cached is not null)
+        {
+            var cachedCandidate = new MagnetCandidate(cached.Magnet, cached.InfoHash, cached.Size, cached.Seeders, cached.Indexer);
+            if (await IsCandidateAllowedAsync(magnetKey, cachedCandidate, ct).ConfigureAwait(false))
+            {
+                candidates.Add(BuildCandidateRequest(meta, type, tmdbId, imdb, season, episode, cachedCandidate, cfg, fromCache: true));
+                seen.Add(cachedCandidate.Magnet);
+            }
+        }
 
-        if (magnet is null || string.IsNullOrEmpty(magnet.Magnet))
+        var ranked = await _magnetSelector.SelectRankedAsync(
+            tmdbId, imdb, type, season, episode,
+            meta.Title, meta.Year,
+            ct).ConfigureAwait(false);
+        foreach (var magnet in ranked)
+        {
+            if (string.IsNullOrWhiteSpace(magnet.Magnet) || !seen.Add(magnet.Magnet))
+            {
+                continue;
+            }
+
+            if (!await IsCandidateAllowedAsync(magnetKey, magnet, ct).ConfigureAwait(false))
+            {
+                continue;
+            }
+
+            candidates.Add(BuildCandidateRequest(meta, type, tmdbId, imdb, season, episode, magnet, cfg, fromCache: false));
+        }
+
+        if (candidates.Count == 0)
         {
             await _db.MarkUnavailableAsync(
                 unavailableKey,
                 retryAfter: TimeSpan.FromHours(cfg.UnavailableRetryAfterHours),
                 ct).ConfigureAwait(false);
             throw new InvalidOperationException(
-                $"MagnetSelector returned no magnet for {metadataType}/{tmdbId} (season={season} episode={episode}); marked unavailable for {cfg.UnavailableRetryAfterHours}h");
+                $"No unfailed magnet candidates for {metadataType}/{tmdbId} (season={season} episode={episode}); marked unavailable for {cfg.UnavailableRetryAfterHours}h");
         }
 
-        if (cachedMagnet is null)
-        {
-            await _db.PutCachedMagnetAsync(
-                magnetKey,
-                new MagnetCacheEntry
-                {
-                    Magnet = magnet.Magnet,
-                    InfoHash = magnet.InfoHash,
-                    Size = magnet.Size,
-                    Seeders = magnet.Seeders,
-                    Indexer = magnet.Indexer,
-                    CachedAt = DateTimeOffset.UtcNow,
-                    Ttl = TimeSpan.FromHours(cfg.MagnetCacheTtlHours),
-                    Source = "user",
-                },
-                ct).ConfigureAwait(false);
-        }
-
-        return new GostreamAddRequest
-        {
-            Type = type,
-            Tmdb = tmdbId,
-            Imdb = type == "movie" ? imdb : null,
-            SeriesImdb = type == "episode" ? imdb : null,
-            Title = meta.Title,
-            Year = meta.Year,
-            Season = season,
-            Episode = episode,
-            Magnet = magnet.Magnet,
-            MinQuality = string.IsNullOrWhiteSpace(cfg.GostreamMinQuality) ? null : cfg.GostreamMinQuality,
-        };
+        return candidates;
     }
+
+    private static CandidateAddRequest BuildCandidateRequest(
+        TmdbMetadataRow meta,
+        string type,
+        int tmdbId,
+        string? imdb,
+        int? season,
+        int? episode,
+        MagnetCandidate magnet,
+        PluginConfiguration cfg,
+        bool fromCache)
+        => new(
+            new GostreamAddRequest
+            {
+                Type = type,
+                Tmdb = tmdbId,
+                Imdb = type == "movie" ? imdb : null,
+                SeriesImdb = type == "episode" ? imdb : null,
+                Title = meta.Title,
+                Year = meta.Year,
+                Season = season,
+                Episode = episode,
+                Magnet = magnet.Magnet,
+                MinQuality = string.IsNullOrWhiteSpace(cfg.GostreamMinQuality) ? null : cfg.GostreamMinQuality,
+            },
+            magnet,
+            fromCache);
+
+    private async Task<bool> IsCandidateAllowedAsync(MagnetCacheKey key, MagnetCandidate magnet, CancellationToken ct)
+        => await _db.GetMagnetFailureAsync(ToFailureKey(key, magnet), ct).ConfigureAwait(false) is null;
+
+    private async Task<GostreamAddResult> AddWithCandidateRetryAsync(
+        IReadOnlyList<CandidateAddRequest> candidates,
+        int tmdbId,
+        string type,
+        int? season,
+        int? episode,
+        string? imdb,
+        UnavailableKey unavailableKey,
+        CancellationToken ct)
+    {
+        Exception? last = null;
+        var cfg = _configProvider();
+        foreach (var candidate in candidates)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                var result = await _gostream.AddAsync(candidate.Request, ct).ConfigureAwait(false);
+                if (!candidate.FromCache)
+                {
+                    try
+                    {
+                        await _db.PutCachedMagnetAsync(
+                            new MagnetCacheKey(tmdbId, imdb, type, season, episode, cfg.SourcePickerPreset),
+                            new MagnetCacheEntry
+                            {
+                                Magnet = candidate.Magnet.Magnet,
+                                InfoHash = candidate.Magnet.InfoHash,
+                                Size = candidate.Magnet.Size,
+                                Seeders = candidate.Magnet.Seeders,
+                                Indexer = candidate.Magnet.Indexer,
+                                CachedAt = DateTimeOffset.UtcNow,
+                                Ttl = TimeSpan.FromHours(cfg.MagnetCacheTtlHours),
+                                Source = "user",
+                            },
+                            ct).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(
+                            ex,
+                            "Failed to cache successful magnet for {Type}/{Tmdb}; materialised_state write will still proceed",
+                            type,
+                            tmdbId);
+                    }
+                }
+
+                return result;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (GostreamBadRequestException ex)
+            {
+                last = ex;
+                await MarkCandidateFailedAsync(candidate, tmdbId, imdb, type, season, episode, cfg, "bad_request", TimeSpan.FromHours(cfg.MagnetCacheTtlHours), ct).ConfigureAwait(false);
+            }
+            catch (GostreamNoValidFilesException ex)
+            {
+                last = ex;
+                await MarkCandidateFailedAsync(candidate, tmdbId, imdb, type, season, episode, cfg, CandidateRejectReason(ex), TimeSpan.FromHours(cfg.MagnetCacheTtlHours), ct).ConfigureAwait(false);
+            }
+            catch (GostreamTimeoutException ex)
+            {
+                last = ex;
+                await MarkCandidateFailedAsync(candidate, tmdbId, imdb, type, season, episode, cfg, "metadata_timeout", TimeSpan.FromHours(cfg.UnavailableRetryAfterHours), ct).ConfigureAwait(false);
+            }
+            catch (GostreamServerException)
+            {
+                throw;
+            }
+        }
+
+        await _db.MarkUnavailableAsync(
+            unavailableKey,
+            retryAfter: TimeSpan.FromHours(cfg.UnavailableRetryAfterHours),
+            ct).ConfigureAwait(false);
+        throw new InvalidOperationException(
+            $"All {candidates.Count} magnet candidates failed for {type}/{tmdbId} s{season}e{episode}; marked unavailable for {cfg.UnavailableRetryAfterHours}h",
+            last);
+    }
+
+    private static string CandidateRejectReason(GostreamNoValidFilesException ex)
+        => ex.Message.Contains("target_episode_not_found", StringComparison.OrdinalIgnoreCase)
+            ? "target_episode_not_found"
+            : "no_valid_files";
+
+    private async Task MarkCandidateFailedAsync(
+        CandidateAddRequest candidate,
+        int tmdbId,
+        string? imdb,
+        string type,
+        int? season,
+        int? episode,
+        PluginConfiguration cfg,
+        string reason,
+        TimeSpan ttl,
+        CancellationToken ct)
+    {
+        var key = new MagnetCacheKey(tmdbId, imdb, type, season, episode, cfg.SourcePickerPreset);
+        var now = DateTimeOffset.UtcNow;
+        await _db.MarkMagnetFailedAsync(
+            ToFailureKey(key, candidate.Magnet),
+            new MagnetFailureEntry
+            {
+                InfoHash = candidate.Magnet.InfoHash,
+                Reason = reason,
+                FailedAt = now,
+                RetryAfter = now.Add(ttl),
+            },
+            ct).ConfigureAwait(false);
+
+        if (candidate.FromCache)
+        {
+            await _db.DeleteCachedMagnetAsync(key, ct).ConfigureAwait(false);
+        }
+
+        _logger.LogWarning(
+            "Marked magnet candidate failed for {Type}/{Tmdb} s{Season}e{Episode}: {Reason} ({Indexer}, {InfoHash})",
+            type,
+            tmdbId,
+            season,
+            episode,
+            reason,
+            candidate.Magnet.Indexer,
+            candidate.Magnet.InfoHash);
+    }
+
+    private static MagnetFailureKey ToFailureKey(MagnetCacheKey key, MagnetCandidate magnet)
+        => new(key.TmdbId, key.ImdbId, key.Type, key.Season, key.Episode, key.Preset, magnet.Magnet);
 
     /// <summary>
     /// Poll the FUSE mount until the file appears, bounded by the

@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Channels;
@@ -56,7 +57,8 @@ public class MaterialiserTests : IDisposable
         string? fusePath = null,
         Action<Mock<IGostreamClient>>? gostreamSetup = null,
         MagnetCandidate? magnet = null,
-        bool magnetReturnsNull = false)
+        bool magnetReturnsNull = false,
+        MagnetCandidate[]? magnets = null)
     {
         fusePath ??= Path.Combine(_fuseMount, "movie.mkv");
         File.WriteAllText(fusePath, "x"); // pre-create so WaitForFusePathAsync returns immediately
@@ -83,7 +85,9 @@ public class MaterialiserTests : IDisposable
                 It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<ChannelItemRefreshOptions>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
-        var indexer = new FakeIndexer(magnetReturnsNull ? null : (magnet ?? new MagnetCandidate("magnet:?xt=urn:btih:DEAD", "DEAD", 5L * 1024 * 1024 * 1024, 50, "test")));
+        var indexer = magnetReturnsNull
+            ? new FakeIndexer(Array.Empty<MagnetCandidate>())
+            : new FakeIndexer(magnets ?? new[] { magnet ?? new MagnetCandidate("magnet:?xt=urn:btih:DEAD", "DEAD", 5L * 1024 * 1024 * 1024, 50, "test") });
         var scorer = new QualityScorer(NullLogger<QualityScorer>.Instance);
         var cfg = new PluginConfiguration
         {
@@ -148,25 +152,21 @@ public class MaterialiserTests : IDisposable
 
     private sealed class FakeIndexer : IIndexerClient
     {
-        private readonly MagnetCandidate? _magnet;
-        public FakeIndexer(MagnetCandidate? magnet) { _magnet = magnet; }
+        private readonly MagnetCandidate[] _magnets;
+        public FakeIndexer(System.Collections.Generic.IEnumerable<MagnetCandidate> magnets) { _magnets = magnets.ToArray(); }
         public string Name => "fake";
         public bool IsEnabled => true;
         public Task<System.Collections.Generic.IReadOnlyList<IndexerCandidate>> SearchAsync(IndexerQuery query, CancellationToken ct)
         {
-            if (_magnet is null) return Task.FromResult<System.Collections.Generic.IReadOnlyList<IndexerCandidate>>(Array.Empty<IndexerCandidate>());
-            return Task.FromResult<System.Collections.Generic.IReadOnlyList<IndexerCandidate>>(new[]
+            return Task.FromResult<System.Collections.Generic.IReadOnlyList<IndexerCandidate>>(_magnets.Select(m => new IndexerCandidate
             {
-                new IndexerCandidate
-                {
-                    Title = "Test Movie 1080p",
-                    Magnet = _magnet.Magnet,
-                    InfoHash = _magnet.InfoHash,
-                    Size = _magnet.Size,
-                    Seeders = _magnet.Seeders,
-                    IndexerName = _magnet.Indexer,
-                }
-            });
+                Title = "Test Movie 1080p",
+                Magnet = m.Magnet,
+                InfoHash = m.InfoHash,
+                Size = m.Size,
+                Seeders = m.Seeders,
+                IndexerName = m.Indexer,
+            }).ToArray());
         }
     }
 
@@ -287,6 +287,54 @@ public class MaterialiserTests : IDisposable
     }
 
     [Fact]
+    public async Task GostreamRejectsFirstCandidate_TriesNextAndMarksMagnetFailed()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieMetadataAsync(db, 300);
+        var bad = new MagnetCandidate("magnet:?xt=urn:btih:BAD", "BAD", 5L * 1024 * 1024 * 1024, 100, "test");
+        var good = new MagnetCandidate("magnet:?xt=urn:btih:GOOD", "GOOD", 5L * 1024 * 1024 * 1024, 50, "test");
+        var calls = 0;
+        var (sut, gostream, _, _, _, cfg) = BuildSut(db,
+            magnets: new[] { bad, good },
+            gostreamSetup: g => g.Setup(x => x.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()))
+                .Returns<GostreamAddRequest, CancellationToken>((req, _) =>
+                {
+                    calls++;
+                    if (req.Magnet == bad.Magnet)
+                    {
+                        throw new GostreamNoValidFilesException("gostream no_valid_files: target_episode_not_found");
+                    }
+
+                    var fuse = Path.Combine(_fuseMount, "retry-good.mkv");
+                    File.WriteAllText(fuse, "x");
+                    return Task.FromResult(new GostreamAddResult
+                    {
+                        StubPath = "/var/gostream/stubs/good.mkv",
+                        FusePath = fuse,
+                        Hash = "good",
+                        Size = 100,
+                    });
+                }));
+
+        var outcome = await sut.MaterialiseAsync(300, "movie", null, null, MaterialiseTrigger.Manual, CancellationToken.None);
+
+        Assert.Equal(MaterialisationStatus.Success, outcome.Status);
+        Assert.Equal(2, calls);
+        Assert.NotNull(await db.GetMaterialisedStateAsync(300, "movie", -1, -1, CancellationToken.None));
+        var failure = await db.GetMagnetFailureAsync(
+            new MagnetFailureKey(300, "tt0000042", "movie", null, null, cfg.SourcePickerPreset, bad.Magnet),
+            CancellationToken.None);
+        Assert.NotNull(failure);
+        Assert.Equal("target_episode_not_found", failure!.Reason);
+        var cached = await db.GetCachedMagnetAsync(
+            new MagnetCacheKey(300, "tt0000042", "movie", null, null, cfg.SourcePickerPreset),
+            CancellationToken.None);
+        Assert.NotNull(cached);
+        Assert.Equal(good.Magnet, cached!.Magnet);
+        gostream.Verify(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()), Times.Exactly(2));
+    }
+
+    [Fact]
     public async Task PreFlightRefreshThrows_MaterialiseStillProceeds()
     {
         using var db = await NewDbAsync();
@@ -404,7 +452,7 @@ public class MaterialiserTests : IDisposable
         refresh.Setup(r => r.RefreshChannelItemAsync(It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<ChannelItemRefreshOptions>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
         var cfg = new PluginConfiguration { FusePathWaitTimeoutSeconds = 1, FusePathPollIntervalMilliseconds = 50, MinSeeders = 1, MinSizeGb1080p = 1, MinSizeGb4K = 1 };
-        var indexer = new FakeIndexer(new MagnetCandidate("magnet:?xt=urn:btih:DEAD", "DEAD", 5L * 1024 * 1024 * 1024, 10, "f"));
+        var indexer = new FakeIndexer(new[] { new MagnetCandidate("magnet:?xt=urn:btih:DEAD", "DEAD", 5L * 1024 * 1024 * 1024, 10, "f") });
         var selector = new MagnetSelector(new IIndexerClient[] { indexer }, new QualityScorer(NullLogger<QualityScorer>.Instance), NullLogger<MagnetSelector>.Instance, () => cfg);
         var legacySut = new Materialiser(libMgr.Object, db, gostream.Object, selector, externalIds, refresh.Object, state, NullLogger<Materialiser>.Instance, () => cfg);
 

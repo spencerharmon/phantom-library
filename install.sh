@@ -152,8 +152,8 @@ echo "  Phantom stub root:  $PHANTOM_STUB_ROOT"
 echo "  Phantom DB:         $PHANTOM_DB_PATH"
 echo
 
-# Refuse to install over a pre-channel-arch phantom.db. The plugin will
-# HARD-REFUSE schema versions 1..8 at runtime; catching it here gives the
+# Refuse to install over a pre-v10 phantom.db. The plugin will
+# HARD-REFUSE schema versions 1..9 at runtime; catching it here gives the
 # operator a clear action before restarting Jellyfin.
 if [ -f "$PHANTOM_DB_PATH" ] && command -v sqlite3 >/dev/null 2>&1; then
   PHANTOM_SCHEMA="$($SUDO sqlite3 "$PHANTOM_DB_PATH" 'PRAGMA user_version;' 2>/dev/null || echo unknown)"
@@ -161,11 +161,11 @@ if [ -f "$PHANTOM_DB_PATH" ] && command -v sqlite3 >/dev/null 2>&1; then
     ''|unknown)
       yellow "Could not read phantom.db user_version at $PHANTOM_DB_PATH; runtime plugin will validate it."
       ;;
-    0|9)
+    0|10)
       :
       ;;
     *)
-      die "phantom.db schema is v$PHANTOM_SCHEMA but Phantom Library $PLUGIN_VERSION requires v9. Stop Jellyfin and run: sudo bash scripts/phantom-wipe.sh --commit"
+      die "phantom.db schema is v$PHANTOM_SCHEMA but Phantom Library $PLUGIN_VERSION requires v10. Stop Jellyfin and run: sudo bash scripts/phantom-wipe.sh --commit"
       ;;
   esac
 fi

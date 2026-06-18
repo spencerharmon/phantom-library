@@ -294,7 +294,7 @@ fi
 # 8. Already-clean detection -> no-op exit.
 # Even when there are 0 BaseItems / 0 phantom_items / 0 stubs, an
 # existing phantom.db must still be moved aside so the v0.3 plugin can
-# recreate schema v9. This is the common post-wipe-retry case: old v5
+# recreate current schema. This is the common post-wipe-retry case: old v5
 # phantom.db remains but all old rows were already removed.
 if [[ $N_PHANTOM_BI -eq 0 && $N_PHANTOM_ROWS -eq 0 && $N_FILES -eq 0 && ! -f "$PHANTOM_DB" ]]; then
     bold "==> Nothing to do"

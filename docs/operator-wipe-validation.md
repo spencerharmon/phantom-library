@@ -96,7 +96,7 @@ Pre-wipe and post-wipe row counts on the sandbox `jellyfin.db`:
 
 `phantom.db` is renamed aside (`phantom.db.wiped.<UTC-ts>`) along
 with its `-wal` / `-shm` sidecars. The plugin recreates an empty
-schema-v9 `phantom.db` on next start via `PhantomDb.EnsureSchema`.
+schema-v10 `phantom.db` on next start via `PhantomDb.EnsureSchema`.
 
 ## Verification queries (reproducible)
 

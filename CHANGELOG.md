@@ -21,6 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Discovery refresh now stops at TMDB's page-500 Discover limit and writes
   TMDB hit metadata before exposing discovery rows, avoiding cold-row channel
   sweeps during long catalogue refreshes.
+- TV episode materialisation now tries ranked magnet candidates in order
+  instead of failing after the first gostream rejection. Candidate-specific
+  failures such as `no_valid_files`, `target_episode_not_found`, metadata
+  timeouts, and server errors are negative-cached so later attempts skip
+  known-bad magnets and can advance to the next preferred source.
+- Gostream `/api/library/add` episode handling now selects the largest
+  valid video file whose filename matches the requested season/episode,
+  returning `422 target_episode_not_found` instead of pointing an episode
+  stub at the largest unrelated file in a season/series pack. Existing
+  stubs are detected before touching the torrent engine, and rejected
+  candidates only remove unreferenced torrent hashes.
 - Phantom channel playback now uses Jellyfin's native `RequiresOpening`
   media-source flow instead of the finite splash video. TV/mobile/web
   clients that auto-open live media sources should show their native
@@ -37,6 +48,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### BREAKING — requires wipe + patched Jellyfin
 
+- BREAKING: requires wipe. Phantom DB schema is now v10 to add the
+  candidate-level `magnet_failure_cache` table used by retry-over-magnets;
+  follow `docs/operator-wipe-validation.md` / `scripts/phantom-wipe.sh`
+  before installing this build.
+
 Phantom Library v0.3.0 replaces the file-on-disk phantom
 architecture with a Jellyfin `IChannel`-based design backed by a
 small additive patch to Jellyfin's `ChannelManager`. Phantom items
@@ -49,9 +65,10 @@ per-item channel refresh primitive (added by the patch) re-binds
 the ChannelItem to the now-real `BaseItem` produced by Jellyfin's
 scan of the gostream-served file.
 
-`phantom.db` schema bumped to v9 (was v5 in v0.2.0.0). The new
+`phantom.db` schema bumped to v10 (was v5 in v0.2.0.0). The new
 schema captures channel-item registrations, per-item materialise
-state, and the additional bookkeeping the channel arch needs.
+state, candidate-level magnet failure caching, and the additional
+bookkeeping the channel arch needs.
 Per `AGENTS.md` § "No database migrations until v1.0", the
 upgrade path is **wipe and rebuild**.
 
@@ -141,7 +158,7 @@ database safety").
   (in-place DLL swap; recommended) and Model B (run Jellyfin from
   a self-built tree). Includes package-manager-clobber detection
   via md5 compare against `.pre-phantom-bak` sidecars.
-- **`phantom.db` schema v9.** Channel-item registration + per-item
+- **`phantom.db` schema v10.** Channel-item registration + per-item
   materialise-state bookkeeping. Wipe-and-rebuild upgrade path
   per AGENTS.md.
 

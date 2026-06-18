@@ -23,6 +23,16 @@ public sealed record MagnetCacheEntry
 
 public sealed record UnavailableKey(int? TmdbId, string? ImdbId, string Type, int? Season, int? Episode);
 
+public sealed record MagnetFailureKey(int? TmdbId, string? ImdbId, string Type, int? Season, int? Episode, string Preset, string Magnet);
+
+public sealed record MagnetFailureEntry
+{
+    public required string InfoHash { get; init; }
+    public required string Reason { get; init; }
+    public required DateTimeOffset FailedAt { get; init; }
+    public required DateTimeOffset RetryAfter { get; init; }
+}
+
 /// <summary>
 /// Row of the <c>discovery_cache</c> table. Movies and series only;
 /// season/episode level discovery is not tracked here (those come
@@ -99,21 +109,23 @@ public sealed record TmdbEpisodeRow(
 
 /// <summary>
 /// SQLite-backed persistence for the plugin's private state under the
-/// channel architecture (schema v8). Single writer, serialised via a
+/// channel architecture (schema v10). Single writer, serialised via a
 /// process-wide <see cref="SemaphoreSlim"/>; concurrent readers
 /// permitted via separate short-lived connections.
 ///
-/// Schema v9 is a clean break from the v5 file-on-disk schema (v6/v7/v8
+/// Schema v10 is a clean break from the v5 file-on-disk schema (v6/v7/v8
 /// were intermediate channel-arch revisions that never reached prod;
 /// v9 adds the <c>tmdb_episode_cache</c> table the shows channel needs
-/// for per-episode display metadata at refresh time). Per
+/// for per-episode display metadata at refresh time; v10 adds
+/// <c>magnet_failure_cache</c> so rejected pack candidates do not
+/// block viable alternatives). Per
 /// AGENTS.md "No database migrations until v1.0", existing databases
-/// at any pre-v9 user_version are HARD-REFUSED and the operator must
+/// at any pre-v10 user_version are HARD-REFUSED and the operator must
 /// run <c>scripts/phantom-wipe.sh</c> before restart.
 /// </summary>
 public sealed class PhantomDb : IDisposable
 {
-    private const int CurrentSchemaVersion = 9;
+    private const int CurrentSchemaVersion = 10;
 
     private readonly string _connectionString;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
@@ -210,12 +222,12 @@ public sealed class PhantomDb : IDisposable
                 + $" version {CurrentSchemaVersion}. Downgrade is not supported. Wipe and rebuild.");
         }
 
-        // version == 0: fresh / never-initialised DB. Create the v8 schema.
+        // version == 0: fresh / never-initialised DB. Create the v10 schema.
         using var tx = conn.BeginTransaction();
         using (var cmd = conn.CreateCommand())
         {
             cmd.Transaction = tx;
-            cmd.CommandText = SchemaV9Sql;
+            cmd.CommandText = SchemaV10Sql;
             cmd.ExecuteNonQuery();
         }
 
@@ -229,7 +241,7 @@ public sealed class PhantomDb : IDisposable
         tx.Commit();
     }
 
-    private const string SchemaV9Sql = @"
+    private const string SchemaV10Sql = @"
 -- Channel-arch discovery: trending + similar-of-favourited TMDB ids,
 -- one row per (tmdb_id, type). Synthesised into ChannelItemInfos by
 -- PhantomMoviesChannel / PhantomShowsChannel at browse time.
@@ -321,6 +333,27 @@ CREATE TABLE IF NOT EXISTS magnet_cache (
     source      TEXT NOT NULL,
     PRIMARY KEY (tmdb_id, imdb_id, type, season, episode, preset)
 );
+
+-- Candidate-level negative cache: a specific magnet failed for a
+-- specific materialisation key. This is distinct from
+-- unavailable_marker, which means no acceptable candidate exists for
+-- the item at all.
+CREATE TABLE IF NOT EXISTS magnet_failure_cache (
+    tmdb_id     INTEGER NOT NULL DEFAULT 0,
+    imdb_id     TEXT NOT NULL DEFAULT '',
+    type        TEXT NOT NULL,
+    season      INTEGER NOT NULL DEFAULT 0,
+    episode     INTEGER NOT NULL DEFAULT 0,
+    preset      TEXT NOT NULL DEFAULT '',
+    magnet      TEXT NOT NULL,
+    info_hash   TEXT NOT NULL,
+    reason      TEXT NOT NULL,
+    failed_at   INTEGER NOT NULL,
+    retry_after INTEGER NOT NULL,
+    PRIMARY KEY (tmdb_id, imdb_id, type, season, episode, preset, magnet)
+);
+CREATE INDEX IF NOT EXISTS idx_magnet_failure_cache_retry_after
+    ON magnet_failure_cache(retry_after);
 
 -- Surviving table from v1: indexers returned nothing for a key; back
 -- off until retry_after.
@@ -456,6 +489,117 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
             cmd.Parameters.AddWithValue("$ttl", (long)entry.Ttl.TotalSeconds);
             cmd.Parameters.AddWithValue("$source", entry.Source);
             await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task DeleteCachedMagnetAsync(MagnetCacheKey key, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"DELETE FROM magnet_cache
+                WHERE tmdb_id=$tmdb
+                  AND imdb_id=$imdb
+                  AND type=$type
+                  AND season=$season
+                  AND episode=$episode
+                  AND preset=$preset;";
+            BindKey(cmd, key);
+            cmd.Parameters.AddWithValue("$preset", key.Preset);
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    // ---- magnet_failure_cache ----
+
+    public async Task<MagnetFailureEntry?> GetMagnetFailureAsync(MagnetFailureKey key, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT info_hash, reason, failed_at, retry_after
+            FROM magnet_failure_cache
+            WHERE tmdb_id=$tmdb
+              AND imdb_id=$imdb
+              AND type=$type
+              AND season=$season
+              AND episode=$episode
+              AND preset=$preset
+              AND magnet=$magnet
+            LIMIT 1;";
+        BindKey(cmd, new MagnetCacheKey(key.TmdbId, key.ImdbId, key.Type, key.Season, key.Episode, key.Preset));
+        cmd.Parameters.AddWithValue("$preset", key.Preset);
+        cmd.Parameters.AddWithValue("$magnet", key.Magnet);
+
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (!await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            return null;
+        }
+
+        var retryAfter = DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(3));
+        if (DateTimeOffset.UtcNow >= retryAfter)
+        {
+            return null;
+        }
+
+        return new MagnetFailureEntry
+        {
+            InfoHash = r.GetString(0),
+            Reason = r.GetString(1),
+            FailedAt = DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(2)),
+            RetryAfter = retryAfter,
+        };
+    }
+
+    public async Task MarkMagnetFailedAsync(MagnetFailureKey key, MagnetFailureEntry entry, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+        ArgumentNullException.ThrowIfNull(entry);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"INSERT OR REPLACE INTO magnet_failure_cache
+                (tmdb_id, imdb_id, type, season, episode, preset, magnet, info_hash, reason, failed_at, retry_after)
+                VALUES ($tmdb,$imdb,$type,$season,$episode,$preset,$magnet,$hash,$reason,$failed,$retry);";
+            BindKey(cmd, new MagnetCacheKey(key.TmdbId, key.ImdbId, key.Type, key.Season, key.Episode, key.Preset));
+            cmd.Parameters.AddWithValue("$preset", key.Preset);
+            cmd.Parameters.AddWithValue("$magnet", key.Magnet);
+            cmd.Parameters.AddWithValue("$hash", entry.InfoHash);
+            cmd.Parameters.AddWithValue("$reason", entry.Reason);
+            cmd.Parameters.AddWithValue("$failed", entry.FailedAt.ToUnixTimeSeconds());
+            cmd.Parameters.AddWithValue("$retry", entry.RetryAfter.ToUnixTimeSeconds());
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<int> PurgeExpiredMagnetFailuresAsync(CancellationToken ct)
+    {
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "DELETE FROM magnet_failure_cache WHERE retry_after < $now;";
+            cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
         finally
         {
