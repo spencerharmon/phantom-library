@@ -26,17 +26,16 @@ namespace Jellyfin.Plugin.PhantomLibrary.Scheduled;
 ///   2. Walk /discover/movie and /discover/tv up to the configured
 ///      <see cref="PluginConfiguration.SuggestionsCatalogueMaxItems"/>
 ///      cap so the channel surface is catalogue-sized, not just trending.
-///   3. Upsert each (tmdb_id, type) into <c>discovery_cache</c>.
-///   4. Warm <c>tmdb_metadata</c> for every (tmdb_id, type) just
-///      discovered, so the channel browse pipeline can synthesise
-///      ChannelItemInfos without TMDB on the hot path. (Plan §3.1
-///      IMPORTANT 4 fix.)
-///   5. Stale-prune discovery_cache rows older than
+///   3. Upsert TMDB hit metadata into <c>tmdb_metadata</c>, then upsert
+///      each (tmdb_id, type) into <c>discovery_cache</c>. Metadata is
+///      written before discovery rows so concurrent channel refreshes never
+///      see cold rows and incorrectly sweep existing channel items.
+///   4. Stale-prune discovery_cache rows older than
 ///      <see cref="PluginConfiguration.DiscoveryCacheTtlDays"/>, but
 ///      preserve rows that have a matching materialised_state row
 ///      (we want to keep the discovery surface alive for items the
 ///      operator has already bothered to materialise).
-///   6. Bump the movies + shows channel DataVersion so the next browse
+///   5. Bump the movies + shows channel DataVersion so the next browse
 ///      sees the new contents.
 ///
 /// Replaces the deleted M11-era SuggestionsRefreshTask. Same role,
@@ -50,6 +49,7 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
     private const int DefaultDiscoveryRefreshIntervalHours = 6;
     private const int DefaultDiscoveryCacheTtlDays = 30;
     private const int DefaultCatalogueMaxItems = 5000;
+    private const int TmdbMaxDiscoverPage = 500;
 
     private readonly CachedTmdbReader _tmdb;
     private readonly ITmdbClient _tmdbClient;
@@ -147,8 +147,7 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
             var (movies, fromCacheM) = await _tmdb.TrendingMoviesAsync("week", language, cancellationToken).ConfigureAwait(false);
             foreach (var hit in movies)
             {
-                await _db.UpsertDiscoveryCacheAsync(hit.Id, "movie", cancellationToken).ConfigureAwait(false);
-                discovered.Add((hit.Id, "movie"));
+                await UpsertDiscoveredHitAsync(hit, "movie", discovered, cancellationToken).ConfigureAwait(false);
             }
 
             _logger.LogInformation("Trending movies: {Count} hits (cached={Cached})", movies.Count, fromCacheM);
@@ -168,8 +167,7 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
             var (series, fromCacheS) = await _tmdb.TrendingSeriesAsync("week", language, cancellationToken).ConfigureAwait(false);
             foreach (var hit in series)
             {
-                await _db.UpsertDiscoveryCacheAsync(hit.Id, "series", cancellationToken).ConfigureAwait(false);
-                discovered.Add((hit.Id, "series"));
+                await UpsertDiscoveredHitAsync(hit, "series", discovered, cancellationToken).ConfigureAwait(false);
             }
 
             _logger.LogInformation("Trending series: {Count} hits (cached={Cached})", series.Count, fromCacheS);
@@ -217,38 +215,9 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
 
         progress.Report(50);
 
-        // --- Phase 4: warm tmdb_metadata for everything just discovered ----
-        var warmed = 0;
-        var warmFailed = 0;
-        var idx = 0;
-        foreach (var (tmdb, type) in discovered)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            try
-            {
-                await WarmMetadataAsync(tmdb, type, language, cancellationToken).ConfigureAwait(false);
-                warmed++;
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                warmFailed++;
-                _logger.LogDebug(ex, "tmdb_metadata warm failed for {Type}:{Tmdb}", type, tmdb);
-            }
+        _logger.LogInformation("tmdb_metadata warm from discovery hits: {Warmed} ok", discovered.Count);
 
-            idx++;
-            if (discovered.Count > 0)
-            {
-                progress.Report(50 + (idx * 35.0 / discovered.Count));
-            }
-        }
-
-        _logger.LogInformation("tmdb_metadata warm: {Warmed} ok, {Failed} failed", warmed, warmFailed);
-
-        // --- Phase 5: TTL eviction with materialise protection --------------
+        // --- Phase 4: TTL eviction with materialise protection --------------
         progress.Report(90);
         var cutoff = DateTimeOffset.UtcNow.Subtract(TimeSpan.FromDays(ttlDays));
         var totalEvicted = 0;
@@ -298,7 +267,7 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
         _logger.LogInformation("Discovery refresh complete. Discovered={Disc} EvictedTotal={Ev}",
             discovered.Count, totalEvicted);
 
-        // --- Phase 6: bump DataVersions so channels re-query ---------------
+        // --- Phase 5: bump DataVersions so channels re-query ---------------
         _state.BumpDataVersion(ChannelStateProvider.KindMovies);
         _state.BumpDataVersion(ChannelStateProvider.KindShows);
         progress.Report(100);
@@ -321,7 +290,7 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
         var processed = 0;
         var uniqueDiscovered = 0;
         var cachedPages = 0;
-        while (processed < maxItems)
+        while (processed < maxItems && page <= TmdbMaxDiscoverPage)
         {
             cancellationToken.ThrowIfCancellationRequested();
             IReadOnlyList<TmdbSearchHit> hits;
@@ -359,8 +328,8 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
                     break;
                 }
 
-                await _db.UpsertDiscoveryCacheAsync(hit.Id, kind, cancellationToken).ConfigureAwait(false);
-                if (discovered.Add((hit.Id, kind)))
+                var added = await UpsertDiscoveredHitAsync(hit, kind, discovered, cancellationToken).ConfigureAwait(false);
+                if (added)
                 {
                     uniqueDiscovered++;
                 }
@@ -371,6 +340,15 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
             page++;
         }
 
+        if (page > TmdbMaxDiscoverPage && processed < maxItems)
+        {
+            _logger.LogInformation(
+                "Discover {Kind}: reached TMDB max page {MaxPage}; stopping before configured cap {Cap}",
+                kind,
+                TmdbMaxDiscoverPage,
+                maxItems);
+        }
+
         _logger.LogInformation(
             "Discover {Kind}: processed={Processed} unique={Unique} pages={Pages} cachedPages={CachedPages} cap={Cap}",
             kind,
@@ -379,6 +357,42 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
             page - 1,
             cachedPages,
             maxItems);
+    }
+
+    private async Task<bool> UpsertDiscoveredHitAsync(
+        TmdbSearchHit hit,
+        string type,
+        HashSet<(int Tmdb, string Type)> discovered,
+        CancellationToken ct)
+    {
+        var row = MapSearchHitToMetadata(hit, type);
+        if (string.IsNullOrWhiteSpace(row.Title))
+        {
+            _logger.LogDebug("Skipping discovery hit {Type}:{Tmdb} because TMDB returned no title", type, hit.Id);
+            return false;
+        }
+
+        await _db.UpsertTmdbMetadataAsync(row, ct).ConfigureAwait(false);
+        await _db.UpsertDiscoveryCacheAsync(hit.Id, type, ct).ConfigureAwait(false);
+        return discovered.Add((hit.Id, type));
+    }
+
+    private static TmdbMetadataRow MapSearchHitToMetadata(TmdbSearchHit hit, string type)
+    {
+        var title = !string.IsNullOrWhiteSpace(hit.Title) ? hit.Title! : (hit.OriginalTitle ?? string.Empty);
+        return new TmdbMetadataRow(
+            TmdbId: hit.Id,
+            Type: type,
+            Title: title,
+            Year: ParseYear(hit.ReleaseDate),
+            Overview: hit.Overview,
+            PosterUrl: BuildImageUrl(hit.PosterPath),
+            BackdropUrl: BuildImageUrl(hit.BackdropPath),
+            Genres: null,
+            OfficialRating: null,
+            CommunityRating: hit.VoteAverage,
+            OriginalTitle: hit.OriginalTitle,
+            FetchedAt: DateTimeOffset.UtcNow);
     }
 
     private async Task WarmMetadataAsync(int tmdb, string type, string? language, CancellationToken ct)
