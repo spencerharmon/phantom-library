@@ -12,6 +12,32 @@ authoritative project docs. This file translates them into
 conventions an agent needs to operate session-to-session
 without re-deriving them.
 
+## Topic → source-of-truth index
+
+Use this file as the routing map. When work touches one of these
+areas, read the linked source doc before editing code.
+
+| Topic | Read first | Why |
+| --- | --- | --- |
+| Current channel-architecture work | `docs/plans/channel-handoff-onboarding.md`, then `docs/plans/channel-handoff.md` | Active execution plan, phase state, known tradeoffs |
+| Channel architecture design | `docs/plans/channel-architecture.md` | Channel item model, IDs, materialised state, browse shape |
+| Testing / rig usage | `docs/agents/testing.md`, `tools/rig-scenarios/` | Required live Jellyfin rig workflow; unit tests are not enough |
+| Movie channel playback/materialise regression coverage | `tools/rig-scenarios/35-channel-e2e-playback.sh` | Movie browse → playback → native-open materialise → stream assertions |
+| TV episode playback/materialise regression coverage | `tools/rig-scenarios/36-channel-episode-e2e-playback.sh` | Series → season → episode browse, badge scope, native-open playback |
+| Operator deployment | `docs/operator-deploy.md`, `install.sh` | Patched Jellyfin DLL deployment models, package-manager clobber checks |
+| Jellyfin patch maintenance | `scripts/jellyfin-patches/REBASE.md`, `scripts/jellyfin-patches/` | Patch stack, exact upstream tag, rebase workflow |
+| Wipe / rebuild validation | `docs/operator-wipe-validation.md`, `scripts/phantom-wipe.sh` | Pre-v1.0 schema-change path, wipe verification |
+| Production DB safety | `AGENTS.md` § "Production database safety" | Clone/test/destructive SQL rules; do not improvise SQL in chat |
+| Stub naming / legacy sentinel | `AGENTS.md` § "Canonical phantom stub naming scheme" | Native `[tmdbid-<id>]` naming; never create legacy `__phantom_tmdb` paths |
+| Historical scanner race / migration failures | `docs/plans/scanner-race-reactor.md`, `docs/plans/M12-investigation-results.md`, `docs/plans/M12-collision-recovery.md` | Why runtime migrations, scanner races, and hand-written SQL are forbidden |
+| Release notes / operator-visible changes | `CHANGELOG.md` | Required for user-visible behavior, breaking wipes, deploy notes |
+| Milestone status / done definition | `PLAN.md` | Project intent and milestone tracker |
+| User-facing behavior/docs | `README.md` | Operator-facing configuration and usage |
+
+If a protocol becomes too detailed for `AGENTS.md`, put the durable
+procedure in the relevant design/operator doc above and keep only the
+routing rule here.
+
 ## No database migrations until v1.0 (always, no exceptions)
 
 **Pre-v1.0, this project does not ship database migrations.** Not
