@@ -119,6 +119,52 @@ ls /tmp/jf-rig/logs/observer-*.log   # mutation timeline
 bash /tmp/jf-rig/bin/rig-down.sh
 ```
 
+### Scenario authoring contract
+
+When a production regression or user-visible behavior change is not
+covered by an existing rig script, add or extend a scenario under
+`tools/rig-scenarios/`. Prefer a deterministic mock-backed scenario
+over manual clicking. A good scenario:
+
+- Starts from a reset rig (`rig-up.sh --reset`) so it is repeatable.
+- Drives Jellyfin only through REST/API calls a real client would use.
+- Uses the TMDB/gostream mocks for deterministic external behavior.
+- Asserts both API responses and SQLite state when persistence matters.
+- Fails on HTTP errors, `PlaybackInfo.ErrorCode`, duplicate/missing
+  media sources, invalid/non-Guid `MediaSourceInfo.Id`, wrong paths,
+  zero-byte streams, and missing/incorrect DB rows.
+- Covers the exact item kind involved. Movie tests do not prove episode
+  behavior; episode tests must navigate series → season → episode.
+- Runs in one shell invocation or under user-mode systemd units so
+  Jellyfin is not killed by tool pgroup cleanup.
+- Leaves logs in `/tmp/jf-rig/logs/` for post-failure inspection.
+
+Current high-value scenarios:
+
+```bash
+tools/rig-scenarios/35-channel-e2e-playback.sh
+# Movie channel: discovery, existing gostream enrichment, native-open
+# phantom materialise, real stream, DB sanity.
+
+tools/rig-scenarios/36-channel-episode-e2e-playback.sh
+# TV channel: series → season → episode browse, badge scope,
+# native-open episode materialise, real TV stream, DB sanity.
+```
+
+For native phantom playback, scenarios must assert the two-step Jellyfin
+contract:
+
+1. `GET /Items/{id}/PlaybackInfo` returns exactly one source with
+   `RequiresOpening=true`, an OpenToken ending in the expected
+   `phantom:<ChannelItemId>`, and no splash/file path.
+2. `POST /Items/{id}/PlaybackInfo?AutoOpenLiveStream=true` returns one
+   real file source with `RequiresOpening=false`, a host-visible gostream
+   path, probed media streams, and a stream URL that returns bytes.
+
+Do not accept a finite splash video as passing native playback coverage.
+That was the pre-hardening fallback and causes TV/mobile clients to
+exit when the splash ends.
+
 Key facts about the persistent rig:
 
 - **TMDB mock on `127.0.0.1:18099`** serves a fixed set of 3

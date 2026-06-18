@@ -72,6 +72,113 @@ What this buys:
 - ~50% net plugin code reduction (only this time honestly measured
   against the critic's mitigations)
 
+## Post-implementation contracts (v0.3 hardening)
+
+These contracts were established during the v0.3 production hardening
+session after the basic channel design shipped. Keep them as design
+constraints for future channel work.
+
+### Native playback contract
+
+Phantom playback must use Jellyfin's native media-source opening flow,
+not a finite splash video as the normal path.
+
+For an unmaterialised playable item (movie or episode), `PlaybackInfo`
+should expose exactly one source with:
+
+- `RequiresOpening = true`
+- `OpenToken = <provider-prefix>_phantom:<ChannelItemId>`
+- `Path = ""` (no splash file path)
+- Guid-shaped `MediaSourceInfo.Id`
+
+When a client posts `PlaybackInfo` with `AutoOpenLiveStream=true`, the
+plugin's `IMediaSourceProvider.OpenMediaSource` implementation must:
+
+1. Start materialisation with trigger `Play`.
+2. Wait for `materialised_state` and the real FUSE file.
+3. Return a real file `MediaSourceInfo` with `RequiresOpening=false`.
+4. Preserve one-source semantics: no duplicate splash/static/dynamic
+   sources beside the real file.
+5. Ensure the returned stream opens with non-zero bytes.
+
+Reason: native TV/mobile clients cannot be reliably forced to stop a
+currently playing splash video and auto-switch to a newly materialised
+file. The only server-side UX that maps to native clients is: do not
+start playback until the real file is ready; let the client show its
+native loading indicator during `OpenMediaSource`.
+
+### Channel cache invalidation contract
+
+Jellyfin caches channel provider output by `IChannel.DataVersion`.
+Any change to channel output shape must invalidate that cache. This
+includes changes to:
+
+- `ChannelItemInfo.Id` / `ExternalId`
+- `Tags`
+- `ProviderIds`
+- `MediaSources`
+- path semantics
+- phantom/materialised/orphan grouping
+- real-vs-phantom item selection
+
+If a code change alters any of those contracts, bump the channel
+DataVersion salt or otherwise force DataVersion to change. Do not rely
+on restart, install, or scheduled-task timing to flush stale channel
+JSON. Stale channel cache has already surfaced as lingering orphan
+items and splash media sources after the provider logic was fixed.
+
+### Badge / client UI contract
+
+Browser badges are advisory UI on top of server truth. The server state
+endpoint must only return badge states for playable, materialise-capable
+items:
+
+- movies
+- episodes
+
+It must omit navigation/container rows:
+
+- series folders
+- season folders
+- unknown/orphan containers unless explicitly designed otherwise
+
+Client badge JS must be idempotent under Jellyfin's DOM churn:
+
+- Do not remove/reinsert an unchanged badge on every MutationObserver
+  callback.
+- Ignore mutations caused solely by `.phantom-badge` elements.
+- Poll only visible `Phantom` / `Virtual` / `Materialising` items.
+- Stop polling when items leave the visible DOM or reach a terminal
+  state.
+
+Reason: the first polling implementation repeatedly removed and
+reinserted the detail-page badge, triggering its own MutationObserver
+forever; a single item page pinned CPU and exhausted browser memory.
+
+### Gostream path contract
+
+Gostream-returned paths must be normalized to host-visible configured
+roots before they are persisted or emitted:
+
+- movies: `PluginConfiguration.GostreamMoviesRoot`
+- episodes: `PluginConfiguration.GostreamShowsRoot`
+
+The plugin must handle gostream returning container-internal paths such
+as `/mnt/gostream-mkv-virtual/...` when the host-visible path is under
+`/var/gostream/gostream-mkv-virtual/...`. Use configured roots plus
+filename/search fallback; do not persist unreachable container paths in
+`materialised_state` or Jellyfin `BaseItems.Path`.
+
+Existing gostream files that TMDB-match discovery rows are
+materialised-equivalent for playback and badges, but they must not get
+fake `materialised_state` rows: eviction/removal semantics depend on
+`materialised_state.stub_path` referring to plugin-created gostream
+registrations.
+
+Movie and TV paths must both be covered. Movie-only tests are
+insufficient; the TV episode path has distinct TMDB, IMDB, season,
+episode, FUSE-root, and channel-folder behavior.
+
 ## Part 1: the Jellyfin patch
 
 ### File: `src/Jellyfin.LiveTv/Channels/ChannelManager.cs`

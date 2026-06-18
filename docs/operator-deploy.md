@@ -30,14 +30,40 @@ Two DLLs need swapping:
 - `MediaBrowser.Controller.dll`
 - `Jellyfin.LiveTv.dll`
 
-`./install.sh --build` builds the patched versions of both and prints
-the exact deploy commands at the end of its output, with paths
-pre-filled for your detected Jellyfin install dir.
+`./install.sh --build` builds the patched versions of both and, by
+default, deploys them alongside the plugin DLL. The install script also
+verifies the destination DLL hashes after copy. Use
+`--no-deploy-jellyfin-dlls` only when you intentionally want to build but
+not touch the runtime Jellyfin install.
+
+## Runtime alignment contract
+
+Phantom Library v0.3+ is sensitive to exact Jellyfin runtime/source
+alignment:
+
+- The in-tree Jellyfin source clone must be exact tag `v10.11.9`
+  (base SHA `e83a7e62f2`) unless the patch stack has deliberately been
+  rebased.
+- The runtime Jellyfin installed on the operator box must also be
+  `10.11.9` when installing this patch stack.
+- The plugin DLL alone is not enough: `MediaBrowser.Controller.dll` and
+  `Jellyfin.LiveTv.dll` in the runtime install dir must be the patched
+  build outputs that correspond to the plugin.
+- `./install.sh --build` is the expected deploy path for normal
+  operator installs because it builds plugin + patched Jellyfin and
+  deploys the patched runtime DLLs by default.
+- After package-manager upgrades of Jellyfin, assume patched DLLs may
+  have been clobbered. Re-run `./install.sh --build` before debugging
+  plugin load or channel/playback failures.
+
+Do not diagnose `TypeLoadException`, channel-refresh failures, or
+native-open playback failures until the runtime DLL hashes have been
+verified against the freshly built patched DLLs.
 
 ## Deploy models
 
-You have two options. Model A is what `install.sh` prints commands
-for; Model B is for the more cautious operator who'd rather not
+You have two options. Model A is what `install.sh --build` performs by
+default; Model B is for the more cautious operator who'd rather not
 modify system files.
 
 ### Model A — in-place swap of the system Jellyfin DLLs (recommended)
@@ -122,8 +148,9 @@ file, the patch has been clobbered. Re-run:
 
 ```
 cd /path/to/repo
-./install.sh --build   # rebuilds patched DLLs
-# then re-run the install -m 644 commands from Model A above.
+./install.sh --build   # rebuilds and redeploys patched DLLs by default
+# or, if using --no-deploy-jellyfin-dlls, re-run the install -m 644
+# commands from Model A above yourself.
 ```
 
 You'll also see `TypeLoadException` for `IChannelItemRefreshManager`

@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- Added durable design/testing/deploy protocols for native phantom
+  playback, channel cache invalidation, badge/UI scope, gostream path
+  normalization, rig scenario authoring, and patched Jellyfin runtime
+  alignment.
+
 ### Fixed
 
 - Phantom channel playback now uses Jellyfin's native `RequiresOpening`
