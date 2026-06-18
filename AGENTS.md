@@ -372,22 +372,34 @@ Output DLL:
 
 ## Test
 
-### Unit tests
+### Unit tests are necessary but not sufficient
 
 ```bash
 dotnet test
 ```
 
-Always green before opening a PR. If you need to weaken a
-test to make a change pass, do not — fix the change.
+Always keep unit tests green. If you need to weaken a test to
+make a change pass, do not — fix the change.
 
-### Live integration tests
+**Do not call a channel, playback, install/deploy, Jellyfin patch,
+materialisation, badge/UI, gostream-path, scheduled-task, or database-
+shape change done based on unit tests alone.** Unit tests have missed
+real regressions in this repo because Jellyfin's channel cache,
+`PlaybackInfo` / `LiveStreams/Open` flow, static vs dynamic media-source
+merging, patched assemblies, browser MutationObserver behaviour, and
+SQLite/Jellyfin BaseItems shape only exist in the live server path.
+
+### Live integration tests are mandatory for user-visible flows
 
 **Read `docs/agents/testing.md` first.** Short version:
 
 - Operator does not want to be in the loop for routine test
   cycles. You have read access to their Jellyfin DBs and a
   rig directory at `/tmp/jf-test/`.
+- Use the rig scripts in `tools/rig-scenarios/` or add a new
+  scenario when existing coverage does not exercise the bug/fix.
+  A regression reported from prod should first become a failing
+  rig scenario whenever practical, then pass after the fix.
 - Spin up your own Jellyfin instance from a clone of the
   prod DB on port `:18096` (production owns `:8096`; do
   not bind it).
@@ -399,7 +411,23 @@ test to make a change pass, do not — fix the change.
   bash calls. The entire test
   (start → wait → drive → inspect → kill) must run inside
   a single bash invocation. The doc explains the pattern
-  and ships a working `run-test.sh`.
+  and ships working rig scripts.
+
+Minimum expectations before marking a user-visible change done:
+
+1. `dotnet build -c Release`
+2. `dotnet test`
+3. Relevant rig scenario(s), for example:
+   - `tools/rig-scenarios/35-channel-e2e-playback.sh` for movie
+     channel browse/playback/materialise.
+   - `tools/rig-scenarios/36-channel-episode-e2e-playback.sh` for TV
+     series → season → episode browse/playback/materialise.
+4. If no existing rig scenario covers the changed behaviour, add one
+   or extend the closest scenario. Do not substitute manual clicking or
+   unit tests for rig coverage.
+5. When production verification is still useful, use Jellyfin API/log
+   APIs yourself after the rig passes. Do not ask the operator to tail
+   logs, restart prod for routine checks, or run SQL for you.
 
 The only legitimate reasons to ask the operator about
 testing:
