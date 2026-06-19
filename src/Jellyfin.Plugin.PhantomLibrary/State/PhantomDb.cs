@@ -44,6 +44,36 @@ public sealed record DiscoveryCacheRow(
     DateTimeOffset DiscoveredAt,
     DateTimeOffset LastRefreshed);
 
+public sealed record CatalogueHitWriteResult(int Seen, int Inserted, int MetadataInserted, int MetadataSkipped, int AvailabilityInserted, int SeriesExpansionInserted);
+
+public sealed record AvailabilityItemRow(
+    int TmdbId,
+    string Type,
+    int Season,
+    int Episode,
+    string Status,
+    DateTimeOffset? CheckedAt,
+    DateTimeOffset NextCheckAt,
+    string? CandidateMagnet,
+    string? CandidateInfoHash,
+    long? CandidateSize,
+    int? CandidateSeeders,
+    string? CandidateIndexer,
+    string? CandidateSource,
+    int ProbeGeneration,
+    string? LeaseOwner);
+
+public sealed record VisibleMovieRow(
+    TmdbMetadataRow Metadata,
+    MaterialisedStateRow? Materialised,
+    AvailabilityItemRow? Availability);
+
+public sealed record VisibleSeriesRow(TmdbMetadataRow Metadata, int AvailableEpisodeCount, int MaterialisedEpisodeCount);
+
+public sealed record VisibleSeasonRow(int SeriesTmdbId, int Season, int AvailableEpisodeCount, int MaterialisedEpisodeCount);
+
+public sealed record DueSeriesExpansionRow(int SeriesTmdbId, int ProbeGeneration, string LeaseOwner);
+
 /// <summary>
 /// Row of the <c>materialised_state</c> table. <c>Season</c> and
 /// <c>Episode</c> use the <c>-1</c> sentinel for movies (per critic v2
@@ -109,23 +139,24 @@ public sealed record TmdbEpisodeRow(
 
 /// <summary>
 /// SQLite-backed persistence for the plugin's private state under the
-/// channel architecture (schema v10). Single writer, serialised via a
+/// channel architecture (schema v11). Single writer, serialised via a
 /// process-wide <see cref="SemaphoreSlim"/>; concurrent readers
 /// permitted via separate short-lived connections.
 ///
-/// Schema v10 is a clean break from the v5 file-on-disk schema (v6/v7/v8
+/// Schema v11 is a clean break from the v5 file-on-disk schema (v6/v7/v8
 /// were intermediate channel-arch revisions that never reached prod;
 /// v9 adds the <c>tmdb_episode_cache</c> table the shows channel needs
 /// for per-episode display metadata at refresh time; v10 adds
 /// <c>magnet_failure_cache</c> so rejected pack candidates do not
-/// block viable alternatives). Per
+/// block viable alternatives; v11 adds append-only catalogue and
+/// availability scheduler state). Per
 /// AGENTS.md "No database migrations until v1.0", existing databases
-/// at any pre-v10 user_version are HARD-REFUSED and the operator must
+/// at any pre-v11 user_version are HARD-REFUSED and the operator must
 /// run <c>scripts/phantom-wipe.sh</c> before restart.
 /// </summary>
 public sealed class PhantomDb : IDisposable
 {
-    private const int CurrentSchemaVersion = 10;
+    private const int CurrentSchemaVersion = 11;
 
     private readonly string _connectionString;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
@@ -222,7 +253,7 @@ public sealed class PhantomDb : IDisposable
                 + $" version {CurrentSchemaVersion}. Downgrade is not supported. Wipe and rebuild.");
         }
 
-        // version == 0: fresh / never-initialised DB. Create the v10 schema.
+        // version == 0: fresh / never-initialised DB. Create the v11 schema.
         using var tx = conn.BeginTransaction();
         using (var cmd = conn.CreateCommand())
         {
@@ -254,6 +285,82 @@ CREATE TABLE IF NOT EXISTS discovery_cache (
 );
 CREATE INDEX IF NOT EXISTS idx_discovery_cache_last_refreshed
     ON discovery_cache(last_refreshed);
+
+-- v11 append-only catalogue. Discovery/recommendation surfaces feed this
+-- table; absence from a later TMDB response does not delete a row.
+CREATE TABLE IF NOT EXISTS catalogue_items (
+    tmdb_id       INTEGER NOT NULL,
+    type          TEXT NOT NULL CHECK(type IN ('movie','series')),
+    first_seen_at INTEGER NOT NULL,
+    last_seen_at  INTEGER NOT NULL,
+    source_mask   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (tmdb_id, type)
+);
+CREATE INDEX IF NOT EXISTS idx_catalogue_items_type_last_seen
+    ON catalogue_items(type, last_seen_at);
+
+-- Series expansion state. Separate from catalogue_items so expansion has
+-- its own due/lease lifecycle.
+CREATE TABLE IF NOT EXISTS series_expansion_state (
+    series_tmdb_id   INTEGER PRIMARY KEY,
+    last_expanded_at INTEGER,
+    next_expand_at   INTEGER NOT NULL,
+    lease_owner      TEXT,
+    lease_until      INTEGER,
+    probe_generation INTEGER NOT NULL DEFAULT 0,
+    last_error_kind  TEXT,
+    last_error_message TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_series_expansion_due
+    ON series_expansion_state(next_expand_at, lease_until);
+
+-- Episode catalogue derived from TMDB season payloads. Availability is
+-- tracked separately because search source state changes independently
+-- from TMDB's episode list.
+CREATE TABLE IF NOT EXISTS series_episode_catalogue (
+    series_tmdb_id INTEGER NOT NULL,
+    episode_tmdb_id INTEGER NOT NULL,
+    season INTEGER NOT NULL CHECK(season >= 0),
+    episode INTEGER NOT NULL CHECK(episode > 0),
+    air_date TEXT,
+    first_seen_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    PRIMARY KEY (series_tmdb_id, season, episode)
+);
+CREATE INDEX IF NOT EXISTS idx_series_episode_catalogue_episode_tmdb
+    ON series_episode_catalogue(episode_tmdb_id);
+
+-- Probe scheduler state. Materialised rows and real gostream files remain
+-- visible regardless of this table; availability only gates unmaterialised
+-- phantom visibility.
+CREATE TABLE IF NOT EXISTS availability_items (
+    tmdb_id INTEGER NOT NULL,
+    type TEXT NOT NULL CHECK(type IN ('movie','episode')),
+    season INTEGER NOT NULL DEFAULT -1,
+    episode INTEGER NOT NULL DEFAULT -1,
+    status TEXT NOT NULL CHECK(status IN ('unknown','available','unavailable')),
+    checked_at INTEGER,
+    next_check_at INTEGER NOT NULL,
+    candidate_magnet TEXT,
+    candidate_info_hash TEXT,
+    candidate_size INTEGER,
+    candidate_seeders INTEGER,
+    candidate_indexer TEXT,
+    candidate_source TEXT,
+    probe_policy_hash TEXT,
+    last_error_kind TEXT,
+    last_error_message TEXT,
+    lease_owner TEXT,
+    lease_until INTEGER,
+    probe_generation INTEGER NOT NULL DEFAULT 0,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    CHECK ((type='movie' AND season=-1 AND episode=-1) OR (type='episode' AND season>=0 AND episode>0)),
+    PRIMARY KEY (tmdb_id, type, season, episode)
+);
+CREATE INDEX IF NOT EXISTS idx_availability_due
+    ON availability_items(next_check_at, lease_until, status);
+CREATE INDEX IF NOT EXISTS idx_availability_status_type
+    ON availability_items(status, type, tmdb_id, season, episode);
 
 -- Channel-arch materialised state: one row per (tmdb_id, type, season,
 -- episode). Movies use sentinel season=-1, episode=-1; series episodes
@@ -660,6 +767,25 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
         }
     }
 
+    public async Task DeleteUnavailableAsync(UnavailableKey key, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"DELETE FROM unavailable_marker
+                WHERE tmdb_id=$tmdb AND imdb_id=$imdb AND type=$type AND season=$season AND episode=$episode;";
+            BindKey(cmd, new MagnetCacheKey(key.TmdbId, key.ImdbId, key.Type, key.Season, key.Episode, string.Empty));
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public async Task<int> PurgeExpiredUnavailableMarkersAsync(CancellationToken ct)
     {
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
@@ -904,6 +1030,694 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
             _writeLock.Release();
         }
     }
+
+    // ---- catalogue / availability v11 ----
+
+    public async Task<CatalogueHitWriteResult> UpsertCatalogueHitsAsync(IReadOnlyList<TmdbMetadataRow> rows, int sourceMask, DateTimeOffset now, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(rows);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var tx = await conn.BeginTransactionAsync(ct).ConfigureAwait(false);
+            var seen = 0;
+            var inserted = 0;
+            var metadataInserted = 0;
+            var metadataSkipped = 0;
+            var availabilityInserted = 0;
+            var seriesExpansionInserted = 0;
+            foreach (var row in rows)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (row.Type != "movie" && row.Type != "series")
+                {
+                    throw new ArgumentException($"Unsupported catalogue type '{row.Type}'", nameof(rows));
+                }
+
+                if (string.IsNullOrWhiteSpace(row.Title))
+                {
+                    continue;
+                }
+
+                seen++;
+                var nowUnix = now.ToUnixTimeSeconds();
+                await using (var cmd = conn.CreateCommand())
+                {
+                    cmd.Transaction = (SqliteTransaction)tx;
+                    cmd.CommandText = @"INSERT OR IGNORE INTO catalogue_items
+                        (tmdb_id, type, first_seen_at, last_seen_at, source_mask)
+                        VALUES ($tmdb,$type,$now,$now,$mask);";
+                    cmd.Parameters.AddWithValue("$tmdb", row.TmdbId);
+                    cmd.Parameters.AddWithValue("$type", row.Type);
+                    cmd.Parameters.AddWithValue("$now", nowUnix);
+                    cmd.Parameters.AddWithValue("$mask", sourceMask);
+                    inserted += await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                }
+
+                await using (var cmd = conn.CreateCommand())
+                {
+                    cmd.Transaction = (SqliteTransaction)tx;
+                    cmd.CommandText = @"UPDATE catalogue_items
+                        SET last_seen_at=$now, source_mask=(source_mask | $mask)
+                        WHERE tmdb_id=$tmdb AND type=$type;";
+                    cmd.Parameters.AddWithValue("$tmdb", row.TmdbId);
+                    cmd.Parameters.AddWithValue("$type", row.Type);
+                    cmd.Parameters.AddWithValue("$now", nowUnix);
+                    cmd.Parameters.AddWithValue("$mask", sourceMask);
+                    await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                }
+
+                var metaChange = 0;
+                await using (var cmd = conn.CreateCommand())
+                {
+                    cmd.Transaction = (SqliteTransaction)tx;
+                    cmd.CommandText = @"INSERT OR IGNORE INTO tmdb_metadata
+                        (tmdb_id, type, title, year, overview, poster_url, backdrop_url,
+                         genres_json, official_rating, community_rating, original_title, fetched_at)
+                        VALUES ($tmdb,$type,$title,$year,$overview,$poster,$backdrop,
+                                $genres,$rating,$community,$origtitle,$fetched);";
+                    BindMetadata(cmd, row);
+                    metaChange = await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                }
+
+                if (metaChange > 0)
+                {
+                    metadataInserted += metaChange;
+                }
+                else
+                {
+                    metadataSkipped++;
+                }
+
+                if (row.Type == "movie")
+                {
+                    await using var cmd = conn.CreateCommand();
+                    cmd.Transaction = (SqliteTransaction)tx;
+                    cmd.CommandText = @"INSERT OR IGNORE INTO availability_items
+                        (tmdb_id, type, season, episode, status, next_check_at)
+                        VALUES ($tmdb,'movie',-1,-1,'unknown',$now);";
+                    cmd.Parameters.AddWithValue("$tmdb", row.TmdbId);
+                    cmd.Parameters.AddWithValue("$now", nowUnix);
+                    availabilityInserted += await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                }
+                else
+                {
+                    await using var cmd = conn.CreateCommand();
+                    cmd.Transaction = (SqliteTransaction)tx;
+                    cmd.CommandText = @"INSERT OR IGNORE INTO series_expansion_state
+                        (series_tmdb_id, next_expand_at) VALUES ($tmdb,$now);";
+                    cmd.Parameters.AddWithValue("$tmdb", row.TmdbId);
+                    cmd.Parameters.AddWithValue("$now", nowUnix);
+                    seriesExpansionInserted += await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                }
+            }
+
+            await tx.CommitAsync(ct).ConfigureAwait(false);
+            return new CatalogueHitWriteResult(seen, inserted, metadataInserted, metadataSkipped, availabilityInserted, seriesExpansionInserted);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    private static void BindMetadata(SqliteCommand cmd, TmdbMetadataRow row)
+    {
+        cmd.Parameters.AddWithValue("$tmdb", row.TmdbId);
+        cmd.Parameters.AddWithValue("$type", row.Type);
+        cmd.Parameters.AddWithValue("$title", row.Title);
+        cmd.Parameters.AddWithValue("$year", (object?)row.Year ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$overview", (object?)row.Overview ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$poster", (object?)row.PosterUrl ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$backdrop", (object?)row.BackdropUrl ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$genres", row.Genres is null ? (object)DBNull.Value : System.Text.Json.JsonSerializer.Serialize(row.Genres));
+        cmd.Parameters.AddWithValue("$rating", (object?)row.OfficialRating ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$community", (object?)row.CommunityRating ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$origtitle", (object?)row.OriginalTitle ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$fetched", row.FetchedAt.ToUnixTimeSeconds());
+    }
+
+    public async Task<AvailabilityItemRow?> ClaimDueAvailabilityAsync(string owner, TimeSpan leaseDuration, DateTimeOffset now, string policyHash, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(owner);
+        ArgumentException.ThrowIfNullOrWhiteSpace(policyHash);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var tx = await conn.BeginTransactionAsync(ct).ConfigureAwait(false);
+            AvailabilityItemRow? row = null;
+            await using (var cmd = conn.CreateCommand())
+            {
+                cmd.Transaction = (SqliteTransaction)tx;
+                cmd.CommandText = @"SELECT tmdb_id,type,season,episode,status,checked_at,next_check_at,
+                           candidate_magnet,candidate_info_hash,candidate_size,candidate_seeders,
+                           candidate_indexer,candidate_source,probe_generation,lease_owner
+                    FROM availability_items
+                    WHERE (next_check_at <= $now OR probe_policy_hash IS NULL OR probe_policy_hash <> $policy)
+                      AND (lease_until IS NULL OR lease_until < $now)
+                    ORDER BY CASE WHEN checked_at IS NULL THEN 0 WHEN status='available' THEN 1 WHEN status='unavailable' THEN 2 ELSE 3 END,
+                             next_check_at ASC
+                    LIMIT 1;";
+                cmd.Parameters.AddWithValue("$now", now.ToUnixTimeSeconds());
+                cmd.Parameters.AddWithValue("$policy", policyHash);
+                await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+                if (await r.ReadAsync(ct).ConfigureAwait(false))
+                {
+                    row = ReadAvailability(r);
+                }
+            }
+
+            if (row is null)
+            {
+                await tx.CommitAsync(ct).ConfigureAwait(false);
+                return null;
+            }
+
+            var generation = row.ProbeGeneration + 1;
+            await using (var cmd = conn.CreateCommand())
+            {
+                cmd.Transaction = (SqliteTransaction)tx;
+                cmd.CommandText = @"UPDATE availability_items
+                    SET lease_owner=$owner, lease_until=$until, probe_generation=$gen, attempt_count=attempt_count+1
+                    WHERE tmdb_id=$tmdb AND type=$type AND season=$season AND episode=$episode
+                      AND probe_generation=$oldGen
+                      AND (lease_until IS NULL OR lease_until < $now);";
+                cmd.Parameters.AddWithValue("$owner", owner);
+                cmd.Parameters.AddWithValue("$until", now.Add(leaseDuration).ToUnixTimeSeconds());
+                cmd.Parameters.AddWithValue("$gen", generation);
+                cmd.Parameters.AddWithValue("$oldGen", row.ProbeGeneration);
+                cmd.Parameters.AddWithValue("$now", now.ToUnixTimeSeconds());
+                cmd.Parameters.AddWithValue("$tmdb", row.TmdbId);
+                cmd.Parameters.AddWithValue("$type", row.Type);
+                cmd.Parameters.AddWithValue("$season", row.Season);
+                cmd.Parameters.AddWithValue("$episode", row.Episode);
+                if (await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) != 1)
+                {
+                    await tx.CommitAsync(ct).ConfigureAwait(false);
+                    return null;
+                }
+            }
+
+            await tx.CommitAsync(ct).ConfigureAwait(false);
+            return row with { ProbeGeneration = generation, LeaseOwner = owner };
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<bool> CompleteAvailabilityProbeAsync(
+        AvailabilityItemRow lease,
+        string status,
+        DateTimeOffset checkedAt,
+        DateTimeOffset nextCheckAt,
+        string policyHash,
+        MagnetCacheEntry? candidate,
+        string? errorKind,
+        string? errorMessage,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(lease);
+        ArgumentException.ThrowIfNullOrWhiteSpace(status);
+        if (status != "unknown" && status != "available" && status != "unavailable")
+        {
+            throw new ArgumentException($"Unsupported availability status '{status}'", nameof(status));
+        }
+
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"UPDATE availability_items SET
+                    status=$status,
+                    checked_at=$checked,
+                    next_check_at=$next,
+                    candidate_magnet=$magnet,
+                    candidate_info_hash=$hash,
+                    candidate_size=$size,
+                    candidate_seeders=$seeders,
+                    candidate_indexer=$indexer,
+                    candidate_source=$source,
+                    probe_policy_hash=$policy,
+                    last_error_kind=$errKind,
+                    last_error_message=$errMsg,
+                    lease_owner=NULL,
+                    lease_until=NULL
+                WHERE tmdb_id=$tmdb AND type=$type AND season=$season AND episode=$episode
+                  AND lease_owner=$owner AND probe_generation=$generation;";
+            cmd.Parameters.AddWithValue("$status", status);
+            cmd.Parameters.AddWithValue("$checked", checkedAt.ToUnixTimeSeconds());
+            cmd.Parameters.AddWithValue("$next", nextCheckAt.ToUnixTimeSeconds());
+            cmd.Parameters.AddWithValue("$magnet", (object?)candidate?.Magnet ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$hash", (object?)candidate?.InfoHash ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$size", (object?)candidate?.Size ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$seeders", (object?)candidate?.Seeders ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$indexer", (object?)candidate?.Indexer ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$source", (object?)candidate?.Source ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$policy", policyHash);
+            cmd.Parameters.AddWithValue("$errKind", (object?)SanitizeError(errorKind, 64) ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$errMsg", (object?)SanitizeError(errorMessage, 512) ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$tmdb", lease.TmdbId);
+            cmd.Parameters.AddWithValue("$type", lease.Type);
+            cmd.Parameters.AddWithValue("$season", lease.Season);
+            cmd.Parameters.AddWithValue("$episode", lease.Episode);
+            cmd.Parameters.AddWithValue("$owner", lease.LeaseOwner ?? string.Empty);
+            cmd.Parameters.AddWithValue("$generation", lease.ProbeGeneration);
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) == 1;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<bool> RescheduleAvailabilityTransientAsync(AvailabilityItemRow lease, DateTimeOffset nextCheckAt, string errorKind, string? errorMessage, CancellationToken ct)
+    {
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"UPDATE availability_items SET
+                    next_check_at=$next,
+                    last_error_kind=$errKind,
+                    last_error_message=$errMsg,
+                    lease_owner=NULL,
+                    lease_until=NULL
+                WHERE tmdb_id=$tmdb AND type=$type AND season=$season AND episode=$episode
+                  AND lease_owner=$owner AND probe_generation=$generation;";
+            cmd.Parameters.AddWithValue("$next", nextCheckAt.ToUnixTimeSeconds());
+            cmd.Parameters.AddWithValue("$errKind", SanitizeError(errorKind, 64));
+            cmd.Parameters.AddWithValue("$errMsg", (object?)SanitizeError(errorMessage, 512) ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$tmdb", lease.TmdbId);
+            cmd.Parameters.AddWithValue("$type", lease.Type);
+            cmd.Parameters.AddWithValue("$season", lease.Season);
+            cmd.Parameters.AddWithValue("$episode", lease.Episode);
+            cmd.Parameters.AddWithValue("$owner", lease.LeaseOwner ?? string.Empty);
+            cmd.Parameters.AddWithValue("$generation", lease.ProbeGeneration);
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) == 1;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    private static string? SanitizeError(string? value, int maxLength)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        var cleaned = value.Replace('\r', ' ').Replace('\n', ' ').Trim();
+        return cleaned.Length <= maxLength ? cleaned : cleaned[..maxLength];
+    }
+
+    public async Task<DueSeriesExpansionRow?> ClaimDueSeriesExpansionAsync(string owner, TimeSpan leaseDuration, DateTimeOffset now, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(owner);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var tx = await conn.BeginTransactionAsync(ct).ConfigureAwait(false);
+            int? seriesTmdb = null;
+            var oldGeneration = 0;
+            await using (var cmd = conn.CreateCommand())
+            {
+                cmd.Transaction = (SqliteTransaction)tx;
+                cmd.CommandText = @"SELECT series_tmdb_id, probe_generation FROM series_expansion_state
+                    WHERE next_expand_at <= $now AND (lease_until IS NULL OR lease_until < $now)
+                    ORDER BY CASE WHEN last_expanded_at IS NULL THEN 0 ELSE 1 END, next_expand_at ASC
+                    LIMIT 1;";
+                cmd.Parameters.AddWithValue("$now", now.ToUnixTimeSeconds());
+                await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+                if (await r.ReadAsync(ct).ConfigureAwait(false))
+                {
+                    seriesTmdb = r.GetInt32(0);
+                    oldGeneration = r.GetInt32(1);
+                }
+            }
+
+            if (!seriesTmdb.HasValue)
+            {
+                await tx.CommitAsync(ct).ConfigureAwait(false);
+                return null;
+            }
+
+            var generation = oldGeneration + 1;
+            await using (var cmd = conn.CreateCommand())
+            {
+                cmd.Transaction = (SqliteTransaction)tx;
+                cmd.CommandText = @"UPDATE series_expansion_state
+                    SET lease_owner=$owner, lease_until=$until, probe_generation=$gen
+                    WHERE series_tmdb_id=$tmdb AND probe_generation=$oldGen
+                      AND (lease_until IS NULL OR lease_until < $now);";
+                cmd.Parameters.AddWithValue("$owner", owner);
+                cmd.Parameters.AddWithValue("$until", now.Add(leaseDuration).ToUnixTimeSeconds());
+                cmd.Parameters.AddWithValue("$gen", generation);
+                cmd.Parameters.AddWithValue("$oldGen", oldGeneration);
+                cmd.Parameters.AddWithValue("$now", now.ToUnixTimeSeconds());
+                cmd.Parameters.AddWithValue("$tmdb", seriesTmdb.Value);
+                if (await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) != 1)
+                {
+                    await tx.CommitAsync(ct).ConfigureAwait(false);
+                    return null;
+                }
+            }
+
+            await tx.CommitAsync(ct).ConfigureAwait(false);
+            return new DueSeriesExpansionRow(seriesTmdb.Value, generation, owner);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<bool> CompleteSeriesExpansionAsync(
+        DueSeriesExpansionRow lease,
+        IReadOnlyList<TmdbEpisodeRow> episodes,
+        IReadOnlyDictionary<(int Season, int Episode), (int EpisodeTmdbId, string? AirDate)> episodeIds,
+        DateTimeOffset now,
+        DateTimeOffset nextExpandAt,
+        TimeSpan releaseDelay,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(lease);
+        ArgumentNullException.ThrowIfNull(episodes);
+        ArgumentNullException.ThrowIfNull(episodeIds);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var tx = await conn.BeginTransactionAsync(ct).ConfigureAwait(false);
+            foreach (var row in episodes)
+            {
+                ct.ThrowIfCancellationRequested();
+                await using (var cmd = conn.CreateCommand())
+                {
+                    cmd.Transaction = (SqliteTransaction)tx;
+                    cmd.CommandText = @"INSERT OR IGNORE INTO tmdb_episode_cache
+                        (series_tmdb_id, season, episode, title, overview, still_url, air_date, runtime_minutes, fetched_at)
+                        VALUES ($series,$season,$episode,$title,$overview,$still,$air,$runtime,$fetched);";
+                    cmd.Parameters.AddWithValue("$series", row.SeriesTmdbId);
+                    cmd.Parameters.AddWithValue("$season", row.Season);
+                    cmd.Parameters.AddWithValue("$episode", row.Episode);
+                    cmd.Parameters.AddWithValue("$title", row.Title);
+                    cmd.Parameters.AddWithValue("$overview", (object?)row.Overview ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("$still", (object?)row.StillUrl ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("$air", (object?)row.AirDate ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("$runtime", (object?)row.RuntimeMinutes ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("$fetched", row.FetchedAt.ToUnixTimeSeconds());
+                    await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                }
+
+                episodeIds.TryGetValue((row.Season, row.Episode), out var ids);
+                await using (var cmd = conn.CreateCommand())
+                {
+                    cmd.Transaction = (SqliteTransaction)tx;
+                    cmd.CommandText = @"INSERT INTO series_episode_catalogue
+                        (series_tmdb_id, episode_tmdb_id, season, episode, air_date, first_seen_at, last_seen_at)
+                        VALUES ($series,$epTmdb,$season,$episode,$air,$now,$now)
+                        ON CONFLICT(series_tmdb_id, season, episode) DO UPDATE SET
+                            episode_tmdb_id=excluded.episode_tmdb_id,
+                            air_date=excluded.air_date,
+                            last_seen_at=excluded.last_seen_at;";
+                    cmd.Parameters.AddWithValue("$series", row.SeriesTmdbId);
+                    cmd.Parameters.AddWithValue("$epTmdb", ids.EpisodeTmdbId);
+                    cmd.Parameters.AddWithValue("$season", row.Season);
+                    cmd.Parameters.AddWithValue("$episode", row.Episode);
+                    cmd.Parameters.AddWithValue("$air", (object?)ids.AirDate ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue("$now", now.ToUnixTimeSeconds());
+                    await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                }
+
+                var nextCheck = ComputeEpisodeNextCheck(row.AirDate, now, releaseDelay);
+                await using (var cmd = conn.CreateCommand())
+                {
+                    cmd.Transaction = (SqliteTransaction)tx;
+                    cmd.CommandText = @"INSERT OR IGNORE INTO availability_items
+                        (tmdb_id, type, season, episode, status, next_check_at)
+                        VALUES ($series,'episode',$season,$episode,'unknown',$next);";
+                    cmd.Parameters.AddWithValue("$series", row.SeriesTmdbId);
+                    cmd.Parameters.AddWithValue("$season", row.Season);
+                    cmd.Parameters.AddWithValue("$episode", row.Episode);
+                    cmd.Parameters.AddWithValue("$next", nextCheck.ToUnixTimeSeconds());
+                    await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                }
+            }
+
+            await using (var cmd = conn.CreateCommand())
+            {
+                cmd.Transaction = (SqliteTransaction)tx;
+                cmd.CommandText = @"UPDATE series_expansion_state SET
+                        last_expanded_at=$now,
+                        next_expand_at=$next,
+                        lease_owner=NULL,
+                        lease_until=NULL,
+                        last_error_kind=NULL,
+                        last_error_message=NULL
+                    WHERE series_tmdb_id=$series AND lease_owner=$owner AND probe_generation=$generation;";
+                cmd.Parameters.AddWithValue("$now", now.ToUnixTimeSeconds());
+                cmd.Parameters.AddWithValue("$next", nextExpandAt.ToUnixTimeSeconds());
+                cmd.Parameters.AddWithValue("$series", lease.SeriesTmdbId);
+                cmd.Parameters.AddWithValue("$owner", lease.LeaseOwner);
+                cmd.Parameters.AddWithValue("$generation", lease.ProbeGeneration);
+                if (await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) != 1)
+                {
+                    await tx.RollbackAsync(ct).ConfigureAwait(false);
+                    return false;
+                }
+            }
+
+            await tx.CommitAsync(ct).ConfigureAwait(false);
+            return true;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    private static DateTimeOffset ComputeEpisodeNextCheck(string? airDate, DateTimeOffset now, TimeSpan releaseDelay)
+    {
+        if (!string.IsNullOrWhiteSpace(airDate)
+            && DateTimeOffset.TryParse(airDate, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AssumeUniversal, out var parsed)
+            && parsed > now)
+        {
+            return parsed.Add(releaseDelay);
+        }
+
+        return now;
+    }
+
+    public async Task<bool> FailSeriesExpansionAsync(DueSeriesExpansionRow lease, DateTimeOffset nextExpandAt, string errorKind, string? errorMessage, CancellationToken ct)
+    {
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"UPDATE series_expansion_state SET
+                    next_expand_at=$next,
+                    lease_owner=NULL,
+                    lease_until=NULL,
+                    last_error_kind=$kind,
+                    last_error_message=$message
+                WHERE series_tmdb_id=$series AND lease_owner=$owner AND probe_generation=$generation;";
+            cmd.Parameters.AddWithValue("$next", nextExpandAt.ToUnixTimeSeconds());
+            cmd.Parameters.AddWithValue("$kind", SanitizeError(errorKind, 64));
+            cmd.Parameters.AddWithValue("$message", (object?)SanitizeError(errorMessage, 512) ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$series", lease.SeriesTmdbId);
+            cmd.Parameters.AddWithValue("$owner", lease.LeaseOwner);
+            cmd.Parameters.AddWithValue("$generation", lease.ProbeGeneration);
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) == 1;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<IReadOnlyList<VisibleMovieRow>> ListVisibleMovieRowsAsync(CancellationToken ct)
+    {
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT m.tmdb_id,m.type,m.title,m.year,m.overview,m.poster_url,m.backdrop_url,
+                   m.genres_json,m.official_rating,m.community_rating,m.original_title,m.fetched_at,
+                   ms.tmdb_id,ms.type,ms.season,ms.episode,ms.stub_path,ms.fuse_path,ms.materialised_at,
+                   a.tmdb_id,a.type,a.season,a.episode,a.status,a.checked_at,a.next_check_at,
+                   a.candidate_magnet,a.candidate_info_hash,a.candidate_size,a.candidate_seeders,
+                   a.candidate_indexer,a.candidate_source,a.probe_generation,a.lease_owner
+            FROM tmdb_metadata m
+            LEFT JOIN materialised_state ms ON ms.tmdb_id=m.tmdb_id AND ms.type='movie'
+            LEFT JOIN availability_items a ON a.tmdb_id=m.tmdb_id AND a.type='movie' AND a.season=-1 AND a.episode=-1
+            WHERE m.type='movie' AND (ms.tmdb_id IS NOT NULL OR a.status='available')
+            ORDER BY COALESCE(ms.materialised_at, m.fetched_at) DESC;";
+        var list = new List<VisibleMovieRow>();
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            var meta = ReadTmdbMetadata(r, 0);
+            MaterialisedStateRow? mat = r.IsDBNull(12) ? null : new MaterialisedStateRow(
+                r.GetInt32(12), r.GetString(13), r.GetInt32(14), r.GetInt32(15), r.GetString(16), r.GetString(17), DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(18)));
+            AvailabilityItemRow? av = r.IsDBNull(19) ? null : ReadAvailability(r, 19);
+            list.Add(new VisibleMovieRow(meta, mat, av));
+        }
+
+        return list;
+    }
+
+    public async Task<IReadOnlyList<VisibleSeriesRow>> ListVisibleSeriesRowsAsync(CancellationToken ct)
+    {
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT m.tmdb_id,m.type,m.title,m.year,m.overview,m.poster_url,m.backdrop_url,
+                   m.genres_json,m.official_rating,m.community_rating,m.original_title,m.fetched_at,
+                   COALESCE(av.available_count,0), COALESCE(mat.materialised_count,0)
+            FROM tmdb_metadata m
+            LEFT JOIN (
+                SELECT tmdb_id, COUNT(*) AS available_count FROM availability_items
+                WHERE type='episode' AND status='available'
+                GROUP BY tmdb_id
+            ) av ON av.tmdb_id=m.tmdb_id
+            LEFT JOIN (
+                SELECT tmdb_id, COUNT(*) AS materialised_count FROM materialised_state
+                WHERE type='episode'
+                GROUP BY tmdb_id
+            ) mat ON mat.tmdb_id=m.tmdb_id
+            WHERE m.type='series' AND (COALESCE(av.available_count,0) > 0 OR COALESCE(mat.materialised_count,0) > 0)
+            ORDER BY m.fetched_at DESC;";
+        var list = new List<VisibleSeriesRow>();
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            list.Add(new VisibleSeriesRow(
+                ReadTmdbMetadata(r, 0),
+                Convert.ToInt32(r.GetInt64(12)),
+                Convert.ToInt32(r.GetInt64(13))));
+        }
+
+        return list;
+    }
+
+    public async Task<IReadOnlyList<VisibleSeasonRow>> ListVisibleSeasonsAsync(int seriesTmdbId, CancellationToken ct)
+    {
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT season,
+                   SUM(CASE WHEN source='available' THEN 1 ELSE 0 END) AS available_count,
+                   SUM(CASE WHEN source='materialised' THEN 1 ELSE 0 END) AS materialised_count
+            FROM (
+                SELECT season, 'available' AS source FROM availability_items
+                WHERE tmdb_id=$series AND type='episode' AND status='available'
+                UNION ALL
+                SELECT season, 'materialised' AS source FROM materialised_state
+                WHERE tmdb_id=$series AND type='episode'
+            )
+            GROUP BY season
+            ORDER BY season;";
+        cmd.Parameters.AddWithValue("$series", seriesTmdbId);
+        var list = new List<VisibleSeasonRow>();
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            list.Add(new VisibleSeasonRow(seriesTmdbId, r.GetInt32(0), Convert.ToInt32(r.GetInt64(1)), Convert.ToInt32(r.GetInt64(2))));
+        }
+
+        return list;
+    }
+
+    public async Task<IReadOnlyList<(int SeriesTmdbId, int Season, int Episode)>> ListVisibleEpisodeIdsAsync(CancellationToken ct)
+    {
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT tmdb_id, season, episode FROM availability_items
+                WHERE type='episode' AND status='available'
+            UNION
+            SELECT tmdb_id, season, episode FROM materialised_state
+                WHERE type='episode'
+            ORDER BY tmdb_id, season, episode;";
+        var list = new List<(int SeriesTmdbId, int Season, int Episode)>();
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            list.Add((r.GetInt32(0), r.GetInt32(1), r.GetInt32(2)));
+        }
+
+        return list;
+    }
+
+    public async Task<bool> IsEpisodeVisibleAsync(int seriesTmdbId, int season, int episode, CancellationToken ct)
+    {
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT 1 FROM materialised_state
+                WHERE tmdb_id=$series AND type='episode' AND season=$season AND episode=$episode
+            UNION ALL
+            SELECT 1 FROM availability_items
+                WHERE tmdb_id=$series AND type='episode' AND season=$season AND episode=$episode AND status='available'
+            LIMIT 1;";
+        cmd.Parameters.AddWithValue("$series", seriesTmdbId);
+        cmd.Parameters.AddWithValue("$season", season);
+        cmd.Parameters.AddWithValue("$episode", episode);
+        var v = await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
+        return v is not null and not DBNull;
+    }
+
+    private static TmdbMetadataRow ReadTmdbMetadata(SqliteDataReader r, int offset)
+    {
+        string[]? genres = null;
+        if (!r.IsDBNull(offset + 7))
+        {
+            try
+            {
+                genres = System.Text.Json.JsonSerializer.Deserialize<string[]>(r.GetString(offset + 7));
+            }
+            catch (System.Text.Json.JsonException)
+            {
+                genres = null;
+            }
+        }
+
+        return new TmdbMetadataRow(
+            r.GetInt32(offset),
+            r.GetString(offset + 1),
+            r.GetString(offset + 2),
+            r.IsDBNull(offset + 3) ? null : r.GetInt32(offset + 3),
+            r.IsDBNull(offset + 4) ? null : r.GetString(offset + 4),
+            r.IsDBNull(offset + 5) ? null : r.GetString(offset + 5),
+            r.IsDBNull(offset + 6) ? null : r.GetString(offset + 6),
+            genres,
+            r.IsDBNull(offset + 8) ? null : r.GetString(offset + 8),
+            r.IsDBNull(offset + 9) ? null : r.GetDouble(offset + 9),
+            r.IsDBNull(offset + 10) ? null : r.GetString(offset + 10),
+            DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(offset + 11)));
+    }
+
+    private static AvailabilityItemRow ReadAvailability(SqliteDataReader r, int offset = 0)
+        => new(
+            r.GetInt32(offset),
+            r.GetString(offset + 1),
+            r.GetInt32(offset + 2),
+            r.GetInt32(offset + 3),
+            r.GetString(offset + 4),
+            r.IsDBNull(offset + 5) ? null : DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(offset + 5)),
+            DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(offset + 6)),
+            r.IsDBNull(offset + 7) ? null : r.GetString(offset + 7),
+            r.IsDBNull(offset + 8) ? null : r.GetString(offset + 8),
+            r.IsDBNull(offset + 9) ? null : r.GetInt64(offset + 9),
+            r.IsDBNull(offset + 10) ? null : r.GetInt32(offset + 10),
+            r.IsDBNull(offset + 11) ? null : r.GetString(offset + 11),
+            r.IsDBNull(offset + 12) ? null : r.GetString(offset + 12),
+            r.GetInt32(offset + 13),
+            r.IsDBNull(offset + 14) ? null : r.GetString(offset + 14));
 
     // ---- materialise_in_flight ----
 

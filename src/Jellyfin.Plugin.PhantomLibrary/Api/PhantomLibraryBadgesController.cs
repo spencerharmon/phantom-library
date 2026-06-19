@@ -178,7 +178,11 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
         }
 
         var path = item.Path ?? string.Empty;
-        return path.Contains("/gostream", StringComparison.OrdinalIgnoreCase)
+        var cfg = Plugin.Instance?.Configuration;
+        var movieRoot = cfg?.GostreamMoviesRoot ?? "/var/gostream/gostream-mkv-virtual/movies";
+        var showRoot = cfg?.GostreamShowsRoot ?? "/var/gostream/gostream-mkv-virtual/tv";
+        return (path.StartsWith(movieRoot.TrimEnd('/'), StringComparison.OrdinalIgnoreCase)
+                || path.StartsWith(showRoot.TrimEnd('/'), StringComparison.OrdinalIgnoreCase))
             && (path.EndsWith(".mkv", StringComparison.OrdinalIgnoreCase)
                 || path.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase)
                 || path.EndsWith(".m4v", StringComparison.OrdinalIgnoreCase)
@@ -190,9 +194,9 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
     {
         var seen = new HashSet<string>(StringComparer.Ordinal);
 
-        foreach (var row in await _db.ListDiscoveryCacheAsync("movie", ct).ConfigureAwait(false))
+        foreach (var row in await _db.ListVisibleMovieRowsAsync(ct).ConfigureAwait(false))
         {
-            var id = ChannelItemId.ForMovie(row.TmdbId);
+            var id = ChannelItemId.ForMovie(row.Metadata.TmdbId);
             if (seen.Add(id.Encode()) && ComputeMovieGuid(id) == requestedId)
             {
                 return id;
@@ -208,9 +212,9 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
             }
         }
 
-        foreach (var row in await _db.ListMaterialisedStateAsync("episode", ct).ConfigureAwait(false))
+        foreach (var row in await _db.ListVisibleEpisodeIdsAsync(ct).ConfigureAwait(false))
         {
-            var id = ChannelItemId.ForEpisode(row.TmdbId, row.Season, row.Episode);
+            var id = ChannelItemId.ForEpisode(row.SeriesTmdbId, row.Season, row.Episode);
             if (seen.Add(id.Encode()) && ComputeEpisodeGuid(id) == requestedId)
             {
                 return id;

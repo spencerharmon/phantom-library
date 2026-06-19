@@ -47,14 +47,14 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
     public const string TaskKey = "PhantomLibrary.DiscoveryRefresh";
 
     private const int DefaultDiscoveryRefreshIntervalHours = 6;
-    private const int DefaultDiscoveryCacheTtlDays = 30;
     private const int DefaultCatalogueMaxItems = 5000;
     private const int TmdbMaxDiscoverPage = 500;
+    private const int SourceTrending = 1;
+    private const int SourceDiscover = 2;
 
     private readonly CachedTmdbReader _tmdb;
     private readonly ITmdbClient _tmdbClient;
     private readonly PhantomDb _db;
-    private readonly ChannelStateProvider _state;
     private readonly ILogger<DiscoveryRefreshTask> _logger;
     private readonly Func<PluginConfiguration?> _configurationProvider;
 
@@ -79,7 +79,7 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
         _tmdb = tmdb;
         _tmdbClient = tmdbClient;
         _db = db;
-        _state = state;
+        _ = state;
         _logger = logger;
         ArgumentNullException.ThrowIfNull(configurationProvider);
         _configurationProvider = configurationProvider;
@@ -123,12 +123,6 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
         ArgumentNullException.ThrowIfNull(progress);
         var config = _configurationProvider();
         var language = NormaliseLanguage(config?.DiscoveryLanguage);
-        var ttlDays = config?.DiscoveryCacheTtlDays ?? DefaultDiscoveryCacheTtlDays;
-        if (ttlDays <= 0)
-        {
-            ttlDays = DefaultDiscoveryCacheTtlDays;
-        }
-
         var catalogueMaxItems = config?.SuggestionsCatalogueMaxItems ?? DefaultCatalogueMaxItems;
         if (catalogueMaxItems < 0)
         {
@@ -138,19 +132,23 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
         var discoverMovieCap = (catalogueMaxItems / 2) + (catalogueMaxItems % 2);
         var discoverSeriesCap = catalogueMaxItems / 2;
 
-        var discovered = new HashSet<(int Tmdb, string Type)>();
+        var totalSeen = 0;
+        var totalInserted = 0;
+        var totalAvailabilityInserted = 0;
+        var totalSeriesExpansionInserted = 0;
 
         // --- Phase 1: trending ----------------------------------------------
         progress.Report(0);
         try
         {
             var (movies, fromCacheM) = await _tmdb.TrendingMoviesAsync("week", language, cancellationToken).ConfigureAwait(false);
-            foreach (var hit in movies)
-            {
-                await UpsertDiscoveredHitAsync(hit, "movie", discovered, cancellationToken).ConfigureAwait(false);
-            }
+            var write = await UpsertHitsAsync(movies, "movie", SourceTrending, cancellationToken).ConfigureAwait(false);
+            totalSeen += write.Seen;
+            totalInserted += write.Inserted;
+            totalAvailabilityInserted += write.AvailabilityInserted;
+            totalSeriesExpansionInserted += write.SeriesExpansionInserted;
 
-            _logger.LogInformation("Trending movies: {Count} hits (cached={Cached})", movies.Count, fromCacheM);
+            _logger.LogInformation("Trending movies: {Count} hits (cached={Cached}) inserted={Inserted}", movies.Count, fromCacheM, write.Inserted);
         }
         catch (OperationCanceledException)
         {
@@ -165,12 +163,13 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
         try
         {
             var (series, fromCacheS) = await _tmdb.TrendingSeriesAsync("week", language, cancellationToken).ConfigureAwait(false);
-            foreach (var hit in series)
-            {
-                await UpsertDiscoveredHitAsync(hit, "series", discovered, cancellationToken).ConfigureAwait(false);
-            }
+            var write = await UpsertHitsAsync(series, "series", SourceTrending, cancellationToken).ConfigureAwait(false);
+            totalSeen += write.Seen;
+            totalInserted += write.Inserted;
+            totalAvailabilityInserted += write.AvailabilityInserted;
+            totalSeriesExpansionInserted += write.SeriesExpansionInserted;
 
-            _logger.LogInformation("Trending series: {Count} hits (cached={Cached})", series.Count, fromCacheS);
+            _logger.LogInformation("Trending series: {Count} hits (cached={Cached}) inserted={Inserted}", series.Count, fromCacheS, write.Inserted);
         }
         catch (OperationCanceledException)
         {
@@ -187,17 +186,17 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
         await WalkDiscoverAsync(
             kind: "movie",
             maxItems: discoverMovieCap,
-            discovered: discovered,
             fetchPage: (page, ct) => _tmdb.GetDiscoverMoviesAsync(page, language, ct),
-            cancellationToken).ConfigureAwait(false);
+            counters: result => { totalSeen += result.Seen; totalInserted += result.Inserted; totalAvailabilityInserted += result.AvailabilityInserted; totalSeriesExpansionInserted += result.SeriesExpansionInserted; },
+            cancellationToken: cancellationToken).ConfigureAwait(false);
         progress.Report(37.5);
 
         await WalkDiscoverAsync(
             kind: "series",
             maxItems: discoverSeriesCap,
-            discovered: discovered,
             fetchPage: (page, ct) => _tmdb.GetDiscoverSeriesAsync(page, language, ct),
-            cancellationToken).ConfigureAwait(false);
+            counters: result => { totalSeen += result.Seen; totalInserted += result.Inserted; totalAvailabilityInserted += result.AvailabilityInserted; totalSeriesExpansionInserted += result.SeriesExpansionInserted; },
+            cancellationToken: cancellationToken).ConfigureAwait(false);
         progress.Report(45);
 
         // --- Phase 3: favourite-similar enrichment --------------------------
@@ -215,69 +214,20 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
 
         progress.Report(50);
 
-        _logger.LogInformation("tmdb_metadata warm from discovery hits: {Warmed} ok", discovered.Count);
-
-        // --- Phase 4: TTL eviction with materialise protection --------------
-        progress.Report(90);
-        var cutoff = DateTimeOffset.UtcNow.Subtract(TimeSpan.FromDays(ttlDays));
-        var totalEvicted = 0;
-        foreach (var type in new[] { "movie", "series" })
-        {
-            // Materialised rows use type='movie' (movies channel) and
-            // type='episode' (per-episode rows in series). For discovery
-            // protection we treat 'series' protected if any episode of the
-            // same series tmdb has been materialised — but episode rows are
-            // keyed on the *episode* tmdb id, not series tmdb id. The
-            // plumbing for series-level materialised summary isn't in place
-            // yet (Stage 5.2); for now we use a conservative rule: protect
-            // movie discovery rows that have a materialised_state movie row.
-            // Series rows fall through to pure TTL pruning, which is
-            // acceptable for v0.3.0 (worst case: re-discovered next tick).
-            var protectedTmdbs = new HashSet<int>();
-            if (type == "movie")
-            {
-                var materialised = await _db.ListMaterialisedStateAsync("movie", cancellationToken).ConfigureAwait(false);
-                foreach (var m in materialised)
-                {
-                    protectedTmdbs.Add(m.TmdbId);
-                }
-            }
-
-            // TODO(stage-future): plan §3.1 also wants favourite-protection
-            // on top of materialise-protection. Same blocker as the
-            // enrichment pass above (needs ILibraryManager favourite
-            // lookup). Deferred.
-
-            var rows = await _db.ListDiscoveryCacheAsync(type, cancellationToken).ConfigureAwait(false);
-            var stale = rows.Where(r => r.LastRefreshed < cutoff && !protectedTmdbs.Contains(r.TmdbId)).ToList();
-            foreach (var s in stale)
-            {
-                await _db.DeleteDiscoveryCacheRowAsync(s.TmdbId, type, cancellationToken).ConfigureAwait(false);
-            }
-
-            totalEvicted += stale.Count;
-            _logger.LogInformation(
-                "TTL evict: kind={Kind} candidates={Rows} stale={Stale} evicted={Evicted}",
-                type,
-                rows.Count,
-                stale.Count,
-                stale.Count);
-        }
-
-        _logger.LogInformation("Discovery refresh complete. Discovered={Disc} EvictedTotal={Ev}",
-            discovered.Count, totalEvicted);
-
-        // --- Phase 5: bump DataVersions so channels re-query ---------------
-        _state.BumpDataVersion(ChannelStateProvider.KindMovies);
-        _state.BumpDataVersion(ChannelStateProvider.KindShows);
+        _logger.LogInformation(
+            "Discovery refresh complete. Seen={Seen} NewCatalogue={New} NewAvailability={Avail} NewSeriesExpansion={SeriesExpansion}. Channel DataVersion not bumped until availability visibility changes.",
+            totalSeen,
+            totalInserted,
+            totalAvailabilityInserted,
+            totalSeriesExpansionInserted);
         progress.Report(100);
     }
 
     private async Task WalkDiscoverAsync(
         string kind,
         int maxItems,
-        HashSet<(int Tmdb, string Type)> discovered,
         Func<int, CancellationToken, Task<(IReadOnlyList<TmdbSearchHit> Hits, bool FromCache)>> fetchPage,
+        Action<CatalogueHitWriteResult> counters,
         CancellationToken cancellationToken)
     {
         if (maxItems <= 0)
@@ -288,7 +238,7 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
 
         var page = 1;
         var processed = 0;
-        var uniqueDiscovered = 0;
+        var inserted = 0;
         var cachedPages = 0;
         while (processed < maxItems && page <= TmdbMaxDiscoverPage)
         {
@@ -320,23 +270,11 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
                 break;
             }
 
-            foreach (var hit in hits)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                if (processed >= maxItems)
-                {
-                    break;
-                }
-
-                var added = await UpsertDiscoveredHitAsync(hit, kind, discovered, cancellationToken).ConfigureAwait(false);
-                if (added)
-                {
-                    uniqueDiscovered++;
-                }
-
-                processed++;
-            }
-
+            var pageHits = hits.Take(Math.Max(0, maxItems - processed)).ToList();
+            var write = await UpsertHitsAsync(pageHits, kind, SourceDiscover, cancellationToken).ConfigureAwait(false);
+            counters(write);
+            inserted += write.Inserted;
+            processed += pageHits.Count;
             page++;
         }
 
@@ -350,31 +288,31 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
         }
 
         _logger.LogInformation(
-            "Discover {Kind}: processed={Processed} unique={Unique} pages={Pages} cachedPages={CachedPages} cap={Cap}",
+            "Discover {Kind}: processed={Processed} inserted={Inserted} pages={Pages} cachedPages={CachedPages} cap={Cap}",
             kind,
             processed,
-            uniqueDiscovered,
+            inserted,
             page - 1,
             cachedPages,
             maxItems);
     }
 
-    private async Task<bool> UpsertDiscoveredHitAsync(
-        TmdbSearchHit hit,
-        string type,
-        HashSet<(int Tmdb, string Type)> discovered,
-        CancellationToken ct)
+    private async Task<CatalogueHitWriteResult> UpsertHitsAsync(IReadOnlyList<TmdbSearchHit> hits, string type, int sourceMask, CancellationToken ct)
     {
-        var row = MapSearchHitToMetadata(hit, type);
-        if (string.IsNullOrWhiteSpace(row.Title))
+        var rows = new List<TmdbMetadataRow>(hits.Count);
+        foreach (var hit in hits)
         {
-            _logger.LogDebug("Skipping discovery hit {Type}:{Tmdb} because TMDB returned no title", type, hit.Id);
-            return false;
+            var row = MapSearchHitToMetadata(hit, type);
+            if (string.IsNullOrWhiteSpace(row.Title))
+            {
+                _logger.LogDebug("Skipping discovery hit {Type}:{Tmdb} because TMDB returned no title", type, hit.Id);
+                continue;
+            }
+
+            rows.Add(row);
         }
 
-        await _db.UpsertTmdbMetadataAsync(row, ct).ConfigureAwait(false);
-        await _db.UpsertDiscoveryCacheAsync(hit.Id, type, ct).ConfigureAwait(false);
-        return discovered.Add((hit.Id, type));
+        return await _db.UpsertCatalogueHitsAsync(rows, sourceMask, DateTimeOffset.UtcNow, ct).ConfigureAwait(false);
     }
 
     private static TmdbMetadataRow MapSearchHitToMetadata(TmdbSearchHit hit, string type)
