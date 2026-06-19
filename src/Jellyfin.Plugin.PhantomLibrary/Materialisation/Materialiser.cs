@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Channels;
@@ -54,6 +55,7 @@ public sealed class Materialiser : IMaterialiser
     private readonly ILogger<Materialiser> _logger;
 
     private sealed record CandidateAddRequest(GostreamAddRequest Request, MagnetCandidate Magnet, bool FromCache);
+    private sealed record CandidateAddResult(GostreamAddResult AddResult, string FusePath);
 
     public Materialiser(
         ILibraryManager libraryManager,
@@ -175,10 +177,27 @@ public sealed class Materialiser : IMaterialiser
 
         var (sSentinel, eSentinel) = ChannelItemId.ToSentinels(season, episode);
 
-        if (await _db.GetMaterialisedStateAsync(tmdbId, type, sSentinel, eSentinel, ct)
-                .ConfigureAwait(false) is not null)
+        var existingState = await _db.GetMaterialisedStateAsync(tmdbId, type, sSentinel, eSentinel, ct)
+            .ConfigureAwait(false);
+        if (existingState is not null)
         {
-            return MaterialisationOutcome.Duplicate;
+            var existingPath = type == "movie"
+                ? GostreamPathResolver.ResolveMoviePath(existingState.FusePath)
+                : GostreamPathResolver.ResolveEpisodePath(existingState.FusePath);
+            if (File.Exists(existingPath))
+            {
+                return MaterialisationOutcome.Duplicate;
+            }
+
+            _logger.LogWarning(
+                "Materialised state for {Type}/{Tmdb} (s={Season} e={Episode}) points at missing file {Path}; re-materialising",
+                type,
+                tmdbId,
+                season,
+                episode,
+                existingPath);
+            await _db.DeleteMaterialisedStateAsync(tmdbId, type, sSentinel, eSentinel, ct)
+                .ConfigureAwait(false);
         }
 
         if (await _db.IsMaterialiseInFlightAsync(tmdbId, type, sSentinel, eSentinel, ct)
@@ -265,15 +284,11 @@ public sealed class Materialiser : IMaterialiser
                 tmdbId, type, season, episode, imdb, unavailKey, ct).ConfigureAwait(false);
             var addResult = await AddWithCandidateRetryAsync(
                 candidates, tmdbId, type, season, episode, imdb, unavailKey, ct).ConfigureAwait(false);
-            var fusePath = type == "movie"
-                ? GostreamPathResolver.ResolveMoviePath(addResult.FusePath)
-                : GostreamPathResolver.ResolveEpisodePath(addResult.FusePath);
-            await WaitForFusePathAsync(fusePath, ct).ConfigureAwait(false);
 
             await _db.InsertMaterialisedStateAsync(
                 tmdbId, type, sSentinel, eSentinel,
-                stubPath: addResult.StubPath,
-                fusePath: fusePath,
+                stubPath: addResult.AddResult.StubPath,
+                fusePath: addResult.FusePath,
                 ct).ConfigureAwait(false);
 
             // Post-flight refresh: channel now emits real MediaSource;
@@ -301,13 +316,14 @@ public sealed class Materialiser : IMaterialiser
             {
                 _logger.LogWarning(
                     refreshEx,
-                    "Post-flight RefreshChannelItem failed for {External}; channel will refresh on next browse",
+                    "Post-flight RefreshChannelItem failed for {External}; forcing media-info cache invalidation so next play does not reuse stale opener",
                     externalId);
+                await TryInvalidateMediaInfoCacheAsync(channelId, externalId).ConfigureAwait(false);
             }
 
             _state.BumpDataVersion(channelKind);
 
-            var outcome = MaterialisationOutcome.Success(fusePath, addResult.StubPath);
+            var outcome = MaterialisationOutcome.Success(addResult.FusePath, addResult.AddResult.StubPath);
             LifecycleChanged?.Invoke(this, new MaterialisationLifecycleEvent(
                 Guid.Empty, MaterialisationLifecyclePhase.Finished, outcome));
             _ = trigger; // kept for symmetry with the legacy ctor and for future logging hooks
@@ -342,6 +358,30 @@ public sealed class Materialiser : IMaterialiser
                     "Failed to delete in-flight row for {Type}/{Tmdb}; will be swept on next startup",
                     type, tmdbId);
             }
+        }
+    }
+
+    private async Task TryInvalidateMediaInfoCacheAsync(Guid channelId, string externalId)
+    {
+        try
+        {
+            await _refreshManager.RefreshChannelItemAsync(
+                channelId,
+                externalId,
+                new ChannelItemRefreshOptions
+                {
+                    ForceUpdate = false,
+                    ForceProbe = false,
+                    InvalidateMediaInfoCache = true,
+                },
+                CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Post-flight media-info cache invalidation failed for {External}; next browse/DataVersion refresh must heal stale source",
+                externalId);
         }
     }
 
@@ -475,7 +515,7 @@ public sealed class Materialiser : IMaterialiser
     private async Task<bool> IsCandidateAllowedAsync(MagnetCacheKey key, MagnetCandidate magnet, CancellationToken ct)
         => await _db.GetMagnetFailureAsync(ToFailureKey(key, magnet), ct).ConfigureAwait(false) is null;
 
-    private async Task<GostreamAddResult> AddWithCandidateRetryAsync(
+    private async Task<CandidateAddResult> AddWithCandidateRetryAsync(
         IReadOnlyList<CandidateAddRequest> candidates,
         int tmdbId,
         string type,
@@ -493,6 +533,10 @@ public sealed class Materialiser : IMaterialiser
             try
             {
                 var result = await _gostream.AddAsync(candidate.Request, ct).ConfigureAwait(false);
+                var fusePath = type == "movie"
+                    ? GostreamPathResolver.ResolveMoviePath(result.FusePath)
+                    : GostreamPathResolver.ResolveEpisodePath(result.FusePath);
+                await WaitForFusePathAsync(fusePath, ct).ConfigureAwait(false);
                 if (!candidate.FromCache)
                 {
                     try
@@ -526,7 +570,7 @@ public sealed class Materialiser : IMaterialiser
                     }
                 }
 
-                return result;
+                return new CandidateAddResult(result, fusePath);
             }
             catch (OperationCanceledException)
             {
@@ -541,6 +585,11 @@ public sealed class Materialiser : IMaterialiser
             {
                 last = ex;
                 await MarkCandidateFailedAsync(candidate, tmdbId, imdb, type, season, episode, cfg, CandidateRejectReason(ex), TimeSpan.FromHours(cfg.MagnetCacheTtlHours), ct).ConfigureAwait(false);
+            }
+            catch (FileNotFoundException ex)
+            {
+                last = ex;
+                await MarkCandidateFailedAsync(candidate, tmdbId, imdb, type, season, episode, cfg, "fuse_path_missing", TimeSpan.FromHours(cfg.UnavailableRetryAfterHours), ct).ConfigureAwait(false);
             }
             catch (GostreamTimeoutException ex)
             {
@@ -613,10 +662,9 @@ public sealed class Materialiser : IMaterialiser
 
     /// <summary>
     /// Poll the FUSE mount until the file appears, bounded by the
-    /// configured timeout. Best-effort — a timeout does not roll the
-    /// materialise back; the post-flight RefreshChannelItem still fires
-    /// and on next browse the channel emits the new path. We log and
-    /// continue.
+    /// configured timeout. Timeout rejects the current magnet candidate;
+    /// we do not persist materialised_state for a path Jellyfin cannot
+    /// open.
     /// </summary>
     private async Task WaitForFusePathAsync(string fusePath, CancellationToken ct)
     {
@@ -642,9 +690,8 @@ public sealed class Materialiser : IMaterialiser
             await Task.Delay(pollMs, ct).ConfigureAwait(false);
         }
 
-        _logger.LogWarning(
-            "FUSE path {Path} did not appear within {Seconds}s; persisting materialised_state anyway",
-            fusePath,
-            cfg.FusePathWaitTimeoutSeconds);
+        throw new FileNotFoundException(
+            $"FUSE path {fusePath} did not appear within {cfg.FusePathWaitTimeoutSeconds}s",
+            fusePath);
     }
 }

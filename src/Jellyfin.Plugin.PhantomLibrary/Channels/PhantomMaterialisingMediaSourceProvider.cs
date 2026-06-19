@@ -141,7 +141,7 @@ public sealed class PhantomMaterialisingMediaSourceProvider : IMediaSourceProvid
                     var state = await _db.GetMaterialisedStateAsync(
                         parsed.TmdbId!.Value, "movie", ChannelItemId.Sentinel, ChannelItemId.Sentinel, cancellationToken)
                         .ConfigureAwait(false);
-                    return state is null
+                    return state is null || !File.Exists(GostreamPathResolver.ResolveMoviePath(state.FusePath))
                         ? new[] { CreateOpeningMediaSource(parsed, prefixedToken: false) }
                         : Array.Empty<MediaSourceInfo>();
                 }
@@ -151,7 +151,7 @@ public sealed class PhantomMaterialisingMediaSourceProvider : IMediaSourceProvid
                     var state = await _db.GetMaterialisedStateAsync(
                         parsed.TmdbId!.Value, "episode", parsed.Season!.Value, parsed.Episode!.Value, cancellationToken)
                         .ConfigureAwait(false);
-                    return state is null
+                    return state is null || !File.Exists(GostreamPathResolver.ResolveEpisodePath(state.FusePath))
                         ? new[] { CreateOpeningMediaSource(parsed, prefixedToken: false) }
                         : Array.Empty<MediaSourceInfo>();
                 }
@@ -177,6 +177,24 @@ public sealed class PhantomMaterialisingMediaSourceProvider : IMediaSourceProvid
         var (seasonKey, episodeKey) = ChannelItemId.ToSentinels(season, episode);
         var existing = await _db.GetMaterialisedStateAsync(parsed.TmdbId!.Value, type, seasonKey, episodeKey, cancellationToken)
             .ConfigureAwait(false);
+        if (existing is not null)
+        {
+            var existingPath = ResolveMaterialisedPath(type, existing);
+            if (!File.Exists(existingPath))
+            {
+                _logger.LogWarning(
+                    "Phantom materialised_state for {Type}/{Tmdb} s{Season}e{Episode} points at missing file {Path}; re-materialising",
+                    type,
+                    parsed.TmdbId,
+                    season,
+                    episode,
+                    existingPath);
+                await _db.DeleteMaterialisedStateAsync(parsed.TmdbId.Value, type, seasonKey, episodeKey, cancellationToken)
+                    .ConfigureAwait(false);
+                existing = null;
+            }
+        }
+
         if (existing is null)
         {
             var outcome = await _materialiser.MaterialiseAsync(
@@ -212,9 +230,7 @@ public sealed class PhantomMaterialisingMediaSourceProvider : IMediaSourceProvid
                 string.Create(CultureInfo.InvariantCulture, $"Timed out waiting for Phantom materialise state for {type}/{parsed.TmdbId}"));
         }
 
-        var path = type == "movie"
-            ? GostreamPathResolver.ResolveMoviePath(existing.FusePath)
-            : GostreamPathResolver.ResolveEpisodePath(existing.FusePath);
+        var path = ResolveMaterialisedPath(type, existing);
 
         await WaitForFileAsync(path, cancellationToken).ConfigureAwait(false);
 
@@ -266,6 +282,11 @@ public sealed class PhantomMaterialisingMediaSourceProvider : IMediaSourceProvid
 
         return null;
     }
+
+    private static string ResolveMaterialisedPath(string type, MaterialisedStateRow state)
+        => type == "movie"
+            ? GostreamPathResolver.ResolveMoviePath(state.FusePath)
+            : GostreamPathResolver.ResolveEpisodePath(state.FusePath);
 
     private async Task WaitForFileAsync(string path, CancellationToken ct)
     {

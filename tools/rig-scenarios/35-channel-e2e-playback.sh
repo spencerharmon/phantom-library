@@ -229,18 +229,18 @@ bash tools/rig-scenarios/rig-up.sh --reset
 
 for _ in $(seq 1 60); do
   [ -f "$PHDB" ] && schema=$(sqlite3 "$PHDB" 'PRAGMA user_version;' 2>/dev/null || echo 0) || schema=0
-  [ "$schema" = "10" ] && break
+  [ "$schema" = "11" ] && break
   sleep 1
 done
-[ "${schema:-0}" = "10" ] || fail "phantom schema not v10, got ${schema:-0}"
+[ "${schema:-0}" = "11" ] || fail "phantom schema not v11, got ${schema:-0}"
 
 echo '[1] trigger discovery task'
 api "$API/ScheduledTasks" -o /tmp/tasks.json
 TASK_ID=$(find_task_id) || fail 'discovery task not found'
 api_post "$API/ScheduledTasks/Running/$TASK_ID" -o /tmp/task-run.out || fail 'failed to start discovery task'
 wait_task_idle "$TASK_ID"
-movies_count=$(sqlite3 "$PHDB" "SELECT COUNT(*) FROM discovery_cache WHERE type='movie';")
-[ "$movies_count" -ge 3 ] || fail "expected >=3 discovery movies, got $movies_count"
+movies_count=$(sqlite3 "$PHDB" "SELECT COUNT(*) FROM catalogue_items WHERE type='movie';")
+[ "$movies_count" -ge 3 ] || fail "expected >=3 catalogue movies, got $movies_count"
 
 echo '[2] seed magnet cache for Alpha materialise'
 now=$(date +%s)
@@ -251,6 +251,12 @@ VALUES
 ($ALPHA, 'tt99000001', 'movie', 0, 0, 'gostream-default',
  'magnet:?xt=urn:btih:1111111111111111111111111111111111111111&dn=Phantom+Rig+Alpha',
  '1111111111111111111111111111111111111111', 10485760, 100, 'rig-cache', $now, 86400, 'rig');
+INSERT OR REPLACE INTO availability_items
+(tmdb_id, type, season, episode, status, checked_at, next_check_at, candidate_magnet, candidate_info_hash, candidate_size, candidate_seeders, candidate_indexer, candidate_source)
+VALUES
+($ALPHA, 'movie', -1, -1, 'available', $now, $((now + 604800)),
+ 'magnet:?xt=urn:btih:1111111111111111111111111111111111111111&dn=Phantom+Rig+Alpha',
+ '1111111111111111111111111111111111111111', 10485760, 100, 'rig-cache', 'rig');
 SQL
 
 echo '[3] browse channels'

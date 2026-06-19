@@ -288,6 +288,50 @@ If the change requires *no* operator action beyond the next install,
 say so explicitly: "No operator steps needed; `./install.sh` is
 sufficient." Silence on this question costs the operator time.
 
+## Version handoff / intended-test manifest (always)
+
+When handing off a build for operator testing, include an **INTENDED
+TEST TARGET** block. The operator must be able to verify that the DLL,
+patched Jellyfin assemblies, schema, and gostream binary they are about
+to test are exactly the artifacts you meant them to test. Do not ask the
+operator to test from a vague "latest" or "current worktree" state.
+
+Minimum handoff block:
+
+```text
+INTENDED TEST TARGET
+repo: /home/spencer/git-repos/spencerharmon/phantom-library
+branch: <git branch --show-current>
+commit: <git rev-parse HEAD>
+dirty files: <git status --short, plus git -C gostream status --short>
+plugin schema source: <PhantomDb CurrentSchemaVersion>
+plugin built sha256: <sha256sum src/.../Jellyfin.Plugin.PhantomLibrary.dll>
+plugin deployed sha256: <sha256sum /var/lib/jellyfin/plugins/.../Jellyfin.Plugin.PhantomLibrary.dll>
+patched Jellyfin sha256: <MediaBrowser.Controller.dll + Jellyfin.LiveTv.dll>
+gostream commit/dirty: <git -C gostream rev-parse HEAD + status>
+gostream deployed version/hash: <image id or binary sha, if known>
+phantom.db schema: <sqlite PRAGMA user_version>
+tests run: <exact commands + pass/fail>
+operator steps: <ordered install/restart/test steps>
+```
+
+Rules:
+
+- If `plugin built sha256` and `plugin deployed sha256` differ after
+  install, say the operator is **not testing the intended plugin**.
+  Stop and reinstall; do not debug behavior from a mismatched DLL.
+- If `plugin schema source` and `phantom.db schema` differ, call out
+  whether this is expected (fresh DB not yet created, or wipe required)
+  before restart/testing.
+- If gostream behavior changed, include gostream status/hash in the
+  handoff and say explicitly whether gostream must be rebuilt/restarted.
+- If multiple worktrees are active, name the exact repo path used for
+  build/install. Do not say "main" when you mean a worktree or vice
+  versa.
+- `install.sh` prints a post-install verification block; include it or
+  its relevant lines in the handoff when install/deploy happened during
+  the turn.
+
 ## Single-operator deployment
 
 This project is deployed in a single-operator environment. The

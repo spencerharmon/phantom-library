@@ -74,6 +74,24 @@ public class PhantomShowsChannelTests : IDisposable
             CancellationToken.None);
     }
 
+    private async Task SeedAvailableEpisodeAsync(int seriesTmdb, int season, int episode)
+    {
+        await _db.SetMetaAsync("__test_schema__", "1", CancellationToken.None);
+        await using var conn = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"INSERT OR REPLACE INTO availability_items
+            (tmdb_id,type,season,episode,status,checked_at,next_check_at)
+            VALUES ($tmdb,'episode',$season,$episode,'available',$now,$next);";
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        cmd.Parameters.AddWithValue("$tmdb", seriesTmdb);
+        cmd.Parameters.AddWithValue("$season", season);
+        cmd.Parameters.AddWithValue("$episode", episode);
+        cmd.Parameters.AddWithValue("$now", now);
+        cmd.Parameters.AddWithValue("$next", DateTimeOffset.UtcNow.AddDays(7).ToUnixTimeSeconds());
+        await cmd.ExecuteNonQueryAsync(CancellationToken.None);
+    }
+
     private static TmdbSeriesDetails MakeSeriesDetails(int tmdb, int seasons)
     {
         return new TmdbSeriesDetails(
@@ -132,7 +150,7 @@ public class PhantomShowsChannelTests : IDisposable
     public async Task GetChannelItems_DiscoverySeriesOnly_EmitsSeriesFolder()
     {
         await SeedSeriesMetaAsync(1399, "Game of Thrones");
-        await _db.UpsertDiscoveryCacheAsync(1399, "series", CancellationToken.None);
+        await SeedAvailableEpisodeAsync(1399, 1, 1);
 
         var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
 
@@ -197,8 +215,9 @@ public class PhantomShowsChannelTests : IDisposable
     public async Task GetChannelItems_SeriesFolder_EmitsNSeasons()
     {
         await SeedSeriesMetaAsync(1399, "Game of Thrones");
-        _tmdb.Setup(t => t.GetSeriesAsync(1399, null, It.IsAny<CancellationToken>()))
-            .ReturnsAsync(MakeSeriesDetails(1399, seasons: 3));
+        await SeedAvailableEpisodeAsync(1399, 1, 1);
+        await SeedAvailableEpisodeAsync(1399, 2, 1);
+        await SeedAvailableEpisodeAsync(1399, 3, 1);
 
         var q = new InternalChannelItemQuery { FolderId = "series_1399" };
         var result = await _channel.GetChannelItems(q, CancellationToken.None);
@@ -210,7 +229,7 @@ public class PhantomShowsChannelTests : IDisposable
         Assert.All(result.Items, i =>
         {
             Assert.Equal(ChannelItemType.Folder, i.Type);
-            Assert.Equal(ChannelFolderType.Season, i.FolderType);
+            Assert.Equal(ChannelFolderType.Container, i.FolderType);
             Assert.Equal("Game of Thrones", i.SeriesName);
         });
         Assert.Equal(1, result.Items[0].IndexNumber);
@@ -236,6 +255,9 @@ public class PhantomShowsChannelTests : IDisposable
     public async Task GetChannelItems_SeasonFolder_EmitsPhantomEpisodesWithOpeningSources()
     {
         await SeedSeriesMetaAsync(1399, "Game of Thrones");
+        await SeedAvailableEpisodeAsync(1399, 1, 1);
+        await SeedAvailableEpisodeAsync(1399, 1, 2);
+        await SeedAvailableEpisodeAsync(1399, 1, 3);
         _tmdb.Setup(t => t.GetSeasonAsync(1399, 1, null, It.IsAny<CancellationToken>()))
             .ReturnsAsync(MakeSeasonDetails(1399, 1, 3));
 
@@ -266,9 +288,12 @@ public class PhantomShowsChannelTests : IDisposable
     public async Task GetChannelItems_SeasonFolder_MaterialisedEpisode_EmitsFuseAndNoPhantomTag()
     {
         await SeedSeriesMetaAsync(1399, "Game of Thrones");
+        await SeedAvailableEpisodeAsync(1399, 1, 1);
         _tmdb.Setup(t => t.GetSeasonAsync(1399, 1, null, It.IsAny<CancellationToken>()))
             .ReturnsAsync(MakeSeasonDetails(1399, 1, 2));
-        await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 2, "/stub/e2", "/fuse/got_s01e02.mkv", CancellationToken.None);
+        var fusePath = Path.Combine(_splashHome, "got_s01e02.mkv");
+        await File.WriteAllTextAsync(fusePath, "x", CancellationToken.None);
+        await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 2, "/stub/e2", fusePath, CancellationToken.None);
 
         var q = new InternalChannelItemQuery { FolderId = "season_1399_s01" };
         var result = await _channel.GetChannelItems(q, CancellationToken.None);
@@ -277,11 +302,47 @@ public class PhantomShowsChannelTests : IDisposable
         var e2 = result.Items.First(i => i.Id == "episode_1399_s01e02");
         Assert.Contains("phantom", e1.Tags);
         Assert.DoesNotContain("phantom", e2.Tags);
-        Assert.Equal("/fuse/got_s01e02.mkv", e2.MediaSources[0].Path);
+        Assert.Equal(fusePath, e2.MediaSources[0].Path);
     }
 
     [Fact]
-    public async Task GetChannelItems_SeasonFolder_TmdbReturnsNull_ReturnsEmpty()
+    public async Task GetChannelItems_SeasonFolder_MaterialisedEpisodeWithMissingFile_EmitsOpeningSource()
+    {
+        await SeedSeriesMetaAsync(1399, "Game of Thrones");
+        _tmdb.Setup(t => t.GetSeasonAsync(1399, 1, null, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MakeSeasonDetails(1399, 1, 1));
+        await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 1, "/stub/e1", Path.Combine(_splashHome, "missing_s01e01.mkv"), CancellationToken.None);
+
+        var q = new InternalChannelItemQuery { FolderId = "season_1399_s01" };
+        var result = await _channel.GetChannelItems(q, CancellationToken.None);
+
+        var item = Assert.Single(result.Items);
+        Assert.Contains("phantom", item.Tags);
+        AssertOpeningSource(item.MediaSources[0], "episode_1399_s01e01");
+    }
+
+    [Fact]
+    public async Task GetChannelItems_SeasonFolder_TmdbReturnsNull_FallsBackToEpisodeCache()
+    {
+        await SeedSeriesMetaAsync(1399, "Game of Thrones");
+        await SeedAvailableEpisodeAsync(1399, 1, 1);
+        await _db.UpsertTmdbEpisodeAsync(
+            new TmdbEpisodeRow(1399, 1, 1, "Cached Pilot", "Cached synopsis", null, null, 50, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        _tmdb.Setup(t => t.GetSeasonAsync(1399, 1, null, It.IsAny<CancellationToken>()))
+            .ReturnsAsync((TmdbSeasonDetails?)null);
+
+        var q = new InternalChannelItemQuery { FolderId = "season_1399_s01" };
+        var result = await _channel.GetChannelItems(q, CancellationToken.None);
+
+        var item = Assert.Single(result.Items);
+        Assert.Equal("episode_1399_s01e01", item.Id);
+        Assert.Equal("Cached Pilot", item.Name);
+        Assert.Contains("phantom", item.Tags);
+    }
+
+    [Fact]
+    public async Task GetChannelItems_SeasonFolder_TmdbReturnsNullAndCacheCold_ReturnsEmpty()
     {
         _tmdb.Setup(t => t.GetSeasonAsync(1399, 1, null, It.IsAny<CancellationToken>()))
             .ReturnsAsync((TmdbSeasonDetails?)null);
@@ -300,6 +361,7 @@ public class PhantomShowsChannelTests : IDisposable
     public async Task EpisodeId_StableAcrossPhantomToMaterialiseTransition()
     {
         await SeedSeriesMetaAsync(1399, "Game of Thrones");
+        await SeedAvailableEpisodeAsync(1399, 1, 1);
         _tmdb.Setup(t => t.GetSeasonAsync(1399, 1, null, It.IsAny<CancellationToken>()))
             .ReturnsAsync(MakeSeasonDetails(1399, 1, 1));
 
@@ -308,14 +370,16 @@ public class PhantomShowsChannelTests : IDisposable
         var beforeId = before.Items.Single().Id;
         Assert.Contains("phantom", before.Items.Single().Tags);
 
-        await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 1, "/stub", "/fuse/got_s01e01.mkv", CancellationToken.None);
+        var fusePath = Path.Combine(_splashHome, "stable_s01e01.mkv");
+        await File.WriteAllTextAsync(fusePath, "x", CancellationToken.None);
+        await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 1, "/stub", fusePath, CancellationToken.None);
 
         var after = await _channel.GetChannelItems(q, CancellationToken.None);
         var afterEpisode = after.Items.Single();
         Assert.Equal(beforeId, afterEpisode.Id);
         Assert.Equal("episode_1399_s01e01", afterEpisode.Id);
         Assert.DoesNotContain("phantom", afterEpisode.Tags);
-        Assert.Equal("/fuse/got_s01e01.mkv", afterEpisode.MediaSources[0].Path);
+        Assert.Equal(fusePath, afterEpisode.MediaSources[0].Path);
     }
 
     // ----------------------------------------------------------------
@@ -339,7 +403,7 @@ public class PhantomShowsChannelTests : IDisposable
         var got = await _channel.GetChannelItemAsync("season_1399_s02", CancellationToken.None);
         Assert.NotNull(got);
         Assert.Equal("season_1399_s02", got.Id);
-        Assert.Equal(ChannelFolderType.Season, got.FolderType);
+        Assert.Equal(ChannelFolderType.Container, got.FolderType);
         Assert.Equal(2, got.IndexNumber);
     }
 
@@ -366,13 +430,29 @@ public class PhantomShowsChannelTests : IDisposable
         // the refresh silently no-ops and BaseItem.Path stays at splash.
         _tmdb.Setup(t => t.GetSeasonAsync(1399, 1, null, It.IsAny<CancellationToken>()))
             .ReturnsAsync(MakeSeasonDetails(1399, 1, 1));
-        await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 1, "/stub", "/fuse/got_s01e01.mkv", CancellationToken.None);
+        var fusePath = Path.Combine(_splashHome, "refresh_s01e01.mkv");
+        await File.WriteAllTextAsync(fusePath, "x", CancellationToken.None);
+        await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 1, "/stub", fusePath, CancellationToken.None);
 
         var got = await _channel.GetChannelItemAsync("episode_1399_s01e01", CancellationToken.None);
         Assert.NotNull(got);
         Assert.Equal("episode_1399_s01e01", got.Id);
         Assert.DoesNotContain("phantom", got.Tags);
-        Assert.Equal("/fuse/got_s01e01.mkv", got.MediaSources[0].Path);
+        Assert.Equal(fusePath, got.MediaSources[0].Path);
+    }
+
+    [Fact]
+    public async Task GetChannelItemAsync_Episode_AfterMaterialiseWithMissingFile_ReturnsOpeningSource()
+    {
+        _tmdb.Setup(t => t.GetSeasonAsync(1399, 1, null, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MakeSeasonDetails(1399, 1, 1));
+        await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 1, "/stub", Path.Combine(_splashHome, "missing_refresh_s01e01.mkv"), CancellationToken.None);
+
+        var got = await _channel.GetChannelItemAsync("episode_1399_s01e01", CancellationToken.None);
+
+        Assert.NotNull(got);
+        Assert.Contains("phantom", got.Tags);
+        AssertOpeningSource(got.MediaSources[0], "episode_1399_s01e01");
     }
 
     [Fact]
@@ -419,10 +499,22 @@ public class PhantomShowsChannelTests : IDisposable
     [Fact]
     public async Task GetChannelItemMediaInfo_MaterialisedEpisode_ReturnsFusePath()
     {
-        await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 1, "/stub", "/fuse/ep.mkv", CancellationToken.None);
+        var fusePath = Path.Combine(_splashHome, "media-info.mkv");
+        await File.WriteAllTextAsync(fusePath, "x", CancellationToken.None);
+        await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 1, "/stub", fusePath, CancellationToken.None);
         var got = await _channel.GetChannelItemMediaInfo("episode_1399_s01e01", CancellationToken.None);
         var src = Assert.Single(got);
-        Assert.Equal("/fuse/ep.mkv", src.Path);
+        Assert.Equal(fusePath, src.Path);
+    }
+
+    [Fact]
+    public async Task GetChannelItemMediaInfo_MaterialisedEpisodeWithMissingFile_ReturnsEmpty()
+    {
+        await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 1, "/stub", Path.Combine(_splashHome, "missing-media-info.mkv"), CancellationToken.None);
+
+        var got = await _channel.GetChannelItemMediaInfo("episode_1399_s01e01", CancellationToken.None);
+
+        Assert.Empty(got);
     }
 
     [Fact]
@@ -457,12 +549,16 @@ public class PhantomShowsChannelTests : IDisposable
         await _db.UpsertTmdbEpisodeAsync(
             new TmdbEpisodeRow(1399, 1, 1, "Pilot", null, null, null, null, DateTimeOffset.UtcNow),
             CancellationToken.None);
-        await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 1, "/s1", "/f1", CancellationToken.None);
+        var f1 = Path.Combine(_splashHome, "latest-1.mkv");
+        await File.WriteAllTextAsync(f1, "x", CancellationToken.None);
+        await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 1, "/s1", f1, CancellationToken.None);
         await Task.Delay(1100);
         await _db.UpsertTmdbEpisodeAsync(
             new TmdbEpisodeRow(1399, 1, 2, "Second", null, null, null, null, DateTimeOffset.UtcNow),
             CancellationToken.None);
-        await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 2, "/s2", "/f2", CancellationToken.None);
+        var f2 = Path.Combine(_splashHome, "latest-2.mkv");
+        await File.WriteAllTextAsync(f2, "x", CancellationToken.None);
+        await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 2, "/s2", f2, CancellationToken.None);
 
         var got = (await _channel.GetLatestMedia(new ChannelLatestMediaSearch(), CancellationToken.None)).ToList();
         Assert.Equal(2, got.Count);

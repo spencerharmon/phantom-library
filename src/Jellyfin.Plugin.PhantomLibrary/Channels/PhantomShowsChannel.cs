@@ -147,8 +147,14 @@ public sealed class PhantomShowsChannel
             parsed.TmdbId!.Value, "episode", parsed.Season!.Value, parsed.Episode!.Value,
             cancellationToken).ConfigureAwait(false);
 
-        return state is not null
-            ? new[] { FuseMediaSource(GostreamPathResolver.ResolveEpisodePath(state.FusePath)) }
+        if (state is null)
+        {
+            return Array.Empty<MediaSourceInfo>();
+        }
+
+        var path = GostreamPathResolver.ResolveEpisodePath(state.FusePath);
+        return File.Exists(path)
+            ? new[] { FuseMediaSource(path) }
             : Array.Empty<MediaSourceInfo>();
     }
 
@@ -281,44 +287,52 @@ public sealed class PhantomShowsChannel
 
     private async Task<ChannelItemResult> GetEpisodesForSeasonAsync(int seriesTmdb, int season, CancellationToken ct)
     {
-        // Always re-fetch the season from TMDB on browse so newly aired
-        // episodes appear; upsert each into tmdb_episode_cache so the
-        // refresh path (BuildEpisodeItemAsync via IChannelItemRefresh)
-        // can read them back without another TMDB hit.
+        // Re-fetch the season from TMDB on browse so newly aired episodes
+        // appear, but fall back to tmdb_episode_cache when TMDB is down or
+        // rate-limiting. A transient season fetch failure must not make an
+        // already-known season appear empty.
         var seasonDetails = await SafeGetSeasonAsync(seriesTmdb, season, ct).ConfigureAwait(false);
-        if (seasonDetails is null || seasonDetails.Episodes.Count == 0)
-        {
-            return EmptyResult();
-        }
 
         var seriesMeta = await _db.GetTmdbMetadataAsync(seriesTmdb, "series", ct).ConfigureAwait(false);
         var seriesName = seriesMeta?.Title;
 
-        // Upsert all episodes into tmdb_episode_cache and collect the
-        // canonical row shape for use below.
-        var rows = new List<TmdbEpisodeRow>(seasonDetails.Episodes.Count);
-        foreach (var e in seasonDetails.Episodes)
+        var rows = new List<TmdbEpisodeRow>(seasonDetails?.Episodes.Count ?? 0);
+        if (seasonDetails is not null && seasonDetails.Episodes.Count > 0)
         {
-            if (e.EpisodeNumber <= 0)
+            // Upsert all episodes into tmdb_episode_cache and collect the
+            // canonical row shape for use below.
+            foreach (var e in seasonDetails.Episodes)
             {
-                continue;
-            }
+                if (e.EpisodeNumber <= 0)
+                {
+                    continue;
+                }
 
-            var title = string.IsNullOrWhiteSpace(e.Name)
-                ? $"Episode {e.EpisodeNumber}"
-                : e.Name;
-            var row = new TmdbEpisodeRow(
-                SeriesTmdbId: seriesTmdb,
-                Season: season,
-                Episode: e.EpisodeNumber,
-                Title: title,
-                Overview: e.Overview,
-                StillUrl: BuildImageUrl(e.StillPath),
-                AirDate: e.AirDate,
-                RuntimeMinutes: e.Runtime,
-                FetchedAt: DateTimeOffset.UtcNow);
-            await _db.UpsertTmdbEpisodeAsync(row, ct).ConfigureAwait(false);
-            rows.Add(row);
+                var title = string.IsNullOrWhiteSpace(e.Name)
+                    ? $"Episode {e.EpisodeNumber}"
+                    : e.Name;
+                var row = new TmdbEpisodeRow(
+                    SeriesTmdbId: seriesTmdb,
+                    Season: season,
+                    Episode: e.EpisodeNumber,
+                    Title: title,
+                    Overview: e.Overview,
+                    StillUrl: BuildImageUrl(e.StillPath),
+                    AirDate: e.AirDate,
+                    RuntimeMinutes: e.Runtime,
+                    FetchedAt: DateTimeOffset.UtcNow);
+                await _db.UpsertTmdbEpisodeAsync(row, ct).ConfigureAwait(false);
+                rows.Add(row);
+            }
+        }
+        else
+        {
+            rows.AddRange(await _db.ListEpisodesForSeasonAsync(seriesTmdb, season, ct).ConfigureAwait(false));
+        }
+
+        if (rows.Count == 0)
+        {
+            return EmptyResult();
         }
 
         var items = new List<ChannelItemInfo>(rows.Count);
@@ -400,7 +414,14 @@ public sealed class PhantomShowsChannel
             SeriesName = seriesMeta?.Title,
             IndexNumber = season,
             Type = ChannelItemType.Folder,
-            FolderType = ChannelFolderType.Season,
+            // Use a generic channel container instead of ChannelFolderType.Season.
+            // Jellyfin web treats real Season BaseItems as normal TV seasons and
+            // routes episode browse through /Shows/{id}/Episodes, which reads
+            // already-materialised BaseItem children and can show an empty season
+            // before the channel has been asked for that season's episodes. Keeping
+            // this as a channel container forces child browse back through
+            // IChannel.GetChannelItems where episodes are synthesised on demand.
+            FolderType = ChannelFolderType.Container,
             ImageUrl = seriesMeta?.PosterUrl,
             Tags = new List<string>(),
         };
@@ -453,7 +474,18 @@ public sealed class PhantomShowsChannel
         var tags = new List<string>();
         if (materialised is not null)
         {
-            source = FuseMediaSource(GostreamPathResolver.ResolveEpisodePath(materialised.FusePath));
+            var materialisedPath = GostreamPathResolver.ResolveEpisodePath(materialised.FusePath);
+            if (File.Exists(materialisedPath))
+            {
+                source = FuseMediaSource(materialisedPath);
+            }
+            else
+            {
+                source = PhantomMaterialisingMediaSourceProvider.CreateOpeningMediaSource(
+                    ChannelItemId.ForEpisode(row.SeriesTmdbId, row.Season, row.Episode),
+                    prefixedToken: true);
+                tags.Add("phantom");
+            }
         }
         else
         {

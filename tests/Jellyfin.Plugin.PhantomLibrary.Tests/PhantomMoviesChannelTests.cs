@@ -84,6 +84,22 @@ public class PhantomMoviesChannelTests : IDisposable
             CancellationToken.None);
     }
 
+    private async Task SeedAvailableMovieAsync(int tmdb)
+    {
+        await _db.SetMetaAsync("__test_schema__", "1", CancellationToken.None);
+        await using var conn = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"INSERT OR REPLACE INTO availability_items
+            (tmdb_id,type,season,episode,status,checked_at,next_check_at)
+            VALUES ($tmdb,'movie',-1,-1,'available',$now,$next);";
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        cmd.Parameters.AddWithValue("$tmdb", tmdb);
+        cmd.Parameters.AddWithValue("$now", now);
+        cmd.Parameters.AddWithValue("$next", DateTimeOffset.UtcNow.AddDays(7).ToUnixTimeSeconds());
+        await cmd.ExecuteNonQueryAsync(CancellationToken.None);
+    }
+
     [Fact]
     public async Task GetChannelItems_AllEmpty_ReturnsEmpty()
     {
@@ -96,7 +112,7 @@ public class PhantomMoviesChannelTests : IDisposable
     public async Task GetChannelItems_DiscoveryOnly_EmitsAsPhantomWithOpeningSource()
     {
         await SeedMetaAsync(101, "Discovery Movie");
-        await _db.UpsertDiscoveryCacheAsync(101, "movie", CancellationToken.None);
+        await SeedAvailableMovieAsync(101);
 
         var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
 
@@ -113,7 +129,9 @@ public class PhantomMoviesChannelTests : IDisposable
     public async Task GetChannelItems_MaterialisedOnly_EmitsAsRealWithFusePath()
     {
         await SeedMetaAsync(202, "Materialised Movie");
-        await _db.InsertMaterialisedStateAsync(202, "movie", -1, -1, "/stub/x.mkv", "/fuse/x.mkv", CancellationToken.None);
+        var fusePath = Path.Combine(_moviesRoot, "x.mkv");
+        File.WriteAllText(fusePath, string.Empty);
+        await _db.InsertMaterialisedStateAsync(202, "movie", -1, -1, "/stub/x.mkv", fusePath, CancellationToken.None);
 
         var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
 
@@ -121,9 +139,23 @@ public class PhantomMoviesChannelTests : IDisposable
         var item = result.Items[0];
         Assert.Equal("movie_202", item.Id);
         Assert.DoesNotContain("phantom", item.Tags);
-        Assert.Equal("/fuse/x.mkv", item.MediaSources[0].Path);
+        Assert.Equal(fusePath, item.MediaSources[0].Path);
         Assert.True(Guid.TryParse(item.MediaSources[0].Id, out _));
         Assert.Equal("202", item.ProviderIds["Tmdb"]);
+    }
+
+    [Fact]
+    public async Task GetChannelItems_MaterialisedOnlyWithMissingFile_EmitsOpeningSource()
+    {
+        await SeedMetaAsync(202, "Materialised Movie");
+        await _db.InsertMaterialisedStateAsync(202, "movie", -1, -1, "/stub/x.mkv", Path.Combine(_moviesRoot, "missing-x.mkv"), CancellationToken.None);
+
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+
+        var item = Assert.Single(result.Items);
+        Assert.Equal("movie_202", item.Id);
+        Assert.Contains("phantom", item.Tags);
+        AssertOpeningSource(item.MediaSources[0], "movie_202");
     }
 
     [Fact]
@@ -135,13 +167,15 @@ public class PhantomMoviesChannelTests : IDisposable
         // id must remain "movie_<tmdb>" (no phantom_/real_ prefix).
         await SeedMetaAsync(42, "Forty Two");
         await _db.UpsertDiscoveryCacheAsync(42, "movie", CancellationToken.None);
-        await _db.InsertMaterialisedStateAsync(42, "movie", -1, -1, "/stub", "/fuse/42.mkv", CancellationToken.None);
+        var fusePath = Path.Combine(_moviesRoot, "42.mkv");
+        File.WriteAllText(fusePath, string.Empty);
+        await _db.InsertMaterialisedStateAsync(42, "movie", -1, -1, "/stub", fusePath, CancellationToken.None);
 
         var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
 
         var item = Assert.Single(result.Items);
         Assert.Equal("movie_42", item.Id);
-        Assert.Equal("/fuse/42.mkv", item.MediaSources[0].Path);
+        Assert.Equal(fusePath, item.MediaSources[0].Path);
         Assert.DoesNotContain("phantom", item.Tags);
     }
 
@@ -153,12 +187,14 @@ public class PhantomMoviesChannelTests : IDisposable
         // both times so Jellyfin's BaseItem hash and any UserData
         // (favourites, watched) is preserved across the transition.
         await SeedMetaAsync(99, "Stable Id Movie");
-        await _db.UpsertDiscoveryCacheAsync(99, "movie", CancellationToken.None);
+        await SeedAvailableMovieAsync(99);
 
         var before = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
         var beforeId = before.Items.Single().Id;
 
-        await _db.InsertMaterialisedStateAsync(99, "movie", -1, -1, "/stub", "/fuse/99.mkv", CancellationToken.None);
+        var fusePath = Path.Combine(_moviesRoot, "99.mkv");
+        File.WriteAllText(fusePath, string.Empty);
+        await _db.InsertMaterialisedStateAsync(99, "movie", -1, -1, "/stub", fusePath, CancellationToken.None);
 
         var after = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
         var afterId = after.Items.Single().Id;
@@ -303,7 +339,7 @@ public class PhantomMoviesChannelTests : IDisposable
         // Cold-cache miss: discovery row exists but tmdb_metadata doesn't yet.
         // Channel should skip the item silently (next DiscoveryRefreshTask
         // warms it).
-        await _db.UpsertDiscoveryCacheAsync(777, "movie", CancellationToken.None);
+        await SeedAvailableMovieAsync(777);
 
         var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
 
@@ -314,12 +350,25 @@ public class PhantomMoviesChannelTests : IDisposable
     public async Task GetChannelItemMediaInfo_Materialised_ReturnsFusePath()
     {
         await SeedMetaAsync(50, "Fifty");
-        await _db.InsertMaterialisedStateAsync(50, "movie", -1, -1, "/stub", "/fuse/50.mkv", CancellationToken.None);
+        var fusePath = Path.Combine(_moviesRoot, "50.mkv");
+        File.WriteAllText(fusePath, string.Empty);
+        await _db.InsertMaterialisedStateAsync(50, "movie", -1, -1, "/stub", fusePath, CancellationToken.None);
 
         var got = await _channel.GetChannelItemMediaInfo("movie_50", CancellationToken.None);
         var src = Assert.Single(got);
-        Assert.Equal("/fuse/50.mkv", src.Path);
+        Assert.Equal(fusePath, src.Path);
         Assert.True(Guid.TryParse(src.Id, out _));
+    }
+
+    [Fact]
+    public async Task GetChannelItemMediaInfo_MaterialisedWithMissingFile_ReturnsEmpty()
+    {
+        await SeedMetaAsync(50, "Fifty");
+        await _db.InsertMaterialisedStateAsync(50, "movie", -1, -1, "/stub", Path.Combine(_moviesRoot, "missing-50.mkv"), CancellationToken.None);
+
+        var got = await _channel.GetChannelItemMediaInfo("movie_50", CancellationToken.None);
+
+        Assert.Empty(got);
     }
 
     [Fact]
@@ -340,7 +389,9 @@ public class PhantomMoviesChannelTests : IDisposable
     public async Task GetChannelItemAsync_Materialised_ReturnsItemNotNull()
     {
         await SeedMetaAsync(70, "Seventy");
-        await _db.InsertMaterialisedStateAsync(70, "movie", -1, -1, "/s", "/f/70.mkv", CancellationToken.None);
+        var fusePath = Path.Combine(_moviesRoot, "70.mkv");
+        File.WriteAllText(fusePath, string.Empty);
+        await _db.InsertMaterialisedStateAsync(70, "movie", -1, -1, "/s", fusePath, CancellationToken.None);
 
         var item = await _channel.GetChannelItemAsync("movie_70", CancellationToken.None);
         Assert.NotNull(item);
@@ -349,13 +400,31 @@ public class PhantomMoviesChannelTests : IDisposable
     }
 
     [Fact]
+    public async Task GetChannelItemAsync_MaterialisedWithMissingFile_ReturnsOpeningSource()
+    {
+        await SeedMetaAsync(70, "Seventy");
+        await _db.InsertMaterialisedStateAsync(70, "movie", -1, -1, "/s", Path.Combine(_moviesRoot, "missing-70.mkv"), CancellationToken.None);
+
+        var item = await _channel.GetChannelItemAsync("movie_70", CancellationToken.None);
+
+        Assert.NotNull(item);
+        Assert.Equal("movie_70", item.Id);
+        Assert.Contains("phantom", item.Tags);
+        AssertOpeningSource(item.MediaSources[0], "movie_70");
+    }
+
+    [Fact]
     public async Task GetLatestMedia_ReturnsMaterialisedSortedByMaterialisedAtDesc()
     {
         await SeedMetaAsync(1, "First");
-        await _db.InsertMaterialisedStateAsync(1, "movie", -1, -1, "/s1", "/f1", CancellationToken.None);
+        var f1 = Path.Combine(_moviesRoot, "latest-1.mkv");
+        File.WriteAllText(f1, string.Empty);
+        await _db.InsertMaterialisedStateAsync(1, "movie", -1, -1, "/s1", f1, CancellationToken.None);
         await Task.Delay(1100); // unix-seconds resolution
         await SeedMetaAsync(2, "Second");
-        await _db.InsertMaterialisedStateAsync(2, "movie", -1, -1, "/s2", "/f2", CancellationToken.None);
+        var f2 = Path.Combine(_moviesRoot, "latest-2.mkv");
+        File.WriteAllText(f2, string.Empty);
+        await _db.InsertMaterialisedStateAsync(2, "movie", -1, -1, "/s2", f2, CancellationToken.None);
 
         var got = (await _channel.GetLatestMedia(new ChannelLatestMediaSearch(), CancellationToken.None)).ToList();
 

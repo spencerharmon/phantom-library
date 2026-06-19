@@ -245,13 +245,33 @@ public class MaterialiserTests : IDisposable
     public async Task AlreadyMaterialised_ReturnsDuplicate_NoGostreamCall()
     {
         using var db = await NewDbAsync();
-        await db.InsertMaterialisedStateAsync(50, "movie", -1, -1, "/stub", "/fuse", CancellationToken.None);
+        var existingFuse = Path.Combine(_fuseMount, "already.mkv");
+        File.WriteAllText(existingFuse, "x");
+        await db.InsertMaterialisedStateAsync(50, "movie", -1, -1, "/stub", existingFuse, CancellationToken.None);
         var (sut, gostream, _, _, _, _) = BuildSut(db);
 
         var outcome = await sut.MaterialiseAsync(50, "movie", null, null, MaterialiseTrigger.Manual, CancellationToken.None);
 
         Assert.Equal(MaterialisationStatus.Duplicate, outcome.Status);
         gostream.Verify(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task AlreadyMaterialisedButFileMissing_RematerialisesAndReplacesState()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieMetadataAsync(db, 50);
+        await db.InsertMaterialisedStateAsync(50, "movie", -1, -1, "/stub/old", Path.Combine(_fuseMount, "missing-old.mkv"), CancellationToken.None);
+        var replacementFuse = Path.Combine(_fuseMount, "replacement.mkv");
+        var (sut, gostream, _, _, _, _) = BuildSut(db, fusePath: replacementFuse);
+
+        var outcome = await sut.MaterialiseAsync(50, "movie", null, null, MaterialiseTrigger.Play, CancellationToken.None);
+
+        Assert.Equal(MaterialisationStatus.Success, outcome.Status);
+        var row = await db.GetMaterialisedStateAsync(50, "movie", -1, -1, CancellationToken.None);
+        Assert.NotNull(row);
+        Assert.Equal(replacementFuse, row!.FusePath);
+        gostream.Verify(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]
@@ -284,6 +304,42 @@ public class MaterialiserTests : IDisposable
         Assert.Contains("gostream down", outcome.Error);
         Assert.Null(await db.GetMaterialisedStateAsync(70, "movie", -1, -1, CancellationToken.None));
         Assert.False(await db.IsMaterialiseInFlightAsync(70, "movie", -1, -1, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task GostreamReturnsMissingFusePath_TriesNextCandidate_NoBadMaterialisedState()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieMetadataAsync(db, 300);
+        var bad = new MagnetCandidate("magnet:?xt=urn:btih:BAD", "BAD", 5L * 1024 * 1024 * 1024, 100, "test");
+        var good = new MagnetCandidate("magnet:?xt=urn:btih:GOOD", "GOOD", 5L * 1024 * 1024 * 1024, 50, "test");
+        var missing = Path.Combine(_fuseMount, "missing.mkv");
+        var goodFuse = Path.Combine(_fuseMount, "good-after-missing.mkv");
+        var (sut, _, _, _, _, cfg) = BuildSut(db,
+            magnets: new[] { bad, good },
+            gostreamSetup: g => g.Setup(x => x.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()))
+                .Returns<GostreamAddRequest, CancellationToken>((req, _) =>
+                {
+                    if (req.Magnet == bad.Magnet)
+                    {
+                        return Task.FromResult(new GostreamAddResult { StubPath = "/stub/bad", FusePath = missing, Hash = "bad", Size = 1 });
+                    }
+
+                    File.WriteAllText(goodFuse, "x");
+                    return Task.FromResult(new GostreamAddResult { StubPath = "/stub/good", FusePath = goodFuse, Hash = "good", Size = 1 });
+                }));
+
+        var outcome = await sut.MaterialiseAsync(300, "movie", null, null, MaterialiseTrigger.Manual, CancellationToken.None);
+
+        Assert.Equal(MaterialisationStatus.Success, outcome.Status);
+        var row = await db.GetMaterialisedStateAsync(300, "movie", -1, -1, CancellationToken.None);
+        Assert.NotNull(row);
+        Assert.Equal(goodFuse, row!.FusePath);
+        var failure = await db.GetMagnetFailureAsync(
+            new MagnetFailureKey(300, "tt0000042", "movie", null, null, cfg.SourcePickerPreset, bad.Magnet),
+            CancellationToken.None);
+        Assert.NotNull(failure);
+        Assert.Equal("fuse_path_missing", failure!.Reason);
     }
 
     [Fact]
@@ -356,6 +412,42 @@ public class MaterialiserTests : IDisposable
         Assert.Equal(MaterialisationStatus.Success, outcome.Status);
         // post-flight refresh still happened
         Assert.True(callCount >= 2);
+    }
+
+    [Fact]
+    public async Task PostFlightRefreshThrows_InvalidatesMediaInfoCacheForSecondPlay()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieMetadataAsync(db, 70);
+        var (sut, _, refresh, _, _, _) = BuildSut(db);
+        refresh.Reset();
+        refresh.Setup(r => r.RefreshChannelItemAsync(
+                It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<ChannelItemRefreshOptions>(), It.IsAny<CancellationToken>()))
+            .Returns<Guid, string, ChannelItemRefreshOptions, CancellationToken>((_, _, opts, _) =>
+            {
+                if (opts.ForceProbe)
+                {
+                    throw new InvalidOperationException("post-flight probe failed");
+                }
+
+                return Task.CompletedTask;
+            });
+
+        var outcome = await sut.MaterialiseAsync(70, "movie", null, null, MaterialiseTrigger.Play, CancellationToken.None);
+
+        Assert.Equal(MaterialisationStatus.Success, outcome.Status);
+        refresh.Verify(r => r.RefreshChannelItemAsync(
+            It.IsAny<Guid>(), It.IsAny<string>(),
+            It.Is<ChannelItemRefreshOptions>(o => o.ForceUpdate && !o.ForceProbe && o.InvalidateMediaInfoCache),
+            It.IsAny<CancellationToken>()), Times.Once);
+        refresh.Verify(r => r.RefreshChannelItemAsync(
+            It.IsAny<Guid>(), It.IsAny<string>(),
+            It.Is<ChannelItemRefreshOptions>(o => o.ForceUpdate && o.ForceProbe && o.InvalidateMediaInfoCache),
+            It.IsAny<CancellationToken>()), Times.Once);
+        refresh.Verify(r => r.RefreshChannelItemAsync(
+            It.IsAny<Guid>(), It.IsAny<string>(),
+            It.Is<ChannelItemRefreshOptions>(o => !o.ForceUpdate && !o.ForceProbe && o.InvalidateMediaInfoCache),
+            It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]

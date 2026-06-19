@@ -400,6 +400,6 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
             string.IsNullOrWhiteSpace(cfg.ProwlarrApiKey) ? "no-prowlarr-key" : "prowlarr-key-set",
             cfg.TorrentioBaseUrl);
         var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(raw));
-        return Convert.ToHexString(bytes).ToLowerInvariant();
+        return Convert.ToHexString(bytes);
     }
 }

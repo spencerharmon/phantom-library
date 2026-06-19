@@ -50,17 +50,28 @@ mkdir -p $ROOT/{bin,scenarios,logs,fixtures/tmdb,state,gostream/movies,gostream/
 cp $REPO/tools/rig-scenarios/*.{py,sh} $ROOT/bin/ 2>/dev/null || true
 chmod +x $ROOT/bin/*.py $ROOT/bin/*.sh 2>/dev/null || true
 
-# ---------------------------------------------------------------- jellyfin rig (rebuild from prod)
-if [ $RESET -eq 1 ] || [ ! -f "$JF_DATA/data/jellyfin.db" ]; then
+# ---------------------------------------------------------------- jellyfin rig (rebuild from prod only when missing/explicit)
+if [ ! -f "$JF_DATA/data/jellyfin.db" ] || [ "${RIG_RECOPY_PROD:-0}" = "1" ]; then
   log "reseed jellyfin rig from prod"
   rm -rf /tmp/jf-test
   mkdir -p $JF_DATA/{data,plugins/configurations/PhantomLibrary,root/default} \
            $PLUGIN_DIR \
            $JF_CFG $JF_CACHE $JF_LOG
+  # Routine rig resets reuse the last production clone. If the production
+  # schema/data shape must be refreshed, run with RIG_RECOPY_PROD=1 while
+  # production Jellyfin is stopped; copying db/wal/shm while live can race
+  # WAL writes and corrupt the rig clone.
   cp /var/lib/jellyfin/data/jellyfin.db       $JF_DATA/data/jellyfin.db
   cp /var/lib/jellyfin/data/jellyfin.db-wal   $JF_DATA/data/jellyfin.db-wal 2>/dev/null || true
   cp /var/lib/jellyfin/data/jellyfin.db-shm   $JF_DATA/data/jellyfin.db-shm 2>/dev/null || true
   cp -r /var/lib/jellyfin/root/default/*      $JF_DATA/root/default/ 2>/dev/null || true
+fi
+
+if [ $RESET -eq 1 ] || [ "${RIG_RECOPY_PROD:-0}" = "1" ]; then
+  log "reset phantom state in rig clone"
+  mkdir -p $JF_DATA/{data,plugins/configurations/PhantomLibrary,root/default} \
+           $PLUGIN_DIR \
+           $JF_CFG $JF_CACHE $JF_LOG
   rm -f $JF_DATA/plugins/configurations/PhantomLibrary/phantom.db
 
   # Wipe all Phantom channel rows from the CLONED rig DB; we want deterministic

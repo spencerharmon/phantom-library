@@ -71,7 +71,7 @@ def _series(i):
 
 
 def _season(series_tmdb_id: int, season: int):
-    series = next((s for s in FIXTURES["series"] if s["id"] == series_tmdb_id), None)
+    series = SPECIAL_SERIES.get(series_tmdb_id) or next((s for s in FIXTURES["series"] if s["id"] == series_tmdb_id), None)
     if series is None or season != 1:
         return None
     title = series["name"]
@@ -94,6 +94,24 @@ def _season(series_tmdb_id: int, season: int):
             for e in range(1, 9)
         ],
     }
+
+SPECIAL_SERIES = {
+    85552: {
+        "id": 85552,
+        "name": "Euphoria",
+        "first_air_date": "2019-06-16",
+        "overview": "Real-id fixture for episode materialisation retry testing.",
+        "poster_path": "/euphoria.jpg",
+        "backdrop_path": "/euphoria-bd.jpg",
+        "vote_average": 8.3,
+        "vote_count": 1000,
+        "original_name": "Euphoria",
+        "genre_ids": [18],
+        "imdb_id": "tt8772296",
+        "number_of_seasons": 1,
+        "number_of_episodes": 8,
+    },
+}
 
 ROUTES = {}
 
@@ -153,6 +171,10 @@ def _movie_by_id(tmdb_id, q):
     return 404, {"status_code": 34, "status_message": "not found"}
 
 def _series_by_id(tmdb_id, q):
+    if tmdb_id in SPECIAL_SERIES:
+        s = SPECIAL_SERIES[tmdb_id]
+        return 200, {**s, "genres": [{"id": 18, "name": "Drama"}], "status": "Returning Series",
+                     "origin_country": ["US"]}
     for i, s in enumerate(FIXTURES["series"]):
         if s["id"] == tmdb_id:
             return 200, _series(i)
@@ -205,6 +227,8 @@ class H(BaseHTTPRequestHandler):
             try:
                 tid = int(parts[2])
                 if parts[1] == "tv":
+                    if tid in SPECIAL_SERIES:
+                        return 200, {"imdb_id": SPECIAL_SERIES[tid]["imdb_id"]}
                     for i, s in enumerate(FIXTURES["series"]):
                         if s["id"] == tid:
                             return 200, {"imdb_id": f"tt9910000{i+1}"}

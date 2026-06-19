@@ -168,24 +168,51 @@ uuid.UUID(s.get('Id'))
 PY
 }
 
+assert_materialised_playback_info() {
+  local id=$1 label=$2
+  echo "[materialised-playback-info] $label id=$id"
+  api "$API/Items/$id/PlaybackInfo" -o /tmp/pb-materialised.json || fail "$label materialised PlaybackInfo HTTP error"
+  python3 - "$label" <<'PY'
+import json,sys,uuid
+label=sys.argv[1]
+j=json.load(open('/tmp/pb-materialised.json'))
+if j.get('ErrorCode'):
+    raise SystemExit(f'{label}: PlaybackInfo ErrorCode={j.get("ErrorCode")}')
+sources=j.get('MediaSources') or []
+print('  source_count=', len(sources))
+if len(sources) != 1:
+    raise SystemExit(f'{label}: expected exactly one MediaSource, got {len(sources)}')
+s=sources[0]
+print('  source=', {k:s.get(k) for k in ['Id','Path','RequiresOpening','OpenToken','Protocol','Container']})
+if s.get('RequiresOpening'):
+    raise SystemExit(f'{label}: second PlaybackInfo should use materialised real source')
+path=s.get('Path') or ''
+if '/tmp/jf-rig/gostream/tv/' not in path:
+    raise SystemExit(f'{label}: expected tv gostream path, got {path!r}')
+if s.get('Protocol') != 'File':
+    raise SystemExit(f'{label}: expected File protocol')
+uuid.UUID(s.get('Id'))
+PY
+}
+
 echo '[0] build plugin + start reset rig'
 dotnet build -c Release >/tmp/phantom-episode-e2e-build.log
 bash tools/rig-scenarios/rig-up.sh --reset
 
 for _ in $(seq 1 60); do
   [ -f "$PHDB" ] && schema=$(sqlite3 "$PHDB" 'PRAGMA user_version;' 2>/dev/null || echo 0) || schema=0
-  [ "$schema" = "10" ] && break
+  [ "$schema" = "11" ] && break
   sleep 1
 done
-[ "${schema:-0}" = "10" ] || fail "phantom schema not v10, got ${schema:-0}"
+[ "${schema:-0}" = "11" ] || fail "phantom schema not v11, got ${schema:-0}"
 
 echo '[1] trigger discovery task'
 api "$API/ScheduledTasks" -o /tmp/tasks.json
 TASK_ID=$(find_task_id) || fail 'discovery task not found'
 api_post "$API/ScheduledTasks/Running/$TASK_ID" -o /tmp/task-run.out || fail 'failed to start discovery task'
 wait_task_idle "$TASK_ID"
-series_count=$(sqlite3 "$PHDB" "SELECT COUNT(*) FROM discovery_cache WHERE type='series';")
-[ "$series_count" -ge 2 ] || fail "expected >=2 discovery series, got $series_count"
+series_count=$(sqlite3 "$PHDB" "SELECT COUNT(*) FROM catalogue_items WHERE type='series';")
+[ "$series_count" -ge 2 ] || fail "expected >=2 catalogue series, got $series_count"
 
 echo '[2] seed magnet cache for episode'
 now=$(date +%s)
@@ -196,6 +223,12 @@ VALUES
 ($SERIES, 'tt99100001', 'episode', $SEASON, $EPISODE, 'gostream-default',
  'magnet:?xt=urn:btih:2222222222222222222222222222222222222222&dn=Phantom+Rig+Delta+S01E01',
  '2222222222222222222222222222222222222222', 10485760, 100, 'rig-cache', $now, 86400, 'rig');
+INSERT OR REPLACE INTO availability_items
+(tmdb_id, type, season, episode, status, checked_at, next_check_at, candidate_magnet, candidate_info_hash, candidate_size, candidate_seeders, candidate_indexer, candidate_source)
+VALUES
+($SERIES, 'episode', $SEASON, $EPISODE, 'available', $now, $((now + 604800)),
+ 'magnet:?xt=urn:btih:2222222222222222222222222222222222222222&dn=Phantom+Rig+Delta+S01E01',
+ '2222222222222222222222222222222222222222', 10485760, 100, 'rig-cache', 'rig');
 SQL
 
 echo '[3] browse shows channel series -> season -> episodes'
@@ -306,6 +339,8 @@ if '/tmp/jf-rig/gostream/tv/' not in path:
     raise SystemExit(f'episode source not refreshed to gostream tv path: {path}')
 PY
 assert_stream_opens "$EP_ID" 'mkv' 'materialised-episode'
+assert_materialised_playback_info "$EP_ID" 'materialised-episode-second-play'
+assert_stream_opens "$EP_ID" 'mkv' 'materialised-episode-second-play'
 
 echo '[6] DB sanity: episode BaseItem persisted with episode external id + tv path'
 row=$(sqlite3 "$JDB" "SELECT ExternalId || '|' || Path FROM BaseItems WHERE Id=upper(substr('$EP_ID',1,8)||'-'||substr('$EP_ID',9,4)||'-'||substr('$EP_ID',13,4)||'-'||substr('$EP_ID',17,4)||'-'||substr('$EP_ID',21));")

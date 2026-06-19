@@ -34,6 +34,17 @@ bold()   { printf '\033[1m%s\033[0m\n' "$*"; }
 
 die() { red "ERROR: $*"; exit 1; }
 
+file_sha256() {
+  local path="$1"
+  if [ -f "$path" ]; then
+    sha256sum "$path" | awk '{print $1}'
+  elif [ -n "${SUDO:-}" ] && $SUDO test -f "$path" 2>/dev/null; then
+    $SUDO sha256sum "$path" | awk '{print $1}'
+  else
+    printf 'missing'
+  fi
+}
+
 usage() {
   sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
@@ -97,6 +108,8 @@ PLUGIN_NAME="Jellyfin.Plugin.PhantomLibrary"
 PLUGIN_DISPLAY_NAME="Phantom Library"
 PLUGIN_DIR_NAME="${PLUGIN_NAME}_${PLUGIN_VERSION}"
 DLL_OUT="src/${PLUGIN_NAME}/bin/Release/net9.0/${PLUGIN_NAME}.dll"
+EXPECTED_PHANTOM_SCHEMA="$(grep -R 'private const int CurrentSchemaVersion' -n src/${PLUGIN_NAME}/State/PhantomDb.cs 2>/dev/null | sed -E 's/.*= ([0-9]+);/\1/' | head -1)"
+[ -n "$EXPECTED_PHANTOM_SCHEMA" ] || EXPECTED_PHANTOM_SCHEMA="unknown"
 
 # Detect Jellyfin data dir if not overridden. Order of preference:
 #   1. --jellyfin-data flag.
@@ -152,8 +165,8 @@ echo "  Phantom stub root:  $PHANTOM_STUB_ROOT"
 echo "  Phantom DB:         $PHANTOM_DB_PATH"
 echo
 
-# Refuse to install over a pre-v10 phantom.db. The plugin will
-# HARD-REFUSE schema versions 1..9 at runtime; catching it here gives the
+# Refuse to install over an incompatible phantom.db. The plugin will
+# HARD-REFUSE schema mismatches at runtime; catching it here gives the
 # operator a clear action before restarting Jellyfin.
 if [ -f "$PHANTOM_DB_PATH" ] && command -v sqlite3 >/dev/null 2>&1; then
   PHANTOM_SCHEMA="$($SUDO sqlite3 "$PHANTOM_DB_PATH" 'PRAGMA user_version;' 2>/dev/null || echo unknown)"
@@ -161,11 +174,14 @@ if [ -f "$PHANTOM_DB_PATH" ] && command -v sqlite3 >/dev/null 2>&1; then
     ''|unknown)
       yellow "Could not read phantom.db user_version at $PHANTOM_DB_PATH; runtime plugin will validate it."
       ;;
-    0|10)
+    0)
+      :
+      ;;
+    "$EXPECTED_PHANTOM_SCHEMA")
       :
       ;;
     *)
-      die "phantom.db schema is v$PHANTOM_SCHEMA but Phantom Library $PLUGIN_VERSION requires v10. Stop Jellyfin and run: sudo bash scripts/phantom-wipe.sh --commit"
+      die "phantom.db schema is v$PHANTOM_SCHEMA but Phantom Library $PLUGIN_VERSION requires v$EXPECTED_PHANTOM_SCHEMA. Stop Jellyfin and run: sudo bash scripts/phantom-wipe.sh --commit"
       ;;
   esac
 fi
@@ -347,6 +363,50 @@ if [ "$SRC_MD5" != "$DST_MD5" ]; then
 fi
 green "  ${PLUGIN_NAME}.dll installed (md5 $SRC_MD5)"
 
+SRC_SHA256="$(file_sha256 "$DLL_OUT")"
+DST_SHA256="$(file_sha256 "$PLUGINS_DIR/${PLUGIN_NAME}.dll")"
+if [ "$SRC_SHA256" != "$DST_SHA256" ]; then
+  die "sha256 mismatch after install: src=$SRC_SHA256 dst=$DST_SHA256. Operator would not be testing the intended plugin."
+fi
+
+echo
+bold "Post-install verification:"
+echo "  repo:                    $REPO_ROOT"
+echo "  git commit:              $(git rev-parse HEAD 2>/dev/null || echo unknown)"
+echo "  git dirty files:"
+git status --short 2>/dev/null | sed 's/^/    /' || true
+echo "  plugin schema source:    $EXPECTED_PHANTOM_SCHEMA"
+if [ -f "$PHANTOM_DB_PATH" ] && command -v sqlite3 >/dev/null 2>&1; then
+  VERIFY_PHANTOM_SCHEMA="$($SUDO sqlite3 "$PHANTOM_DB_PATH" 'PRAGMA user_version;' 2>/dev/null || echo unknown)"
+else
+  VERIFY_PHANTOM_SCHEMA="missing"
+fi
+echo "  phantom.db schema:       $VERIFY_PHANTOM_SCHEMA"
+echo "  plugin built sha256:     $SRC_SHA256"
+echo "  plugin deployed sha256:  $DST_SHA256"
+VERIFY_JF_INSTALL_DIR=""
+for cand in /usr/lib/jellyfin /usr/share/jellyfin/bin /opt/jellyfin; do
+  if [ -f "$cand/MediaBrowser.Controller.dll" ] && [ -f "$cand/Jellyfin.LiveTv.dll" ]; then
+    VERIFY_JF_INSTALL_DIR="$cand"
+    break
+  fi
+done
+if [ -n "$VERIFY_JF_INSTALL_DIR" ]; then
+  echo "  Jellyfin install dir:    $VERIFY_JF_INSTALL_DIR"
+  echo "  Controller sha256:       $(file_sha256 "$VERIFY_JF_INSTALL_DIR/MediaBrowser.Controller.dll")"
+  echo "  LiveTv sha256:           $(file_sha256 "$VERIFY_JF_INSTALL_DIR/Jellyfin.LiveTv.dll")"
+else
+  echo "  Jellyfin install dir:    not detected"
+fi
+if [ -d "$REPO_ROOT/gostream/.git" ]; then
+  echo "  gostream commit:         $(git -C "$REPO_ROOT/gostream" rev-parse HEAD 2>/dev/null || echo unknown)"
+  echo "  gostream dirty files:"
+  git -C "$REPO_ROOT/gostream" status --short 2>/dev/null | sed 's/^/    /' || true
+fi
+if [ "$EXPECTED_PHANTOM_SCHEMA" != "unknown" ] && [ "$VERIFY_PHANTOM_SCHEMA" != "missing" ] && [ "$VERIFY_PHANTOM_SCHEMA" != "0" ] && [ "$VERIFY_PHANTOM_SCHEMA" != "$EXPECTED_PHANTOM_SCHEMA" ]; then
+  die "phantom.db schema is v$VERIFY_PHANTOM_SCHEMA but this build expects v$EXPECTED_PHANTOM_SCHEMA. Stop Jellyfin and run: sudo bash scripts/phantom-wipe.sh --commit"
+fi
+
 # ---------------------------------------------------------------- patched jellyfin assemblies (operator-deploy notice)
 # The plugin references IChannelItemRefreshManager (added by the
 # scripts/jellyfin-patches/ patch series). The operator's runtime
@@ -424,6 +484,8 @@ if [ "$DO_BUILD" -eq 1 ]; then
         grep -a -q RefreshChannelItemAsync "$jf_install_dir/Jellyfin.LiveTv.dll" \
           || die "deployed Jellyfin.LiveTv.dll lacks RefreshChannelItemAsync"
         green "  patched Jellyfin DLLs deployed + verified in $jf_install_dir"
+        echo "  deployed Controller sha256: $(file_sha256 "$jf_install_dir/MediaBrowser.Controller.dll")"
+        echo "  deployed LiveTv sha256:     $(file_sha256 "$jf_install_dir/Jellyfin.LiveTv.dll")"
         echo
       fi
 

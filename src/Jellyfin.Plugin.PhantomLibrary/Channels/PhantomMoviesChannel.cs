@@ -152,7 +152,16 @@ public sealed class PhantomMoviesChannel
             var tags = new List<string>();
             if (row.Materialised is not null)
             {
-                sources.Add(FuseMediaSource(GostreamPathResolver.ResolveMoviePath(row.Materialised.FusePath)));
+                var materialisedPath = GostreamPathResolver.ResolveMoviePath(row.Materialised.FusePath);
+                if (File.Exists(materialisedPath))
+                {
+                    sources.Add(FuseMediaSource(materialisedPath));
+                }
+                else
+                {
+                    sources.Add(PhantomMaterialisingMediaSourceProvider.CreateOpeningMediaSource(ChannelItemId.ForMovie(row.Metadata.TmdbId), prefixedToken: true));
+                    tags.Add("phantom");
+                }
             }
             else if (variants is { Count: > 0 })
             {
@@ -213,7 +222,11 @@ public sealed class PhantomMoviesChannel
                         parsed.TmdbId!.Value, "movie", -1, -1, cancellationToken).ConfigureAwait(false);
                     if (state is not null)
                     {
-                        return new[] { FuseMediaSource(GostreamPathResolver.ResolveMoviePath(state.FusePath)) };
+                        var path = GostreamPathResolver.ResolveMoviePath(state.FusePath);
+                        if (File.Exists(path))
+                        {
+                            return new[] { FuseMediaSource(path) };
+                        }
                     }
 
                     return Array.Empty<MediaSourceInfo>();
@@ -320,7 +333,15 @@ public sealed class PhantomMoviesChannel
         if (materialised is not null)
         {
             var materialisedPath = GostreamPathResolver.ResolveMoviePath(materialised.FusePath);
-            sources.Add(FuseMediaSource(materialisedPath));
+            if (File.Exists(materialisedPath))
+            {
+                sources.Add(FuseMediaSource(materialisedPath));
+            }
+            else
+            {
+                sources.Add(PhantomMaterialisingMediaSourceProvider.CreateOpeningMediaSource(ChannelItemId.ForMovie(tmdb), prefixedToken: true));
+                tags.Add("phantom");
+            }
         }
         else if (variants is { Count: > 0 })
         {
