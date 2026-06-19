@@ -140,23 +140,35 @@ public sealed class PhantomMoviesChannel
             }
         }
 
-        // --- 1. Materialised movies (highest priority/default source), with any existing gostream variants attached. ---
-        var materialised = await _db.ListMaterialisedStateAsync("movie", cancellationToken).ConfigureAwait(false);
-        foreach (var row in materialised)
+        // --- 1. Visible catalogue movies. Materialised rows are always visible;
+        // unmaterialised phantoms are visible only after availability probing
+        // found a viable candidate. ---
+        var visible = await _db.ListVisibleMovieRowsAsync(cancellationToken).ConfigureAwait(false);
+        foreach (var row in visible)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            variantsByTmdb.TryGetValue(row.TmdbId, out var variants);
-            var built = await BuildMovieItemAsync(row.TmdbId, row, variants, cancellationToken).ConfigureAwait(false);
-            if (built is null)
+            variantsByTmdb.TryGetValue(row.Metadata.TmdbId, out var variants);
+            var sources = new List<MediaSourceInfo>();
+            var tags = new List<string>();
+            if (row.Materialised is not null)
             {
-                continue;
+                sources.Add(FuseMediaSource(GostreamPathResolver.ResolveMoviePath(row.Materialised.FusePath)));
+            }
+            else if (variants is { Count: > 0 })
+            {
+                sources.Add(SelectDefaultVariant(variants));
+            }
+            else
+            {
+                sources.Add(PhantomMaterialisingMediaSourceProvider.CreateOpeningMediaSource(ChannelItemId.ForMovie(row.Metadata.TmdbId), prefixedToken: true));
+                tags.Add("phantom");
             }
 
-            items.Add(built);
-            emittedTmdbs.Add(row.TmdbId);
+            items.Add(BuildMovieItemFromMetadata(row.Metadata, sources, tags));
+            emittedTmdbs.Add(row.Metadata.TmdbId);
         }
 
-        // --- 2. Gostream files with TMDB hits (real media; outrank discovery phantoms). Group variants by TMDB. ---
+        // --- 2. Gostream files with TMDB hits (real media; outrank unprobed discovery phantoms). Group variants by TMDB. ---
         foreach (var kvp in variantsByTmdb.OrderBy(k => metadataByTmdb[k.Key].Title, StringComparer.OrdinalIgnoreCase))
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -170,28 +182,7 @@ public sealed class PhantomMoviesChannel
             emittedTmdbs.Add(kvp.Key);
         }
 
-        // --- 3. Discovery movies (skip materialised + enriched gostream). ---
-        var discovery = await _db.ListDiscoveryCacheAsync("movie", cancellationToken).ConfigureAwait(false);
-        foreach (var row in discovery)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (emittedTmdbs.Contains(row.TmdbId))
-            {
-                continue;
-            }
-
-            var built = await BuildMovieItemAsync(row.TmdbId, materialised: null, variants: null, cancellationToken).ConfigureAwait(false);
-            if (built is null)
-            {
-                // Cold-cache miss; DiscoveryRefreshTask warms next tick.
-                continue;
-            }
-
-            items.Add(built);
-            emittedTmdbs.Add(row.TmdbId);
-        }
-
-        // --- 4. Raw orphan fallback for files that could not be enriched. ---
+        // --- 3. Raw orphan fallback for files that could not be enriched. ---
         foreach (var o in unresolvedOrphans)
         {
             cancellationToken.ThrowIfCancellationRequested();

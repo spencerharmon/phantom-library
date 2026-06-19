@@ -404,27 +404,36 @@ public sealed class Materialiser : IMaterialiser
             }
         }
 
-        var ranked = await _magnetSelector.SelectRankedAsync(
+        var probe = await _magnetSelector.ProbeAsync(
             tmdbId, imdb, type, season, episode,
             meta.Title, meta.Year,
             ct).ConfigureAwait(false);
-        foreach (var magnet in ranked)
+        if (probe.Outcome == MagnetProbeOutcome.Available)
         {
-            if (string.IsNullOrWhiteSpace(magnet.Magnet) || !seen.Add(magnet.Magnet))
+            foreach (var magnet in probe.Candidates)
             {
-                continue;
-            }
+                if (string.IsNullOrWhiteSpace(magnet.Magnet) || !seen.Add(magnet.Magnet))
+                {
+                    continue;
+                }
 
-            if (!await IsCandidateAllowedAsync(magnetKey, magnet, ct).ConfigureAwait(false))
-            {
-                continue;
-            }
+                if (!await IsCandidateAllowedAsync(magnetKey, magnet, ct).ConfigureAwait(false))
+                {
+                    continue;
+                }
 
-            candidates.Add(BuildCandidateRequest(meta, type, tmdbId, imdb, season, episode, magnet, cfg, fromCache: false));
+                candidates.Add(BuildCandidateRequest(meta, type, tmdbId, imdb, season, episode, magnet, cfg, fromCache: false));
+            }
         }
 
         if (candidates.Count == 0)
         {
+            if (probe.Outcome == MagnetProbeOutcome.IndeterminateTransient)
+            {
+                throw new InvalidOperationException(
+                    $"Source availability transient for {metadataType}/{tmdbId} (season={season} episode={episode}): {probe.ErrorKind} {probe.ErrorMessage}");
+            }
+
             await _db.MarkUnavailableAsync(
                 unavailableKey,
                 retryAfter: TimeSpan.FromHours(cfg.UnavailableRetryAfterHours),

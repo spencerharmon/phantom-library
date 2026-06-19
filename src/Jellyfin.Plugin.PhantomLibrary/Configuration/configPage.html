@@ -195,6 +195,30 @@
                             <label class="inputLabel inputLabelUnfocused" for="SuggestionsCatalogueMaxItems">TMDB Discover catalogue cap (max Discover rows across movies+series; trending is always included; default 5000)</label>
                             <input id="SuggestionsCatalogueMaxItems" name="SuggestionsCatalogueMaxItems" type="number" min="0" is="emby-input" />
                         </div>
+                        <div class="checkboxContainer checkboxContainer-withDescription">
+                            <label><input id="AvailabilityProbeEnabled" name="AvailabilityProbeEnabled" type="checkbox" is="emby-checkbox" /> Enable availability probing</label>
+                            <div class="fieldDescription">Available phantoms are shown; unavailable/unprobed phantoms stay hidden. Materialised and real gostream files always stay visible.</div>
+                        </div>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="AvailabilityProbeMinIntervalSeconds">Availability probe min interval seconds (catch-up)</label>
+                            <input id="AvailabilityProbeMinIntervalSeconds" name="AvailabilityProbeMinIntervalSeconds" type="number" min="1" is="emby-input" />
+                        </div>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="AvailabilityProbeMaxIntervalSeconds">Availability probe max interval seconds (steady state)</label>
+                            <input id="AvailabilityProbeMaxIntervalSeconds" name="AvailabilityProbeMaxIntervalSeconds" type="number" min="1" is="emby-input" />
+                        </div>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="AvailabilityMaxBatchSize">Availability probe batch size per tick</label>
+                            <input id="AvailabilityMaxBatchSize" name="AvailabilityMaxBatchSize" type="number" min="1" is="emby-input" />
+                        </div>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="AvailabilityAvailableTtlDays">Available probe TTL days</label>
+                            <input id="AvailabilityAvailableTtlDays" name="AvailabilityAvailableTtlDays" type="number" min="1" is="emby-input" />
+                        </div>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="AvailabilityUnavailableTtlDays">Unavailable probe TTL days</label>
+                            <input id="AvailabilityUnavailableTtlDays" name="AvailabilityUnavailableTtlDays" type="number" min="1" is="emby-input" />
+                        </div>
                         <div>
                             <button is="emby-button" id="PhantomLibraryRefreshSuggestionsBtn" type="button" class="raised block">
                                 <span>Refresh suggestions now</span>
@@ -261,6 +285,12 @@
                             document.querySelector('#PhantomMoviesLibraryName').value = cfg.PhantomMoviesLibraryName || '';
                             document.querySelector('#PhantomShowsLibraryName').value = cfg.PhantomShowsLibraryName || '';
                             document.querySelector('#SuggestionsCatalogueMaxItems').value = cfg.SuggestionsCatalogueMaxItems;
+                            document.querySelector('#AvailabilityProbeEnabled').checked = cfg.AvailabilityProbeEnabled !== false;
+                            document.querySelector('#AvailabilityProbeMinIntervalSeconds').value = cfg.AvailabilityProbeMinIntervalSeconds || 4;
+                            document.querySelector('#AvailabilityProbeMaxIntervalSeconds').value = cfg.AvailabilityProbeMaxIntervalSeconds || 28;
+                            document.querySelector('#AvailabilityMaxBatchSize').value = cfg.AvailabilityMaxBatchSize || 1;
+                            document.querySelector('#AvailabilityAvailableTtlDays').value = cfg.AvailabilityAvailableTtlDays || 7;
+                            document.querySelector('#AvailabilityUnavailableTtlDays').value = cfg.AvailabilityUnavailableTtlDays || 7;
                             Dashboard.hideLoadingMsg();
                         });
                     });
@@ -300,6 +330,12 @@
                             cfg.PhantomMoviesLibraryName = document.querySelector('#PhantomMoviesLibraryName').value;
                             cfg.PhantomShowsLibraryName = document.querySelector('#PhantomShowsLibraryName').value;
                             cfg.SuggestionsCatalogueMaxItems = parseInt(document.querySelector('#SuggestionsCatalogueMaxItems').value, 10);
+                            cfg.AvailabilityProbeEnabled = document.querySelector('#AvailabilityProbeEnabled').checked;
+                            cfg.AvailabilityProbeMinIntervalSeconds = parseInt(document.querySelector('#AvailabilityProbeMinIntervalSeconds').value, 10);
+                            cfg.AvailabilityProbeMaxIntervalSeconds = parseInt(document.querySelector('#AvailabilityProbeMaxIntervalSeconds').value, 10);
+                            cfg.AvailabilityMaxBatchSize = parseInt(document.querySelector('#AvailabilityMaxBatchSize').value, 10);
+                            cfg.AvailabilityAvailableTtlDays = parseInt(document.querySelector('#AvailabilityAvailableTtlDays').value, 10);
+                            cfg.AvailabilityUnavailableTtlDays = parseInt(document.querySelector('#AvailabilityUnavailableTtlDays').value, 10);
                             ApiClient.updatePluginConfiguration(PluginId, cfg).then(function (r) {
                                 Dashboard.processPluginConfigurationUpdateResult(r);
                             });

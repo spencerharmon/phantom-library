@@ -47,7 +47,7 @@ public class PhantomDbTests : IDisposable
     // ----------------------------------------------------------------
 
     [Fact]
-    public async Task FreshDb_CreatesSchemaV10_WithAllExpectedTables()
+    public async Task FreshDb_CreatesSchemaV11_WithAllExpectedTables()
     {
         using var db = await NewDbAsync();
 
@@ -66,11 +66,15 @@ public class PhantomDbTests : IDisposable
             version = Convert.ToInt32(await v.ExecuteScalarAsync());
         }
 
-        Assert.Equal(10, version);
+        Assert.Equal(11, version);
 
         var expectedTables = new[]
         {
             "discovery_cache",
+            "catalogue_items",
+            "series_expansion_state",
+            "series_episode_catalogue",
+            "availability_items",
             "materialised_state",
             "materialise_in_flight",
             "tmdb_external_ids",
@@ -117,7 +121,7 @@ public class PhantomDbTests : IDisposable
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => db.SetMetaAsync("test", "1", CancellationToken.None));
 
-        Assert.Contains("version 10", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("version 11", ex.Message, StringComparison.Ordinal);
         Assert.Contains("wipe", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 

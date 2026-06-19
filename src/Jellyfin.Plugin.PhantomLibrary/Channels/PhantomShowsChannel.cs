@@ -236,42 +236,19 @@ public sealed class PhantomShowsChannel
         var seen = new HashSet<int>();
         var items = new List<ChannelItemInfo>();
 
-        // 1. discovery_cache (type='series')
-        var discovery = await _db.ListDiscoveryCacheAsync("series", ct).ConfigureAwait(false);
-        foreach (var row in discovery)
+        // Visible series are derived from available episode phantoms plus
+        // materialised episodes. Raw discovery-only series stay hidden until
+        // the availability worker finds at least one playable episode.
+        var visible = await _db.ListVisibleSeriesRowsAsync(ct).ConfigureAwait(false);
+        foreach (var row in visible)
         {
             ct.ThrowIfCancellationRequested();
-            if (!seen.Add(row.TmdbId))
+            if (!seen.Add(row.Metadata.TmdbId))
             {
                 continue;
             }
 
-            var built = await BuildSeriesItemAsync(row.TmdbId, ct).ConfigureAwait(false);
-            if (built is not null)
-            {
-                items.Add(built);
-            }
-        }
-
-        // 2. materialised_state (type='episode') projected to distinct series tmdb_ids.
-        //    A series with at least one materialised episode but no discovery row
-        //    still surfaces as a top-level tile so the user can navigate to the
-        //    real file (e.g. autopilot pre-materialised something the user
-        //    favourited from an external nav).
-        var materialised = await _db.ListMaterialisedStateAsync("episode", ct).ConfigureAwait(false);
-        foreach (var row in materialised)
-        {
-            ct.ThrowIfCancellationRequested();
-            if (!seen.Add(row.TmdbId))
-            {
-                continue;
-            }
-
-            var built = await BuildSeriesItemAsync(row.TmdbId, ct).ConfigureAwait(false);
-            if (built is not null)
-            {
-                items.Add(built);
-            }
+            items.Add(BuildSeriesItemFromMetadata(row.Metadata));
         }
 
         return new ChannelItemResult
@@ -283,19 +260,12 @@ public sealed class PhantomShowsChannel
 
     private async Task<ChannelItemResult> GetSeasonsForSeriesAsync(int seriesTmdb, CancellationToken ct)
     {
-        // Need NumberOfSeasons. Skip the folder silently if TMDB doesn't
-        // resolve — better than emitting a partial / lying listing.
-        var details = await SafeGetSeriesAsync(seriesTmdb, ct).ConfigureAwait(false);
-        if (details is null || details.NumberOfSeasons <= 0)
-        {
-            return EmptyResult();
-        }
-
-        var items = new List<ChannelItemInfo>(details.NumberOfSeasons);
-        for (var n = 1; n <= details.NumberOfSeasons; n++)
+        var visibleSeasons = await _db.ListVisibleSeasonsAsync(seriesTmdb, ct).ConfigureAwait(false);
+        var items = new List<ChannelItemInfo>(visibleSeasons.Count);
+        foreach (var row in visibleSeasons)
         {
             ct.ThrowIfCancellationRequested();
-            var built = await BuildSeasonItemAsync(seriesTmdb, n, ct).ConfigureAwait(false);
+            var built = await BuildSeasonItemAsync(seriesTmdb, row.Season, ct).ConfigureAwait(false);
             if (built is not null)
             {
                 items.Add(built);
@@ -355,6 +325,11 @@ public sealed class PhantomShowsChannel
         foreach (var row in rows)
         {
             ct.ThrowIfCancellationRequested();
+            if (!await _db.IsEpisodeVisibleAsync(seriesTmdb, season, row.Episode, ct).ConfigureAwait(false))
+            {
+                continue;
+            }
+
             var materialised = await _db.GetMaterialisedStateAsync(
                 seriesTmdb, "episode", season, row.Episode, ct).ConfigureAwait(false);
             items.Add(BuildEpisodeItemFromRow(row, materialised, seriesName));
@@ -381,7 +356,12 @@ public sealed class PhantomShowsChannel
             return null;
         }
 
-        var id = ChannelItemId.ForSeries(seriesTmdb).Encode();
+        return BuildSeriesItemFromMetadata(meta);
+    }
+
+    private static ChannelItemInfo BuildSeriesItemFromMetadata(TmdbMetadataRow meta)
+    {
+        var id = ChannelItemId.ForSeries(meta.TmdbId).Encode();
         var item = new ChannelItemInfo
         {
             Id = id,
@@ -403,7 +383,7 @@ public sealed class PhantomShowsChannel
             item.Genres = meta.Genres.ToList();
         }
 
-        item.ProviderIds["Tmdb"] = seriesTmdb.ToString(CultureInfo.InvariantCulture);
+        item.ProviderIds["Tmdb"] = meta.TmdbId.ToString(CultureInfo.InvariantCulture);
         return item;
     }
 

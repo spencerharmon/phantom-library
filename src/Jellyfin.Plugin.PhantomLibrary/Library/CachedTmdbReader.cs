@@ -9,6 +9,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
 using Jellyfin.Plugin.PhantomLibrary.Clients.Models;
+using Jellyfin.Plugin.PhantomLibrary.Configuration;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using Microsoft.Extensions.Logging;
 
@@ -39,12 +40,19 @@ public sealed class CachedTmdbReader
     private readonly ITmdbClient _tmdb;
     private readonly PhantomDb _db;
     private readonly ILogger<CachedTmdbReader> _logger;
+    private readonly Func<PluginConfiguration> _configProvider;
 
     public CachedTmdbReader(ITmdbClient tmdb, PhantomDb db, ILogger<CachedTmdbReader> logger)
+        : this(tmdb, db, logger, () => Plugin.Instance?.Configuration ?? new PluginConfiguration())
+    {
+    }
+
+    internal CachedTmdbReader(ITmdbClient tmdb, PhantomDb db, ILogger<CachedTmdbReader> logger, Func<PluginConfiguration> configProvider)
     {
         _tmdb = tmdb;
         _db = db;
         _logger = logger;
+        _configProvider = configProvider;
     }
 
     /// <summary>Public counters incremented on every fetch — handy for tests / log lines.</summary>
@@ -76,7 +84,7 @@ public sealed class CachedTmdbReader
             "discover/movie",
             new Dictionary<string, string?> { ["page"] = page.ToString(CultureInfo.InvariantCulture) },
             language,
-            TrendingTtl,
+            DiscoverTtl(),
             innerCt => _tmdb.DiscoverMoviesAsync(page, language, innerCt),
             ct);
 
@@ -85,7 +93,7 @@ public sealed class CachedTmdbReader
             "discover/tv",
             new Dictionary<string, string?> { ["page"] = page.ToString(CultureInfo.InvariantCulture) },
             language,
-            TrendingTtl,
+            DiscoverTtl(),
             innerCt => _tmdb.DiscoverSeriesAsync(page, language, innerCt),
             ct);
 
@@ -124,6 +132,12 @@ public sealed class CachedTmdbReader
             SimilarRecommendationsTtl,
             innerCt => _tmdb.GetSeriesRecommendationsAsync(tmdbId, language, innerCt),
             ct);
+
+    private TimeSpan DiscoverTtl()
+    {
+        var hours = _configProvider().DiscoverCacheTtlHours;
+        return TimeSpan.FromHours(hours > 0 ? hours : 24);
+    }
 
     private async Task<(IReadOnlyList<TmdbSearchHit> Hits, bool FromCache)> FetchAsync(
         string endpoint,

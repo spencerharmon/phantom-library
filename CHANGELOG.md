@@ -13,6 +13,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   normalization, rig scenario authoring, and patched Jellyfin runtime
   alignment.
 
+### Changed
+
+- BREAKING: requires wipe. Phantom DB schema is now v11 to split append-only
+  TMDB catalogue discovery from source availability. Discovery no longer prunes
+  rows simply because TMDB stops returning them, and channel visibility is gated
+  by bounded availability probes instead of raw discovery membership.
+- Added configurable availability probing cadence/TTLs, mandatory probe leases,
+  stale-available visibility, transient-error preservation, and series expansion
+  scheduling so large catalogues can be refreshed incrementally without full
+  Jellyfin channel cache churn.
+- Added perf profiling scripts under `tools/perf/` for discovery, channel browse,
+  and materialise flows.
+
 ### Fixed
 
 - Discovery refresh now walks paginated TMDB Discover results up to
@@ -48,8 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### BREAKING — requires wipe + patched Jellyfin
 
-- BREAKING: requires wipe. Phantom DB schema is now v10 to add the
-  candidate-level `magnet_failure_cache` table used by retry-over-magnets;
+- BREAKING: requires wipe. Phantom DB schema is now v11 to add append-only
+  `catalogue_items`, `availability_items`, `series_expansion_state`, and
+  `series_episode_catalogue` tables used by the bounded availability scheduler;
   follow `docs/operator-wipe-validation.md` / `scripts/phantom-wipe.sh`
   before installing this build.
 
@@ -65,10 +79,11 @@ per-item channel refresh primitive (added by the patch) re-binds
 the ChannelItem to the now-real `BaseItem` produced by Jellyfin's
 scan of the gostream-served file.
 
-`phantom.db` schema bumped to v10 (was v5 in v0.2.0.0). The new
+`phantom.db` schema bumped to v11 (was v5 in v0.2.0.0). The new
 schema captures channel-item registrations, per-item materialise
-state, candidate-level magnet failure caching, and the additional
-bookkeeping the channel arch needs.
+state, candidate-level magnet failure caching, append-only TMDB catalogue
+membership, series expansion state, and bounded source availability
+bookkeeping.
 Per `AGENTS.md` § "No database migrations until v1.0", the
 upgrade path is **wipe and rebuild**.
 

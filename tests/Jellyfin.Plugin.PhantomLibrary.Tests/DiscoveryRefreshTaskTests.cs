@@ -59,18 +59,21 @@ public class DiscoveryRefreshTaskTests : IDisposable
             () => config);
     }
 
-    private async Task SetDiscoveryLastRefreshedAsync(int tmdbId, string type, DateTimeOffset lastRefreshed)
+    private async Task<IReadOnlyList<int>> ListCatalogueAsync(string type)
     {
         await using var conn = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
         await conn.OpenAsync();
         await using var cmd = conn.CreateCommand();
-        cmd.CommandText = @"UPDATE discovery_cache
-            SET last_refreshed=$lastRefreshed
-            WHERE tmdb_id=$tmdb AND type=$type;";
-        cmd.Parameters.AddWithValue("$lastRefreshed", lastRefreshed.ToUnixTimeSeconds());
-        cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+        cmd.CommandText = "SELECT tmdb_id FROM catalogue_items WHERE type=$type ORDER BY tmdb_id;";
         cmd.Parameters.AddWithValue("$type", type);
-        await cmd.ExecuteNonQueryAsync(CancellationToken.None);
+        var list = new List<int>();
+        await using var r = await cmd.ExecuteReaderAsync(CancellationToken.None);
+        while (await r.ReadAsync(CancellationToken.None))
+        {
+            list.Add(r.GetInt32(0));
+        }
+
+        return list;
     }
 
     [Fact]
@@ -85,14 +88,14 @@ public class DiscoveryRefreshTaskTests : IDisposable
 
         await task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
 
-        var movies = await _db.ListDiscoveryCacheAsync("movie", CancellationToken.None);
-        var series = await _db.ListDiscoveryCacheAsync("series", CancellationToken.None);
+        var movies = await ListCatalogueAsync("movie");
+        var series = await ListCatalogueAsync("series");
 
         Assert.Equal(2, movies.Count);
-        Assert.Contains(movies, r => r.TmdbId == 101);
-        Assert.Contains(movies, r => r.TmdbId == 102);
+        Assert.Contains(101, movies);
+        Assert.Contains(102, movies);
         Assert.Single(series);
-        Assert.Equal(201, series[0].TmdbId);
+        Assert.Equal(201, series[0]);
     }
 
     [Fact]
@@ -140,13 +143,13 @@ public class DiscoveryRefreshTaskTests : IDisposable
 
         await task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
 
-        var movies = await _db.ListDiscoveryCacheAsync("movie", CancellationToken.None);
-        var series = await _db.ListDiscoveryCacheAsync("series", CancellationToken.None);
+        var movies = await ListCatalogueAsync("movie");
+        var series = await ListCatalogueAsync("series");
 
-        Assert.Equal(new[] { 301, 302, 303 }, movies.Select(r => r.TmdbId).OrderBy(id => id));
-        Assert.Equal(new[] { 401, 402 }, series.Select(r => r.TmdbId).OrderBy(id => id));
-        Assert.DoesNotContain(movies, r => r.TmdbId == 304);
-        Assert.DoesNotContain(series, r => r.TmdbId == 403);
+        Assert.Equal(new[] { 301, 302, 303 }, movies.OrderBy(id => id));
+        Assert.Equal(new[] { 401, 402 }, series.OrderBy(id => id));
+        Assert.DoesNotContain(304, movies);
+        Assert.DoesNotContain(403, series);
         Assert.Equal(new[] { 1, 2 }, tmdb.DiscoverMoviePageCalls);
         Assert.Equal(new[] { 1 }, tmdb.DiscoverSeriesPageCalls);
     }
@@ -183,11 +186,11 @@ public class DiscoveryRefreshTaskTests : IDisposable
 
         await task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
 
-        var movies = await _db.ListDiscoveryCacheAsync("movie", CancellationToken.None);
-        var series = await _db.ListDiscoveryCacheAsync("series", CancellationToken.None);
+        var movies = await ListCatalogueAsync("movie");
+        var series = await ListCatalogueAsync("series");
 
         Assert.Single(movies);
-        Assert.Equal(301, movies[0].TmdbId);
+        Assert.Equal(301, movies[0]);
         Assert.Empty(series);
         Assert.Equal(new[] { 1, 2 }, tmdb.DiscoverMoviePageCalls);
         Assert.Equal(new[] { 1 }, tmdb.DiscoverSeriesPageCalls);
@@ -217,8 +220,8 @@ public class DiscoveryRefreshTaskTests : IDisposable
 
         await task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
 
-        var movies = await _db.ListDiscoveryCacheAsync("movie", CancellationToken.None);
-        Assert.Equal(new[] { 101, 102 }, movies.Select(r => r.TmdbId).OrderBy(id => id));
+        var movies = await ListCatalogueAsync("movie");
+        Assert.Equal(new[] { 101, 102 }, movies.OrderBy(id => id));
         Assert.Empty(tmdb.MovieDetailCalls);
         var meta101 = await _db.GetTmdbMetadataAsync(101, "movie", CancellationToken.None);
         var meta102 = await _db.GetTmdbMetadataAsync(102, "movie", CancellationToken.None);
@@ -240,54 +243,23 @@ public class DiscoveryRefreshTaskTests : IDisposable
     }
 
     [Fact]
-    public async Task Execute_TtlEviction_RemovesStaleKeepsFresh()
+    public async Task Execute_RediscoveryDoesNotDeleteExistingCatalogueRows()
     {
-        // Seed one stale row + one fresh row in discovery_cache; no
-        // materialised_state, so neither is protected by materialise.
-        await _db.UpsertDiscoveryCacheAsync(900, "movie", CancellationToken.None);
-        await SetDiscoveryLastRefreshedAsync(900, "movie", DateTimeOffset.UtcNow.AddDays(-2));
-        await _db.UpsertDiscoveryCacheAsync(901, "movie", CancellationToken.None);
+        var first = new StubTmdbClient { TrendingMovies = new[] { Hit(900, "Movie 900"), Hit(901, "Movie 901") } };
+        await NewTask(first, new PluginConfiguration { SuggestionsCatalogueMaxItems = 0 })
+            .ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
 
-        var tmdb = new StubTmdbClient();
-        var task = NewTask(tmdb, new PluginConfiguration
-        {
-            DiscoveryCacheTtlDays = 1,
-            SuggestionsCatalogueMaxItems = 0,
-        });
+        var second = new StubTmdbClient { TrendingMovies = new[] { Hit(901, "Movie 901") } };
+        await NewTask(second, new PluginConfiguration { SuggestionsCatalogueMaxItems = 0 })
+            .ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
 
-        await task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
-
-        var remaining = await _db.ListDiscoveryCacheAsync("movie", CancellationToken.None);
-        Assert.Contains(remaining, r => r.TmdbId == 901);
-        Assert.DoesNotContain(remaining, r => r.TmdbId == 900);
+        var remaining = await ListCatalogueAsync("movie");
+        Assert.Contains(900, remaining);
+        Assert.Contains(901, remaining);
     }
 
     [Fact]
-    public async Task Execute_TtlEviction_ProtectsMaterialisedDiscoveryRows()
-    {
-        // Seed two stale discovery rows. The matching materialised_state row
-        // protects tmdb=500; unprotected tmdb=501 should be pruned by the task.
-        await _db.UpsertDiscoveryCacheAsync(500, "movie", CancellationToken.None);
-        await SetDiscoveryLastRefreshedAsync(500, "movie", DateTimeOffset.UtcNow.AddDays(-2));
-        await _db.InsertMaterialisedStateAsync(500, "movie", -1, -1, "/stub", "/fuse", CancellationToken.None);
-        await _db.UpsertDiscoveryCacheAsync(501, "movie", CancellationToken.None);
-        await SetDiscoveryLastRefreshedAsync(501, "movie", DateTimeOffset.UtcNow.AddDays(-2));
-
-        var tmdb = new StubTmdbClient();
-        var task = NewTask(tmdb, new PluginConfiguration
-        {
-            DiscoveryCacheTtlDays = 1,
-            SuggestionsCatalogueMaxItems = 0,
-        });
-        await task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
-
-        var rows = await _db.ListDiscoveryCacheAsync("movie", CancellationToken.None);
-        Assert.Contains(rows, r => r.TmdbId == 500);
-        Assert.DoesNotContain(rows, r => r.TmdbId == 501);
-    }
-
-    [Fact]
-    public async Task Execute_BumpsBothChannelDataVersions()
+    public async Task Execute_DoesNotBumpChannelDataVersionsForHiddenDiscoveryOnlyRows()
     {
         var moviesBefore = _state.DataVersion(ChannelStateProvider.KindMovies);
         var showsBefore = _state.DataVersion(ChannelStateProvider.KindShows);
@@ -305,8 +277,8 @@ public class DiscoveryRefreshTaskTests : IDisposable
         var moviesAfter = _state.DataVersion(ChannelStateProvider.KindMovies);
         var showsAfter = _state.DataVersion(ChannelStateProvider.KindShows);
 
-        Assert.NotEqual(moviesBefore, moviesAfter);
-        Assert.NotEqual(showsBefore, showsAfter);
+        Assert.Equal(moviesBefore, moviesAfter);
+        Assert.Equal(showsBefore, showsAfter);
     }
 
     [Fact]
@@ -323,7 +295,7 @@ public class DiscoveryRefreshTaskTests : IDisposable
 
         await task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
 
-        var rows = await _db.ListDiscoveryCacheAsync("movie", CancellationToken.None);
+        var rows = await ListCatalogueAsync("movie");
         Assert.Single(rows);
         var meta = await _db.GetTmdbMetadataAsync(1, "movie", CancellationToken.None);
         Assert.NotNull(meta);

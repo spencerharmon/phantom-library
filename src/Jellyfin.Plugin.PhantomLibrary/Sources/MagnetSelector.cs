@@ -23,6 +23,29 @@ public sealed record MagnetCandidate(
     int Seeders,
     string Indexer);
 
+public enum MagnetProbeOutcome
+{
+    Available,
+    DefinitiveUnavailable,
+    IndeterminateTransient,
+}
+
+public sealed record MagnetProbeResult(
+    MagnetProbeOutcome Outcome,
+    IReadOnlyList<MagnetCandidate> Candidates,
+    string? ErrorKind,
+    string? ErrorMessage)
+{
+    public static MagnetProbeResult Available(IReadOnlyList<MagnetCandidate> candidates)
+        => new(MagnetProbeOutcome.Available, candidates, null, null);
+
+    public static MagnetProbeResult DefinitiveUnavailable()
+        => new(MagnetProbeOutcome.DefinitiveUnavailable, Array.Empty<MagnetCandidate>(), null, null);
+
+    public static MagnetProbeResult Transient(string kind, string? message)
+        => new(MagnetProbeOutcome.IndeterminateTransient, Array.Empty<MagnetCandidate>(), kind, message);
+}
+
 /// <summary>
 /// Aggregates results from every registered <see cref="IIndexerClient"/>
 /// and picks the best release per the configured <see cref="QualityScorer"/>
@@ -100,6 +123,23 @@ public sealed class MagnetSelector
         ArgumentException.ThrowIfNullOrWhiteSpace(type);
         ArgumentException.ThrowIfNullOrWhiteSpace(title);
 
+        var probe = await ProbeAsync(tmdbId, imdbId, type, season, episode, title, year, ct).ConfigureAwait(false);
+        return probe.Outcome == MagnetProbeOutcome.Available ? probe.Candidates : Array.Empty<MagnetCandidate>();
+    }
+
+    public async Task<MagnetProbeResult> ProbeAsync(
+        int tmdbId,
+        string? imdbId,
+        string type,
+        int? season,
+        int? episode,
+        string title,
+        int? year,
+        CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        ArgumentException.ThrowIfNullOrWhiteSpace(title);
+
         var query = new IndexerQuery
         {
             Type = type,
@@ -112,24 +152,26 @@ public sealed class MagnetSelector
             Episode = episode,
         };
 
+        var enabled = _indexers.Where(i => i.IsEnabled).ToList();
+        if (enabled.Count == 0)
+        {
+            return MagnetProbeResult.Transient("no_enabled_indexers", "No enabled indexers are configured");
+        }
+
         var aggregated = new List<IndexerCandidate>();
-        foreach (var indexer in _indexers)
+        var failures = new List<string>();
+        var successfulResponses = 0;
+        foreach (var indexer in enabled)
         {
             ct.ThrowIfCancellationRequested();
-            if (!indexer.IsEnabled)
-            {
-                continue;
-            }
-
             try
             {
                 var hits = await indexer.SearchAsync(query, ct).ConfigureAwait(false);
-                if (hits is null || hits.Count == 0)
+                successfulResponses++;
+                if (hits is { Count: > 0 })
                 {
-                    continue;
+                    aggregated.AddRange(hits);
                 }
-
-                aggregated.AddRange(hits);
             }
             catch (OperationCanceledException)
             {
@@ -137,33 +179,25 @@ public sealed class MagnetSelector
             }
             catch (IndexerAuthException ex)
             {
-                _logger.LogWarning(
-                    ex,
-                    "Indexer {Indexer} returned auth failure for {Type}/{Tmdb}; skipping",
-                    indexer.Name,
-                    type,
-                    tmdbId);
+                failures.Add($"{indexer.Name}:auth");
+                _logger.LogWarning(ex, "Indexer {Indexer} returned auth failure for {Type}/{Tmdb}", indexer.Name, type, tmdbId);
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(
-                    ex,
-                    "Indexer {Indexer} failed for {Type}/{Tmdb}; skipping",
-                    indexer.Name,
-                    type,
-                    tmdbId);
+                failures.Add($"{indexer.Name}:transient");
+                _logger.LogWarning(ex, "Indexer {Indexer} failed for {Type}/{Tmdb}", indexer.Name, type, tmdbId);
             }
         }
 
         if (aggregated.Count == 0)
         {
-            _logger.LogInformation(
-                "No indexer returned candidates for {Type}/{Tmdb} s{Season} e{Episode}",
-                type,
-                tmdbId,
-                season,
-                episode);
-            return Array.Empty<MagnetCandidate>();
+            if (failures.Count > 0 || successfulResponses == 0)
+            {
+                return MagnetProbeResult.Transient("indexer_partial_or_total_failure", string.Join(";", failures));
+            }
+
+            _logger.LogInformation("No indexer returned candidates for {Type}/{Tmdb} s{Season} e{Episode}", type, tmdbId, season, episode);
+            return MagnetProbeResult.DefinitiveUnavailable();
         }
 
         var cfg = _configProvider();
@@ -179,26 +213,24 @@ public sealed class MagnetSelector
 
         if (ranked.Count == 0)
         {
-            _logger.LogInformation(
-                "Scorer rejected all {N} candidates for {Type}/{Tmdb}",
-                aggregated.Count,
-                type,
-                tmdbId);
-            return Array.Empty<MagnetCandidate>();
+            if (failures.Count > 0)
+            {
+                return MagnetProbeResult.Transient("indexer_partial_failure_all_candidates_rejected", string.Join(";", failures));
+            }
+
+            _logger.LogInformation("Scorer rejected all {N} candidates for {Type}/{Tmdb}", aggregated.Count, type, tmdbId);
+            return MagnetProbeResult.DefinitiveUnavailable();
         }
 
-        return ranked.Select(picked =>
+        var candidates = ranked.Select(picked =>
         {
             var indexerLabel = !string.IsNullOrWhiteSpace(picked.IndexerName)
                 ? picked.IndexerName!
-                : (_indexers.FirstOrDefault()?.Name ?? "unknown");
+                : (enabled.FirstOrDefault()?.Name ?? "unknown");
 
-            return new MagnetCandidate(
-                picked.Magnet,
-                picked.InfoHash,
-                picked.Size,
-                picked.Seeders,
-                indexerLabel);
+            return new MagnetCandidate(picked.Magnet, picked.InfoHash, picked.Size, picked.Seeders, indexerLabel);
         }).ToList();
+
+        return MagnetProbeResult.Available(candidates);
     }
 }

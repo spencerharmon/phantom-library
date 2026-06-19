@@ -66,7 +66,21 @@ public class PluginConfiguration : BasePluginConfiguration
 
         DiscoveryRefreshIntervalHours = 6;
         DiscoveryCacheTtlDays = 30;
+        TrendingCacheTtlHours = 6;
+        DiscoverCacheTtlHours = 24;
         DiscoveryLanguage = string.Empty;
+
+        AvailabilityProbeEnabled = true;
+        AvailabilityProbeMinIntervalSeconds = 4;
+        AvailabilityProbeMaxIntervalSeconds = 28;
+        AvailabilityAvailableTtlDays = 7;
+        AvailabilityUnavailableTtlDays = 7;
+        AvailabilityTransientRetryMinutes = 30;
+        AvailabilityMaxBatchSize = 1;
+        AvailabilityLeaseMinutes = 15;
+        SeriesExpansionTtlDays = 7;
+        SeriesExpansionTransientRetryMinutes = 60;
+        EpisodeReleaseDelayHours = 12;
         GostreamMoviesRoot = "/var/gostream/gostream-mkv-virtual/movies";
         GostreamShowsRoot = "/var/gostream/gostream-mkv-virtual/tv";
 
@@ -238,6 +252,45 @@ public class PluginConfiguration : BasePluginConfiguration
     /// matching materialised_state row, which acts as protection).
     /// </summary>
     public int DiscoveryCacheTtlDays { get; set; }
+
+    /// <summary>TTL for raw TMDB trending response cache rows.</summary>
+    public int TrendingCacheTtlHours { get; set; }
+
+    /// <summary>TTL for raw TMDB Discover page response cache rows.</summary>
+    public int DiscoverCacheTtlHours { get; set; }
+
+    /// <summary>Enables bounded background source availability probing.</summary>
+    public bool AvailabilityProbeEnabled { get; set; }
+
+    /// <summary>Fastest availability scheduler cadence during backlog catch-up.</summary>
+    public int AvailabilityProbeMinIntervalSeconds { get; set; }
+
+    /// <summary>Slowest availability scheduler cadence during steady state.</summary>
+    public int AvailabilityProbeMaxIntervalSeconds { get; set; }
+
+    /// <summary>TTL for available phantom source probes.</summary>
+    public int AvailabilityAvailableTtlDays { get; set; }
+
+    /// <summary>TTL for unavailable phantom source probes.</summary>
+    public int AvailabilityUnavailableTtlDays { get; set; }
+
+    /// <summary>Retry delay after transient probe failures that must not change visibility.</summary>
+    public int AvailabilityTransientRetryMinutes { get; set; }
+
+    /// <summary>Maximum items probed per scheduler tick.</summary>
+    public int AvailabilityMaxBatchSize { get; set; }
+
+    /// <summary>Lease window for in-progress availability probes.</summary>
+    public int AvailabilityLeaseMinutes { get; set; }
+
+    /// <summary>TTL for TV series expansion passes.</summary>
+    public int SeriesExpansionTtlDays { get; set; }
+
+    /// <summary>Retry delay after transient series expansion failures.</summary>
+    public int SeriesExpansionTransientRetryMinutes { get; set; }
+
+    /// <summary>Delay after an episode air date before probing sources.</summary>
+    public int EpisodeReleaseDelayHours { get; set; }
 
     /// <summary>
     /// TMDB language code passed to discovery calls. Empty means
