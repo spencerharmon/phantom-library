@@ -121,6 +121,26 @@ tools/perf/profile-rig-channel-browse.sh
 tools/perf/profile-rig-materialise.sh
 ```
 
+## Known bug: materialised episode disappears/flickers during materialise
+
+During episode materialisation, Jellyfin can briefly route season/episode
+browse through stale channel `BaseItem` children instead of the freshly
+synthesised channel response. Symptoms:
+
+- the episode being materialised disappears and reappears after refresh;
+- an empty or duplicate season folder appears;
+- sibling phantom episodes show stale splash-backed `BaseItem` rows.
+
+Observed with Spider-Noir S01E01 after a wipe: `materialised_state` and the
+real gostream file existed, and the Jellyfin `BaseItems` row eventually pointed
+at the correct gostream path, but UI browse was temporarily inconsistent while
+channel caches and parent/child `BaseItem` rows converged.
+
+Current workaround: refresh the page after materialise completes. Planned fix:
+make materialise update parent series/season/item channel rows atomically from
+Jellyfin's perspective, and add a channel cleanup/repair pass that removes stale
+splash child rows that are no longer visible under availability gating.
+
 ## Future work
 
 - Add DB backlog gauges for due availability and due series expansion counts.
