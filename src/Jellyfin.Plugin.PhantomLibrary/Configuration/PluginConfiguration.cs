@@ -68,6 +68,8 @@ public class PluginConfiguration : BasePluginConfiguration
         DiscoveryCacheTtlDays = 30;
         TrendingCacheTtlHours = 6;
         DiscoverCacheTtlHours = 24;
+        DiscoverPagesPerRun = 50;
+        DiscoverPageDelayMilliseconds = 100;
         DiscoveryLanguage = string.Empty;
 
         AvailabilityProbeEnabled = true;
@@ -258,6 +260,16 @@ public class PluginConfiguration : BasePluginConfiguration
 
     /// <summary>TTL for raw TMDB Discover page response cache rows.</summary>
     public int DiscoverCacheTtlHours { get; set; }
+
+    /// <summary>
+    /// Maximum TMDB Discover pages walked per kind per discovery run. The
+    /// task stores a cursor and resumes next run; zero means walk to TMDB's
+    /// page-500 limit in one run.
+    /// </summary>
+    public int DiscoverPagesPerRun { get; set; }
+
+    /// <summary>Delay between Discover page fetch/write batches.</summary>
+    public int DiscoverPageDelayMilliseconds { get; set; }
 
     /// <summary>Enables bounded background source availability probing.</summary>
     public bool AvailabilityProbeEnabled { get; set; }

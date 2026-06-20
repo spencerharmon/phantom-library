@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Jellyfin channel cache churn.
 - Added perf profiling scripts under `tools/perf/` for discovery, channel browse,
   and materialise flows.
+- Added cold-start discovery throttles (`DiscoverPagesPerRun`,
+  `DiscoverPageDelayMilliseconds`) with persisted per-kind cursors so post-wipe
+  TMDB discovery can fill incrementally instead of stampeding Jellyfin.
+- Added Phantom Prometheus metrics on Jellyfin's normal `/metrics` endpoint when
+  Jellyfin metrics are enabled.
 
 ### Fixed
 
