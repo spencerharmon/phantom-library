@@ -93,50 +93,73 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
             return Ok(result);
         }
 
+        var requests = new List<(string Raw, Guid Guid)>();
         foreach (var raw in request.Ids)
         {
             ct.ThrowIfCancellationRequested();
-            if (string.IsNullOrWhiteSpace(raw) || !Guid.TryParse(raw, out var guid))
+            if (!string.IsNullOrWhiteSpace(raw) && Guid.TryParse(raw, out var guid))
             {
-                continue;
+                requests.Add((raw, guid));
             }
+        }
 
+        if (requests.Count == 0)
+        {
+            return Ok(result);
+        }
+
+        var resolved = new Dictionary<Guid, (BaseItem? Item, ChannelItemId Parsed)>();
+        var unresolved = new HashSet<Guid>(requests.Select(r => r.Guid));
+
+        foreach (var guid in unresolved.ToArray())
+        {
+            ct.ThrowIfCancellationRequested();
             var item = _libraryManager.GetItemById(guid);
-            if (item is null)
+            if (TryParsePhantomItem(item, out var parsed))
             {
-                var matches = _libraryManager.GetItemList(new InternalItemsQuery
-                {
-                    ItemIds = new[] { guid },
-                    SourceTypes = new[] { SourceType.Channel },
-                });
-                item = matches.Count > 0 ? matches[0] : null;
+                resolved[guid] = (item, parsed);
+                unresolved.Remove(guid);
             }
+        }
 
-            if (item is null)
+        if (unresolved.Count > 0)
+        {
+            var matches = _libraryManager.GetItemList(new InternalItemsQuery
             {
-                var phantomItems = _libraryManager.GetItemList(new InternalItemsQuery
+                ItemIds = unresolved.ToArray(),
+                SourceTypes = new[] { SourceType.Channel },
+            });
+
+            foreach (var item in matches ?? Array.Empty<BaseItem>())
+            {
+                ct.ThrowIfCancellationRequested();
+                if (!unresolved.Contains(item.Id) || !TryParsePhantomItem(item, out var parsed))
                 {
-                    ChannelIds = new[] { ChannelIds.Movies, ChannelIds.Shows },
-                    SourceTypes = new[] { SourceType.Channel },
-                });
-                foreach (var candidate in phantomItems)
-                {
-                    if (candidate.Id == guid)
-                    {
-                        item = candidate;
-                        break;
-                    }
+                    continue;
                 }
+
+                resolved[item.Id] = (item, parsed);
+                unresolved.Remove(item.Id);
             }
+        }
+
+        Dictionary<Guid, ChannelItemId>? computedIds = null;
+
+        foreach (var (raw, guid) in requests)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            BaseItem? item = null;
             ChannelItemId parsed;
-            if (item is not null && ChannelIds.IsPhantom(item.ChannelId) && ChannelItemId.TryParse(item.ExternalId, out parsed))
+            if (resolved.TryGetValue(guid, out var hit))
             {
-                // resolved through Jellyfin library manager
+                item = hit.Item;
+                parsed = hit.Parsed;
             }
             else
             {
-                var computed = await TryResolveByComputedChannelIdAsync(guid, ct).ConfigureAwait(false);
-                if (computed is null)
+                computedIds ??= await BuildComputedChannelIdMapAsync(ct).ConfigureAwait(false);
+                if (!computedIds.TryGetValue(guid, out var computed))
                 {
                     continue;
                 }
@@ -252,38 +275,55 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
                 || path.EndsWith(".webm", StringComparison.OrdinalIgnoreCase));
     }
 
-    private async Task<ChannelItemId?> TryResolveByComputedChannelIdAsync(Guid requestedId, CancellationToken ct)
+    private static bool TryParsePhantomItem(BaseItem? item, out ChannelItemId parsed)
     {
+        if (item is not null
+            && ChannelIds.IsPhantom(item.ChannelId)
+            && ChannelItemId.TryParse(item.ExternalId, out parsed))
+        {
+            return true;
+        }
+
+        parsed = null!;
+        return false;
+    }
+
+    private async Task<Dictionary<Guid, ChannelItemId>> BuildComputedChannelIdMapAsync(CancellationToken ct)
+    {
+        var result = new Dictionary<Guid, ChannelItemId>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
 
         foreach (var row in await _db.ListVisibleMovieRowsAsync(ct).ConfigureAwait(false))
         {
+            ct.ThrowIfCancellationRequested();
             var id = ChannelItemId.ForMovie(row.Metadata.TmdbId);
-            if (seen.Add(id.Encode()) && ComputeMovieGuid(id) == requestedId)
+            if (seen.Add(id.Encode()))
             {
-                return id;
+                result.TryAdd(ComputeMovieGuid(id), id);
             }
         }
 
         foreach (var row in await _db.ListMaterialisedStateAsync("movie", ct).ConfigureAwait(false))
         {
+            ct.ThrowIfCancellationRequested();
             var id = ChannelItemId.ForMovie(row.TmdbId);
-            if (seen.Add(id.Encode()) && ComputeMovieGuid(id) == requestedId)
+            if (seen.Add(id.Encode()))
             {
-                return id;
+                result.TryAdd(ComputeMovieGuid(id), id);
             }
         }
 
         foreach (var row in await _db.ListVisibleEpisodeIdsAsync(ct).ConfigureAwait(false))
         {
+            ct.ThrowIfCancellationRequested();
             var id = ChannelItemId.ForEpisode(row.SeriesTmdbId, row.Season, row.Episode);
-            if (seen.Add(id.Encode()) && ComputeEpisodeGuid(id) == requestedId)
+            if (seen.Add(id.Encode()))
             {
-                return id;
+                result.TryAdd(ComputeEpisodeGuid(id), id);
             }
         }
 
-        return null;
+        return result;
     }
 
     private Guid ComputeMovieGuid(ChannelItemId id)

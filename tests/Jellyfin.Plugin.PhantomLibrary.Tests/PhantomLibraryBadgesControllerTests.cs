@@ -234,6 +234,23 @@ public class PhantomLibraryBadgesControllerTests : IDisposable
     }
 
     [Fact]
+    public async Task UnresolvedIds_DoNotScanEntirePhantomChannel()
+    {
+        using var db = await NewDbAsync();
+        var id = Guid.NewGuid();
+        var lib = new Mock<ILibraryManager>(MockBehavior.Loose);
+        lib.Setup(l => l.GetItemById(id)).Returns((BaseItem?)null);
+        lib.Setup(l => l.GetItemList(It.Is<InternalItemsQuery>(q => q.ItemIds != null && q.ItemIds.Contains(id))))
+            .Returns(new List<BaseItem>());
+
+        var ctrl = MakeController(lib.Object, db);
+        var res = await ctrl.States(new PhantomLibraryStatesRequest { Ids = new() { id.ToString() } }, CancellationToken.None);
+
+        Assert.Empty(Cast(res));
+        lib.Verify(l => l.GetItemList(It.Is<InternalItemsQuery>(q => q.ChannelIds != null && q.ChannelIds.Count > 0)), Times.Never);
+    }
+
+    [Fact]
     public async Task MalformedGuid_Ignored()
     {
         using var db = await NewDbAsync();
