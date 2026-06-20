@@ -161,6 +161,10 @@ public sealed class CachedTmdbReader
                 return (deserialised, true);
             }
         }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "tmdb_cache read failed for {Endpoint}; falling back to HTTP", endpoint);
@@ -173,6 +177,10 @@ public sealed class CachedTmdbReader
         {
             var json = JsonSerializer.Serialize(hits, JsonOpts);
             await _db.PutTmdbCacheAsync(endpoint, paramsHash, lang, json, ttl, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch (Exception ex)
         {

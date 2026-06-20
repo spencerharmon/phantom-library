@@ -230,10 +230,25 @@ public class DiscoveryRefreshTaskTests : IDisposable
     }
 
     [Fact]
+    public async Task Execute_DiscoverWalkHonoursPagesPerRunAndResumesCursor()
+    {
+        var tmdb = new StubTmdbClient { GeneratedDiscoverMoviePages = 10 };
+        var config = new PluginConfiguration { SuggestionsCatalogueMaxItems = 100, DiscoverPagesPerRun = 2, DiscoverPageDelayMilliseconds = 0 };
+
+        await NewTask(tmdb, config).ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
+        await NewTask(tmdb, config).ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
+
+        Assert.Equal(new[] { 1, 2, 3, 4 }, tmdb.DiscoverMoviePageCalls);
+        var movies = await ListCatalogueAsync("movie");
+        Assert.Contains(300001, movies);
+        Assert.Contains(300004, movies);
+    }
+
+    [Fact]
     public async Task Execute_DiscoverWalkStopsAtTmdbPageLimit()
     {
         var tmdb = new StubTmdbClient { GeneratedDiscoverMoviePages = 600 };
-        var task = NewTask(tmdb, new PluginConfiguration { SuggestionsCatalogueMaxItems = 2000 });
+        var task = NewTask(tmdb, new PluginConfiguration { SuggestionsCatalogueMaxItems = 2000, DiscoverPagesPerRun = 0 });
 
         await task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
 

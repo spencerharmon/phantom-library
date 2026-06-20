@@ -8,6 +8,7 @@ using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Channels;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
 using Jellyfin.Plugin.PhantomLibrary.Configuration;
+using Jellyfin.Plugin.PhantomLibrary.Diagnostics;
 using Jellyfin.Plugin.PhantomLibrary.Materialisation;
 using Jellyfin.Plugin.PhantomLibrary.Sources;
 using Jellyfin.Plugin.PhantomLibrary.State;
@@ -159,6 +160,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
             return false;
         }
 
+        using var timer = PhantomMetrics.TimeAvailabilityProbe();
         try
         {
             var metaType = lease.Type == "movie" ? "movie" : "series";
@@ -171,6 +173,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
                     "missing_metadata",
                     $"Missing title/year for {metaType}/{lease.TmdbId}",
                     ct).ConfigureAwait(false);
+                PhantomMetrics.AvailabilityProbe(lease.Type, "transient");
                 return true;
             }
 
@@ -227,6 +230,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
                             BumpFor(lease.Type);
                         }
 
+                        PhantomMetrics.AvailabilityProbe(lease.Type, "available");
                         _logger.LogInformation("Availability available {Type}/{Tmdb} s{Season}e{Episode} via {Indexer}", lease.Type, lease.TmdbId, lease.Season, lease.Episode, picked.Indexer);
                         return true;
                     }
@@ -247,6 +251,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
                         BumpFor(lease.Type);
                     }
 
+                    PhantomMetrics.AvailabilityProbe(lease.Type, "unavailable");
                     _logger.LogInformation("Availability unavailable {Type}/{Tmdb} s{Season}e{Episode}", lease.Type, lease.TmdbId, lease.Season, lease.Episode);
                     return true;
 
@@ -257,6 +262,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
                         probe.ErrorKind ?? "transient",
                         probe.ErrorMessage,
                         ct).ConfigureAwait(false);
+                    PhantomMetrics.AvailabilityProbe(lease.Type, "transient");
                     _logger.LogInformation("Availability transient {Type}/{Tmdb} s{Season}e{Episode}: {Kind}", lease.Type, lease.TmdbId, lease.Season, lease.Episode, probe.ErrorKind);
                     return true;
 
@@ -276,6 +282,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
                 "probe_exception",
                 ex.Message,
                 CancellationToken.None).ConfigureAwait(false);
+            PhantomMetrics.AvailabilityProbe(lease.Type, "transient");
             _logger.LogWarning(ex, "Availability probe exception for {Type}/{Tmdb}", lease.Type, lease.TmdbId);
             return true;
         }
@@ -306,6 +313,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
                     "series_not_found_or_empty",
                     null,
                     ct).ConfigureAwait(false);
+                PhantomMetrics.SeriesExpansion("empty");
                 return true;
             }
 
@@ -350,6 +358,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
                 now.AddDays(Math.Max(1, cfg.SeriesExpansionTtlDays)),
                 TimeSpan.FromHours(Math.Max(0, cfg.EpisodeReleaseDelayHours)),
                 ct).ConfigureAwait(false);
+            PhantomMetrics.SeriesExpansion("success");
             _logger.LogInformation("Series expansion complete tmdb={Tmdb} episodes={Episodes}", lease.SeriesTmdbId, rows.Count);
             return true;
         }
@@ -365,6 +374,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
                 "series_expansion_exception",
                 ex.Message,
                 CancellationToken.None).ConfigureAwait(false);
+            PhantomMetrics.SeriesExpansion("transient");
             _logger.LogWarning(ex, "Series expansion failed for tmdb={Tmdb}", lease.SeriesTmdbId);
             return true;
         }
@@ -397,9 +407,19 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
             cfg.MinSizeGb1080p.ToString(CultureInfo.InvariantCulture),
             cfg.MinSizeGb4K.ToString(CultureInfo.InvariantCulture),
             cfg.ProwlarrBaseUrl,
-            string.IsNullOrWhiteSpace(cfg.ProwlarrApiKey) ? "no-prowlarr-key" : "prowlarr-key-set",
+            KeyFingerprint(cfg.ProwlarrApiKey),
             cfg.TorrentioBaseUrl);
         var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(raw));
         return Convert.ToHexString(bytes);
+    }
+
+    private static string KeyFingerprint(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return "no-prowlarr-key";
+        }
+
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value.Trim())));
     }
 }

@@ -1033,6 +1033,24 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
 
     // ---- catalogue / availability v11 ----
 
+    public async Task<int> CountCatalogueItemsAsync(string type, int? sourceMask, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = sourceMask.HasValue
+            ? "SELECT COUNT(*) FROM catalogue_items WHERE type=$type AND (source_mask & $mask) != 0;"
+            : "SELECT COUNT(*) FROM catalogue_items WHERE type=$type;";
+        cmd.Parameters.AddWithValue("$type", type);
+        if (sourceMask.HasValue)
+        {
+            cmd.Parameters.AddWithValue("$mask", sourceMask.Value);
+        }
+
+        var v = await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
+        return Convert.ToInt32(v, System.Globalization.CultureInfo.InvariantCulture);
+    }
+
     public async Task<CatalogueHitWriteResult> UpsertCatalogueHitsAsync(IReadOnlyList<TmdbMetadataRow> rows, int sourceMask, DateTimeOffset now, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(rows);

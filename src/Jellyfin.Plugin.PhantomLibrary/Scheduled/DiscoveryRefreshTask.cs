@@ -8,6 +8,7 @@ using Jellyfin.Plugin.PhantomLibrary.Channels;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
 using Jellyfin.Plugin.PhantomLibrary.Clients.Models;
 using Jellyfin.Plugin.PhantomLibrary.Configuration;
+using Jellyfin.Plugin.PhantomLibrary.Diagnostics;
 using Jellyfin.Plugin.PhantomLibrary.Library;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Model.Tasks;
@@ -16,30 +17,21 @@ using Microsoft.Extensions.Logging;
 namespace Jellyfin.Plugin.PhantomLibrary.Scheduled;
 
 /// <summary>
-/// Periodic scheduled task that populates the channel-arch
-/// discovery_cache + tmdb_metadata tables.
+/// Periodic scheduled task that feeds the append-only Phantom catalogue
+/// from TMDB trending and Discover.
 ///
 /// On each tick:
 ///   1. Pull /trending/movie/week and /trending/tv/week via
-///      <see cref="CachedTmdbReader"/> (which round-trips through the
-///      tmdb_cache table for cheap idempotency).
-///   2. Walk /discover/movie and /discover/tv up to the configured
-///      <see cref="PluginConfiguration.SuggestionsCatalogueMaxItems"/>
-///      cap so the channel surface is catalogue-sized, not just trending.
-///   3. Upsert TMDB hit metadata into <c>tmdb_metadata</c>, then upsert
-///      each (tmdb_id, type) into <c>discovery_cache</c>. Metadata is
-///      written before discovery rows so concurrent channel refreshes never
-///      see cold rows and incorrectly sweep existing channel items.
-///   4. Stale-prune discovery_cache rows older than
-///      <see cref="PluginConfiguration.DiscoveryCacheTtlDays"/>, but
-///      preserve rows that have a matching materialised_state row
-///      (we want to keep the discovery surface alive for items the
-///      operator has already bothered to materialise).
-///   5. Bump the movies + shows channel DataVersion so the next browse
-///      sees the new contents.
-///
-/// Replaces the deleted M11-era SuggestionsRefreshTask. Same role,
-/// channel-arch shape.
+///      <see cref="CachedTmdbReader"/>.
+///   2. Walk /discover/movie and /discover/tv from persisted per-kind
+///      cursors, bounded by <see cref="PluginConfiguration.DiscoverPagesPerRun"/>
+///      so a post-wipe cold start does not stampede Jellyfin.
+///   3. Insert new catalogue rows and missing metadata only; rediscovery
+///      does not rewrite metadata, prune catalogue rows, or bump channel
+///      DataVersions.
+///   4. Enqueue new movies for availability probing and new series for
+///      bounded series expansion. Channel visibility changes only after
+///      availability/materialised state changes.
 /// </summary>
 public sealed class DiscoveryRefreshTask : IScheduledTask
 {
@@ -129,13 +121,26 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
             catalogueMaxItems = 0;
         }
 
-        var discoverMovieCap = (catalogueMaxItems / 2) + (catalogueMaxItems % 2);
-        var discoverSeriesCap = catalogueMaxItems / 2;
+        var configuredMovieCap = (catalogueMaxItems / 2) + (catalogueMaxItems % 2);
+        var configuredSeriesCap = catalogueMaxItems / 2;
+        var existingMovies = await _db.CountCatalogueItemsAsync("movie", SourceDiscover, cancellationToken).ConfigureAwait(false);
+        var existingSeries = await _db.CountCatalogueItemsAsync("series", SourceDiscover, cancellationToken).ConfigureAwait(false);
+        var discoverMovieCap = Math.Max(0, configuredMovieCap - existingMovies);
+        var discoverSeriesCap = Math.Max(0, configuredSeriesCap - existingSeries);
+        var discoverPagesPerRun = config?.DiscoverPagesPerRun ?? 50;
+        if (discoverPagesPerRun < 0)
+        {
+            discoverPagesPerRun = 50;
+        }
+
+        var discoverPageDelay = TimeSpan.FromMilliseconds(Math.Max(0, config?.DiscoverPageDelayMilliseconds ?? 100));
 
         var totalSeen = 0;
         var totalInserted = 0;
         var totalAvailabilityInserted = 0;
         var totalSeriesExpansionInserted = 0;
+
+        using var discoveryTimer = PhantomMetrics.TimeDiscoveryRun();
 
         // --- Phase 1: trending ----------------------------------------------
         progress.Report(0);
@@ -143,6 +148,7 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
         {
             var (movies, fromCacheM) = await _tmdb.TrendingMoviesAsync("week", language, cancellationToken).ConfigureAwait(false);
             var write = await UpsertHitsAsync(movies, "movie", SourceTrending, cancellationToken).ConfigureAwait(false);
+            PhantomMetrics.DiscoveryRows("movie", write.Seen, write.Inserted, write.AvailabilityInserted, write.SeriesExpansionInserted);
             totalSeen += write.Seen;
             totalInserted += write.Inserted;
             totalAvailabilityInserted += write.AvailabilityInserted;
@@ -164,6 +170,7 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
         {
             var (series, fromCacheS) = await _tmdb.TrendingSeriesAsync("week", language, cancellationToken).ConfigureAwait(false);
             var write = await UpsertHitsAsync(series, "series", SourceTrending, cancellationToken).ConfigureAwait(false);
+            PhantomMetrics.DiscoveryRows("series", write.Seen, write.Inserted, write.AvailabilityInserted, write.SeriesExpansionInserted);
             totalSeen += write.Seen;
             totalInserted += write.Inserted;
             totalAvailabilityInserted += write.AvailabilityInserted;
@@ -188,6 +195,8 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
             maxItems: discoverMovieCap,
             fetchPage: (page, ct) => _tmdb.GetDiscoverMoviesAsync(page, language, ct),
             counters: result => { totalSeen += result.Seen; totalInserted += result.Inserted; totalAvailabilityInserted += result.AvailabilityInserted; totalSeriesExpansionInserted += result.SeriesExpansionInserted; },
+            pagesPerRun: discoverPagesPerRun,
+            pageDelay: discoverPageDelay,
             cancellationToken: cancellationToken).ConfigureAwait(false);
         progress.Report(37.5);
 
@@ -196,6 +205,8 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
             maxItems: discoverSeriesCap,
             fetchPage: (page, ct) => _tmdb.GetDiscoverSeriesAsync(page, language, ct),
             counters: result => { totalSeen += result.Seen; totalInserted += result.Inserted; totalAvailabilityInserted += result.AvailabilityInserted; totalSeriesExpansionInserted += result.SeriesExpansionInserted; },
+            pagesPerRun: discoverPagesPerRun,
+            pageDelay: discoverPageDelay,
             cancellationToken: cancellationToken).ConfigureAwait(false);
         progress.Report(45);
 
@@ -228,6 +239,8 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
         int maxItems,
         Func<int, CancellationToken, Task<(IReadOnlyList<TmdbSearchHit> Hits, bool FromCache)>> fetchPage,
         Action<CatalogueHitWriteResult> counters,
+        int pagesPerRun,
+        TimeSpan pageDelay,
         CancellationToken cancellationToken)
     {
         if (maxItems <= 0)
@@ -236,11 +249,22 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
             return;
         }
 
-        var page = 1;
+        var cursorKey = $"discovery.cursor.{kind}";
+        var offsetKey = $"discovery.cursor.{kind}.offset";
+        var cursorText = await _db.GetMetaAsync(cursorKey, cancellationToken).ConfigureAwait(false);
+        var offsetText = await _db.GetMetaAsync(offsetKey, cancellationToken).ConfigureAwait(false);
+        var page = int.TryParse(cursorText, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedCursor)
+            ? Math.Clamp(parsedCursor, 1, TmdbMaxDiscoverPage)
+            : 1;
+        var offset = int.TryParse(offsetText, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedOffset)
+            ? Math.Max(0, parsedOffset)
+            : 0;
         var processed = 0;
         var inserted = 0;
         var cachedPages = 0;
-        while (processed < maxItems && page <= TmdbMaxDiscoverPage)
+        var pages = 0;
+        var stopAfterPages = pagesPerRun == 0 ? int.MaxValue : pagesPerRun;
+        while (processed < maxItems && page <= TmdbMaxDiscoverPage && pages < stopAfterPages)
         {
             cancellationToken.ThrowIfCancellationRequested();
             IReadOnlyList<TmdbSearchHit> hits;
@@ -259,6 +283,7 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
                 break;
             }
 
+            PhantomMetrics.DiscoveryPage(kind, fromCache);
             if (fromCache)
             {
                 cachedPages++;
@@ -266,16 +291,50 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
 
             if (hits.Count == 0)
             {
-                _logger.LogInformation("Discover {Kind}: page {Page} returned no hits; stopping", kind, page);
+                _logger.LogInformation("Discover {Kind}: page {Page} returned no hits; resetting cursor", kind, page);
+                page = 1;
+                offset = 0;
+                await PersistDiscoverCursorAsync(cursorKey, offsetKey, page, offset, cancellationToken).ConfigureAwait(false);
+                PhantomMetrics.DiscoveryCursor(kind, page);
                 break;
             }
 
-            var pageHits = hits.Take(Math.Max(0, maxItems - processed)).ToList();
+            if (offset >= hits.Count)
+            {
+                offset = 0;
+            }
+
+            var remaining = Math.Max(0, maxItems - processed);
+            var pageHits = hits.Skip(offset).Take(remaining).ToList();
             var write = await UpsertHitsAsync(pageHits, kind, SourceDiscover, cancellationToken).ConfigureAwait(false);
+            PhantomMetrics.DiscoveryRows(kind, write.Seen, write.Inserted, write.AvailabilityInserted, write.SeriesExpansionInserted);
             counters(write);
             inserted += write.Inserted;
             processed += pageHits.Count;
-            page++;
+            offset += pageHits.Count;
+            pages++;
+            var reachedTmdbPageLimit = false;
+            if (offset >= hits.Count)
+            {
+                page++;
+                offset = 0;
+                if (page > TmdbMaxDiscoverPage)
+                {
+                    page = 1;
+                    reachedTmdbPageLimit = true;
+                }
+            }
+
+            await PersistDiscoverCursorAsync(cursorKey, offsetKey, page, offset, cancellationToken).ConfigureAwait(false);
+            PhantomMetrics.DiscoveryCursor(kind, page);
+            if (reachedTmdbPageLimit)
+            {
+                break;
+            }
+            if (pageDelay > TimeSpan.Zero && processed < maxItems && pages < stopAfterPages)
+            {
+                await Task.Delay(pageDelay, cancellationToken).ConfigureAwait(false);
+            }
         }
 
         if (page > TmdbMaxDiscoverPage && processed < maxItems)
@@ -288,13 +347,22 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
         }
 
         _logger.LogInformation(
-            "Discover {Kind}: processed={Processed} inserted={Inserted} pages={Pages} cachedPages={CachedPages} cap={Cap}",
+            "Discover {Kind}: processed={Processed} inserted={Inserted} pages={Pages} cachedPages={CachedPages} cap={Cap} nextPage={NextPage} nextOffset={NextOffset} pagesPerRun={PagesPerRun}",
             kind,
             processed,
             inserted,
-            page - 1,
+            pages,
             cachedPages,
-            maxItems);
+            maxItems,
+            page,
+            offset,
+            pagesPerRun);
+    }
+
+    private async Task PersistDiscoverCursorAsync(string cursorKey, string offsetKey, int page, int offset, CancellationToken ct)
+    {
+        await _db.SetMetaAsync(cursorKey, page.ToString(CultureInfo.InvariantCulture), ct).ConfigureAwait(false);
+        await _db.SetMetaAsync(offsetKey, offset.ToString(CultureInfo.InvariantCulture), ct).ConfigureAwait(false);
     }
 
     private async Task<CatalogueHitWriteResult> UpsertHitsAsync(IReadOnlyList<TmdbSearchHit> hits, string type, int sourceMask, CancellationToken ct)
