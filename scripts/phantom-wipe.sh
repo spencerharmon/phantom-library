@@ -228,29 +228,44 @@ fi
 
 # 6. Counts.
 #
-# Channel-arch wipe targets THREE path namespaces in BaseItems:
+# Channel-arch wipe targets THREE path namespaces plus the Phantom channel
+# cache rows in BaseItems:
 #   1. STUB_ROOT/%               legacy phantom stub tree (file-on-disk arch)
 #   2. JF_ROOT_DEFAULT/gostream-% the two CollectionFolders backing the
 #                                old gostream-movies / gostream-shows libraries
 #   3. GOSTREAM_ROOT/%           real gostream content scanned via those
 #                                CollectionFolders (must clear so the new
 #                                IChannel implementation owns the IDs)
-# All three are joined as `Path LIKE p1 OR Path LIKE p2 OR Path LIKE p3`
+#   4. Phantom channel IDs       Jellyfin's channel-cache BaseItems for
+#                                Phantom Movies / Phantom Shows. These rows
+#                                are pathless or point at splash.mp4, so a
+#                                path-only wipe misses them and stale cache
+#                                can survive across schema wipes.
+# All four targets are joined into one WHERE clause and used consistently
 # in every count + delete query below.
 STUB_PATH_LIKE="${STUB_ROOT%/}/%"
 CF_PATH_LIKE="${JF_ROOT_DEFAULT%/}/gostream-%"
 GS_PATH_LIKE="${GOSTREAM_ROOT%/}/%"
+PHANTOM_MOVIES_CHANNEL_ID="80089D10-394F-B545-B5E4-D7D56A872393"
+PHANTOM_SHOWS_CHANNEL_ID="40AB6E9A-F516-A84F-46DC-EA7140855D88"
+PHANTOM_CHANNEL_IDS="'$PHANTOM_MOVIES_CHANNEL_ID','$PHANTOM_SHOWS_CHANNEL_ID'"
 
 # Composable WHERE clause used by all phantom-target queries. We also
 # match BaseItems whose Path is EXACTLY the gostream CollectionFolder
 # dir (no trailing slash); the `/gostream-%` LIKE already covers them.
-PHANTOM_WHERE="Path LIKE '$STUB_PATH_LIKE' OR Path LIKE '$CF_PATH_LIKE' OR Path LIKE '$GS_PATH_LIKE'"
+PHANTOM_PATH_WHERE="Path LIKE '$STUB_PATH_LIKE' OR Path LIKE '$CF_PATH_LIKE' OR Path LIKE '$GS_PATH_LIKE'"
+PHANTOM_CHANNEL_WHERE="upper(ChannelId) IN ($PHANTOM_CHANNEL_IDS)"
+PHANTOM_WHERE="$PHANTOM_PATH_WHERE OR $PHANTOM_CHANNEL_WHERE"
+
+PHANTOM_CLOSURE_CTE="WITH RECURSIVE phantom_ids(Id) AS (SELECT Id FROM BaseItems WHERE $PHANTOM_WHERE UNION SELECT b.Id FROM BaseItems b JOIN phantom_ids p ON b.ParentId=p.Id)"
 
 TOTAL_BI="$(sqlite3 "$JF_RO_URI" "SELECT COUNT(*) FROM BaseItems;")"
-N_PHANTOM_BI="$(sqlite3 "$JF_RO_URI" "SELECT COUNT(*) FROM BaseItems WHERE $PHANTOM_WHERE;")"
+N_PHANTOM_BI="$(sqlite3 "$JF_RO_URI" "$PHANTOM_CLOSURE_CTE SELECT COUNT(*) FROM phantom_ids;")"
 N_STUB_BI="$(sqlite3 "$JF_RO_URI" "SELECT COUNT(*) FROM BaseItems WHERE Path LIKE '$STUB_PATH_LIKE';")"
 N_CF_BI="$(sqlite3 "$JF_RO_URI" "SELECT COUNT(*) FROM BaseItems WHERE Path LIKE '$CF_PATH_LIKE';")"
 N_GS_BI="$(sqlite3 "$JF_RO_URI" "SELECT COUNT(*) FROM BaseItems WHERE Path LIKE '$GS_PATH_LIKE';")"
+N_CHANNEL_BI="$(sqlite3 "$JF_RO_URI" "SELECT COUNT(*) FROM BaseItems WHERE $PHANTOM_CHANNEL_WHERE;")"
+N_DESCENDANT_BI=$((N_PHANTOM_BI - $(sqlite3 "$JF_RO_URI" "SELECT COUNT(*) FROM BaseItems WHERE $PHANTOM_WHERE;")))
 
 if [[ -f "$PHANTOM_DB" ]]; then
     PH_RO_URI="file:${PHANTOM_DB}?mode=ro"
@@ -278,16 +293,23 @@ info "  phantom-target BaseItems (to delete)  : $N_PHANTOM_BI"
 info "    via STUB_ROOT ($STUB_ROOT/%)        : $N_STUB_BI"
 info "    via JF_ROOT_DEFAULT (gostream CFs)  : $N_CF_BI"
 info "    via GOSTREAM_ROOT ($GOSTREAM_ROOT/%): $N_GS_BI"
+info "    via Phantom channel cache rows      : $N_CHANNEL_BI"
+info "    via child rows reached by cascade   : $N_DESCENDANT_BI"
 info "  phantom_items rows                    : $N_PHANTOM_ROWS"
 info "  stub entries under movies/            : $N_FILES_MOVIES"
 info "  stub entries under shows/             : $N_FILES_SHOWS"
 info "  stub entries total                    : $N_FILES"
 
-# 7. Sanity bound: phantom BaseItems must be <= 50% of total.
+# 7. Sanity bound for path-derived rows. Channel-cache rows can be a very
+# large fraction of BaseItems after a bad channel-cache population run (that
+# is one reason this wipe exists), but path-derived rows should still be a
+# minority on the operator DB. Keep the old guard for non-channel selectors
+# while allowing exact Phantom ChannelId cleanup to proceed.
+N_PATH_BI=$((N_STUB_BI + N_CF_BI + N_GS_BI))
 if [[ $TOTAL_BI -gt 0 ]]; then
-    # 2 * phantom > total  =>  phantom > total/2
-    if (( 2 * N_PHANTOM_BI > TOTAL_BI )); then
-        die "SANITY: phantom BaseItems ($N_PHANTOM_BI) exceeds 50% of total ($TOTAL_BI). Refusing."
+    # 2 * path-derived phantom > total  =>  path-derived phantom > total/2
+    if (( 2 * N_PATH_BI > TOTAL_BI )); then
+        die "SANITY: path-derived phantom BaseItems ($N_PATH_BI) exceeds 50% of total ($TOTAL_BI). Refusing."
     fi
 fi
 
@@ -350,7 +372,12 @@ SQL_FILE="/tmp/.phantom-wipe.${TS}.sql"
     echo "PRAGMA foreign_keys = ON;"
     echo "BEGIN TRANSACTION;"
     echo "CREATE TEMP TABLE _phantom_ids AS"
-    echo "  SELECT Id FROM BaseItems WHERE $PHANTOM_WHERE;"
+    echo "  WITH RECURSIVE phantom_ids(Id) AS ("
+    echo "    SELECT Id FROM BaseItems WHERE $PHANTOM_WHERE"
+    echo "    UNION"
+    echo "    SELECT b.Id FROM BaseItems b JOIN phantom_ids p ON b.ParentId=p.Id"
+    echo "  )"
+    echo "  SELECT Id FROM phantom_ids;"
     for entry in "${FK_TABLES[@]}" "${EXTRA_TABLES[@]}"; do
         tbl="${entry%%:*}"
         cols="${entry#*:}"

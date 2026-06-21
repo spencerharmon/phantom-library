@@ -88,6 +88,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   separation between series folders and episodes.
 - Post-materialise refresh failures now force a media-info cache invalidation
   fallback, so a second play cannot reuse the stale pre-materialise opener.
+- `scripts/phantom-wipe.sh` now removes Phantom Movies/Shows channel-cache
+  `BaseItems` by channel id, including child rows reached through Jellyfin's
+  `ParentId` hierarchy. Prior wipes only targeted path-owned stub/gostream
+  rows, so stale channel cache could survive and leave Jellyfin with hundreds
+  of thousands of obsolete Phantom episode rows.
 
 ### BREAKING — requires wipe + patched Jellyfin
 
