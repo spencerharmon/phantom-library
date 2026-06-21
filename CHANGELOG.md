@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Phantom DB retention remains deferred/no-op and is now labelled that way in the admin UI instead of presenting an active retention policy.
+- Legacy per-user preferences admin page/link is hidden until a real per-user preferences API is reintroduced.
 - BREAKING: requires wipe. Phantom DB schema is now v11 to split append-only
   TMDB catalogue discovery from source availability. Discovery no longer prunes
   rows simply because TMDB stops returning them, and channel visibility is gated
@@ -33,6 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fixed the admin settings "Enable availability probing" checkbox markup so
+  Jellyfin's `emby-checkbox` initializer can attach and the setting can be toggled.
+- Indexer probing now distinguishes successful empty 2xx source results from transient failures (transport errors, timeouts, 5xx, malformed upstream responses, and unavailable indexers), preventing transient Prowlarr/Torrentio outages from poisoning availability, unavailable markers, or magnet failure cache state.
+- Concurrent materialise/open requests for the same movie or episode now use an atomic in-flight claim, so only one request calls gostream and losers return already-in-progress without deleting the winner's in-flight row.
+- Phantom badge visibility settings are enforced server-side: `Off` returns no badge states, `HideForNonAdmins` hides badges from non-admin users, and `AlwaysShow` preserves existing badge behavior.
 - Discovery refresh now walks paginated TMDB Discover results up to
   `SuggestionsCatalogueMaxItems`, so Phantom Movies/Shows get thousands
   of catalogue rows instead of only the tiny weekly-trending surface.

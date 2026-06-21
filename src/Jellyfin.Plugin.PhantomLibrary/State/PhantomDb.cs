@@ -1739,7 +1739,7 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
 
     // ---- materialise_in_flight ----
 
-    public async Task UpsertMaterialiseInFlightAsync(int tmdbId, string type, int season, int episode, CancellationToken ct)
+    public async Task<bool> TryInsertMaterialiseInFlightAsync(int tmdbId, string type, int season, int episode, CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(type);
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
@@ -1747,22 +1747,25 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
         {
             await using var conn = await OpenAsync(ct).ConfigureAwait(false);
             await using var cmd = conn.CreateCommand();
-            cmd.CommandText = @"INSERT INTO materialise_in_flight
+            cmd.CommandText = @"INSERT OR IGNORE INTO materialise_in_flight
                 (tmdb_id, type, season, episode, started_at)
-                VALUES ($tmdb, $type, $season, $episode, $now)
-                ON CONFLICT(tmdb_id, type, season, episode) DO UPDATE SET
-                    started_at = excluded.started_at;";
+                VALUES ($tmdb, $type, $season, $episode, $now);";
             cmd.Parameters.AddWithValue("$tmdb", tmdbId);
             cmd.Parameters.AddWithValue("$type", type);
             cmd.Parameters.AddWithValue("$season", season);
             cmd.Parameters.AddWithValue("$episode", episode);
             cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
-            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) == 1;
         }
         finally
         {
             _writeLock.Release();
         }
+    }
+
+    public async Task UpsertMaterialiseInFlightAsync(int tmdbId, string type, int season, int episode, CancellationToken ct)
+    {
+        _ = await TryInsertMaterialiseInFlightAsync(tmdbId, type, season, episode, ct).ConfigureAwait(false);
     }
 
     public async Task DeleteMaterialiseInFlightAsync(int tmdbId, string type, int season, int episode, CancellationToken ct)

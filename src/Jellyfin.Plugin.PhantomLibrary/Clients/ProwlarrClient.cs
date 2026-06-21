@@ -107,12 +107,12 @@ public sealed class ProwlarrClient : IIndexerClient
         catch (HttpRequestException ex)
         {
             _logger.LogWarning(ex, "Prowlarr request failed (network)");
-            return Array.Empty<IndexerCandidate>();
+            throw new IndexerTransientException("Prowlarr transport failure", ex);
         }
         catch (TaskCanceledException ex) when (!ct.IsCancellationRequested)
         {
             _logger.LogWarning(ex, "Prowlarr request timed out");
-            return Array.Empty<IndexerCandidate>();
+            throw new IndexerTransientException("Prowlarr request timed out", ex);
         }
 
         try
@@ -123,21 +123,29 @@ public sealed class ProwlarrClient : IIndexerClient
                 throw new IndexerAuthException($"Prowlarr authentication failed ({status})");
             }
 
-            if (status >= 500)
-            {
-                _logger.LogWarning("Prowlarr returned {Status}; returning empty result", status);
-                return Array.Empty<IndexerCandidate>();
-            }
-
             if (!resp.IsSuccessStatusCode)
             {
-                _logger.LogWarning("Prowlarr returned {Status}; returning empty result", status);
-                return Array.Empty<IndexerCandidate>();
+                _logger.LogWarning("Prowlarr returned {Status}; treating indexer result as transient", status);
+                throw new IndexerTransientException($"Prowlarr returned HTTP {status}");
             }
 
-            var body = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-            var items = await JsonSerializer.DeserializeAsync<List<ProwlarrItemDto>>(body, JsonOpts, ct).ConfigureAwait(false)
-                ?? new List<ProwlarrItemDto>();
+            List<ProwlarrItemDto>? items;
+            try
+            {
+                var body = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+                items = await JsonSerializer.DeserializeAsync<List<ProwlarrItemDto>>(body, JsonOpts, ct).ConfigureAwait(false);
+            }
+            catch (JsonException ex)
+            {
+                _logger.LogWarning(ex, "Prowlarr returned malformed JSON");
+                throw new IndexerTransientException("Prowlarr returned malformed JSON", ex);
+            }
+
+            if (items is null)
+            {
+                throw new IndexerTransientException("Prowlarr returned malformed JSON: expected array");
+            }
+
             var results = new List<IndexerCandidate>(items.Count);
             foreach (var it in items)
             {

@@ -55,10 +55,26 @@ public class ProwlarrClientTests
     }
 
     [Fact]
-    public async Task Server_Error_Returns_Empty()
+    public async Task Server_Error_Throws_Transient()
     {
         var c = Make(new QueuedHandler().Enqueue(HttpStatusCode.BadGateway));
-        var r = await c.SearchAsync(new IndexerQuery { Type = "movie", Imdb = "tt1" }, CancellationToken.None);
-        Assert.Empty(r);
+        await Assert.ThrowsAsync<IndexerTransientException>(() =>
+            c.SearchAsync(new IndexerQuery { Type = "movie", Imdb = "tt1" }, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Transport_Error_Throws_Transient()
+    {
+        var c = Make(new QueuedHandler().EnqueueException(new HttpRequestException("network down")));
+        await Assert.ThrowsAsync<IndexerTransientException>(() =>
+            c.SearchAsync(new IndexerQuery { Type = "movie", Imdb = "tt1" }, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Malformed_Response_Throws_Transient()
+    {
+        var c = Make(new QueuedHandler().Enqueue(HttpStatusCode.OK, "{"));
+        await Assert.ThrowsAsync<IndexerTransientException>(() =>
+            c.SearchAsync(new IndexerQuery { Type = "movie", Imdb = "tt1" }, CancellationToken.None));
     }
 }

@@ -116,8 +116,9 @@
                             <input id="EvictionScheduleCron" name="EvictionScheduleCron" type="text" is="emby-input" />
                         </div>
                         <div class="inputContainer">
-                            <label class="inputLabel inputLabelUnfocused" for="PhantomRetentionDays">Phantom DB retention (days)</label>
-                            <input id="PhantomRetentionDays" name="PhantomRetentionDays" type="number" min="1" is="emby-input" />
+                            <label class="inputLabel inputLabelUnfocused" for="PhantomRetentionDays">Phantom DB retention days (deferred; currently no-op)</label>
+                            <input id="PhantomRetentionDays" name="PhantomRetentionDays" type="number" min="1" disabled="disabled" is="emby-input" />
+                            <div class="fieldDescription">Catalogue retention is not enforced in this build; rows remain append-only until a tested retention sweeper ships.</div>
                         </div>
                     </fieldset>
 
@@ -205,8 +206,11 @@
                             <input id="DiscoverPageDelayMilliseconds" name="DiscoverPageDelayMilliseconds" type="number" min="0" is="emby-input" />
                         </div>
                         <div class="checkboxContainer checkboxContainer-withDescription">
-                            <label><input id="AvailabilityProbeEnabled" name="AvailabilityProbeEnabled" type="checkbox" is="emby-checkbox" /> Enable availability probing</label>
-                            <div class="fieldDescription">Available phantoms are shown; unavailable/unprobed phantoms stay hidden. Materialised and real gostream files always stay visible.</div>
+                            <label>
+                                <input id="AvailabilityProbeEnabled" name="AvailabilityProbeEnabled" type="checkbox" is="emby-checkbox" />
+                                <span>Enable availability probing</span>
+                            </label>
+                            <div class="fieldDescription checkboxFieldDescription">Available phantoms are shown; unavailable/unprobed phantoms stay hidden. Materialised and real gostream files always stay visible.</div>
                         </div>
                         <div class="inputContainer">
                             <label class="inputLabel inputLabelUnfocused" for="AvailabilityProbeMinIntervalSeconds">Availability probe min interval seconds (catch-up)</label>
@@ -233,16 +237,6 @@
                                 <span>Refresh suggestions now</span>
                             </button>
                             <div id="PhantomLibraryRefreshSuggestionsResult" class="fieldDescription"></div>
-                        </div>
-                    </fieldset>
-
-                    <fieldset class="verticalSection">
-                        <legend>Per-user preferences</legend>
-                        <div>
-                            <a is="emby-linkbutton" class="raised block"
-                               href="configurationpage?name=Phantom%20Library%20%E2%80%94%20User%20Prefs">
-                                <span>Manage per-user preferences →</span>
-                            </a>
                         </div>
                     </fieldset>
 
@@ -327,7 +321,8 @@
                             cfg.EvictionEnabled = document.querySelector('#EvictionEnabled').checked;
                             cfg.EvictionIdleDays = parseInt(document.querySelector('#EvictionIdleDays').value, 10);
                             cfg.EvictionScheduleCron = document.querySelector('#EvictionScheduleCron').value;
-                            cfg.PhantomRetentionDays = parseInt(document.querySelector('#PhantomRetentionDays').value, 10);
+                            // PhantomRetentionDays remains config-backed for compatibility, but retention is deferred/no-op.
+                            // Keep existing value instead of saving a disabled input as an accidental destructive-policy signal.
                             cfg.MaterialisationConcurrencyGlobal = parseInt(document.querySelector('#MaterialisationConcurrencyGlobal').value, 10);
                             cfg.MaterialisationConcurrencyPerIndexer = parseInt(document.querySelector('#MaterialisationConcurrencyPerIndexer').value, 10);
                             cfg.EagerResolveEnabled = document.querySelector('#EagerResolveEnabled').checked;

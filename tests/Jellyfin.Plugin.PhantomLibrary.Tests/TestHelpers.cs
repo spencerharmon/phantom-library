@@ -42,6 +42,12 @@ internal sealed class QueuedHandler : HttpMessageHandler
         return this;
     }
 
+    public QueuedHandler EnqueueException(Exception exception)
+    {
+        _responses.Enqueue(_ => throw exception);
+        return this;
+    }
+
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
         Requests.Add(request);

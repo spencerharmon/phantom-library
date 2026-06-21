@@ -290,6 +290,31 @@ public class PhantomDbTests : IDisposable
     }
 
     [Fact]
+    public async Task MaterialiseInFlight_TryInsert_IsAtomicClaim()
+    {
+        using var db = await NewDbAsync();
+
+        var first = await db.TryInsertMaterialiseInFlightAsync(42, "movie", -1, -1, CancellationToken.None);
+        var second = await db.TryInsertMaterialiseInFlightAsync(42, "movie", -1, -1, CancellationToken.None);
+
+        Assert.True(first);
+        Assert.False(second);
+        Assert.True(await db.IsMaterialiseInFlightAsync(42, "movie", -1, -1, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task MaterialiseInFlight_ConcurrentTryInsert_OnlyOneWins()
+    {
+        using var db = await NewDbAsync();
+
+        var claims = await Task.WhenAll(Enumerable.Range(0, 8).Select(_ =>
+            db.TryInsertMaterialiseInFlightAsync(42, "movie", -1, -1, CancellationToken.None)));
+
+        Assert.Equal(1, claims.Count(x => x));
+        Assert.Equal(7, claims.Count(x => !x));
+    }
+
+    [Fact]
     public async Task MaterialiseInFlight_PurgeStale_RemovesOldRows_KeepsFresh()
     {
         using var db = await NewDbAsync();

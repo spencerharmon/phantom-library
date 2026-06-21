@@ -51,14 +51,15 @@ public class MaterialiserTests : IDisposable
         return db;
     }
 
-    private (Materialiser sut, Mock<IGostreamClient> gostream, Mock<IChannelItemRefreshManager> refresh, FakeIndexer indexer, PhantomDb db, PluginConfiguration cfg) BuildSut(
+    private (Materialiser sut, Mock<IGostreamClient> gostream, Mock<IChannelItemRefreshManager> refresh, IIndexerClient indexer, PhantomDb db, PluginConfiguration cfg) BuildSut(
         PhantomDb db,
         string? imdb = "tt0000042",
         string? fusePath = null,
         Action<Mock<IGostreamClient>>? gostreamSetup = null,
         MagnetCandidate? magnet = null,
         bool magnetReturnsNull = false,
-        MagnetCandidate[]? magnets = null)
+        MagnetCandidate[]? magnets = null,
+        Exception? indexerException = null)
     {
         fusePath ??= Path.Combine(_fuseMount, "movie.mkv");
         File.WriteAllText(fusePath, "x"); // pre-create so WaitForFusePathAsync returns immediately
@@ -85,9 +86,11 @@ public class MaterialiserTests : IDisposable
                 It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<ChannelItemRefreshOptions>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
-        var indexer = magnetReturnsNull
-            ? new FakeIndexer(Array.Empty<MagnetCandidate>())
-            : new FakeIndexer(magnets ?? new[] { magnet ?? new MagnetCandidate("magnet:?xt=urn:btih:DEAD", "DEAD", 5L * 1024 * 1024 * 1024, 50, "test") });
+        IIndexerClient indexer = indexerException is not null
+            ? new ThrowingIndexer(indexerException)
+            : magnetReturnsNull
+                ? new FakeIndexer(Array.Empty<MagnetCandidate>())
+                : new FakeIndexer(magnets ?? new[] { magnet ?? new MagnetCandidate("magnet:?xt=urn:btih:DEAD", "DEAD", 5L * 1024 * 1024 * 1024, 50, "test") });
         var scorer = new QualityScorer(NullLogger<QualityScorer>.Instance);
         var cfg = new PluginConfiguration
         {
@@ -148,6 +151,16 @@ public class MaterialiserTests : IDisposable
             () => cfg);
 
         return (sut, gostream, refresh, indexer, db, cfg);
+    }
+
+    private sealed class ThrowingIndexer : IIndexerClient
+    {
+        private readonly Exception _exception;
+        public ThrowingIndexer(Exception exception) { _exception = exception; }
+        public string Name => "throwing";
+        public bool IsEnabled => true;
+        public Task<System.Collections.Generic.IReadOnlyList<IndexerCandidate>> SearchAsync(IndexerQuery query, CancellationToken ct)
+            => Task.FromException<System.Collections.Generic.IReadOnlyList<IndexerCandidate>>(_exception);
     }
 
     private sealed class FakeIndexer : IIndexerClient
@@ -287,7 +300,60 @@ public class MaterialiserTests : IDisposable
         gostream.Verify(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
+    [Fact]
+    public async Task ConcurrentMaterialise_SameTuple_OnlyOneGostreamAdd()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieMetadataAsync(db, 60);
+        var fuse = Path.Combine(_fuseMount, "concurrent.mkv");
+        File.WriteAllText(fuse, "x");
+        var addEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseAdd = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var addCalls = 0;
+        var (sut, gostream, _, _, _, _) = BuildSut(db, fusePath: fuse, gostreamSetup: g =>
+            g.Setup(x => x.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()))
+                .Returns(async () =>
+                {
+                    Interlocked.Increment(ref addCalls);
+                    addEntered.TrySetResult();
+                    await releaseAdd.Task;
+                    return new GostreamAddResult
+                    {
+                        StubPath = "/var/gostream/stubs/concurrent.mkv",
+                        FusePath = fuse,
+                        Hash = "abc",
+                        Size = 100,
+                    };
+                }));
+
+        var first = sut.MaterialiseAsync(60, "movie", null, null, MaterialiseTrigger.Play, CancellationToken.None);
+        await addEntered.Task;
+        var second = sut.MaterialiseAsync(60, "movie", null, null, MaterialiseTrigger.Play, CancellationToken.None);
+        releaseAdd.SetResult();
+
+        var outcomes = await Task.WhenAll(first, second);
+
+        Assert.Contains(outcomes, o => o.Status == MaterialisationStatus.Success);
+        Assert.Contains(outcomes, o => o.Status == MaterialisationStatus.AlreadyInProgress);
+        Assert.Equal(1, addCalls);
+        gostream.Verify(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
     // ---- failure paths ----
+
+    [Fact]
+    public async Task TransientIndexerFailure_DoesNotWriteUnavailableMarker()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieMetadataAsync(db, 90);
+        var (sut, gostream, _, _, _, _) = BuildSut(db, indexerException: new IndexerTransientException("timeout"));
+
+        var outcome = await sut.MaterialiseAsync(90, "movie", null, null, MaterialiseTrigger.Manual, CancellationToken.None);
+
+        Assert.Equal(MaterialisationStatus.Error, outcome.Status);
+        Assert.Null(await db.IsMarkedUnavailableAsync(new UnavailableKey(90, "tt0000042", "movie", null, null), CancellationToken.None));
+        gostream.Verify(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
 
     [Fact]
     public async Task GostreamFails_NoMaterialisedRow_InFlightCleanedUp_ErrorReturned()

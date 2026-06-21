@@ -200,59 +200,55 @@ public sealed class Materialiser : IMaterialiser
                 .ConfigureAwait(false);
         }
 
-        if (await _db.IsMaterialiseInFlightAsync(tmdbId, type, sSentinel, eSentinel, ct)
-                .ConfigureAwait(false))
+        var claimed = await _db.TryInsertMaterialiseInFlightAsync(tmdbId, type, sSentinel, eSentinel, ct)
+            .ConfigureAwait(false);
+        if (!claimed)
         {
             return MaterialisationOutcome.AlreadyInProgress;
         }
 
-        // Resolve IMDB. Movies use their own (optional for some indexers);
-        // episodes use the parent SERIES IMDB (gostream requires it).
-        var imdbLookupType = type == "episode" ? "series" : "movie";
-        var imdb = await _externalIds.GetImdbIdAsync(tmdbId, imdbLookupType, ct)
-            .ConfigureAwait(false);
-
-        if (type == "episode" && string.IsNullOrEmpty(imdb))
-        {
-            return MaterialisationOutcome.ErrorResult(
-                $"Could not resolve IMDB id for series tmdb={tmdbId}; gostream requires series_imdb for episodes");
-        }
-
-        // Unavailable-marker gate. The DB helper uses BindKey which
-        // collapses nullable season/episode (NULL → 0); we match by
-        // passing nullable variants through verbatim so a movie's key
-        // (null, null, ...) and an episode's key (1, 2, ...) compare
-        // correctly against marker rows that were written via the same
-        // helper.
-        var unavailKey = new UnavailableKey(
-            TmdbId: tmdbId,
-            ImdbId: imdb,
-            Type: type,
-            Season: season,
-            Episode: episode);
-        var marker = await _db.IsMarkedUnavailableAsync(unavailKey, ct).ConfigureAwait(false);
-        if (marker.HasValue)
-        {
-            return MaterialisationOutcome.ErrorResult(
-                $"Marked unavailable until {marker.Value:O}; skipping {type}/{tmdbId} s{season} e{episode}");
-        }
-
-        var channelKind = type == "movie" ? ChannelStateProvider.KindMovies : ChannelStateProvider.KindShows;
-        var channelId = ChannelIds.For(channelKind);
-        var externalId = type == "movie"
-            ? ChannelItemId.ForMovie(tmdbId).Encode()
-            : ChannelItemId.ForEpisode(tmdbId, season!.Value, episode!.Value).Encode();
-
-        LifecycleChanged?.Invoke(this, new MaterialisationLifecycleEvent(
-            Guid.Empty, MaterialisationLifecyclePhase.Started, null));
-
-        // BLOCKER 2 fix: the in-flight write + pre-flight refresh sit
-        // inside the try/finally so a throw from either still deletes
-        // the in-flight row.
-        await _db.UpsertMaterialiseInFlightAsync(tmdbId, type, sSentinel, eSentinel, ct)
-            .ConfigureAwait(false);
         try
         {
+            // Resolve IMDB. Movies use their own (optional for some indexers);
+            // episodes use the parent SERIES IMDB (gostream requires it).
+            var imdbLookupType = type == "episode" ? "series" : "movie";
+            var imdb = await _externalIds.GetImdbIdAsync(tmdbId, imdbLookupType, ct)
+                .ConfigureAwait(false);
+
+            if (type == "episode" && string.IsNullOrEmpty(imdb))
+            {
+                return MaterialisationOutcome.ErrorResult(
+                    $"Could not resolve IMDB id for series tmdb={tmdbId}; gostream requires series_imdb for episodes");
+            }
+
+            // Unavailable-marker gate. The DB helper uses BindKey which
+            // collapses nullable season/episode (NULL → 0); we match by
+            // passing nullable variants through verbatim so a movie's key
+            // (null, null, ...) and an episode's key (1, 2, ...) compare
+            // correctly against marker rows that were written via the same
+            // helper.
+            var unavailKey = new UnavailableKey(
+                TmdbId: tmdbId,
+                ImdbId: imdb,
+                Type: type,
+                Season: season,
+                Episode: episode);
+            var marker = await _db.IsMarkedUnavailableAsync(unavailKey, ct).ConfigureAwait(false);
+            if (marker.HasValue)
+            {
+                return MaterialisationOutcome.ErrorResult(
+                    $"Marked unavailable until {marker.Value:O}; skipping {type}/{tmdbId} s{season} e{episode}");
+            }
+
+            var channelKind = type == "movie" ? ChannelStateProvider.KindMovies : ChannelStateProvider.KindShows;
+            var channelId = ChannelIds.For(channelKind);
+            var externalId = type == "movie"
+                ? ChannelItemId.ForMovie(tmdbId).Encode()
+                : ChannelItemId.ForEpisode(tmdbId, season!.Value, episode!.Value).Encode();
+
+            LifecycleChanged?.Invoke(this, new MaterialisationLifecycleEvent(
+                Guid.Empty, MaterialisationLifecyclePhase.Started, null));
+
             _state.BumpDataVersion(channelKind);
 
             try

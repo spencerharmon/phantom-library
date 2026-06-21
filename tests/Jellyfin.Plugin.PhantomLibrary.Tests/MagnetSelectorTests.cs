@@ -136,6 +136,99 @@ public class MagnetSelectorTests
     }
 
     [Fact]
+    public async Task AllEnabledIndexersTransient_ReturnsIndeterminateTransient()
+    {
+        var ix1 = new Mock<IIndexerClient>(MockBehavior.Strict);
+        ix1.SetupGet(i => i.IsEnabled).Returns(true);
+        ix1.SetupGet(i => i.Name).Returns("ix1");
+        ix1.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new IndexerTransientException("timeout"));
+
+        var ix2 = new Mock<IIndexerClient>(MockBehavior.Strict);
+        ix2.SetupGet(i => i.IsEnabled).Returns(true);
+        ix2.SetupGet(i => i.Name).Returns("ix2");
+        ix2.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new IndexerTransientException("bad gateway"));
+
+        var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
+        var sel = new MagnetSelector(new[] { ix1.Object, ix2.Object }, scorer, NullLogger<MagnetSelector>.Instance, TestConfig);
+
+        var probe = await sel.ProbeAsync(1, "tt1", "movie", null, null, "Movie", 2020, CancellationToken.None);
+
+        Assert.Equal(MagnetProbeOutcome.IndeterminateTransient, probe.Outcome);
+    }
+
+    [Fact]
+    public async Task OneEmptyOneTransientNoCandidates_ReturnsIndeterminateTransient()
+    {
+        var empty = new Mock<IIndexerClient>(MockBehavior.Strict);
+        empty.SetupGet(i => i.IsEnabled).Returns(true);
+        empty.SetupGet(i => i.Name).Returns("empty");
+        empty.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Array.Empty<IndexerCandidate>());
+
+        var timeout = new Mock<IIndexerClient>(MockBehavior.Strict);
+        timeout.SetupGet(i => i.IsEnabled).Returns(true);
+        timeout.SetupGet(i => i.Name).Returns("timeout");
+        timeout.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new IndexerTransientException("timeout"));
+
+        var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
+        var sel = new MagnetSelector(new[] { empty.Object, timeout.Object }, scorer, NullLogger<MagnetSelector>.Instance, TestConfig);
+
+        var probe = await sel.ProbeAsync(1, "tt1", "movie", null, null, "Movie", 2020, CancellationToken.None);
+
+        Assert.Equal(MagnetProbeOutcome.IndeterminateTransient, probe.Outcome);
+    }
+
+    [Fact]
+    public async Task AllEnabledIndexersEmpty_ReturnsDefinitiveUnavailable()
+    {
+        var ix1 = new Mock<IIndexerClient>(MockBehavior.Strict);
+        ix1.SetupGet(i => i.IsEnabled).Returns(true);
+        ix1.SetupGet(i => i.Name).Returns("ix1");
+        ix1.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Array.Empty<IndexerCandidate>());
+
+        var ix2 = new Mock<IIndexerClient>(MockBehavior.Strict);
+        ix2.SetupGet(i => i.IsEnabled).Returns(true);
+        ix2.SetupGet(i => i.Name).Returns("ix2");
+        ix2.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Array.Empty<IndexerCandidate>());
+
+        var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
+        var sel = new MagnetSelector(new[] { ix1.Object, ix2.Object }, scorer, NullLogger<MagnetSelector>.Instance, TestConfig);
+
+        var probe = await sel.ProbeAsync(1, "tt1", "movie", null, null, "Movie", 2020, CancellationToken.None);
+
+        Assert.Equal(MagnetProbeOutcome.DefinitiveUnavailable, probe.Outcome);
+    }
+
+    [Fact]
+    public async Task OneCandidateOneTransient_UsesCandidate()
+    {
+        var candidate = new Mock<IIndexerClient>(MockBehavior.Strict);
+        candidate.SetupGet(i => i.IsEnabled).Returns(true);
+        candidate.SetupGet(i => i.Name).Returns("candidate");
+        candidate.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { MakeCandidate("Movie 1080p", 5, 10) });
+
+        var timeout = new Mock<IIndexerClient>(MockBehavior.Strict);
+        timeout.SetupGet(i => i.IsEnabled).Returns(true);
+        timeout.SetupGet(i => i.Name).Returns("timeout");
+        timeout.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new IndexerTransientException("timeout"));
+
+        var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
+        var sel = new MagnetSelector(new[] { candidate.Object, timeout.Object }, scorer, NullLogger<MagnetSelector>.Instance, TestConfig);
+
+        var probe = await sel.ProbeAsync(1, "tt1", "movie", null, null, "Movie", 2020, CancellationToken.None);
+
+        Assert.Equal(MagnetProbeOutcome.Available, probe.Outcome);
+        Assert.Single(probe.Candidates);
+    }
+
+    [Fact]
     public async Task EpisodeQuery_PassesSeriesImdb()
     {
         IndexerQuery? captured = null;

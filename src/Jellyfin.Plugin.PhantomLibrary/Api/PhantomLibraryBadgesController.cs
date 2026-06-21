@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Channels;
+using Jellyfin.Plugin.PhantomLibrary.Configuration;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Entities;
@@ -47,15 +49,28 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
 {
     private readonly ILibraryManager _libraryManager;
     private readonly PhantomDb _db;
+    private readonly IUserManager _userManager;
+    private readonly Func<PluginConfiguration> _configProvider;
 
     public const string StatePhantom = "Phantom";
     public const string StateMaterialising = "Materialising";
     public const string StateMaterialised = "Materialised";
 
-    public PhantomLibraryBadgesController(ILibraryManager libraryManager, PhantomDb db)
+    public PhantomLibraryBadgesController(ILibraryManager libraryManager, PhantomDb db, IUserManager userManager)
+        : this(libraryManager, db, userManager, () => Plugin.Instance?.Configuration ?? new PluginConfiguration())
+    {
+    }
+
+    internal PhantomLibraryBadgesController(
+        ILibraryManager libraryManager,
+        PhantomDb db,
+        IUserManager userManager,
+        Func<PluginConfiguration> configProvider)
     {
         _libraryManager = libraryManager ?? throw new ArgumentNullException(nameof(libraryManager));
         _db = db ?? throw new ArgumentNullException(nameof(db));
+        _userManager = userManager ?? throw new ArgumentNullException(nameof(userManager));
+        _configProvider = configProvider ?? throw new ArgumentNullException(nameof(configProvider));
     }
 
     /// <summary>
@@ -67,6 +82,13 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
     {
         var result = new Dictionary<string, string>(StringComparer.Ordinal);
         if (request?.Ids is null || request.Ids.Count == 0)
+        {
+            return Ok(result);
+        }
+
+        var visibility = _configProvider().PhantomBadgeVisibility;
+        if (visibility == PhantomBadgeVisibility.Off
+            || (visibility == PhantomBadgeVisibility.HideForNonAdmins && !IsRequestAdmin()))
         {
             return Ok(result);
         }
@@ -162,6 +184,46 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
         }
 
         return Ok(result);
+    }
+
+    private bool IsRequestAdmin()
+    {
+        var userIdClaim = User?.Claims.FirstOrDefault(c => string.Equals(c.Type, "Jellyfin-UserId", StringComparison.OrdinalIgnoreCase))?.Value;
+        if (string.IsNullOrWhiteSpace(userIdClaim) || !Guid.TryParse(userIdClaim, out var userId))
+        {
+            return false;
+        }
+
+        var user = _userManager.GetUserById(userId);
+        if (user is null)
+        {
+            return false;
+        }
+
+        var permissionsProperty = user.GetType().GetProperty("Permissions", BindingFlags.Instance | BindingFlags.Public);
+        if (permissionsProperty?.GetValue(user) is not System.Collections.IEnumerable permissions)
+        {
+            return false;
+        }
+
+        foreach (var permission in permissions)
+        {
+            if (permission is null)
+            {
+                continue;
+            }
+
+            var kind = permission.GetType().GetProperty("Kind", BindingFlags.Instance | BindingFlags.Public)?.GetValue(permission)?.ToString();
+            var value = permission.GetType().GetProperty("Value", BindingFlags.Instance | BindingFlags.Public)?.GetValue(permission);
+            if (string.Equals(kind, "IsAdministrator", StringComparison.OrdinalIgnoreCase)
+                && value is bool isAdmin
+                && isAdmin)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static bool IsRealGostreamChannelItem(BaseItem? item)

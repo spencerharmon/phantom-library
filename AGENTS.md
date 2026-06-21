@@ -264,6 +264,10 @@ against a clone before handing it to the operator.
 **The rule: test against a clone, validate the schema, then ship.
 Never the other order.**
 
+## Main worktree cleanliness (always, no exceptions)
+
+Do not leave `/home/spencer/git-repos/spencerharmon/phantom-library` dirty at the end of a task. If work is complete enough to build/test, commit it before handing off or switching tasks. If work must remain incomplete, move it to a dedicated worktree or create a WIP commit with an explicit message and status note; do not strand uncommitted edits in main. Never rely on a chat session staying alive to preserve ownership of dirty state.
+
 ## Operator hand-off rule (always)
 
 When finishing a change the operator will install or test, **always

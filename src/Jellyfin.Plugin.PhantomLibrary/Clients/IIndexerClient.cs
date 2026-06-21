@@ -46,6 +46,14 @@ public sealed class IndexerAuthException : Exception
     public IndexerAuthException(string message, Exception inner) : base(message, inner) { }
 }
 
+/// <summary>Transient or indeterminate indexer failure; callers must not treat it as a definitive empty result.</summary>
+public sealed class IndexerTransientException : Exception
+{
+    public IndexerTransientException() { }
+    public IndexerTransientException(string message) : base(message) { }
+    public IndexerTransientException(string message, Exception inner) : base(message, inner) { }
+}
+
 /// <summary>Helpers for building magnet URIs and parsing info-hashes.</summary>
 public static class MagnetUtils
 {

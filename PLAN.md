@@ -1,11 +1,12 @@
 # Phantom Library — Implementation Plan
 
 A Jellyfin plugin that makes the entire TMDB catalogue appear to exist inside a
-Jellyfin library. Titles materialise on demand: a user favourites or plays an
-item, the plugin asks [gostream](https://github.com/MrRobotoGit/gostream) to
+Jellyfin library. Titles materialise on demand: a user plays an available
+item or triggers a manual materialise action, and the plugin asks [gostream](https://github.com/MrRobotoGit/gostream) to
 register the matching torrent and writes a virtual `.mkv` stub into gostream's
 physical source directory. gostream's FUSE layer turns that stub into a
-seekable file that Jellyfin can scan and stream from.
+seekable file that Jellyfin can stream from. Phantom Library does not write
+raw gostream stubs itself; gostream owns stub/FUSE creation via its API.
 
 Mascot: *Stygiomedusa gigantea*, the giant phantom jelly.
 
@@ -24,7 +25,7 @@ Mascot: *Stygiomedusa gigantea*, the giant phantom jelly.
 
 ---
 
-## Status (as of 2026-06-04)
+## Status (as of 2026-06-19)
 
 | Milestone | Status | Commit |
 |---|---|---|
@@ -43,31 +44,31 @@ Mascot: *Stygiomedusa gigantea*, the giant phantom jelly.
 | M12 — Dedupe-gap heal-on-rediscovery           | ✅ | (unreleased) |
 | M13 — Per-series subdir stub layout for TV phantoms | ✅ | (unreleased) |
 | Spike — Jellyfin-native `[tmdbid-<id>]` stub layout | ✅ | merged into main as `a931379` (file-on-disk architecture; deployed to operator v0.2.0.0; **slated for replacement by M14**) |
-| M14 — IChannel migration + Jellyfin patch | 🚧 EXECUTION-READY, awaiting operator sign-off to begin | plan at `docs/plans/channel-handoff.md`; onboarding at `docs/plans/channel-handoff-onboarding.md` |
+| M14 — IChannel migration + Jellyfin patch | 🚧 IN FLIGHT on main | Channel architecture implemented behind schema v11; remaining work is hardening, operator validation, and cleanup of stale design docs. |
 
 ### Documented partials
 
 - **Custom `QualityPreset` falls back to `GostreamDefault`** with a
   warning log (M4 decision). Revisit when a real custom-scoring use
   case appears.
-- **Per-user preferences via admin sub-page form** rather than
-  native Jellyfin user-prefs integration (M7). Functional; native
-  integration is v0.2 polish.
+- **Per-user preferences are deferred under M14.** Earlier admin sub-page
+  wiring was removed from the active API surface; current favourite
+  protection and availability probing are server-wide settings.
 - **Series-level `Materialise` returns `Error`** (M8). Correct
   behaviour: a Series is a container, not a streamable file.
   Materialise individual Episodes (the autopilot does this for the
   next unwatched episode automatically).
-- **Splash overlay is static pixels** (M5). Per-item status is
-  surfaced via Jellyfin's native overview-text prefix rendered by
-  the client UI, not burnt into the splash video.
-- **M10 binder vs. Jellyfin metadata-saver race.** The CollectionFolder
+- **Splash overlay is static pixels** (M5, historical). M14 native-open
+  playback supersedes splash-as-playback UX; splash assets remain only as
+  legacy/support assets.
+- **M10 binder vs. Jellyfin metadata-saver race (pre-M14 historical).** The CollectionFolder
   binder's `UpdateItemAsync` can race with Jellyfin's
   `FolderMetadataService.RunMetadataSavers` pipeline (in particular
   the `BaseDynamicImageProvider` that fires during folder metadata
   refresh), and the latter can save a stale snapshot AFTER ours
   that reverts `PhysicalLocationsList` / `PhysicalFolderIds` back
-  to the pre-bind state. **Mitigation (in place since
-  `9578a2a`):** the binder verifies persistence via
+  to the pre-bind state. **Pre-M14 mitigation (removed by the M14 IChannel
+  architecture):** the binder verifies persistence via
   `ILibraryManager.RetrieveItem` (the repository read, not the
   in-memory cache) and re-applies the patch up to 30 times across
   ~30 s; if persistence is still lost, an `ItemUpdated` event
@@ -130,21 +131,18 @@ contributors can see the rationale.
     (one bounded blocking call, no indefinite waits) and matches
     gostream's existing sync-engine behaviour.
 
-1. **Quality selection.** Configurable in plugin settings, defaulting to
-   gostream's behaviour (the rules from `internal/syncer/quality/scorer.go`:
-   4K DV > 4K HDR10+ > 4K HDR > 4K > 1080p REMUX > 1080p, with the same
-   seeder and size floors). A simpler preset ("biggest `.mkv`, most
-   seeders") and per-user / per-library overrides are surfaced through the
-   admin config page.
-2. **Indexer source.** Prowlarr is the primary indexer; Torrentio is the
-   fallback. Mirrors gostream's own pattern. If Prowlarr is not configured,
-   Torrentio is used directly.
-3. **TV series scope.** Series support is an MVP requirement, not v0.2. A
-   movies-only PoC is acceptable as an intermediate step but the v0.1
-   release must include series. The plugin proactively materialises (and,
-   where the Vault Mode patch is available, pre-warms) **next episodes**
-   of any series a user is actively watching and **direct sequels** of
-   movies a user has favourited or finished.
+1. **Quality selection.** Configurable in plugin settings. Current M14
+   default is `ResolutionSeeders` (preferred 1080p/fallback order plus seeder
+   weight), with `GostreamDefault` and `BiggestMostSeeded` presets available.
+   Per-user/per-library overrides remain deferred.
+2. **Indexer source.** Prowlarr and Torrentio are both registered indexer
+   sources. Current M14 probes every enabled source, aggregates candidates,
+   and ranks them together; Torrentio is not merely a fallback once Prowlarr
+   returns results.
+3. **TV series scope.** Series support is an MVP requirement. Current M14
+   channel flow supports series → season → episode browse, episode
+   materialise-on-play, and next-episode autopilot after completed playback.
+   Movie sequel autopilot and favourite-triggered prewarming are deferred.
 4. **Library scope and metadata ownership.** The plugin's library and the
    play / favourite system are explicitly decoupled. Virtual items appear
    inline with materialised items in normal Jellyfin views; users do not
@@ -158,32 +156,25 @@ contributors can see the rationale.
      interactions in the plugin.
    - **Layer 2**: gostream's normal pull-bytes-on-demand FUSE behaviour.
 5. **Eviction policy.** Default: evict Materialised items after **7 days**
-   without playback. Configurable through the admin config page. Favourite
-   items have a per-user-configurable toggle, **"Protect favourites from
-   eviction"** (default on). When on, a favourited item is exempt from the
-   timer. When the user un-favourites it, it re-enters the normal eviction
-   schedule on the next garbage-collection round (and is evicted
-   immediately if already past the timeout). Phantom items that never
-   reach Virtual within the deadline are also evicted (see additional
-   design notes below).
-6. **Unavailable titles.** Surface as Virtual with an explicit
-   "unavailable" badge in the UI. No silent hiding, no play-time-only
-   failure.
-7. **Play-press UX.** For Virtual items that have not yet been
-   materialised, the play button is a **fake button** owned by the plugin
-   (a custom `MediaSource` / playback-info shim that returns a Phantom
-   Library status page or short looping animated splash instead of a real
-   stream). It shows the phantom-jelly mascot and rotating playful status
-   messages ("Reticulating splines…", facts about *Stygiomedusa
-   gigantea*, materialisation step labels). As soon as the underlying
-   `Materialiser` finishes, the overlay hands off to Jellyfin's real play
-   button; the user can then press play normally and gostream + Jellyfin
-   take it from there. No 30-second-Jellyfin-timeout risk because the
-   plugin never claims a real `MediaSource` until the FUSE file is ready.
-8. **Gostream integration.** The plugin talks to gostream exclusively
-   through the new `POST /api/library/add` endpoint (the "primary patch"
-   below). No raw stub writes, no dependency on the JSON stub format, no
-   four-step orchestration.
+   without playback. Configurable through the admin config page. Current M14
+   favourite protection is server-wide (`ProtectFavourites`), not per-user.
+   Phantom/catalogue retention is configured but not enforced in M14; catalogue
+   rows are append-only until a retention sweeper is implemented.
+6. **Unavailable titles.** ⚠ Superseded by M14 availability-gated channels.
+   Pre-M14 design surfaced unavailable items with an explicit badge. Current
+   M14 behavior hides unmaterialised items whose `availability_items.status`
+   is `unavailable`; unavailable-badge surfacing is deferred until a deliberate
+   diagnostics/source-management UI exists.
+7. **Play-press UX.** ⚠ Superseded by M14 native-open playback. Earlier
+   milestones used a fake splash media source. Current M14 emits Jellyfin
+   native `RequiresOpening` media sources for unmaterialised channel items;
+   `OpenMediaSource` materialises, waits for FUSE readiness, then returns the
+   real source to the client.
+8. **Gostream integration.** The plugin talks to gostream through patched
+   library-control endpoints: materialisation uses `POST /api/library/add`,
+   eviction uses `POST /api/library/remove`, and Vault Mode/prestage endpoints
+   are optional/deferred. No raw stub writes, no dependency on the JSON stub
+   format, no four-step orchestration.
 9. **Auth between plugin and gostream.** Punt. Plugin and gostream are
    assumed reachable on a trusted network (loopback for the common
    single-host case, private LAN otherwise). README documents this; a
@@ -203,49 +194,56 @@ These refine the lifecycle model and shape several milestones.
   will not be re-considered for materialisation unless TMDB / a
   suggestions surface re-introduces it. This prevents Phantom DB bloat
   from one-time browsing.
-- **Eager indexer resolution (parallel pre-resolve).** As soon as a
-  Phantom item is observed (e.g. surfaced in Suggestions, returned by
-  search, mentioned as a "Similar to" of something the user is
-  interacting with), the plugin enqueues a *background* indexer query
-  against Prowlarr (with Torrentio fallback) keyed by the item's
-  IMDB / TMDB ID. The chosen candidate magnet is cached in `magnet_cache`.
-  When the user later presses play or favourites, the materialiser hits
-  the cached candidate and skips straight to the gostream API call,
-  cutting perceived latency by the indexer round-trip (typically 2–10 s
-  for Prowlarr, more for Torrentio). Concurrency caps and per-indexer
-  rate-limiting from `MaterialisationQueue` apply; pre-resolve is
-  deprioritised relative to user-triggered materialisations.
+- **Availability-gated discovery + scheduled source probing.** TMDB
+  discovery now feeds an append-only local catalogue (`catalogue_items`,
+  plus `series_episode_catalogue` for episodes). Catalogue membership
+  alone does **not** make an unmaterialised item visible. A bounded
+  background availability scheduler leases due rows from
+  `availability_items`, resolves IMDb as needed, probes Prowlarr/Torrentio
+  through `MagnetSelector`, stores the best ranked candidate in
+  `magnet_cache`, and marks the row `available`, `unavailable`, or
+  transiently deferred. The worker uses configurable catch-up/steady-state
+  cadences and TTLs in plugin settings (`AvailabilityProbe*` fields);
+  this replaces the old eager pre-resolve model where every discovered
+  phantom immediately cached one chosen magnet. Materialised items and
+  already-real gostream files stay visible regardless of availability
+  state.
 - **Two-layer lazy loading is the architectural identity.** Layer 1 is
   Phantom → Virtual → Materialised inside the plugin. Layer 2 is
   gostream's normal FUSE-on-demand byte serving. Documentation, UI copy,
   and the README all lean on this framing.
-- **Deferred feature: manual torrent picker.** A future capability that
-  lets a user view candidate torrents from multiple indexers for a
-  Virtual item and pick one explicitly (rather than relying on the
-  quality scorer). Useful when the user wants a specific release group,
-  audio track, or smaller / larger file size than the default. Tracked
-  below in the Deferred Features section; not part of v0.1.
+- **Deferred feature: manual torrent picker / source rejection.** A future
+  capability that lets a user view ranked candidate torrents from multiple
+  indexers for a Virtual/Materialised item, reject the current candidate,
+  and optionally pick a replacement explicitly (rather than relying only on
+  the quality scorer). Useful when the user wants a specific release group,
+  audio track, or smaller / larger file size than the default. The current
+  backend now has candidate-level failure caching (`magnet_failure_cache`)
+  and ranked candidate probing, which are prerequisites for this UI, but
+  no operator-facing picker/reject endpoint is part of the current slice.
 
 ---
 
 ## Goals
 
-- A Jellyfin user opens search, types a title, the plugin returns TMDB
-  results that are not yet in the library. The user picks one; the plugin
-  registers it as a Virtual library item with full TMDB metadata.
-- The user presses ❤️ on any Virtual item. The plugin resolves the best
-  available torrent, calls gostream to register it, writes the `.mkv` stub,
-  triggers a targeted library refresh. Within seconds the item is
-  Materialised: it has a real FUSE-backed path and is playable from any
-  Jellyfin client.
-- The user presses ▶️ on a Virtual item that has not yet been materialised.
-  The plugin attempts synchronous materialisation within Jellyfin's
-  PlaybackInfo budget. If it succeeds the stream starts; if it would exceed
-  the budget, a friendly message is returned and a background
-  materialisation is enqueued so the second press works.
-- "Recommended for you", "Similar to X", and "Trending" surfaces in Jellyfin
-  are populated by Virtual items pulled from TMDB, so housemates discover
-  content without leaving Jellyfin.
+- A Jellyfin user opens a Phantom channel and sees TMDB-backed channel items
+  that are not yet materialised but have already passed source-availability
+  probing. Native remote search remains raw TMDB-backed identify/search and is
+  not availability-gated in the current M14 slice.
+- The user presses ▶️ on an available Phantom movie/episode, or triggers a
+  manual materialise action. The plugin resolves ranked torrent candidates,
+  calls gostream to register the first working source, and refreshes the exact
+  channel item. Within seconds
+  the item is Materialised: the stable channel item now emits a real
+  FUSE-backed media source and is playable from any Jellyfin client.
+- The user presses ▶️ on an available Phantom item that has not yet been
+  materialised. Jellyfin's native `RequiresOpening` media-source flow keeps
+  the client in its normal loading state while materialisation runs. If the
+  first candidate fails, candidate-level backoff advances to the next ranked
+  candidate without hiding the item.
+- Phantom Movies and Phantom Shows channels expose TMDB-backed discovery
+  surfaces. Channel latest rows replace pre-M14 native Movies/TV Home-row
+  integration; favourite-similar/recommendation ingestion is deferred.
 - Works across every Jellyfin client (web, Android, iOS, Android TV, Apple
   TV) because all of the above is server-side and uses native Jellyfin
   primitives (library items, remote search, media source provider). No
@@ -253,8 +251,8 @@ These refine the lifecycle model and shape several milestones.
 
 ## Non-goals (v0.1)
 
-- A custom web "Discover" tab. Native Jellyfin search + Suggestions cover the
-  same ground without per-client UI work.
+- A custom web "Discover" tab. Phantom Movies/Shows channels cover discovery
+  without a separate per-client tab.
 - Pre-bulk-importing TMDB. Lazy materialisation is the design.
 - Replacing gostream's own scheduled Movies / TV sync. They continue to run
   and pre-populate trending content; Phantom Library complements them.
@@ -299,34 +297,42 @@ These refine the lifecycle model and shape several milestones.
                 └───────────────────────────┘  └─────────────────────────────┘
 ```
 
+The diagram is conceptual: under M14, Phantom Movies/Shows are `IChannel`
+surfaces. The plugin enumerates gostream FUSE paths directly for orphan files
+and uses per-item channel refresh after materialisation; it does not rely on
+Jellyfin library scanner/CollectionFolder binding for phantom channel items.
+
 ## Item lifecycle
 
 | State | Storage | Playable | Metadata | Notes |
 |-------|---------|----------|----------|-------|
-| **Phantom** | Plugin DB only, not in Jellyfin | No (fake play button shows splash) | Cached TMDB | Surfaces via remote search, suggestions, similar-to. Evicted from plugin DB if not promoted within the eviction deadline. Indexer query may be pre-resolved in the background. |
-| **Virtual** | Plugin DB + Jellyfin DB row (`LocationType = Virtual`, no `Path`) | No (fake play button shows splash with materialisation status) | Full TMDB, locally persisted | Created when a user favourites a Phantom, attempts to play it, or it is surfaced as a "Similar to" of an active interaction |
-| **Materialised** | Same Jellyfin DB row, `LocationType = FileSystem`, `Path` set to FUSE-backed `.mkv` | Yes (Jellyfin's real player) | Same TMDB metadata, no re-fetch | Stub exists in `gostream-mkv-real`, FUSE serves it from `gostream-mkv-virtual`. Real ▶ button takes over from the splash overlay |
-| **Watched** | Same row + per-user data (watched, position, rating, favourite) | Yes | All preserved | Standard Jellyfin behaviour; per-user as normal |
-| **Evicted** | Demoted back to Virtual (Jellyfin row preserved with no `Path`) or, for Phantoms that never promoted, removed from plugin DB | No (until re-materialised) | Preserved across Virtual eviction; lost on Phantom eviction | Triggered by eviction sweeper: default 7 days without playback. Favourites exempt when "Protect favourites" is on for that user. |
+| **Catalogued** | `catalogue_items` / `series_episode_catalogue` + TMDB metadata cache | No | Cached TMDB | Discovered from TMDB but not shown as an unmaterialised channel item until availability probing marks it available. |
+| **Available Phantom** | `availability_items.status='available'` plus cached candidate; channel item is synthesised on browse | Yes via native-open materialisation | Cached TMDB | Channel emits `RequiresOpening` media source. Play/manual materialise triggers materialisation; no real Jellyfin file path exists yet. |
+| **Materialising** | `materialise_in_flight` row | Pending | Cached TMDB | Channel/badge state can show in-progress while gostream registration and FUSE-path wait run. |
+| **Materialised** | `materialised_state` row with gostream stub/FUSE paths; channel item keeps stable external id | Yes (real FUSE media source) | Same TMDB metadata | Channel emits a concrete file media source. If the FUSE path disappears, browse/playback falls back to phantom opener and re-materialises. |
+| **Unavailable** | `availability_items.status='unavailable'` for visibility; `unavailable_marker` for materialise backoff | No | Cached TMDB | Availability status hides unmaterialised browse rows. `unavailable_marker` gates materialisation attempts only and is not currently joined into browse queries. |
+| **Evicted** | `materialised_state` removed after gostream remove/unprestage; catalogue/metadata may remain | No until re-materialised | Cached TMDB retained | Eviction sweeper handles idle materialised rows. Favourites can be protected by server-wide config. |
 
 Transitions are driven by:
 
-- **User actions** — favouriting, attempting to play (fake button),
-  watching, un-favouriting.
-- **Suggestions / similar-to surfaces** — populate Phantoms in the plugin
-  DB so they can be indexer-pre-resolved before any user click.
-- **Series autopilot** — when a user is actively watching a series, the
-  next episode (and, where Vault Mode is available, a small prefetch
-  window beyond it) materialises automatically. Same for direct sequels
-  of favourited / completed films.
+- **User actions** — attempting to play via native-open source, manual
+  materialise actions, watching, and un-favouriting/eviction interactions.
+  Favourite-to-materialise is not wired in the current M14 slice.
+- **Discovery / availability surfaces** — Discover and trending populate
+  catalogue rows; the availability worker probes sources before making
+  unmaterialised phantoms visible. Similar/recommendation ingestion remains
+  deferred.
+- **Series autopilot** — when a user completes an episode, the next episode
+  can be queued/materialised according to server-wide autopilot settings.
+  Movie sequel autopilot and favourite-triggered materialisation are deferred.
 - **gostream sync engine** — continues to pre-populate trending content
   independently of the plugin. The plugin's eviction sweeper does not
   remove items it does not own; sync-engine stubs are gostream's
   responsibility.
 - **Eviction sweeper** — background `IHostedService` runs on a schedule
-  (default daily), demotes idle Materialised items to Virtual and prunes
-  stale Phantoms from the plugin DB. Per-user favourite-protection toggle
-  consulted before demoting any Materialised item.
+  (default daily), removes idle materialised state via gostream, and leaves
+  catalogue/availability rows for future re-materialisation. Favourite
+  protection is currently server-wide.
 
 ---
 
@@ -334,96 +340,30 @@ Transitions are driven by:
 
 ### Project layout
 
-```
+Current M14/channel-architecture source layout (abridged):
+
+```text
 phantom-library/
-├── PLAN.md                              (this file)
-├── README.md
-├── LICENSE
-├── build.yaml                           (jellyfin-plugin manifest source)
-├── manifest.json                        (published plugin repo manifest)
-├── src/
-│   └── Jellyfin.Plugin.PhantomLibrary/
-│       ├── Jellyfin.Plugin.PhantomLibrary.csproj
-│       ├── Plugin.cs                    (entry point, GUID, name, version)
-│       ├── PluginServiceRegistrator.cs  (DI registrations)
-│       ├── Configuration/
-│       │   ├── PluginConfiguration.cs   (TMDB key, gostream URLs, indexer cfg,
-│       │   │                             quality knobs, eviction policy)
-│       │   └── configPage.html          (admin config UI in Jellyfin dashboard)
-│       ├── Api/
-│       │   ├── PhantomLibraryController.cs   (REST: trigger refresh, manual
-│       │   │                                  enqueue, status, debug)
-│       │   └── Models/                       (DTOs)
-│       ├── Search/
-│       │   ├── TmdbMovieRemoteSearchProvider.cs   (IRemoteSearchProvider<Movie,
-│       │   │                                       MovieInfo>)
-│       │   ├── TmdbSeriesRemoteSearchProvider.cs  (Series is MVP, ships in v0.1)
-│       │   └── PhantomImageProvider.cs            (IRemoteImageProvider, pulls
-│       │                                           TMDB posters/backdrops)
-│       ├── Library/
-│       │   ├── VirtualItemFactory.cs    (creates Virtual BaseItem rows from
-│       │   │                             TMDB payloads)
-│       │   ├── SuggestionsContributor.cs (feeds Virtual items into "Trending",
-│       │   │                              "Similar", "Recommended" rows)
-│       │   ├── VirtualLibraryRoot.cs    (the synthetic library folder where
-│       │   │                              Phantom Library owns items)
-│       │   └── SeriesAutopilot.cs       (watches "Next Up" / playback-finished
-│       │                                  events; materialises next episode and
-│       │                                  sequels ahead of need)
-│       ├── Playback/
-│       │   ├── PhantomMediaSourceProvider.cs   (IMediaSourceProvider — owns the
-│       │   │                                    fake play button for Virtual /
-│       │   │                                    Phantom items; returns a splash
-│       │   │                                    MediaSource that loops while
-│       │   │                                    materialisation runs in
-│       │   │                                    background; hands off to
-│       │   │                                    Jellyfin's real player once the
-│       │   │                                    FUSE path is ready)
-│       │   └── SplashStream.cs                 (the looping splash payload:
-│       │                                         phantom-jelly logo, status text,
-│       │                                         rotating jelly trivia)
-│       ├── Materialisation/
-│       │   ├── MaterialisationQueue.cs  (Channel<T> + N workers, per-indexer
-│       │   │                             concurrency caps for rate limits;
-│       │   │                             separate lanes for user-triggered
-│       │   │                             vs. eager-pre-resolve work)
-│       │   ├── Materialiser.cs          (one item end-to-end: indexer →
-│       │   │                             gostream API → library refresh →
-│       │   │                             Jellyfin item promotion)
-│       │   ├── EagerResolver.cs         (background pre-resolution of Phantom
-│       │   │                              items so the magnet is cached before
-│       │   │                              the user ever clicks)
-│       │   ├── UserDataSavedListener.cs (subscribes to IUserDataManager
-│       │   │                              .UserDataSaved; enqueues on
-│       │   │                              ❤️ transitions and toggles persist
-│       │   │                              flag when Vault Mode is present)
-│       │   └── EvictionSweeper.cs       (hosted background service;
-│       │                                  per-user favourite-protection;
-│       │                                  prunes stale Phantoms; demotes idle
-│       │                                  Materialised items to Virtual)
-│       ├── Clients/
-│       │   ├── ITmdbClient.cs / TmdbClient.cs
-│       │   ├── IGostreamClient.cs / GostreamClient.cs   (talks exclusively to
-│       │   │                                              `/api/library/add` on
-│       │   │                                              :9080 — primary patch)
-│       │   ├── IIndexerClient.cs / ProwlarrClient.cs / TorrentioClient.cs
-│       │   └── QualityScorer.cs                            (configurable; default
-│       │                                                    mirrors gostream's
-│       │                                                    scorer.go)
-│       ├── State/
-│       │   ├── PhantomDb.cs            (SQLite, separate from Jellyfin's DB;
-│       │   │                            phantom registry, magnet cache,
-│       │   │                            indexer-query cache, materialisation
-│       │   │                            history, eviction timestamps,
-│       │   │                            per-user favourite-protection prefs)
-│       │   └── Migrations/
-│       └── Util/
-│           └── ImdbTmdbMapper.cs
-└── tests/
-    └── Jellyfin.Plugin.PhantomLibrary.Tests/
-        └── …                            (xUnit; mock Jellyfin host;
-                                           integration tests against a local
-                                           gostream)
+├── AGENTS.md / PLAN.md / CHANGELOG.md / README.md
+├── install.sh
+├── scripts/jellyfin-patches/        (additive Jellyfin IChannel refresh patch)
+├── src/Jellyfin.Plugin.PhantomLibrary/
+│   ├── Plugin.cs
+│   ├── PluginServiceRegistrator.cs
+│   ├── Configuration/               (server-wide config + web shims)
+│   ├── Api/                         (plugin REST: state/materialise/actions)
+│   ├── Channels/                    (PhantomMoviesChannel, PhantomShowsChannel,
+│   │                                  native-open media source provider, IDs,
+│   │                                  gostream orphan enumeration)
+│   ├── Scheduled/                   (DiscoveryRefreshTask, AvailabilityProbeWorker)
+│   ├── Materialisation/             (Materialiser, queue, eviction, autopilot,
+│   │                                  playback/user-data listeners)
+│   ├── Sources/                     (MagnetSelector ranked probing)
+│   ├── Clients/                     (TMDB, gostream, Prowlarr, Torrentio)
+│   ├── State/PhantomDb.cs           (schema v11, catalogue/availability/materialise state)
+│   └── Playback/                    (splash metadata/legacy support helpers)
+├── tests/Jellyfin.Plugin.PhantomLibrary.Tests/
+└── tools/rig-scenarios/             (live Jellyfin rig scenarios)
 ```
 
 ### Key Jellyfin extension points
@@ -431,32 +371,30 @@ phantom-library/
 - **`IRemoteSearchProvider<TItemType, TLookupInfoType>`** — registered for
   both `Movie` and `Series` (series is MVP). Surfaces TMDB hits inside
   Jellyfin's native search UI on every client.
-- **`IRemoteImageProvider`** — supplies TMDB posters/backdrops for items the
-  plugin owns.
-- **`IUserDataManager.UserDataSaved`** event — fires when favourite toggles,
-  playback state changes, watched flag changes. `UserDataSavedListener`
-  filters: favourite-to-true on a Phantom or Virtual item enqueues
-  materialisation; playback-stopped-near-end on an episode triggers
-  `SeriesAutopilot` for the next episode; favourite-to-false re-enters the
-  item into normal eviction scheduling.
-- **`IMediaSourceProvider`** —
-  `PhantomMediaSourceProvider.GetMediaSources` is invoked during
-  `/Items/{id}/PlaybackInfo`. For Phantom / Virtual items it returns the
-  splash MediaSource (the fake play button) and enqueues materialisation;
-  for Materialised items it returns nothing (Jellyfin uses its normal
-  file-based MediaSource for the FUSE path).
-- **`ILibraryManager`** — `CreateItem`, `UpdateItem`, `RefreshLibrary`
-  (scoped to the single directory the gostream API returned).
-- **`IServerEntryPoint` / `IHostedService`** — for the materialisation
-  queue workers, the eager pre-resolver, the series autopilot, and the
-  eviction sweeper.
+- **Channel/search image URLs** — channel and search DTOs set `ImageUrl`
+  from cached TMDB metadata; there is no active `IRemoteImageProvider`
+  implementation in the M14 channel slice.
+- **`IUserDataManager.UserDataSaved`** event — current M14 listener observes
+  playback completion and forwards completed episodes to autopilot. Favourite
+  materialisation and per-user preference handling are deferred.
+- **`IMediaSourceProvider` / native open** —
+  `PhantomMaterialisingMediaSourceProvider` emits native `RequiresOpening`
+  sources for unmaterialised movies/episodes. `OpenMediaSource` performs
+  materialisation, waits for FUSE readiness, and returns the final real file
+  source to Jellyfin clients. The old splash fake-button flow is historical.
+- **`IChannel` / `IChannelItemRefreshManager`** — Phantom Movies/Shows
+  are channel surfaces. Targeted refresh swaps an item from native-open
+  phantom source to real FUSE source after materialisation without relying
+  on filesystem phantom stubs.
+- **`IHostedService`** — for materialisation queue workers, availability
+  probing, series expansion, playback/user-data listeners, and eviction.
 
 ### Configuration
 
 Server-wide settings live in the Jellyfin admin dashboard
-(`configPage.html`). Per-user toggles live in the user-preferences page
-(the plugin contributes a section via the standard Jellyfin user-settings
-extension point).
+(`configPage.html`). Historical per-user preference UI is not part of the
+current M14 slice; favourite protection and availability probing are
+server-wide until native per-user integration is revisited.
 
 Server-wide:
 
@@ -465,80 +403,142 @@ Server-wide:
   `:8090` is talked to only for diagnostics.
 - Prowlarr URL + API key (primary indexer)
 - Torrentio URL (fallback indexer)
-- Quality preset (defaults to gostream-equivalent scoring) plus minimum
-  seeders, size floors, and a free-form override for the scorer's tunable
-  weights for advanced users
+- Quality preset (current default: `ResolutionSeeders` with preferred
+  1080p order) plus minimum seeders, size floors, resolution fallback
+  order, and scorer weights
 - Eviction defaults: enabled / disabled, idle days (default 7), GC schedule
-- Materialisation concurrency caps (per-indexer, global)
-- Eager pre-resolve enabled / disabled, max concurrent pre-resolves
-- Phantom DB retention (default same as eviction window)
+- Materialisation concurrency caps (global worker count currently enforced;
+  per-indexer cap is configured but not yet enforced in M14)
+- Availability probing: enabled/disabled, catch-up and steady-state tick
+  intervals, per-tick batch size, available/unavailable TTLs, transient
+  retry delay, and probe lease duration
+- Series expansion: TTL/delay for expanding catalogued series into episode
+  availability rows
+- Phantom DB retention (configuration field retained but labelled deferred/no-op in the
+  admin UI; catalogue is currently append-only)
 - Series autopilot: enabled / disabled, prefetch window in episodes
   (default 1)
-- "Phantom badge" visibility (always show / hide for non-admins / off)
-- Splash content (default loop, custom upload, jelly-trivia rotation
-  enabled)
+- "Phantom badge" visibility (`AlwaysShow`, `HideForNonAdmins`, `Off`) is
+  enforced server-side by the badge-state API.
+- Splash content fields are legacy/no-op under M14 native-open playback
+  unless a future UI reuses them
 
-Per-user:
+Deferred per-user preferences:
 
-- Protect favourites from eviction (default on)
-- Show Phantom items in browse views (default on)
-- Allow eager pre-resolve based on this user's interactions (default on;
-  off for read-only / guest accounts)
+- Protect favourites from eviction per user (current implementation uses
+  server-wide `ProtectFavourites`).
+- Show/hide Phantom items per user.
+- Allow background source probing based on this user's interactions.
+
+The legacy user-preferences page and admin link are hidden because the
+corresponding API endpoints were removed; per-user controls remain deferred
+until a real per-user contract is implemented.
 
 ### Materialisation flow
 
-`Materialiser.MaterialiseAsync(Item item, MaterialiseTrigger trigger)`
+`Materialiser.MaterialiseAsync(tmdbId, type, season, episode, trigger)`
 
-1. Look up cached indexer resolution in `PhantomDb.magnet_cache`. If
-   present, fresh, and from an eager pre-resolve, skip to step 4.
-2. Query Prowlarr by IMDB / TMDB ID. If no acceptable candidate, fall back
-   to Torrentio. Apply the configured `QualityScorer`. Cache the best
-   result.
-3. If no acceptable candidate: persist "unavailable" state in `PhantomDb`
-   and update the Jellyfin item to display the unavailable badge. Return.
-4. `POST /api/library/add` to gostream `:9080` including the IMDB / TMDB
-   ID, the title and year, and (optionally) the resolved magnet. For TV
-   episodes also include `season`, `episode`, `series_imdb`. The call
-   blocks for torrent-metadata resolution (bounded server-side, default
-   45s, 504 on exceed).
-5. Gostream replies with `{stub_path, fuse_path, hash, size}`. Filename
+1. Reject unsupported container types (series/season), short-circuit if
+   the tuple already has `materialised_state`, then atomically claim
+   `materialise_in_flight` with `INSERT OR IGNORE`. A loser returns
+   `AlreadyInProgress` and never calls gostream; only the winner owns row
+   cleanup.
+2. Resolve TMDB metadata and IMDb. Episode requests use the parent series
+   IMDb because gostream's episode API is keyed by `series_imdb`.
+3. Build a ranked candidate list. The materialiser tries a fresh cached
+   `magnet_cache` entry first when it has not been candidate-failed, then
+   calls `MagnetSelector.ProbeAsync` to aggregate/rank all acceptable
+   Prowlarr/Torrentio candidates. Candidates present in
+   `magnet_failure_cache` are skipped until their `retry_after` expires.
+   Availability-probe candidate fields are an advisory winner/cache seed;
+   the materialiser is the final authority and re-filters against
+   candidate-level failures before calling gostream.
+4. If all enabled source probes return successful empty 2xx responses,
+   write/update `unavailable_marker` and return an error. Transport
+   failures, timeouts, 5xx, malformed upstream responses, unavailable
+   indexers, or mixed empty+transient results are indeterminate/transient
+   and must not write `unavailable_marker`, `availability_items.status='unavailable'`,
+   or candidate failure cache entries.
+5. For each candidate in preference order, `POST /api/library/add` to
+   gostream `:9080` including TMDB/IMDb, title/year, magnet, and for TV
+   episodes `season`, `episode`, `series_imdb`. The call blocks for
+   torrent-metadata resolution (bounded server-side, default 45s, 504 on
+   exceed).
+6. Gostream replies with `{stub_path, fuse_path, hash, size}`. Filename
    conventions, JSON stub layout, and physical-path placement are
-   entirely gostream's responsibility — the plugin does not need to
-   know them. The plugin then polls `File.Exists(fuse_path)` with a
-   short backoff (cap 5s) to confirm the stub has propagated through
-   the FUSE layer.
-6. Call `ILibraryManager.RefreshLibrary` scoped to
-   `dirname(fuse_path)` so Jellyfin picks up the new file without a full
-   scan.
-7. Promote the Jellyfin item from Phantom or Virtual to Materialised:
-   update its `Path` and `LocationType`; persist per-user data intact. If
-   Jellyfin rejects in-place mutation (see Risks), create a new
-   FileSystem-backed item and migrate user data across.
-8. If Vault Mode is present and the item is favourited by any user with
-   "Protect favourites" enabled, rewrite the stub via gostream to set
-   `persist=true` and call `POST /api/library/prestage`.
-9. Emit a `PhantomMaterialised` event for instrumentation.
-
-Failure modes are recorded in `PhantomDb.materialisation_log` with a
-backoff so that one bad title doesn't get retried in a tight loop.
+   gostream's responsibility. The plugin requires `File.Exists(fuse_path)`
+   before writing `materialised_state`; a missing FUSE path marks only that
+   candidate failed and advances to the next candidate.
+7. Candidate-specific failures (`bad_request`, `no_valid_files`,
+   `target_episode_not_found`, `metadata_timeout`, `fuse_path_missing`)
+   write `magnet_failure_cache` and advance. Non-504 gostream 5xx errors
+   are treated as transient service failures and do not candidate-poison.
+8. On first candidate success, insert `materialised_state`, cache the
+   successful magnet, and refresh the exact channel item via the patched
+   `IChannelItemRefreshManager`. Materialised rows are emitted with real
+   FUSE media sources; unmaterialised rows use Jellyfin's native
+   `RequiresOpening` media-source flow.
+9. Vault Mode endpoints exist in the client interface, but favourite-driven
+   prestage/persist wiring is deferred in the current M14 slice. Eviction
+   favourite protection is server-wide and prevents removal; it does not yet
+   force full-file gostream persistence.
 
 ### State persistence
 
-`PhantomDb` lives at `<dataPath>/plugins/PhantomLibrary/phantom.db`. Schema
+`PhantomDb` lives at `<dataPath>/plugins/configurations/PhantomLibrary/phantom.db`. Schema
 sketch:
 
 | Table | Purpose |
 |-------|---------|
-| `phantom_items` | Mapping Jellyfin item GUID ↔ TMDB ID / IMDB ID, current state (Phantom / Virtual / Materialised), first-seen and last-touched timestamps, eviction-protection flags, type (movie / series / episode) |
-| `magnet_cache` | Cached indexer results per (tmdb_id, quality_preset), with TTL, seeder snapshot, and a flag noting whether the result came from eager pre-resolve or user-triggered query |
-| `materialisation_log` | Audit trail of each attempt: trigger (favourite / play / autopilot / pre-resolve), duration, outcome, error |
-| `unavailable_marker` | TMDB IDs that returned no acceptable torrent, with retry-after timestamp |
-| `user_prefs` | Per-Jellyfin-user toggles (protect-favourites, show-phantoms, allow-eager-pre-resolve) |
-| `autopilot_state` | Per-(user, series) cursor: last episode played, next episode pre-materialised, prefetch-window cursor |
+| `discovery_cache` | Legacy/channel-compatibility discovery table still present in v11; no longer the long-term visibility source of truth. |
+| `catalogue_items` | Append-only TMDB movie/series catalogue membership discovered from Discover/trending surfaces. Later TMDB misses do not prune rows. |
+| `series_expansion_state` | Due/lease/error state for expanding a catalogued series into seasons/episodes. |
+| `series_episode_catalogue` | Per-(series, season, episode) episode catalogue rows derived from TMDB season payloads. |
+| `availability_items` | Probe scheduler state and visibility gate for unmaterialised movies/episodes: status, due time, leases, probe policy hash, selected candidate metadata, transient errors. |
+| `materialised_state` | One row per materialised movie/episode tuple with gostream stub/FUSE paths. Materialised rows are always visible regardless of availability status. |
+| `materialise_in_flight` | Short-lived idempotency/coordination row while a materialise call is running; startup sweeper removes stale rows. |
+| `magnet_cache` | Cached successful candidate per (tmdb/imdb/type/season/episode/preset), including magnet, info hash, size, seeders, indexer, TTL, and source (`availability` or user-triggered materialise). |
+| `magnet_failure_cache` | Candidate-level negative cache keyed by item tuple + preset + magnet. Prevents one bad season pack or bad file from blocking later candidates. |
+| `unavailable_marker` | Item-level backoff when no acceptable candidate exists, distinct from candidate failures. |
+| `tmdb_metadata`, `tmdb_episode_cache`, `tmdb_external_ids`, `tmdb_cache` | TMDB-derived metadata, episode display cache, IMDb lookup cache, and raw endpoint cache used by channel synthesis and source probing. |
+| `plugin_meta` | Small key/value metadata (channel data versions, one-shot markers). |
 
-Kept separate from Jellyfin's DB to avoid schema-version coupling and to
-survive plugin upgrades without database migrations against Jellyfin's
-schema.
+Kept separate from Jellyfin's DB to avoid schema-version coupling. Pre-v1.0
+plugin DB schema changes still do **not** migrate in place: v11 hard-refuses
+pre-v11 `phantom.db` and requires the operator to run the wipe/rebuild
+procedure before installing the new DLL.
+
+### Availability scheduler flow (schema v11)
+
+Discovery and source search are now decoupled:
+
+1. `DiscoveryRefreshTask` walks TMDB Discover plus trending pages up to
+   configured caps and writes catalogue rows plus warmed metadata. It does
+   **not** delete catalogue rows just because a later Discover walk omits
+   them. Similar/recommendation feeds are still deferred and should be wired
+   into this same catalogue ingestion path when implemented.
+2. Series catalogue rows enqueue `series_expansion_state`; the availability
+   worker can lease one due series at a time, fetch TMDB season payloads,
+   write `series_episode_catalogue`/`tmdb_episode_cache`, and enqueue episode
+   `availability_items`. In the current worker tick, due availability probes
+   are attempted before series expansion; large availability backlogs can
+   delay expansion until later ticks unless batch/cadence settings are raised.
+3. The same worker leases due `availability_items`, resolves metadata/IMDb,
+   probes indexers through `MagnetSelector.ProbeAsync`, and stores status:
+   `available`, `unavailable`, or transient retry. Availability rows include
+   the selected candidate fields so channel browse can cheaply gate visibility
+   and later materialisation can start from a cached winner.
+4. Channel browse shows unmaterialised Phantom movies/episodes when their
+   `availability_items.status` is `available`; TTLs schedule re-probe rather
+   than being enforced directly during browse. It always shows
+   `materialised_state` rows. Movie-channel browse also surfaces real orphan
+   gostream movie files; TV orphan enumeration is not yet wired into Phantom
+   Shows.
+5. The worker is bounded by plugin settings for enablement, min/max tick
+   interval, batch size, probe lease, available/unavailable TTL, and transient
+   retry delay. If a future change switches this to an actual cron-expression
+   format, document whether five-field or six-field/seconds cron syntax is
+   accepted and update tests accordingly.
 
 ---
 
@@ -562,9 +562,11 @@ Request body:
   "season": 1,                  // episodes only
   "episode": 4,                 // episodes only
   "series_imdb": "tt0903747",   // episodes only
-  "magnet": "magnet:?xt=urn:btih:...",  // optional — if omitted, gostream
-                                         // resolves via its own indexer chain
-  "min_quality": "1080p"        // optional override of scheduler defaults
+  "magnet": "magnet:?xt=urn:btih:...",  // required for Phantom Library's
+                                         // current materialiser; gostream-side
+                                         // indexer resolution remains deferred
+  "min_quality": "1080p"        // accepted by request shape; currently
+                                  // ignored by gostream handler
 }
 ```
 
@@ -604,10 +606,13 @@ Files likely touched in gostream:
 - `internal/syncer/quality/scorer.go` — expose a public `Score` function for
   the new endpoint.
 
-Backwards compatibility: the plugin should detect the endpoint at startup
-(`GET /api/library/add` returns 405 if present, 404 if not) and fall back to
-the four-step direct flow against `:8090` + raw stub writes if absent. This
-keeps the plugin usable against unpatched gostream.
+Runtime requirement: Phantom Library's current materialiser requires the
+patched gostream `/api/library/add` endpoint and always sends a selected
+magnet. There is no raw-stub-write fallback against unpatched gostream in
+M14. If eviction is enabled (default), the patched gostream must also expose
+`/api/library/remove`. The current client treats a 404 from remove as
+"already gone" and proceeds with plugin-state deletion, so unpatched/remove-
+absent gostream is unsafe with eviction enabled.
 
 ### Secondary patch (optional, larger): Jellyfin watchlist source
 
@@ -616,11 +621,14 @@ A separate, smaller change replacing the hardcoded Plex watchlist source in
 Jellyfin Favourites adapter. Useful for users who do not want to run the
 Phantom Library plugin but do run Jellyfin. Tracked as an independent PR.
 
-### Tertiary patch (nice-to-have): eviction API
+### Tertiary patch (required when eviction is enabled): eviction API
 
 `POST /api/library/remove` with `{stub_path}` — removes the torrent from
 GoStorm, deletes the stub, and updates the inode map. Phantom Library's
-eviction sweeper calls this.
+eviction sweeper calls this; operators must disable eviction if deploying a
+gostream build without this endpoint. Current client semantics swallow 404
+as already-removed, so endpoint absence must not be represented as a generic
+404 in production deployments.
 
 ### Quaternary patch (independent PR): persistent full-file SSD cache ("Vault Mode")
 

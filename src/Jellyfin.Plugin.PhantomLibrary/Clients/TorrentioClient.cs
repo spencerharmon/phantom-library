@@ -60,8 +60,8 @@ public sealed class TorrentioClient : IIndexerClient
 
         if (string.IsNullOrWhiteSpace(query.Imdb) && string.IsNullOrWhiteSpace(query.SeriesImdb))
         {
-            _logger.LogWarning("Torrentio requires an IMDB id; query for type={Type} title={Title} skipped", query.Type, query.Title);
-            return Array.Empty<IndexerCandidate>();
+            _logger.LogWarning("Torrentio requires an IMDB id; query for type={Type} title={Title} cannot be proven empty", query.Type, query.Title);
+            throw new IndexerTransientException("Torrentio requires an IMDB id");
         }
 
         string url;
@@ -74,7 +74,7 @@ public sealed class TorrentioClient : IIndexerClient
             if (query.Season is null || query.Episode is null)
             {
                 _logger.LogWarning("Torrentio episode query missing season/episode");
-                return Array.Empty<IndexerCandidate>();
+                throw new IndexerTransientException("Torrentio episode query missing season/episode");
             }
 
             var seriesImdb = !string.IsNullOrWhiteSpace(query.SeriesImdb) ? query.SeriesImdb : query.Imdb;
@@ -94,27 +94,37 @@ public sealed class TorrentioClient : IIndexerClient
         catch (HttpRequestException ex)
         {
             _logger.LogWarning(ex, "Torrentio request failed");
-            return Array.Empty<IndexerCandidate>();
+            throw new IndexerTransientException("Torrentio transport failure", ex);
         }
         catch (TaskCanceledException ex) when (!ct.IsCancellationRequested)
         {
             _logger.LogWarning(ex, "Torrentio request timed out");
-            return Array.Empty<IndexerCandidate>();
+            throw new IndexerTransientException("Torrentio request timed out", ex);
         }
 
         try
         {
             if (!resp.IsSuccessStatusCode)
             {
-                _logger.LogWarning("Torrentio returned {Status}; returning empty result", (int)resp.StatusCode);
-                return Array.Empty<IndexerCandidate>();
+                _logger.LogWarning("Torrentio returned {Status}; treating indexer result as transient", (int)resp.StatusCode);
+                throw new IndexerTransientException($"Torrentio returned HTTP {(int)resp.StatusCode}");
             }
 
-            var stream = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-            var dto = await JsonSerializer.DeserializeAsync<TorrentioResponseDto>(stream, JsonOpts, ct).ConfigureAwait(false);
+            TorrentioResponseDto? dto;
+            try
+            {
+                var stream = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+                dto = await JsonSerializer.DeserializeAsync<TorrentioResponseDto>(stream, JsonOpts, ct).ConfigureAwait(false);
+            }
+            catch (JsonException ex)
+            {
+                _logger.LogWarning(ex, "Torrentio returned malformed JSON");
+                throw new IndexerTransientException("Torrentio returned malformed JSON", ex);
+            }
+
             if (dto?.Streams is null)
             {
-                return Array.Empty<IndexerCandidate>();
+                throw new IndexerTransientException("Torrentio returned malformed JSON: missing streams array");
             }
 
             var results = new List<IndexerCandidate>(dto.Streams.Count);
