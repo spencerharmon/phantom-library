@@ -93,6 +93,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ParentId` hierarchy. Prior wipes only targeted path-owned stub/gostream
   rows, so stale channel cache could survive and leave Jellyfin with hundreds
   of thousands of obsolete Phantom episode rows.
+- Availability probing now arms its background timer even when disabled at
+  startup, so enabling it later in plugin settings starts filling visible
+  phantom rows without requiring a Jellyfin restart.
 
 ### BREAKING — requires wipe + patched Jellyfin
 

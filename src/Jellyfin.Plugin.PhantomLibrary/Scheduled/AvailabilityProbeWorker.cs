@@ -70,15 +70,13 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
     {
         _stopping = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var cfg = _configProvider();
-        if (!cfg.AvailabilityProbeEnabled)
-        {
-            _logger.LogInformation("Availability probe worker disabled by configuration");
-            return Task.CompletedTask;
-        }
-
         var interval = TimeSpan.FromSeconds(Math.Max(1, cfg.AvailabilityProbeMinIntervalSeconds));
         _timer = new Timer(_ => _currentTick = TickAsync(_stopping.Token), null, interval, interval);
-        _logger.LogInformation("Availability probe worker started interval={Interval}s owner={Owner}", interval.TotalSeconds, _owner);
+        _logger.LogInformation(
+            "Availability probe worker started interval={Interval}s owner={Owner} enabled={Enabled}",
+            interval.TotalSeconds,
+            _owner,
+            cfg.AvailabilityProbeEnabled);
         return Task.CompletedTask;
     }
 

@@ -33,6 +33,28 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
     }
 
     [Fact]
+    public async Task StartAsync_DisabledConfigurationStillArmsTimerForLaterEnable()
+    {
+        using var db = await NewDbAsync();
+        var cfg = Config();
+        cfg.AvailabilityProbeEnabled = false;
+        var worker = BuildWorker(db, cfg, new EmptyIndexer());
+
+        await worker.StartAsync(CancellationToken.None);
+        try
+        {
+            var timerField = typeof(AvailabilityProbeWorker).GetField("_timer", BindingFlags.Instance | BindingFlags.NonPublic)
+                ?? throw new MissingFieldException(nameof(AvailabilityProbeWorker), "_timer");
+            Assert.NotNull(timerField.GetValue(worker));
+        }
+        finally
+        {
+            await worker.StopAsync(CancellationToken.None);
+            worker.Dispose();
+        }
+    }
+
+    [Fact]
     public async Task TransientAllFail_DoesNotWriteUnavailableOrMarker()
     {
         using var db = await NewDbAsync();
