@@ -572,6 +572,31 @@ public class PhantomShowsChannelTests : IDisposable
     }
 
     [Fact]
+    public async Task GostreamOnlyTvFiles_GroupVariantsAndKeepFilesWithoutEpisodeTokenVisible()
+    {
+        var seasonDir = Path.Combine(_enumerator.ShowsRootOverride!, "Variant_Show (2026)", "Season.01");
+        Directory.CreateDirectory(seasonDir);
+        await File.WriteAllTextAsync(Path.Combine(seasonDir, "Variant_Show_S01E01_720p_aaaaaaaa.mkv"), "x", CancellationToken.None);
+        var best = Path.Combine(seasonDir, "Variant_Show_S01E01_2160p_bbbbbbbb.mkv");
+        await File.WriteAllTextAsync(best, "x", CancellationToken.None);
+        var noToken = Path.Combine(seasonDir, "Special Feature cccccccc.mkv");
+        await File.WriteAllTextAsync(noToken, "x", CancellationToken.None);
+
+        var top = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var series = Assert.Single(top.Items, i => string.Equals(i.Name, "Variant Show", StringComparison.Ordinal));
+        var seasons = await _channel.GetChannelItems(new InternalChannelItemQuery { FolderId = series.Id }, CancellationToken.None);
+        var season = Assert.Single(seasons.Items);
+        var episodes = await _channel.GetChannelItems(new InternalChannelItemQuery { FolderId = season.Id }, CancellationToken.None);
+
+        Assert.Equal(2, episodes.Items.Count);
+        var parsed = Assert.Single(episodes.Items, i => i.IndexNumber == 1);
+        Assert.Equal(best, Assert.Single(parsed.MediaSources).Path);
+        var unparsed = Assert.Single(episodes.Items, i => i.IndexNumber is null);
+        Assert.Equal(noToken, Assert.Single(unparsed.MediaSources).Path);
+        Assert.Equal(1, unparsed.ParentIndexNumber);
+    }
+
+    [Fact]
     public async Task GostreamOnlyTvFiles_WithTmdbHit_UseSeriesMetadata()
     {
         var seasonDir = Path.Combine(_enumerator.ShowsRootOverride!, "56_Days (2026)", "Season.01");

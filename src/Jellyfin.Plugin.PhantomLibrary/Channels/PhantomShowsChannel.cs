@@ -451,10 +451,10 @@ public sealed partial class PhantomShowsChannel
                 continue;
             }
 
-            foreach (var externalEpisode in externalSeason.Episodes)
+            foreach (var externalEpisode in SelectExternalEpisodeVariants(externalSeason.Episodes))
             {
-                if (!TryParseEpisodeNumber(Path.GetFileNameWithoutExtension(externalEpisode.Path), out _, out var episodeNumber)
-                    || emittedEpisodes.Contains(episodeNumber))
+                var hasEpisodeNumber = TryParseEpisodeNumber(Path.GetFileNameWithoutExtension(externalEpisode.Path), out _, out var episodeNumber);
+                if (hasEpisodeNumber && emittedEpisodes.Contains(episodeNumber))
                 {
                     continue;
                 }
@@ -463,9 +463,9 @@ public sealed partial class PhantomShowsChannel
                 var item = row is null
                     ? BuildOrphanEpisodeItem(externalEpisode)
                     : BuildExternalEpisodeItemFromRow(row, externalEpisode, seriesName ?? external.Metadata.Title);
-                if (item is not null)
+                items.Add(item);
+                if (hasEpisodeNumber)
                 {
-                    items.Add(item);
                     emittedEpisodes.Add(episodeNumber);
                 }
             }
@@ -503,12 +503,10 @@ public sealed partial class PhantomShowsChannel
             return EmptyResult();
         }
 
-        var items = season.Episodes
+        var items = SelectExternalEpisodeVariants(season.Episodes)
             .Select(BuildOrphanEpisodeItem)
-            .Where(i => i is not null)
-            .OrderBy(i => i!.IndexNumber ?? int.MaxValue)
-            .ThenBy(i => i!.Name, StringComparer.OrdinalIgnoreCase)
-            .Cast<ChannelItemInfo>()
+            .OrderBy(i => i.IndexNumber ?? int.MaxValue)
+            .ThenBy(i => i.Name, StringComparer.OrdinalIgnoreCase)
             .ToList();
         return new ChannelItemResult { Items = items, TotalRecordCount = items.Count };
     }
@@ -863,12 +861,45 @@ public sealed partial class PhantomShowsChannel
         };
     }
 
-    private static ChannelItemInfo? BuildOrphanEpisodeItem(GostreamFileEntry episode)
+    private static List<GostreamFileEntry> SelectExternalEpisodeVariants(IReadOnlyList<GostreamFileEntry> episodes)
+        => episodes
+            .GroupBy(EpisodeVariantKey, StringComparer.Ordinal)
+            .Select(g => g.OrderByDescending(e => ScoreVariantPath(e.Path)).ThenBy(e => e.Path, StringComparer.Ordinal).First())
+            .ToList();
+
+    private static string EpisodeVariantKey(GostreamFileEntry episode)
     {
         var fileName = Path.GetFileNameWithoutExtension(episode.Path);
-        if (!TryParseEpisodeNumber(fileName, out var season, out var episodeNumber))
+        return TryParseEpisodeNumber(fileName, out var season, out var episodeNumber)
+            ? $"s{season:00}e{episodeNumber:00}"
+            : "path:" + episode.Path;
+    }
+
+    private static int ScoreVariantPath(string path)
+    {
+        var name = Path.GetFileNameWithoutExtension(path);
+        var score = 0;
+        if (name.Contains("2160p", StringComparison.OrdinalIgnoreCase) || name.Contains("4k", StringComparison.OrdinalIgnoreCase)) score += 100;
+        if (name.Contains("1080p", StringComparison.OrdinalIgnoreCase)) score += 50;
+        if (name.Contains("remux", StringComparison.OrdinalIgnoreCase)) score += 30;
+        if (name.Contains("dv", StringComparison.OrdinalIgnoreCase)) score += 12;
+        if (name.Contains("hdr", StringComparison.OrdinalIgnoreCase)) score += 8;
+        if (name.Contains("atmos", StringComparison.OrdinalIgnoreCase)) score += 6;
+        if (name.Contains("5.1", StringComparison.OrdinalIgnoreCase)) score += 3;
+        return score;
+    }
+
+    private static ChannelItemInfo BuildOrphanEpisodeItem(GostreamFileEntry episode)
+    {
+        var fileName = Path.GetFileNameWithoutExtension(episode.Path);
+        var hasEpisodeNumber = TryParseEpisodeNumber(fileName, out var season, out var episodeNumber);
+        if (!hasEpisodeNumber)
         {
-            return null;
+            var seasonDirName = Directory.GetParent(episode.Path)?.Name ?? string.Empty;
+            if (!TryParseSeasonNumberFromText(seasonDirName, out season))
+            {
+                season = 0;
+            }
         }
 
         var seriesDir = Directory.GetParent(Directory.GetParent(episode.Path)!.FullName)!.FullName;
@@ -881,8 +912,8 @@ public sealed partial class PhantomShowsChannel
             Type = ChannelItemType.Media,
             ContentType = ChannelMediaContentType.Episode,
             MediaType = ChannelMediaType.Video,
-            ParentIndexNumber = season,
-            IndexNumber = episodeNumber,
+            ParentIndexNumber = season > 0 ? season : null,
+            IndexNumber = hasEpisodeNumber ? episodeNumber : null,
             SeriesName = seriesName,
             Tags = new List<string> { "external" },
             MediaSources = new List<MediaSourceInfo> { FuseMediaSource(episode.Path) },
@@ -918,6 +949,25 @@ public sealed partial class PhantomShowsChannel
         }
 
         return withoutHash.Replace('_', ' ').Trim();
+    }
+
+    private static bool TryParseSeasonNumberFromText(string text, out int season)
+    {
+        season = 0;
+        var s = text.Trim().Replace('.', ' ').Replace('_', ' ');
+        if (s.StartsWith("Season ", StringComparison.OrdinalIgnoreCase))
+        {
+            return int.TryParse(s.AsSpan("Season ".Length).Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out season);
+        }
+
+        if (s.StartsWith("Season", StringComparison.OrdinalIgnoreCase))
+        {
+            return int.TryParse(s.AsSpan("Season".Length).Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out season);
+        }
+
+        return s.Length > 1
+            && (s[0] == 'S' || s[0] == 's')
+            && int.TryParse(s.AsSpan(1).Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out season);
     }
 
     private static bool TryParseEpisodeNumber(string fileName, out int season, out int episode)

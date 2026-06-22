@@ -109,6 +109,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - External TV series now use TMDB search/details when available, giving
   gostream-only TV folders normal titles, posters, overviews, genres, and
   TMDB provider IDs instead of raw folder-only metadata.
+- External TV episode browse now groups duplicate files for the same SxxExx
+  and chooses the best-quality variant, while still showing playable files
+  that lack an episode token instead of silently dropping them.
 
 ### BREAKING — requires wipe + patched Jellyfin
 
