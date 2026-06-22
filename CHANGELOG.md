@@ -106,6 +106,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so a large movie backlog cannot starve TV phantom episode creation.
 - Phantom channel data-version salt now changes for external-media support,
   forcing Jellyfin to rebuild stale channel cache after install.
+- External TV series now use TMDB search/details when available, giving
+  gostream-only TV folders normal titles, posters, overviews, genres, and
+  TMDB provider IDs instead of raw folder-only metadata.
 
 ### BREAKING — requires wipe + patched Jellyfin
 

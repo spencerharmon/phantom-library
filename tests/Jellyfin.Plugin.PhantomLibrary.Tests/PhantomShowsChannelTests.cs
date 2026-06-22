@@ -572,6 +572,27 @@ public class PhantomShowsChannelTests : IDisposable
     }
 
     [Fact]
+    public async Task GostreamOnlyTvFiles_WithTmdbHit_UseSeriesMetadata()
+    {
+        var seasonDir = Path.Combine(_enumerator.ShowsRootOverride!, "56_Days (2026)", "Season.01");
+        Directory.CreateDirectory(seasonDir);
+        await File.WriteAllTextAsync(Path.Combine(seasonDir, "56_Days_S01E01_72a275d4.mkv"), "x", CancellationToken.None);
+        _tmdb.Setup(t => t.SearchSeriesAsync("56 Days", 2026, null, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { new TmdbSearchHit(99056001, "56 Days From TMDB", "56 Days Original", "Search overview", "/search-poster.jpg", null, "2026-01-01", 7.5, 10) });
+        _tmdb.Setup(t => t.GetSeriesAsync(99056001, null, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new TmdbSeriesDetails(99056001, "56 Days From TMDB", "56 Days Original", "Full overview", "/poster.jpg", "/backdrop.jpg", "2026-01-01", 8.1, 11, new[] { "Drama" }, "Returning", 1, 1, new[] { "US" }, "tt99056001"));
+
+        var top = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+
+        var series = Assert.Single(top.Items, i => string.Equals(i.Name, "56 Days From TMDB", StringComparison.Ordinal));
+        Assert.StartsWith("orphanseries_", series.Id, StringComparison.Ordinal);
+        Assert.Equal("Full overview", series.Overview);
+        Assert.Equal("https://image.tmdb.org/t/p/w500/poster.jpg", series.ImageUrl);
+        Assert.Equal("99056001", series.ProviderIds["Tmdb"]);
+        Assert.Contains("external", series.Tags);
+    }
+
+    [Fact]
     public async Task GostreamOnlyTvFiles_AppearAsOrphanSeriesSeasonsAndEpisodes()
     {
         var seasonDir = Path.Combine(_enumerator.ShowsRootOverride!, "56_Days (2026)", "Season.01");

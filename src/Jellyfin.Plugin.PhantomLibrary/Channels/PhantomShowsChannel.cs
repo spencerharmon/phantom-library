@@ -7,6 +7,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
+using Jellyfin.Plugin.PhantomLibrary.Clients.Models;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Controller.Channels;
 using MediaBrowser.Controller.Drawing;
@@ -53,6 +54,7 @@ public sealed partial class PhantomShowsChannel
     private readonly SplashSourceProvider _splashSource;
     private readonly ChannelStateProvider _state;
     private readonly GostreamFilesystemEnumerator _enumerator;
+    private readonly Dictionary<string, int> _gostreamSeriesTmdbByPath = new(StringComparer.Ordinal);
     private readonly ILogger<PhantomShowsChannel> _logger;
     private readonly Func<string?> _languageProvider;
 
@@ -323,6 +325,19 @@ public sealed partial class PhantomShowsChannel
                 continue;
             }
 
+            var enriched = await TryResolveEnrichedGostreamSeriesAsync(series, ct).ConfigureAwait(false);
+            if (enriched is not null)
+            {
+                if (seen.Contains(enriched.TmdbId))
+                {
+                    continue;
+                }
+
+                items.Add(BuildExternalSeriesItemFromMetadata(enriched.Metadata, series));
+                seen.Add(enriched.TmdbId);
+                continue;
+            }
+
             items.Add(BuildOrphanSeriesItem(series));
         }
 
@@ -337,6 +352,7 @@ public sealed partial class PhantomShowsChannel
     {
         var visibleSeasons = await _db.ListVisibleSeasonsAsync(seriesTmdb, ct).ConfigureAwait(false);
         var items = new List<ChannelItemInfo>(visibleSeasons.Count);
+        var emitted = new HashSet<int>();
         foreach (var row in visibleSeasons)
         {
             ct.ThrowIfCancellationRequested();
@@ -344,6 +360,18 @@ public sealed partial class PhantomShowsChannel
             if (built is not null)
             {
                 items.Add(built);
+                emitted.Add(row.Season);
+            }
+        }
+
+        foreach (var external in await FindExternalSeriesByTmdbAsync(seriesTmdb, ct).ConfigureAwait(false))
+        {
+            foreach (var season in external.Series.Seasons.Where(s => s.Episodes.Count > 0).OrderBy(s => s.SeasonNumber))
+            {
+                if (emitted.Add(season.SeasonNumber))
+                {
+                    items.Add(BuildExternalSeasonItem(external.Metadata, external.Series, season));
+                }
             }
         }
 
@@ -399,12 +427,8 @@ public sealed partial class PhantomShowsChannel
             rows.AddRange(await _db.ListEpisodesForSeasonAsync(seriesTmdb, season, ct).ConfigureAwait(false));
         }
 
-        if (rows.Count == 0)
-        {
-            return EmptyResult();
-        }
-
         var items = new List<ChannelItemInfo>(rows.Count);
+        var emittedEpisodes = new HashSet<int>();
         foreach (var row in rows)
         {
             ct.ThrowIfCancellationRequested();
@@ -416,6 +440,35 @@ public sealed partial class PhantomShowsChannel
             var materialised = await _db.GetMaterialisedStateAsync(
                 seriesTmdb, "episode", season, row.Episode, ct).ConfigureAwait(false);
             items.Add(BuildEpisodeItemFromRow(row, materialised, seriesName));
+            emittedEpisodes.Add(row.Episode);
+        }
+
+        foreach (var external in await FindExternalSeriesByTmdbAsync(seriesTmdb, ct).ConfigureAwait(false))
+        {
+            var externalSeason = external.Series.Seasons.FirstOrDefault(s => s.SeasonNumber == season);
+            if (externalSeason is null)
+            {
+                continue;
+            }
+
+            foreach (var externalEpisode in externalSeason.Episodes)
+            {
+                if (!TryParseEpisodeNumber(Path.GetFileNameWithoutExtension(externalEpisode.Path), out _, out var episodeNumber)
+                    || emittedEpisodes.Contains(episodeNumber))
+                {
+                    continue;
+                }
+
+                var row = rows.FirstOrDefault(r => r.Episode == episodeNumber);
+                var item = row is null
+                    ? BuildOrphanEpisodeItem(externalEpisode)
+                    : BuildExternalEpisodeItemFromRow(row, externalEpisode, seriesName ?? external.Metadata.Title);
+                if (item is not null)
+                {
+                    items.Add(item);
+                    emittedEpisodes.Add(episodeNumber);
+                }
+            }
         }
 
         return new ChannelItemResult
@@ -473,6 +526,104 @@ public sealed partial class PhantomShowsChannel
         }
 
         return null;
+    }
+
+    private sealed record EnrichedGostreamSeries(int TmdbId, TmdbMetadataRow Metadata, GostreamSeriesEntry Series);
+
+    private async Task<IReadOnlyList<EnrichedGostreamSeries>> FindExternalSeriesByTmdbAsync(int tmdbId, CancellationToken ct)
+    {
+        var matches = new List<EnrichedGostreamSeries>();
+        foreach (var series in await _enumerator.EnumerateSeriesAsync(ct).ConfigureAwait(false))
+        {
+            ct.ThrowIfCancellationRequested();
+            var enriched = await TryResolveEnrichedGostreamSeriesAsync(series, ct).ConfigureAwait(false);
+            if (enriched is not null && enriched.TmdbId == tmdbId)
+            {
+                matches.Add(enriched);
+            }
+        }
+
+        return matches;
+    }
+
+    private async Task<EnrichedGostreamSeries?> TryResolveEnrichedGostreamSeriesAsync(GostreamSeriesEntry series, CancellationToken ct)
+    {
+        var (title, year) = ParseSeriesDirectoryName(Path.GetFileName(series.DirectoryPath));
+        if (string.IsNullOrWhiteSpace(title))
+        {
+            return null;
+        }
+
+        int tmdbId;
+        lock (_gostreamSeriesTmdbByPath)
+        {
+            _gostreamSeriesTmdbByPath.TryGetValue(series.DirectoryPath, out tmdbId);
+        }
+
+        if (tmdbId == 0)
+        {
+            IReadOnlyList<TmdbSearchHit> hits;
+            try
+            {
+                hits = await _tmdb.SearchSeriesAsync(title, year, _languageProvider(), ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "TMDB search failed for gostream TV directory {Path}", series.DirectoryPath);
+                return null;
+            }
+
+            if (hits.Count == 0)
+            {
+                return null;
+            }
+
+            tmdbId = hits[0].Id;
+            lock (_gostreamSeriesTmdbByPath)
+            {
+                _gostreamSeriesTmdbByPath[series.DirectoryPath] = tmdbId;
+            }
+        }
+
+        var metadata = await _db.GetTmdbMetadataAsync(tmdbId, "series", ct).ConfigureAwait(false);
+        if (metadata is null)
+        {
+            try
+            {
+                var details = await _tmdb.GetSeriesAsync(tmdbId, _languageProvider(), ct).ConfigureAwait(false);
+                if (details is null)
+                {
+                    return null;
+                }
+
+                metadata = MapSeriesDetails(details);
+                await _db.UpsertTmdbMetadataAsync(metadata, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "TMDB details fetch failed for gostream TV directory {Path} tmdb={Tmdb}", series.DirectoryPath, tmdbId);
+                return null;
+            }
+        }
+
+        return new EnrichedGostreamSeries(tmdbId, metadata, series);
+    }
+
+    private static TmdbMetadataRow MapSeriesDetails(TmdbSeriesDetails details)
+    {
+        return new TmdbMetadataRow(
+            details.Id,
+            "series",
+            details.Name,
+            ParseYear(details.FirstAirDate),
+            details.Overview,
+            BuildImageUrl(details.PosterPath),
+            BuildImageUrl(details.BackdropPath),
+            details.Genres,
+            null,
+            details.VoteAverage,
+            details.OriginalName,
+            DateTimeOffset.UtcNow);
     }
 
     // ----------------------------------------------------------------
@@ -644,6 +795,40 @@ public sealed partial class PhantomShowsChannel
         }
 
         item.ProviderIds["Tmdb"] = row.SeriesTmdbId.ToString(CultureInfo.InvariantCulture);
+        return item;
+    }
+
+    private static ChannelItemInfo BuildExternalSeriesItemFromMetadata(TmdbMetadataRow meta, GostreamSeriesEntry series)
+    {
+        var item = BuildSeriesItemFromMetadata(meta);
+        item.Id = OrphanSeriesPrefix + ChannelItemId.ForOrphanPath(series.DirectoryPath).OrphanHash;
+        item.FolderType = ChannelFolderType.Container;
+        item.Tags = new List<string> { "external" };
+        return item;
+    }
+
+    private static ChannelItemInfo BuildExternalSeasonItem(TmdbMetadataRow meta, GostreamSeriesEntry series, GostreamSeasonEntry season)
+    {
+        var hash = ChannelItemId.ForOrphanPath(series.DirectoryPath).OrphanHash;
+        return new ChannelItemInfo
+        {
+            Id = $"{OrphanSeasonPrefix}{hash}_s{season.SeasonNumber:00}",
+            Name = "Season " + season.SeasonNumber.ToString(CultureInfo.InvariantCulture),
+            SeriesName = meta.Title,
+            IndexNumber = season.SeasonNumber,
+            Type = ChannelItemType.Folder,
+            FolderType = ChannelFolderType.Container,
+            ImageUrl = meta.PosterUrl,
+            Tags = new List<string> { "external" },
+        };
+    }
+
+    private ChannelItemInfo BuildExternalEpisodeItemFromRow(TmdbEpisodeRow row, GostreamFileEntry externalEpisode, string? seriesName)
+    {
+        var item = BuildEpisodeItemFromRow(row, materialised: null, seriesName);
+        item.Id = OrphanEpisodePrefix + ChannelItemId.ForOrphanPath(externalEpisode.Path).OrphanHash;
+        item.Tags = new List<string> { "external" };
+        item.MediaSources = new List<MediaSourceInfo> { FuseMediaSource(externalEpisode.Path) };
         return item;
     }
 
@@ -867,6 +1052,9 @@ public sealed partial class PhantomShowsChannel
         Items = Array.Empty<ChannelItemInfo>(),
         TotalRecordCount = 0,
     };
+
+    private static int? ParseYear(string? date)
+        => !string.IsNullOrWhiteSpace(date) && date.Length >= 4 && int.TryParse(date[..4], NumberStyles.Integer, CultureInfo.InvariantCulture, out var y) ? y : null;
 
     private static string? BuildImageUrl(string? path)
     {
