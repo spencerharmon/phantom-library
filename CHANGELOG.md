@@ -116,9 +116,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   data-version salt again so stale raw external folders are rebuilt with TMDB
   metadata on install.
 - Availability probing now explicitly alternates episode and movie claims, and
-  episode claims spread across series before probing deeper into a single
-  long-running series, so due TV probes add more shows to the UI instead of
-  spending many ticks on one catalogue.
+  episode claims advance through a persisted series cursor before wrapping, so
+  due TV probes add more shows to the UI without running a full-table grouped
+  claim query over million-row episode catalogues every tick.
 - Gostream-backed TMDB series now use canonical series/season/episode ids for
   children; existing files direct-play while missing TMDB episodes remain
   visible as phantoms.

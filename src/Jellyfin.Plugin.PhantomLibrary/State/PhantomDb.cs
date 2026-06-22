@@ -1185,36 +1185,19 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
         {
             await using var conn = await OpenAsync(ct).ConfigureAwait(false);
             await using var tx = await conn.BeginTransactionAsync(ct).ConfigureAwait(false);
-            AvailabilityItemRow? row = null;
-            await using (var cmd = conn.CreateCommand())
+            var sqliteTx = (SqliteTransaction)tx;
+            var preferredEpisode = string.Equals(preferredType, "episode", StringComparison.Ordinal);
+
+            AvailabilityItemRow? row;
+            if (preferredEpisode)
             {
-                cmd.Transaction = (SqliteTransaction)tx;
-                cmd.CommandText = @"SELECT tmdb_id,type,season,episode,status,checked_at,next_check_at,
-                           candidate_magnet,candidate_info_hash,candidate_size,candidate_seeders,
-                           candidate_indexer,candidate_source,probe_generation,lease_owner
-                    FROM availability_items
-                    WHERE (next_check_at <= $now OR probe_policy_hash IS NULL OR probe_policy_hash <> $policy)
-                      AND (lease_until IS NULL OR lease_until < $now)
-                      AND ($preferred IS NULL OR type=$preferred)
-                    ORDER BY CASE
-                                 WHEN $preferred='episode' AND type='episode' THEN
-                                   (SELECT COUNT(*) FROM availability_items peer
-                                    WHERE peer.type='episode'
-                                      AND peer.tmdb_id=availability_items.tmdb_id
-                                      AND peer.checked_at IS NOT NULL)
-                                 ELSE 0
-                             END ASC,
-                             CASE WHEN checked_at IS NULL THEN 0 WHEN status='available' THEN 1 WHEN status='unavailable' THEN 2 ELSE 3 END,
-                             next_check_at ASC
-                    LIMIT 1;";
-                cmd.Parameters.AddWithValue("$now", now.ToUnixTimeSeconds());
-                cmd.Parameters.AddWithValue("$policy", policyHash);
-                cmd.Parameters.AddWithValue("$preferred", (object?)preferredType ?? DBNull.Value);
-                await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
-                if (await r.ReadAsync(ct).ConfigureAwait(false))
-                {
-                    row = ReadAvailability(r);
-                }
+                var cursor = await GetLongMetaInTransactionAsync(conn, sqliteTx, "availability.cursor.episode_series", ct).ConfigureAwait(false);
+                row = await TryReadDueEpisodeAfterCursorAsync(conn, sqliteTx, now, policyHash, cursor, ct).ConfigureAwait(false)
+                    ?? await TryReadDueEpisodeAfterCursorAsync(conn, sqliteTx, now, policyHash, null, ct).ConfigureAwait(false);
+            }
+            else
+            {
+                row = await TryReadDueAvailabilityAsync(conn, sqliteTx, now, policyHash, preferredType, ct).ConfigureAwait(false);
             }
 
             if (row is null)
@@ -1226,7 +1209,7 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
             var generation = row.ProbeGeneration + 1;
             await using (var cmd = conn.CreateCommand())
             {
-                cmd.Transaction = (SqliteTransaction)tx;
+                cmd.Transaction = sqliteTx;
                 cmd.CommandText = @"UPDATE availability_items
                     SET lease_owner=$owner, lease_until=$until, probe_generation=$gen, attempt_count=attempt_count+1
                     WHERE tmdb_id=$tmdb AND type=$type AND season=$season AND episode=$episode
@@ -1248,6 +1231,11 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
                 }
             }
 
+            if (preferredEpisode)
+            {
+                await SetMetaInTransactionAsync(conn, sqliteTx, "availability.cursor.episode_series", row.TmdbId.ToString(System.Globalization.CultureInfo.InvariantCulture), ct).ConfigureAwait(false);
+            }
+
             await tx.CommitAsync(ct).ConfigureAwait(false);
             return row with { ProbeGeneration = generation, LeaseOwner = owner };
         }
@@ -1255,6 +1243,91 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
         {
             _writeLock.Release();
         }
+    }
+
+    private static async Task<AvailabilityItemRow?> TryReadDueAvailabilityAsync(
+        SqliteConnection conn,
+        SqliteTransaction tx,
+        DateTimeOffset now,
+        string policyHash,
+        string? preferredType,
+        CancellationToken ct)
+    {
+        await using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = @"SELECT tmdb_id,type,season,episode,status,checked_at,next_check_at,
+                   candidate_magnet,candidate_info_hash,candidate_size,candidate_seeders,
+                   candidate_indexer,candidate_source,probe_generation,lease_owner
+            FROM availability_items
+            WHERE (next_check_at <= $now OR probe_policy_hash IS NULL OR probe_policy_hash <> $policy)
+              AND (lease_until IS NULL OR lease_until < $now)
+              AND ($preferred IS NULL OR type=$preferred)
+            ORDER BY CASE WHEN checked_at IS NULL THEN 0 WHEN status='available' THEN 1 WHEN status='unavailable' THEN 2 ELSE 3 END,
+                     next_check_at ASC
+            LIMIT 1;";
+        cmd.Parameters.AddWithValue("$now", now.ToUnixTimeSeconds());
+        cmd.Parameters.AddWithValue("$policy", policyHash);
+        cmd.Parameters.AddWithValue("$preferred", (object?)preferredType ?? DBNull.Value);
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        return await r.ReadAsync(ct).ConfigureAwait(false) ? ReadAvailability(r) : null;
+    }
+
+    private static async Task<AvailabilityItemRow?> TryReadDueEpisodeAfterCursorAsync(
+        SqliteConnection conn,
+        SqliteTransaction tx,
+        DateTimeOffset now,
+        string policyHash,
+        long? cursor,
+        CancellationToken ct)
+    {
+        await using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = @"SELECT tmdb_id,type,season,episode,status,checked_at,next_check_at,
+                   candidate_magnet,candidate_info_hash,candidate_size,candidate_seeders,
+                   candidate_indexer,candidate_source,probe_generation,lease_owner
+            FROM availability_items
+            WHERE type='episode'
+              AND ($cursor IS NULL OR tmdb_id > $cursor)
+              AND (next_check_at <= $now OR probe_policy_hash IS NULL OR probe_policy_hash <> $policy)
+              AND (lease_until IS NULL OR lease_until < $now)
+            ORDER BY tmdb_id ASC,
+                     CASE WHEN checked_at IS NULL THEN 0 WHEN status='available' THEN 1 WHEN status='unavailable' THEN 2 ELSE 3 END,
+                     season ASC,
+                     episode ASC
+            LIMIT 1;";
+        cmd.Parameters.AddWithValue("$cursor", (object?)cursor ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$now", now.ToUnixTimeSeconds());
+        cmd.Parameters.AddWithValue("$policy", policyHash);
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        return await r.ReadAsync(ct).ConfigureAwait(false) ? ReadAvailability(r) : null;
+    }
+
+    private static async Task<long?> GetLongMetaInTransactionAsync(SqliteConnection conn, SqliteTransaction tx, string key, CancellationToken ct)
+    {
+        await using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "SELECT value FROM plugin_meta WHERE key=$k LIMIT 1;";
+        cmd.Parameters.AddWithValue("$k", key);
+        var value = await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
+        if (value is null or DBNull)
+        {
+            return null;
+        }
+
+        return long.TryParse((string)value, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var parsed)
+            ? parsed
+            : null;
+    }
+
+    private static async Task SetMetaInTransactionAsync(SqliteConnection conn, SqliteTransaction tx, string key, string value, CancellationToken ct)
+    {
+        await using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = @"INSERT INTO plugin_meta(key, value) VALUES($k, $v)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value;";
+        cmd.Parameters.AddWithValue("$k", key);
+        cmd.Parameters.AddWithValue("$v", value);
+        await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     }
 
     public async Task<bool> CompleteAvailabilityProbeAsync(

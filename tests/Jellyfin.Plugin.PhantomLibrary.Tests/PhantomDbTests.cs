@@ -655,6 +655,7 @@ public class PhantomDbTests : IDisposable
     public async Task ClaimDueAvailability_PreferredEpisodeSpreadsAcrossSeriesBeforeDeepeningOneSeries()
     {
         using var db = await NewDbAsync();
+        await db.SetMetaAsync("availability.cursor.episode_series", "100", CancellationToken.None);
         await using var conn = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
         await conn.OpenAsync();
         await using (var cmd = conn.CreateCommand())
