@@ -64,6 +64,44 @@ public sealed class GostreamFilesystemEnumerator
     /// <summary>Test-only override for the shows root path.</summary>
     internal string? ShowsRootOverride { get; set; }
 
+    public string MoviesVersion() => FilesystemVersion(MoviesRoot);
+
+    public string ShowsVersion() => FilesystemVersion(ShowsRoot);
+
+    private static string FilesystemVersion(string root)
+    {
+        if (!Directory.Exists(root))
+        {
+            return "missing";
+        }
+
+        try
+        {
+            var count = 0;
+            var maxTicks = Directory.GetLastWriteTimeUtc(root).Ticks;
+            foreach (var path in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+            {
+                if (!IsVideoFile(path))
+                {
+                    continue;
+                }
+
+                count++;
+                var ticks = File.GetLastWriteTimeUtc(path).Ticks;
+                if (ticks > maxTicks)
+                {
+                    maxTicks = ticks;
+                }
+            }
+
+            return count.ToString(System.Globalization.CultureInfo.InvariantCulture) + ":" + maxTicks.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+        catch
+        {
+            return "error";
+        }
+    }
+
     /// <summary>
     /// Enumerate orphan movie files. A file is "orphan" iff its path is
     /// neither in <paramref name="knownTmdbs"/>'s materialised-state

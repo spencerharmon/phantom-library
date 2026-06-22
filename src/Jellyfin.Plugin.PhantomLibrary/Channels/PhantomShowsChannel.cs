@@ -93,7 +93,7 @@ public sealed partial class PhantomShowsChannel
     public string Description => "Phantom Library — TV discovery + on-demand materialise via gostream.";
 
     /// <inheritdoc />
-    public string DataVersion => _state.DataVersion(ChannelStateProvider.KindShows);
+    public string DataVersion => _state.DataVersion(ChannelStateProvider.KindShows) + ":fs:" + _enumerator.ShowsVersion();
 
     /// <inheritdoc />
     public string HomePageUrl => string.Empty;

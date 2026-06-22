@@ -64,7 +64,7 @@ public sealed class PhantomMoviesChannel
     public string Description => "Phantom Library — movie discovery + on-demand materialise via gostream.";
 
     /// <inheritdoc />
-    public string DataVersion => _state.DataVersion(ChannelStateProvider.KindMovies);
+    public string DataVersion => _state.DataVersion(ChannelStateProvider.KindMovies) + ":fs:" + _enumerator.MoviesVersion();
 
     /// <inheritdoc />
     public string HomePageUrl => string.Empty;

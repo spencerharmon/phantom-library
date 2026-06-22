@@ -229,6 +229,7 @@ VALUES
 ($SERIES, 'episode', $SEASON, $EPISODE, 'available', $now, $((now + 604800)),
  'magnet:?xt=urn:btih:2222222222222222222222222222222222222222&dn=Phantom+Rig+Delta+S01E01',
  '2222222222222222222222222222222222222222', 10485760, 100, 'rig-cache', 'rig');
+INSERT OR REPLACE INTO plugin_meta(key,value) VALUES('channel_dataversion_shows', '$now-rig-seed');
 SQL
 
 echo '[3] browse shows channel series -> season -> episodes'

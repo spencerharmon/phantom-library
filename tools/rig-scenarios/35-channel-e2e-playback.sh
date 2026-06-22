@@ -257,6 +257,7 @@ VALUES
 ($ALPHA, 'movie', -1, -1, 'available', $now, $((now + 604800)),
  'magnet:?xt=urn:btih:1111111111111111111111111111111111111111&dn=Phantom+Rig+Alpha',
  '1111111111111111111111111111111111111111', 10485760, 100, 'rig-cache', 'rig');
+INSERT OR REPLACE INTO plugin_meta(key,value) VALUES('channel_dataversion_movies', '$now-rig-seed');
 SQL
 
 echo '[3] browse channels'
