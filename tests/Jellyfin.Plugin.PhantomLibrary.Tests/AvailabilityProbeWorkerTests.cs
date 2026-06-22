@@ -205,7 +205,12 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
 
     private static async Task<bool> InvokeProbeOneAsync(AvailabilityProbeWorker worker, PluginConfiguration cfg)
     {
-        var method = typeof(AvailabilityProbeWorker).GetMethod("ProbeOneAvailabilityAsync", BindingFlags.Instance | BindingFlags.NonPublic)
+        var method = typeof(AvailabilityProbeWorker).GetMethod(
+            "ProbeOneAvailabilityAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic,
+            binder: null,
+            types: new[] { typeof(PluginConfiguration), typeof(CancellationToken) },
+            modifiers: null)
             ?? throw new MissingMethodException(nameof(AvailabilityProbeWorker), "ProbeOneAvailabilityAsync");
         var task = (Task<bool>)(method.Invoke(worker, new object[] { cfg, CancellationToken.None })
             ?? throw new InvalidOperationException("ProbeOneAvailabilityAsync returned null"));

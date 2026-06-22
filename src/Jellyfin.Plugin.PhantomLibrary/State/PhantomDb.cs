@@ -1176,7 +1176,7 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
         cmd.Parameters.AddWithValue("$fetched", row.FetchedAt.ToUnixTimeSeconds());
     }
 
-    public async Task<AvailabilityItemRow?> ClaimDueAvailabilityAsync(string owner, TimeSpan leaseDuration, DateTimeOffset now, string policyHash, CancellationToken ct)
+    public async Task<AvailabilityItemRow?> ClaimDueAvailabilityAsync(string owner, TimeSpan leaseDuration, DateTimeOffset now, string policyHash, CancellationToken ct, string? preferredType = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(owner);
         ArgumentException.ThrowIfNullOrWhiteSpace(policyHash);
@@ -1195,11 +1195,13 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
                     FROM availability_items
                     WHERE (next_check_at <= $now OR probe_policy_hash IS NULL OR probe_policy_hash <> $policy)
                       AND (lease_until IS NULL OR lease_until < $now)
+                      AND ($preferred IS NULL OR type=$preferred)
                     ORDER BY CASE WHEN checked_at IS NULL THEN 0 WHEN status='available' THEN 1 WHEN status='unavailable' THEN 2 ELSE 3 END,
                              next_check_at ASC
                     LIMIT 1;";
                 cmd.Parameters.AddWithValue("$now", now.ToUnixTimeSeconds());
                 cmd.Parameters.AddWithValue("$policy", policyHash);
+                cmd.Parameters.AddWithValue("$preferred", (object?)preferredType ?? DBNull.Value);
                 await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
                 if (await r.ReadAsync(ct).ConfigureAwait(false))
                 {

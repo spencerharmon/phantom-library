@@ -115,19 +115,27 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
                 using var cts = CancellationTokenSource.CreateLinkedTokenSource(serviceStopping);
                 cts.CancelAfter(TimeSpan.FromMinutes(Math.Max(1, cfg.AvailabilityLeaseMinutes)));
 
-                // TV parity: series expansion creates episode availability work.
-                // Do not let a large movie availability backlog starve shows.
-                var preferSeriesExpansion = i % 2 == 0;
-                var didWork = preferSeriesExpansion
-                    ? await ExpandOneSeriesAsync(cfg, cts.Token).ConfigureAwait(false)
-                    : await ProbeOneAvailabilityAsync(cfg, cts.Token).ConfigureAwait(false);
-                if (!didWork)
+                // TV parity: series expansion creates episode availability work,
+                // and episode probes must not sit behind a movie backlog. Each
+                // slot gives TV expansion a chance, then probes availability
+                // with alternating episode/movie preference and fallback.
+                var expanded = i % 2 == 0 && await ExpandOneSeriesAsync(cfg, cts.Token).ConfigureAwait(false);
+                var preferredType = i % 2 == 0 ? "episode" : "movie";
+                var probed = await ProbeOneAvailabilityAsync(cfg, preferredType, cts.Token).ConfigureAwait(false);
+                if (!probed)
                 {
-                    didWork = preferSeriesExpansion
-                        ? await ProbeOneAvailabilityAsync(cfg, cts.Token).ConfigureAwait(false)
-                        : await ExpandOneSeriesAsync(cfg, cts.Token).ConfigureAwait(false);
+                    probed = await ProbeOneAvailabilityAsync(cfg, preferredType == "episode" ? "movie" : "episode", cts.Token).ConfigureAwait(false);
+                }
+                if (!probed)
+                {
+                    probed = await ProbeOneAvailabilityAsync(cfg, preferredType: null, cts.Token).ConfigureAwait(false);
+                }
+                if (!expanded && !probed && i % 2 != 0)
+                {
+                    expanded = await ExpandOneSeriesAsync(cfg, cts.Token).ConfigureAwait(false);
                 }
 
+                var didWork = expanded || probed;
                 anyWork |= didWork;
                 if (!didWork)
                 {
@@ -151,7 +159,10 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
         }
     }
 
-    private async Task<bool> ProbeOneAvailabilityAsync(PluginConfiguration cfg, CancellationToken ct)
+    private Task<bool> ProbeOneAvailabilityAsync(PluginConfiguration cfg, CancellationToken ct)
+        => ProbeOneAvailabilityAsync(cfg, preferredType: null, ct);
+
+    private async Task<bool> ProbeOneAvailabilityAsync(PluginConfiguration cfg, string? preferredType, CancellationToken ct)
     {
         var now = DateTimeOffset.UtcNow;
         var policyHash = ComputePolicyHash(cfg);
@@ -160,7 +171,8 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
             TimeSpan.FromMinutes(Math.Max(1, cfg.AvailabilityLeaseMinutes)),
             now,
             policyHash,
-            ct).ConfigureAwait(false);
+            ct,
+            preferredType).ConfigureAwait(false);
         if (lease is null)
         {
             return false;

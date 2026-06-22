@@ -740,6 +740,7 @@ public sealed partial class PhantomShowsChannel
             Id = id,
             Name = "Season " + season.ToString(CultureInfo.InvariantCulture),
             SeriesName = seriesMeta?.Title,
+            Overview = seriesMeta?.Overview,
             IndexNumber = season,
             Type = ChannelItemType.Folder,
             // Use a generic channel container instead of ChannelFolderType.Season.
@@ -870,6 +871,7 @@ public sealed partial class PhantomShowsChannel
             Id = ChannelItemId.ForSeason(meta.TmdbId, season.SeasonNumber).Encode(),
             Name = "Season " + season.SeasonNumber.ToString(CultureInfo.InvariantCulture),
             SeriesName = meta.Title,
+            Overview = meta.Overview,
             IndexNumber = season.SeasonNumber,
             Type = ChannelItemType.Folder,
             FolderType = ChannelFolderType.Container,
