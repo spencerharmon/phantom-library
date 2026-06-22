@@ -102,6 +102,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Gostream/external files are tagged as external playable media rather than
   Phantom state-machine items, so badge responses omit them instead of labeling
   them as materialised phantoms.
+- Availability scheduling now interleaves series expansion with source probing
+  so a large movie backlog cannot starve TV phantom episode creation.
+- Phantom channel data-version salt now changes for external-media support,
+  forcing Jellyfin to rebuild stale channel cache after install.
 
 ### BREAKING — requires wipe + patched Jellyfin
 

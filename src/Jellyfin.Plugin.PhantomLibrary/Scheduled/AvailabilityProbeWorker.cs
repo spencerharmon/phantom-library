@@ -114,10 +114,18 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
             {
                 using var cts = CancellationTokenSource.CreateLinkedTokenSource(serviceStopping);
                 cts.CancelAfter(TimeSpan.FromMinutes(Math.Max(1, cfg.AvailabilityLeaseMinutes)));
-                var didWork = await ProbeOneAvailabilityAsync(cfg, cts.Token).ConfigureAwait(false);
+
+                // TV parity: series expansion creates episode availability work.
+                // Do not let a large movie availability backlog starve shows.
+                var preferSeriesExpansion = i % 2 == 0;
+                var didWork = preferSeriesExpansion
+                    ? await ExpandOneSeriesAsync(cfg, cts.Token).ConfigureAwait(false)
+                    : await ProbeOneAvailabilityAsync(cfg, cts.Token).ConfigureAwait(false);
                 if (!didWork)
                 {
-                    didWork = await ExpandOneSeriesAsync(cfg, cts.Token).ConfigureAwait(false);
+                    didWork = preferSeriesExpansion
+                        ? await ProbeOneAvailabilityAsync(cfg, cts.Token).ConfigureAwait(false)
+                        : await ExpandOneSeriesAsync(cfg, cts.Token).ConfigureAwait(false);
                 }
 
                 anyWork |= didWork;

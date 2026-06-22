@@ -7,6 +7,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Channels;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
+using Jellyfin.Plugin.PhantomLibrary.Clients.Models;
 using Jellyfin.Plugin.PhantomLibrary.Configuration;
 using Jellyfin.Plugin.PhantomLibrary.Materialisation;
 using Jellyfin.Plugin.PhantomLibrary.Scheduled;
@@ -55,6 +56,51 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
     }
 
     [Fact]
+    public async Task Tick_PrefersSeriesExpansionSoMovieBacklogDoesNotStarveTv()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 99000010);
+        await SeedSeriesAsync(db, 99000100);
+        await db.SetImdbIdAsync(99000010, "movie", "tt99000010", CancellationToken.None);
+        var cfg = Config();
+        cfg.AvailabilityMaxBatchSize = 1;
+        var tmdb = new Mock<ITmdbClient>(MockBehavior.Loose);
+        tmdb.Setup(t => t.GetSeriesAsync(99000100, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new TmdbSeriesDetails(
+                99000100,
+                "TV Parity Series",
+                "TV Parity Series",
+                string.Empty,
+                string.Empty,
+                "2020-01-01",
+                "2020-01-01",
+                0,
+                0,
+                Array.Empty<string>(),
+                string.Empty,
+                1,
+                1,
+                Array.Empty<string>(),
+                "tt99000100"));
+        tmdb.Setup(t => t.GetSeasonAsync(99000100, 1, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new TmdbSeasonDetails
+            {
+                SeriesTmdbId = 99000100,
+                SeasonNumber = 1,
+                Episodes = new List<TmdbEpisodeSummary>
+                {
+                    new() { Id = 990001001, SeasonNumber = 1, EpisodeNumber = 1, Name = "Pilot", AirDate = "2020-01-01" },
+                },
+            });
+        var worker = BuildWorker(db, cfg, new EmptyIndexer(), tmdb.Object);
+
+        await InvokeTickAsync(worker);
+
+        Assert.Equal(1, await CountEpisodeAvailabilityRowsAsync());
+        Assert.Equal(0, await ReadAttemptCountAsync(99000010, "movie", -1, -1));
+    }
+
+    [Fact]
     public async Task TransientAllFail_DoesNotWriteUnavailableOrMarker()
     {
         using var db = await NewDbAsync();
@@ -96,14 +142,20 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
         return db;
     }
 
-    private static async Task SeedMovieAsync(PhantomDb db, int tmdbId)
+    private static Task SeedMovieAsync(PhantomDb db, int tmdbId)
+        => SeedCatalogueAsync(db, tmdbId, "movie", "Availability Test Movie");
+
+    private static Task SeedSeriesAsync(PhantomDb db, int tmdbId)
+        => SeedCatalogueAsync(db, tmdbId, "series", "TV Parity Series");
+
+    private static async Task SeedCatalogueAsync(PhantomDb db, int tmdbId, string type, string title)
     {
         await db.UpsertCatalogueHitsAsync(new[]
         {
             new TmdbMetadataRow(
                 tmdbId,
-                "movie",
-                "Availability Test Movie",
+                type,
+                title,
                 2020,
                 null,
                 null,
@@ -133,14 +185,19 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
     private static AvailabilityProbeWorker BuildWorker(PhantomDb db, PluginConfiguration cfg, IIndexerClient indexer)
     {
         var tmdb = new Mock<ITmdbClient>(MockBehavior.Loose);
-        var externalIds = new TmdbExternalIdResolver(db, tmdb.Object, NullLogger<TmdbExternalIdResolver>.Instance);
+        return BuildWorker(db, cfg, indexer, tmdb.Object);
+    }
+
+    private static AvailabilityProbeWorker BuildWorker(PhantomDb db, PluginConfiguration cfg, IIndexerClient indexer, ITmdbClient tmdb)
+    {
+        var externalIds = new TmdbExternalIdResolver(db, tmdb, NullLogger<TmdbExternalIdResolver>.Instance);
         var scorer = new QualityScorer(NullLogger<QualityScorer>.Instance);
         var selector = new MagnetSelector(new[] { indexer }, scorer, NullLogger<MagnetSelector>.Instance, () => cfg);
         return new AvailabilityProbeWorker(
             db,
             selector,
             externalIds,
-            tmdb.Object,
+            tmdb,
             new ChannelStateProvider(db),
             NullLogger<AvailabilityProbeWorker>.Instance,
             () => cfg);
@@ -155,12 +212,43 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
         return await task;
     }
 
+    private static async Task InvokeTickAsync(AvailabilityProbeWorker worker)
+    {
+        var method = typeof(AvailabilityProbeWorker).GetMethod("TickAsync", BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new MissingMethodException(nameof(AvailabilityProbeWorker), "TickAsync");
+        var task = (Task)(method.Invoke(worker, new object[] { CancellationToken.None })
+            ?? throw new InvalidOperationException("TickAsync returned null"));
+        await task;
+    }
+
     private async Task<int> CountRowsAsync(string table)
     {
         await using var conn = new SqliteConnection("Data Source=" + _dbPath);
         await conn.OpenAsync();
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = "SELECT COUNT(*) FROM " + table + ";";
+        return Convert.ToInt32(await cmd.ExecuteScalarAsync(), System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    private async Task<int> CountEpisodeAvailabilityRowsAsync()
+    {
+        await using var conn = new SqliteConnection("Data Source=" + _dbPath);
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT COUNT(*) FROM availability_items WHERE type='episode';";
+        return Convert.ToInt32(await cmd.ExecuteScalarAsync(), System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    private async Task<int> ReadAttemptCountAsync(int tmdbId, string type, int season, int episode)
+    {
+        await using var conn = new SqliteConnection("Data Source=" + _dbPath);
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT attempt_count FROM availability_items WHERE tmdb_id=$tmdb AND type=$type AND season=$season AND episode=$episode;";
+        cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+        cmd.Parameters.AddWithValue("$type", type);
+        cmd.Parameters.AddWithValue("$season", season);
+        cmd.Parameters.AddWithValue("$episode", episode);
         return Convert.ToInt32(await cmd.ExecuteScalarAsync(), System.Globalization.CultureInfo.InvariantCulture);
     }
 

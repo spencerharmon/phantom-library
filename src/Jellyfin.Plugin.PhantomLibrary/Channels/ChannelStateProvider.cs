@@ -27,7 +27,7 @@ public sealed class ChannelStateProvider
     public const string KindMovies = "movies";
     public const string KindShows = "shows";
 
-    private const string DataVersionSalt = "native-open-v1";
+    private const string DataVersionSalt = "external-media-v2";
 
     private static readonly string[] AllKinds = { KindMovies, KindShows };
 
