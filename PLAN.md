@@ -46,14 +46,39 @@ Mascot: *Stygiomedusa gigantea*, the giant phantom jelly.
 | Spike — Jellyfin-native `[tmdbid-<id>]` stub layout | ✅ | merged into main as `a931379` (file-on-disk architecture; deployed to operator v0.2.0.0; **slated for replacement by M14**) |
 | M14 — IChannel migration + Jellyfin patch | 🚧 IN FLIGHT on main | Channel architecture implemented behind schema v11; remaining work is hardening, operator validation, and cleanup of stale design docs. |
 
+### M14 operator requirements ledger
+
+This ledger is the scope authority for M14 completion. Critic review may
+identify missing code, but must not convert requirements to deferred work.
+Only the operator may change `Disposition` from `IMPLEMENT` to `DEFER` or
+`DROP`. Any PLAN text that conflicts with this ledger is stale and must be
+fixed before handoff.
+
+| ID | Requirement | Disposition | Acceptance evidence required |
+|---|---|---|---|
+| REQ-M14-SOURCE-API | Source-management backend APIs: list current source/candidates, reject current source, materialise selected candidate. | IMPLEMENT | API tests + file:line citations for `GET .../Sources`, `POST .../RejectCurrent`, `POST .../MaterialiseCandidate`. |
+| REQ-M14-SOURCE-UI | Source-management web UI: details-panel "Phantom Source" section, candidate dropdown, and "Reject current source" action. | IMPLEMENT | UI/JS tests or DOM evidence showing controls for Phantom items and absence/disabled state for non-Phantom items. |
+| REQ-M14-SOURCE-SAFETY | Rejecting a source skips that candidate, tries next ranked candidate, refreshes item state, and never removes a gostream hash still referenced by another item. | IMPLEMENT | Unit/API tests + rig proof for reject → next source → playback. |
+| REQ-M14-MOBILE | Source-management UX is usable in mobile browser; native mobile limitations must have diagnostics/channel fallback or explicit operator-approved limitation. | IMPLEMENT | Mobile-browser DOM/API evidence or documented fallback with test coverage. |
+| REQ-M14-FAV-MATERIALISE | Favourite-triggered materialisation/prewarming behavior must be implemented or explicitly re-approved by operator as not desired after channel refactor. | IMPLEMENT | UserData/favourite tests showing materialise/prewarm trigger, or operator-approved disposition change. |
+| REQ-M14-PER-USER | Per-user preferences/favourite eviction protection/show-hide/source-probing controls must be implemented or re-evaluated with operator after channel refactor. | IMPLEMENT | API/UI/tests for per-user behavior, or operator-approved disposition change. |
+| REQ-M14-UNAVAILABLE-UX | Unavailable-title UX must be intentionally implemented: visible badge/diagnostics/source-management state, not silent plan deferral. | IMPLEMENT | Badge/API/UI tests proving unavailable state behavior. |
+| REQ-M14-RECOMMENDATIONS | Favourite-similar/recommendation ingestion must be re-evaluated after channel refactor; do not silently drop it. | EVALUATE | Written evaluation against current channel surfaces + operator disposition. |
+| REQ-M14-RETENTION | Phantom/catalogue retention must be re-evaluated after schema v11 append-only catalogue design; config must not imply active pruning unless implemented. | EVALUATE | Written evaluation + either implementation/tests or operator-approved no-op/defer. |
+| REQ-M14-VAULT | Vault Mode/prestage/favourite-driven persistence must be re-evaluated against current gostream and eviction model. | EVALUATE | Written evaluation + implementation/tests or operator-approved disposition. |
+| REQ-M14-CONCURRENCY | Per-indexer concurrency cap must be implemented or removed/renamed so config does not overpromise. | EVALUATE | Concurrency tests or config/UI cleanup with operator-approved disposition. |
+| REQ-M14-SEARCH-GATING | Native remote-search availability gating must be evaluated against channel-only availability gating. | EVALUATE | Written evaluation + operator disposition. |
+| REQ-M14-SPLASH | Splash/fake-button/dynamic overlay remnants must be evaluated after native-open refactor and either removed, repurposed, or operator-approved as historical. | EVALUATE | Written evaluation + code/UI cleanup if still exposed. |
+
 ### Documented partials
 
 - **Custom `QualityPreset` falls back to `GostreamDefault`** with a
   warning log (M4 decision). Revisit when a real custom-scoring use
   case appears.
-- **Per-user preferences are deferred under M14.** Earlier admin sub-page
-  wiring was removed from the active API surface; current favourite
-  protection and availability probing are server-wide settings.
+- **Per-user preferences are tracked by REQ-M14-PER-USER.** Earlier admin
+  sub-page wiring was removed from the active API surface; this is not an
+  approved deferral until the operator accepts the post-channel-refactor
+  disposition.
 - **Series-level `Materialise` returns `Error`** (M8). Correct
   behaviour: a Series is a container, not a streamable file.
   Materialise individual Episodes (the autopilot does this for the
