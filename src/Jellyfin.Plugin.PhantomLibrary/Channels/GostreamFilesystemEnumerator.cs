@@ -26,15 +26,16 @@ public sealed record GostreamSeasonEntry(
     IReadOnlyList<GostreamFileEntry> Episodes);
 
 /// <summary>
-/// Walks the gostream FUSE-mounted virtual MKV tree to enumerate
-/// "orphan" files — items that exist on the gostream side but that the
-/// plugin did not put there (and therefore are not surfaced by phantom
-/// discovery / materialised_state). The movies channel emits these as
-/// raw-filename entries so the operator can still see and play them.
+/// Walks the gostream FUSE-mounted virtual MKV tree to enumerate external
+/// files — playable items that exist on the gostream side but do not have a
+/// Phantom-owned <c>materialised_state</c> row. The channels emit these as
+/// ordinary playable gostream items so phantoms, gostream files, and other
+/// media files can coexist without relying on Jellyfin's library scanner.
 ///
-/// Authoritative source for the (tmdb, fuse_path) mapping is the
-/// plugin's own <c>materialised_state</c> table. Anything else found on
-/// the FUSE mount is treated as an orphan.
+/// Authoritative source for Phantom-owned (tmdb, fuse_path) mappings is the
+/// plugin's own <c>materialised_state</c> table. Files outside that mapping
+/// are still first-class playable channel items; they are just not Phantom
+/// state-machine items.
 ///
 /// Per plan §3.2 / critic IMPORTANT 8: do NOT cross-check with gostream
 /// to derive tmdb ids; that races a foreign source-of-truth. The plugin
@@ -138,14 +139,18 @@ public sealed class GostreamFilesystemEnumerator
     /// the tmdb id is not derivable from the path alone. Stage 5.1
     /// extends this to consult materialised_state for series-id resolution.
     /// </summary>
-    public Task<IReadOnlyList<GostreamSeriesEntry>> EnumerateSeriesAsync(CancellationToken ct)
+    public async Task<IReadOnlyList<GostreamSeriesEntry>> EnumerateSeriesAsync(CancellationToken ct)
     {
         var root = ShowsRoot;
         if (!Directory.Exists(root))
         {
             _logger.LogDebug("Gostream shows root {Root} does not exist; no series", root);
-            return Task.FromResult<IReadOnlyList<GostreamSeriesEntry>>(Array.Empty<GostreamSeriesEntry>());
+            return Array.Empty<GostreamSeriesEntry>();
         }
+
+        var materialisedFusePaths = (await _db.ListMaterialisedStateAsync("episode", ct).ConfigureAwait(false))
+            .Select(r => GostreamPathResolver.ResolvePath(r.FusePath, root))
+            .ToHashSet(StringComparer.Ordinal);
 
         var series = new List<GostreamSeriesEntry>();
         IEnumerable<string> seriesDirs;
@@ -156,7 +161,7 @@ public sealed class GostreamFilesystemEnumerator
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to enumerate series under {Root}", root);
-            return Task.FromResult<IReadOnlyList<GostreamSeriesEntry>>(Array.Empty<GostreamSeriesEntry>());
+            return Array.Empty<GostreamSeriesEntry>();
         }
 
         foreach (var seriesDir in seriesDirs)
@@ -195,7 +200,7 @@ public sealed class GostreamFilesystemEnumerator
 
                 foreach (var ep in epFiles)
                 {
-                    if (!IsVideoFile(ep))
+                    if (!IsVideoFile(ep) || materialisedFusePaths.Contains(ep))
                     {
                         continue;
                     }
@@ -209,10 +214,13 @@ public sealed class GostreamFilesystemEnumerator
                 }
             }
 
-            series.Add(new GostreamSeriesEntry(seriesDir, null, seasons));
+            if (seasons.Count > 0)
+            {
+                series.Add(new GostreamSeriesEntry(seriesDir, null, seasons));
+            }
         }
 
-        return Task.FromResult<IReadOnlyList<GostreamSeriesEntry>>(series);
+        return series;
     }
 
     /// <summary>

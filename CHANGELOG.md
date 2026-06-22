@@ -96,9 +96,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Availability probing now arms its background timer even when disabled at
   startup, so enabling it later in plugin settings starts filling visible
   phantom rows without requiring a Jellyfin restart.
-- Phantom Shows now surfaces gostream-only TV files as raw orphan
+- Phantom Shows now surfaces gostream-only TV files as external
   series/season/episode channel items, including `Season.01` folder parsing,
   instead of only showing episodes already present in `materialised_state`.
+- Gostream/external files are tagged as external playable media rather than
+  Phantom state-machine items, so badge responses omit them instead of labeling
+  them as materialised phantoms.
 
 ### BREAKING — requires wipe + patched Jellyfin
 

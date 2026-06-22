@@ -177,6 +177,27 @@ public class GostreamFilesystemEnumeratorTests : IDisposable
     }
 
     [Fact]
+    public async Task Series_ExcludesMaterialisedEpisodeFusePath()
+    {
+        var seriesDir = Path.Combine(_showsRoot, "My Show (2020)");
+        var season1 = Path.Combine(seriesDir, "Season.01");
+        Directory.CreateDirectory(season1);
+        var materialised = Path.Combine(season1, "My_Show_S01E01_aaaaaaa.mkv");
+        var external = Path.Combine(season1, "My_Show_S01E02_bbbbbbb.mkv");
+        File.WriteAllText(materialised, string.Empty);
+        File.WriteAllText(external, string.Empty);
+        await _db.InsertMaterialisedStateAsync(42, "episode", 1, 1, "/stub", materialised, CancellationToken.None);
+
+        var e = NewEnumerator();
+        var got = await e.EnumerateSeriesAsync(CancellationToken.None);
+
+        var series = Assert.Single(got);
+        var season = Assert.Single(series.Seasons);
+        var episode = Assert.Single(season.Episodes);
+        Assert.Equal(external, episode.Path);
+    }
+
+    [Fact]
     public async Task Series_EmptyRoot_ReturnsEmpty()
     {
         var e = NewEnumerator();

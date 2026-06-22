@@ -583,15 +583,18 @@ public class PhantomShowsChannelTests : IDisposable
         var series = Assert.Single(top.Items, i => string.Equals(i.Name, "56 Days", StringComparison.Ordinal));
         Assert.StartsWith("orphanseries_", series.Id, StringComparison.Ordinal);
         Assert.Equal(2026, series.ProductionYear);
+        Assert.Contains("external", series.Tags);
 
         var seasons = await _channel.GetChannelItems(new InternalChannelItemQuery { FolderId = series.Id }, CancellationToken.None);
         var season = Assert.Single(seasons.Items);
         Assert.Equal("Season 1", season.Name);
         Assert.StartsWith("orphanseason_", season.Id, StringComparison.Ordinal);
+        Assert.Contains("external", season.Tags);
 
         var episodes = await _channel.GetChannelItems(new InternalChannelItemQuery { FolderId = season.Id }, CancellationToken.None);
         var episode = Assert.Single(episodes.Items);
         Assert.StartsWith("orphanepisode_", episode.Id, StringComparison.Ordinal);
+        Assert.Contains("external", episode.Tags);
         Assert.Equal(1, episode.ParentIndexNumber);
         Assert.Equal(1, episode.IndexNumber);
         Assert.Equal(episodePath, Assert.Single(episode.MediaSources).Path);

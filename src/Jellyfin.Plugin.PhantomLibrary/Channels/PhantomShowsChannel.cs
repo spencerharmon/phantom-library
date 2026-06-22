@@ -658,7 +658,7 @@ public sealed partial class PhantomShowsChannel
             FolderType = ChannelFolderType.Container,
             ProductionYear = year,
             PremiereDate = year is { } y ? new DateTime(y, 1, 1, 0, 0, 0, DateTimeKind.Utc) : null,
-            Tags = new List<string> { "orphan" },
+            Tags = new List<string> { "external" },
         };
     }
 
@@ -674,7 +674,7 @@ public sealed partial class PhantomShowsChannel
             IndexNumber = season.SeasonNumber,
             Type = ChannelItemType.Folder,
             FolderType = ChannelFolderType.Container,
-            Tags = new List<string> { "orphan" },
+            Tags = new List<string> { "external" },
         };
     }
 
@@ -699,7 +699,7 @@ public sealed partial class PhantomShowsChannel
             ParentIndexNumber = season,
             IndexNumber = episodeNumber,
             SeriesName = seriesName,
-            Tags = new List<string> { "orphan" },
+            Tags = new List<string> { "external" },
             MediaSources = new List<MediaSourceInfo> { FuseMediaSource(episode.Path) },
         };
     }

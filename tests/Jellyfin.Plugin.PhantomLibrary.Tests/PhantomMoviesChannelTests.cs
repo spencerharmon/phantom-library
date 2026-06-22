@@ -222,7 +222,7 @@ public class PhantomMoviesChannelTests : IDisposable
         var item = Assert.Single(result.Items);
         Assert.Equal("movie_4242", item.Id);
         Assert.Equal("Some Movie", item.Name);
-        Assert.DoesNotContain("orphan", item.Tags);
+        Assert.Contains("external", item.Tags);
         Assert.DoesNotContain("phantom", item.Tags);
         Assert.Equal("4242", item.ProviderIds["Tmdb"]);
         Assert.Equal(path, item.MediaSources[0].Path);
@@ -251,7 +251,7 @@ public class PhantomMoviesChannelTests : IDisposable
         var item = Assert.Single(result.Items);
         Assert.Equal("movie_1318447", item.Id);
         Assert.Equal("Apex", item.Name);
-        Assert.DoesNotContain("orphan", item.Tags);
+        Assert.Contains("external", item.Tags);
         var source = Assert.Single(item.MediaSources);
         Assert.Equal(dv, source.Path);
     }
@@ -277,7 +277,7 @@ public class PhantomMoviesChannelTests : IDisposable
         Assert.Equal("movie_1318447", item.Id);
         var source = Assert.Single(item.MediaSources);
         Assert.Equal(materialised, source.Path);
-        Assert.DoesNotContain("orphan", item.Tags);
+        Assert.DoesNotContain("external", item.Tags);
         Assert.DoesNotContain("phantom", item.Tags);
     }
 
@@ -300,7 +300,7 @@ public class PhantomMoviesChannelTests : IDisposable
         Assert.Equal(path, item.MediaSources[0].Path);
         Assert.True(Guid.TryParse(item.MediaSources[0].Id, out _));
         Assert.DoesNotContain("phantom", item.Tags);
-        Assert.DoesNotContain("orphan", item.Tags);
+        Assert.Contains("external", item.Tags);
     }
 
     [Fact]
@@ -316,7 +316,7 @@ public class PhantomMoviesChannelTests : IDisposable
         var item = Assert.Single(result.Items);
         Assert.StartsWith("orphan_", item.Id, StringComparison.Ordinal);
         Assert.Equal("Some Unknown Movie", item.Name);
-        Assert.Contains("orphan", item.Tags);
+        Assert.Contains("external", item.Tags);
         Assert.Equal(orphanPath, item.MediaSources[0].Path);
         Assert.True(Guid.TryParse(item.MediaSources[0].Id, out _));
     }

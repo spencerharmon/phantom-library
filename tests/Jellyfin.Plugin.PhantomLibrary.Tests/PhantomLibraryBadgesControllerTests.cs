@@ -196,6 +196,23 @@ public class PhantomLibraryBadgesControllerTests : IDisposable
     }
 
     [Fact]
+    public async Task ExternalGostreamMovie_OmittedFromResponse()
+    {
+        using var db = await NewDbAsync();
+        var id = Guid.NewGuid();
+        var item = MakePhantomMovie(id, 30);
+        item.Path = "/var/gostream/gostream-mkv-virtual/movies/external.mkv";
+        item.Tags = new[] { "external" };
+        var lib = new Mock<ILibraryManager>(MockBehavior.Loose);
+        lib.Setup(l => l.GetItemById(id)).Returns(item);
+
+        var ctrl = MakeController(lib.Object, db);
+        var res = await ctrl.States(new PhantomLibraryStatesRequest { Ids = new() { id.ToString() } }, CancellationToken.None);
+
+        Assert.Empty(Cast(res));
+    }
+
+    [Fact]
     public async Task ShowSeriesAndSeasonFolders_Omitted_ButEpisodeReturned()
     {
         using var db = await NewDbAsync();

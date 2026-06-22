@@ -166,6 +166,7 @@ public sealed class PhantomMoviesChannel
             else if (variants is { Count: > 0 })
             {
                 sources.Add(SelectDefaultVariant(variants));
+                tags.Add("external");
             }
             else
             {
@@ -186,7 +187,7 @@ public sealed class PhantomMoviesChannel
                 continue;
             }
 
-            var item = BuildMovieItemFromMetadata(metadataByTmdb[kvp.Key], new[] { SelectDefaultVariant(kvp.Value) }, tags: new List<string>());
+            var item = BuildMovieItemFromMetadata(metadataByTmdb[kvp.Key], new[] { SelectDefaultVariant(kvp.Value) }, tags: new List<string> { "external" });
             items.Add(item);
             emittedTmdbs.Add(kvp.Key);
         }
@@ -346,6 +347,7 @@ public sealed class PhantomMoviesChannel
         else if (variants is { Count: > 0 })
         {
             sources.Add(SelectDefaultVariant(variants));
+            tags.Add("external");
         }
         else
         {
@@ -524,7 +526,7 @@ public sealed class PhantomMoviesChannel
             Type = ChannelItemType.Media,
             ContentType = ChannelMediaContentType.Movie,
             MediaType = ChannelMediaType.Video,
-            Tags = new List<string> { "orphan" },
+            Tags = new List<string> { "external" },
             MediaSources = new List<MediaSourceInfo> { FuseMediaSource(o.Path) },
         };
     }

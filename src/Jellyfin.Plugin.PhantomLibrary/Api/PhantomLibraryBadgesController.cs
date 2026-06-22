@@ -167,6 +167,11 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
                 parsed = computed;
             }
 
+            if (IsExternalGostreamChannelItem(item))
+            {
+                continue;
+            }
+
             // Only movie/episode kinds carry materialise state. Series /
             // season folders are navigation containers; omit them so the
             // browser badge overlay never stamps a badge onto a series or
@@ -249,6 +254,12 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
         return false;
     }
 
+    private static bool IsExternalGostreamChannelItem(BaseItem? item)
+    {
+        return item is not null
+            && item.Tags.Contains("external", StringComparer.OrdinalIgnoreCase);
+    }
+
     private static bool IsRealGostreamChannelItem(BaseItem? item)
     {
         if (item is null)
@@ -257,6 +268,7 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
         }
 
         if (item.Tags.Contains("phantom", StringComparer.OrdinalIgnoreCase)
+            || item.Tags.Contains("external", StringComparer.OrdinalIgnoreCase)
             || item.Tags.Contains("orphan", StringComparer.OrdinalIgnoreCase))
         {
             return false;

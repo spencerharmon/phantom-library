@@ -268,6 +268,23 @@ Never the other order.**
 
 Do not leave `/home/spencer/git-repos/spencerharmon/phantom-library` dirty at the end of a task. If work is complete enough to build/test, commit it before handing off or switching tasks. If work must remain incomplete, move it to a dedicated worktree or create a WIP commit with an explicit message and status note; do not strand uncommitted edits in main. Never rely on a chat session staying alive to preserve ownership of dirty state.
 
+## Movie/TV parity (always, no exceptions)
+
+TV shows/season/episode flows are first-class. Never implement, optimize, repair, test, document, or declare done for a movie path without auditing the corresponding TV path in the same change. If parity is intentionally impossible, record the reason in code, changelog/PR notes, and tests as an explicit scoped exception; otherwise, TV must ship with equivalent behavior and coverage.
+
+Required parity checklist for any channel/playback/materialise/gostream/badge/availability/cache change:
+
+- Browse: movie list and series → season → episode navigation both work.
+- Playback/media sources: movie and episode items both resolve playable/native-open sources.
+- Materialise lifecycle: movie and episode state transitions preserve stable IDs and user data.
+- gostream/external files: movie files and TV files both appear and play through channels; neither is silently dropped because it is outside `materialised_state`.
+- Availability gating: movie and episode/series visibility semantics match unless a TV-specific distinction is documented and tested.
+- Cache cleanup/refresh: movie item cache and TV series/season/episode cache are refreshed/pruned with equivalent narrow scoping.
+- Badges/UI: movie and episode badges/states behave equivalently; series/season containers remain intentionally badge-free.
+- Tests: run/update both `tools/rig-scenarios/35-channel-e2e-playback.sh` and `tools/rig-scenarios/36-channel-episode-e2e-playback.sh` for affected flows. If behavior involves raw gostream/external files, add or run explicit movie + TV external-file rig coverage.
+
+Forbidden shortcut: saying “movies pass” or “unit tests pass” when the analogous TV path was not inspected. That is a bug.
+
 ## Operator hand-off rule (always)
 
 When finishing a change the operator will install or test, **always
