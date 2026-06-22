@@ -859,7 +859,6 @@ public sealed partial class PhantomShowsChannel
     private static ChannelItemInfo BuildExternalSeriesItemFromMetadata(TmdbMetadataRow meta)
     {
         var item = BuildSeriesItemFromMetadata(meta);
-        item.FolderType = ChannelFolderType.Container;
         item.Tags = new List<string> { "external" };
         return item;
     }

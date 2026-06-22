@@ -112,6 +112,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - External TV episode browse now groups duplicate files for the same SxxExx
   and chooses the best-quality variant, while still showing playable files
   that lack an episode token instead of silently dropping them.
+- External TV series now retain Series folder semantics and bump the channel
+  data-version salt again so stale raw external folders are rebuilt with TMDB
+  metadata on install.
 
 ### BREAKING — requires wipe + patched Jellyfin
 
