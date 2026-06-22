@@ -610,7 +610,7 @@ public class PhantomShowsChannelTests : IDisposable
         var top = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
 
         var series = Assert.Single(top.Items, i => string.Equals(i.Name, "56 Days From TMDB", StringComparison.Ordinal));
-        Assert.StartsWith("orphanseries_", series.Id, StringComparison.Ordinal);
+        Assert.Equal("series_99056001", series.Id);
         Assert.Equal("Full overview", series.Overview);
         Assert.Equal("https://image.tmdb.org/t/p/w500/poster.jpg", series.ImageUrl);
         Assert.Equal("99056001", series.ProviderIds["Tmdb"]);

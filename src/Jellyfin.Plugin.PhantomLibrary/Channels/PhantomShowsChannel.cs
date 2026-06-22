@@ -333,7 +333,7 @@ public sealed partial class PhantomShowsChannel
                     continue;
                 }
 
-                items.Add(BuildExternalSeriesItemFromMetadata(enriched.Metadata, series));
+                items.Add(BuildExternalSeriesItemFromMetadata(enriched.Metadata));
                 seen.Add(enriched.TmdbId);
                 continue;
             }
@@ -351,7 +351,10 @@ public sealed partial class PhantomShowsChannel
     private async Task<ChannelItemResult> GetSeasonsForSeriesAsync(int seriesTmdb, CancellationToken ct)
     {
         var visibleSeasons = await _db.ListVisibleSeasonsAsync(seriesTmdb, ct).ConfigureAwait(false);
-        var items = new List<ChannelItemInfo>(visibleSeasons.Count);
+        var externalSeries = await FindExternalSeriesByTmdbAsync(seriesTmdb, ct).ConfigureAwait(false);
+        var externalSeasonNumbers = await ListExternalSeasonNumbersAsync(externalSeries, ct).ConfigureAwait(false);
+        var capacity = visibleSeasons.Count + externalSeasonNumbers.Count;
+        var items = new List<ChannelItemInfo>(capacity);
         var emitted = new HashSet<int>();
         foreach (var row in visibleSeasons)
         {
@@ -364,14 +367,21 @@ public sealed partial class PhantomShowsChannel
             }
         }
 
-        foreach (var external in await FindExternalSeriesByTmdbAsync(seriesTmdb, ct).ConfigureAwait(false))
+        foreach (var seasonNumber in externalSeasonNumbers.Order())
         {
-            foreach (var season in external.Series.Seasons.Where(s => s.Episodes.Count > 0).OrderBy(s => s.SeasonNumber))
+            if (emitted.Contains(seasonNumber))
             {
-                if (emitted.Add(season.SeasonNumber))
-                {
-                    items.Add(BuildExternalSeasonItem(external.Metadata, external.Series, season));
-                }
+                continue;
+            }
+
+            var external = externalSeries.FirstOrDefault(e => e.Series.Seasons.Any(s => s.SeasonNumber == seasonNumber));
+            var seasonEntry = external?.Series.Seasons.FirstOrDefault(s => s.SeasonNumber == seasonNumber)
+                ?? new GostreamSeasonEntry(seasonNumber, Array.Empty<GostreamFileEntry>());
+            var meta = external?.Metadata ?? await _db.GetTmdbMetadataAsync(seriesTmdb, "series", ct).ConfigureAwait(false);
+            if (meta is not null)
+            {
+                items.Add(BuildExternalSeasonItem(meta, seasonEntry));
+                emitted.Add(seasonNumber);
             }
         }
 
@@ -427,47 +437,53 @@ public sealed partial class PhantomShowsChannel
             rows.AddRange(await _db.ListEpisodesForSeasonAsync(seriesTmdb, season, ct).ConfigureAwait(false));
         }
 
-        var items = new List<ChannelItemInfo>(rows.Count);
+        var externalSeries = await FindExternalSeriesByTmdbAsync(seriesTmdb, ct).ConfigureAwait(false);
+        var externalEpisodes = externalSeries
+            .SelectMany(e => e.Series.Seasons.Where(s => s.SeasonNumber == season).SelectMany(s => s.Episodes))
+            .ToList();
+        var externalByEpisode = SelectExternalEpisodeVariants(externalEpisodes)
+            .Select(e => (Entry: e, Parsed: TryParseEpisodeNumber(Path.GetFileNameWithoutExtension(e.Path), out _, out var episodeNumber), Episode: episodeNumber))
+            .Where(e => e.Parsed)
+            .GroupBy(e => e.Episode)
+            .ToDictionary(g => g.Key, g => g.First().Entry);
+        var hasExternalSeries = externalSeries.Count > 0;
+        var externalSeriesName = hasExternalSeries ? externalSeries[0].Metadata.Title : null;
+        var items = new List<ChannelItemInfo>(rows.Count + externalEpisodes.Count);
         var emittedEpisodes = new HashSet<int>();
         foreach (var row in rows)
         {
             ct.ThrowIfCancellationRequested();
-            if (!await _db.IsEpisodeVisibleAsync(seriesTmdb, season, row.Episode, ct).ConfigureAwait(false))
+            if (!hasExternalSeries && !await _db.IsEpisodeVisibleAsync(seriesTmdb, season, row.Episode, ct).ConfigureAwait(false))
             {
                 continue;
             }
 
-            var materialised = await _db.GetMaterialisedStateAsync(
-                seriesTmdb, "episode", season, row.Episode, ct).ConfigureAwait(false);
-            items.Add(BuildEpisodeItemFromRow(row, materialised, seriesName));
+            if (externalByEpisode.TryGetValue(row.Episode, out var externalEpisode))
+            {
+                items.Add(BuildExternalEpisodeItemFromRow(row, externalEpisode, seriesName ?? externalSeriesName));
+            }
+            else
+            {
+                var materialised = await _db.GetMaterialisedStateAsync(
+                    seriesTmdb, "episode", season, row.Episode, ct).ConfigureAwait(false);
+                items.Add(BuildEpisodeItemFromRow(row, materialised, seriesName));
+            }
+
             emittedEpisodes.Add(row.Episode);
         }
 
-        foreach (var external in await FindExternalSeriesByTmdbAsync(seriesTmdb, ct).ConfigureAwait(false))
+        foreach (var externalEpisode in SelectExternalEpisodeVariants(externalEpisodes))
         {
-            var externalSeason = external.Series.Seasons.FirstOrDefault(s => s.SeasonNumber == season);
-            if (externalSeason is null)
+            var hasEpisodeNumber = TryParseEpisodeNumber(Path.GetFileNameWithoutExtension(externalEpisode.Path), out _, out var episodeNumber);
+            if (hasEpisodeNumber && emittedEpisodes.Contains(episodeNumber))
             {
                 continue;
             }
 
-            foreach (var externalEpisode in SelectExternalEpisodeVariants(externalSeason.Episodes))
+            items.Add(BuildOrphanEpisodeItem(externalEpisode));
+            if (hasEpisodeNumber)
             {
-                var hasEpisodeNumber = TryParseEpisodeNumber(Path.GetFileNameWithoutExtension(externalEpisode.Path), out _, out var episodeNumber);
-                if (hasEpisodeNumber && emittedEpisodes.Contains(episodeNumber))
-                {
-                    continue;
-                }
-
-                var row = rows.FirstOrDefault(r => r.Episode == episodeNumber);
-                var item = row is null
-                    ? BuildOrphanEpisodeItem(externalEpisode)
-                    : BuildExternalEpisodeItemFromRow(row, externalEpisode, seriesName ?? external.Metadata.Title);
-                items.Add(item);
-                if (hasEpisodeNumber)
-                {
-                    emittedEpisodes.Add(episodeNumber);
-                }
+                emittedEpisodes.Add(episodeNumber);
             }
         }
 
@@ -486,6 +502,20 @@ public sealed partial class PhantomShowsChannel
             return EmptyResult();
         }
 
+        var enriched = await TryResolveEnrichedGostreamSeriesAsync(series, ct).ConfigureAwait(false);
+        if (enriched is not null)
+        {
+            var seasonNumbers = await ListExternalSeasonNumbersAsync(new[] { enriched }, ct).ConfigureAwait(false);
+            var enrichedItems = seasonNumbers
+                .Order()
+                .Select(seasonNumber => BuildExternalSeasonItem(
+                    enriched.Metadata,
+                    series.Seasons.FirstOrDefault(s => s.SeasonNumber == seasonNumber)
+                        ?? new GostreamSeasonEntry(seasonNumber, Array.Empty<GostreamFileEntry>())))
+                .ToList();
+            return new ChannelItemResult { Items = enrichedItems, TotalRecordCount = enrichedItems.Count };
+        }
+
         var items = series.Seasons
             .Where(s => s.Episodes.Count > 0)
             .OrderBy(s => s.SeasonNumber)
@@ -501,6 +531,12 @@ public sealed partial class PhantomShowsChannel
         if (series is null || season is null)
         {
             return EmptyResult();
+        }
+
+        var enriched = await TryResolveEnrichedGostreamSeriesAsync(series, ct).ConfigureAwait(false);
+        if (enriched is not null)
+        {
+            return await GetEpisodesForSeasonAsync(enriched.TmdbId, seasonNumber, ct).ConfigureAwait(false);
         }
 
         var items = SelectExternalEpisodeVariants(season.Episodes)
@@ -527,6 +563,30 @@ public sealed partial class PhantomShowsChannel
     }
 
     private sealed record EnrichedGostreamSeries(int TmdbId, TmdbMetadataRow Metadata, GostreamSeriesEntry Series);
+
+    private async Task<HashSet<int>> ListExternalSeasonNumbersAsync(IReadOnlyList<EnrichedGostreamSeries> externalSeries, CancellationToken ct)
+    {
+        var seasons = externalSeries
+            .SelectMany(e => e.Series.Seasons)
+            .Where(s => s.Episodes.Count > 0)
+            .Select(s => s.SeasonNumber)
+            .ToHashSet();
+        foreach (var external in externalSeries)
+        {
+            var details = await SafeGetSeriesAsync(external.TmdbId, ct).ConfigureAwait(false);
+            if (details is null)
+            {
+                continue;
+            }
+
+            for (var season = 1; season <= details.NumberOfSeasons; season++)
+            {
+                seasons.Add(season);
+            }
+        }
+
+        return seasons;
+    }
 
     private async Task<IReadOnlyList<EnrichedGostreamSeries>> FindExternalSeriesByTmdbAsync(int tmdbId, CancellationToken ct)
     {
@@ -796,21 +856,19 @@ public sealed partial class PhantomShowsChannel
         return item;
     }
 
-    private static ChannelItemInfo BuildExternalSeriesItemFromMetadata(TmdbMetadataRow meta, GostreamSeriesEntry series)
+    private static ChannelItemInfo BuildExternalSeriesItemFromMetadata(TmdbMetadataRow meta)
     {
         var item = BuildSeriesItemFromMetadata(meta);
-        item.Id = OrphanSeriesPrefix + ChannelItemId.ForOrphanPath(series.DirectoryPath).OrphanHash;
         item.FolderType = ChannelFolderType.Container;
         item.Tags = new List<string> { "external" };
         return item;
     }
 
-    private static ChannelItemInfo BuildExternalSeasonItem(TmdbMetadataRow meta, GostreamSeriesEntry series, GostreamSeasonEntry season)
+    private static ChannelItemInfo BuildExternalSeasonItem(TmdbMetadataRow meta, GostreamSeasonEntry season)
     {
-        var hash = ChannelItemId.ForOrphanPath(series.DirectoryPath).OrphanHash;
         return new ChannelItemInfo
         {
-            Id = $"{OrphanSeasonPrefix}{hash}_s{season.SeasonNumber:00}",
+            Id = ChannelItemId.ForSeason(meta.TmdbId, season.SeasonNumber).Encode(),
             Name = "Season " + season.SeasonNumber.ToString(CultureInfo.InvariantCulture),
             SeriesName = meta.Title,
             IndexNumber = season.SeasonNumber,
@@ -824,7 +882,6 @@ public sealed partial class PhantomShowsChannel
     private ChannelItemInfo BuildExternalEpisodeItemFromRow(TmdbEpisodeRow row, GostreamFileEntry externalEpisode, string? seriesName)
     {
         var item = BuildEpisodeItemFromRow(row, materialised: null, seriesName);
-        item.Id = OrphanEpisodePrefix + ChannelItemId.ForOrphanPath(externalEpisode.Path).OrphanHash;
         item.Tags = new List<string> { "external" };
         item.MediaSources = new List<MediaSourceInfo> { FuseMediaSource(externalEpisode.Path) };
         return item;
