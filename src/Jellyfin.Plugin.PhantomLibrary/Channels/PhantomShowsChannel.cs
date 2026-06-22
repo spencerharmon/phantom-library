@@ -618,53 +618,27 @@ public sealed partial class PhantomShowsChannel
             _gostreamSeriesTmdbByPath.TryGetValue(series.DirectoryPath, out tmdbId);
         }
 
-        if (tmdbId == 0)
+        TmdbMetadataRow? metadata = null;
+        if (tmdbId != 0)
         {
-            IReadOnlyList<TmdbSearchHit> hits;
-            try
-            {
-                hits = await _tmdb.SearchSeriesAsync(title, year, _languageProvider(), ct).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "TMDB search failed for gostream TV directory {Path}", series.DirectoryPath);
-                return null;
-            }
-
-            if (hits.Count == 0)
+            metadata = await _db.GetTmdbMetadataAsync(tmdbId, "series", ct).ConfigureAwait(false);
+        }
+        else
+        {
+            metadata = await _db.FindTmdbMetadataByTitleYearAsync("series", title, year, ct).ConfigureAwait(false);
+            if (metadata is null)
             {
                 return null;
             }
 
-            tmdbId = hits[0].Id;
+            tmdbId = metadata.TmdbId;
             lock (_gostreamSeriesTmdbByPath)
             {
                 _gostreamSeriesTmdbByPath[series.DirectoryPath] = tmdbId;
             }
         }
 
-        var metadata = await _db.GetTmdbMetadataAsync(tmdbId, "series", ct).ConfigureAwait(false);
-        if (metadata is null)
-        {
-            try
-            {
-                var details = await _tmdb.GetSeriesAsync(tmdbId, _languageProvider(), ct).ConfigureAwait(false);
-                if (details is null)
-                {
-                    return null;
-                }
-
-                metadata = MapSeriesDetails(details);
-                await _db.UpsertTmdbMetadataAsync(metadata, ct).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "TMDB details fetch failed for gostream TV directory {Path} tmdb={Tmdb}", series.DirectoryPath, tmdbId);
-                return null;
-            }
-        }
-
-        return new EnrichedGostreamSeries(tmdbId, metadata, series);
+        return metadata is null ? null : new EnrichedGostreamSeries(tmdbId, metadata, series);
     }
 
     private static TmdbMetadataRow MapSeriesDetails(TmdbSeriesDetails details)

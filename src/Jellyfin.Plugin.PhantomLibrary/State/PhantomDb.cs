@@ -2057,6 +2057,34 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
         }
     }
 
+    public async Task<TmdbMetadataRow?> FindTmdbMetadataByTitleYearAsync(string type, string title, int? year, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        ArgumentException.ThrowIfNullOrWhiteSpace(title);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT tmdb_id, type, title, year, overview, poster_url, backdrop_url,
+                   genres_json, official_rating, community_rating, original_title, fetched_at
+            FROM tmdb_metadata
+            WHERE type=$type AND ($year IS NULL OR year=$year)
+            ORDER BY fetched_at DESC;";
+        cmd.Parameters.AddWithValue("$type", type);
+        cmd.Parameters.AddWithValue("$year", (object?)year ?? DBNull.Value);
+        var wanted = NormalizeTitle(title);
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            var row = ReadTmdbMetadata(r);
+            if (string.Equals(NormalizeTitle(row.Title), wanted, StringComparison.Ordinal)
+                || string.Equals(NormalizeTitle(row.OriginalTitle), wanted, StringComparison.Ordinal))
+            {
+                return row;
+            }
+        }
+
+        return null;
+    }
+
     public async Task<TmdbMetadataRow?> GetTmdbMetadataAsync(int tmdbId, string type, CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(type);
@@ -2073,6 +2101,11 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
             return null;
         }
 
+        return ReadTmdbMetadata(r);
+    }
+
+    private static TmdbMetadataRow ReadTmdbMetadata(SqliteDataReader r)
+    {
         string[]? genres = null;
         if (!r.IsDBNull(7))
         {
@@ -2099,6 +2132,25 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
             r.IsDBNull(9) ? null : r.GetDouble(9),
             r.IsDBNull(10) ? null : r.GetString(10),
             DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(11)));
+    }
+
+    private static string NormalizeTitle(string? title)
+    {
+        if (string.IsNullOrWhiteSpace(title))
+        {
+            return string.Empty;
+        }
+
+        var sb = new System.Text.StringBuilder(title.Length);
+        foreach (var ch in title)
+        {
+            if (char.IsLetterOrDigit(ch))
+            {
+                sb.Append(char.ToUpperInvariant(ch));
+            }
+        }
+
+        return sb.ToString();
     }
 
     // ---- tmdb_episode_cache ----

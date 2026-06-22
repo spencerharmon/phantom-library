@@ -122,6 +122,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Gostream-backed TMDB series now use canonical series/season/episode ids for
   children; existing files direct-play while missing TMDB episodes remain
   visible as phantoms.
+- External TV metadata lookup now uses already-cached TMDB metadata instead of
+  performing live TMDB searches during channel browse, avoiding slow/spinning
+  Phantom Shows loads.
 
 ### BREAKING — requires wipe + patched Jellyfin
 

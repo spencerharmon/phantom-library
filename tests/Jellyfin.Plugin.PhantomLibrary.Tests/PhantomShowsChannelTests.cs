@@ -602,10 +602,21 @@ public class PhantomShowsChannelTests : IDisposable
         var seasonDir = Path.Combine(_enumerator.ShowsRootOverride!, "56_Days (2026)", "Season.01");
         Directory.CreateDirectory(seasonDir);
         await File.WriteAllTextAsync(Path.Combine(seasonDir, "56_Days_S01E01_72a275d4.mkv"), "x", CancellationToken.None);
-        _tmdb.Setup(t => t.SearchSeriesAsync("56 Days", 2026, null, It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new[] { new TmdbSearchHit(99056001, "56 Days From TMDB", "56 Days Original", "Search overview", "/search-poster.jpg", null, "2026-01-01", 7.5, 10) });
-        _tmdb.Setup(t => t.GetSeriesAsync(99056001, null, It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new TmdbSeriesDetails(99056001, "56 Days From TMDB", "56 Days Original", "Full overview", "/poster.jpg", "/backdrop.jpg", "2026-01-01", 8.1, 11, new[] { "Drama" }, "Returning", 1, 1, new[] { "US" }, "tt99056001"));
+        await _db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(
+                99056001,
+                "series",
+                "56 Days From TMDB",
+                2026,
+                "Full overview",
+                "https://image.tmdb.org/t/p/w500/poster.jpg",
+                "https://image.tmdb.org/t/p/w500/backdrop.jpg",
+                new[] { "Drama" },
+                null,
+                8.1,
+                "56 Days",
+                DateTimeOffset.UtcNow),
+            CancellationToken.None);
 
         var top = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
 
