@@ -216,6 +216,52 @@ public sealed class GostreamFilesystemEnumerator
     }
 
     /// <summary>
+    /// Walk the shows dir and return the first video file whose
+    /// <see cref="ChannelItemId.ForOrphanPath(string)"/> hash matches
+    /// <paramref name="hash"/>, or null if none.
+    /// </summary>
+    public async Task<GostreamFileEntry?> LookupOrphanEpisodeByHashAsync(string hash, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(hash);
+        var root = ShowsRoot;
+        if (!Directory.Exists(root))
+        {
+            return null;
+        }
+
+        var materialisedFusePaths = (await _db.ListMaterialisedStateAsync("episode", ct).ConfigureAwait(false))
+            .Select(r => GostreamPathResolver.ResolvePath(r.FusePath, root))
+            .ToHashSet(StringComparer.Ordinal);
+
+        IEnumerable<string> files;
+        try
+        {
+            files = Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories);
+        }
+        catch
+        {
+            return null;
+        }
+
+        foreach (var path in files)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (!IsVideoFile(path) || materialisedFusePaths.Contains(path))
+            {
+                continue;
+            }
+
+            var id = ChannelItemId.ForOrphanPath(path);
+            if (string.Equals(id.OrphanHash, hash, StringComparison.Ordinal))
+            {
+                return new GostreamFileEntry(path, null);
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
     /// Walk movies dir and return the first file whose
     /// <see cref="ChannelItemId.ForOrphanPath(string)"/> hash matches
     /// <paramref name="hash"/>, or null if none.
@@ -290,8 +336,8 @@ public sealed class GostreamFilesystemEnumerator
             return false;
         }
 
-        // Common forms: "Season 1", "Season 01", "Season1", "S01", "season 1".
-        var s = dirName.Trim();
+        // Common forms: "Season 1", "Season 01", "Season.01", "Season_01", "Season1", "S01", "season 1".
+        var s = dirName.Trim().Replace('.', ' ').Replace('_', ' ');
         if (s.StartsWith("Season ", StringComparison.OrdinalIgnoreCase))
         {
             return int.TryParse(s.AsSpan("Season ".Length).Trim(), out seasonNumber);

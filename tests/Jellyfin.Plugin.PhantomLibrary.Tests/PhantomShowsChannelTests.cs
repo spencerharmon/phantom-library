@@ -26,6 +26,7 @@ public class PhantomShowsChannelTests : IDisposable
     private readonly PhantomDb _db;
     private readonly ChannelStateProvider _state;
     private readonly SplashSourceProvider _splash;
+    private readonly GostreamFilesystemEnumerator _enumerator;
     private readonly Mock<ITmdbClient> _tmdb;
     private readonly PhantomShowsChannel _channel;
 
@@ -39,9 +40,12 @@ public class PhantomShowsChannelTests : IDisposable
         _db = new PhantomDb(_dbPath);
         _state = new ChannelStateProvider(_db);
         _splash = new SplashSourceProvider(MockPaths(_splashHome));
+        _enumerator = new GostreamFilesystemEnumerator(_db, NullLogger<GostreamFilesystemEnumerator>.Instance);
+        _enumerator.ShowsRootOverride = Path.Combine(Path.GetTempPath(), "phantom-sc-shows-" + stamp);
+        Directory.CreateDirectory(_enumerator.ShowsRootOverride);
         _tmdb = new Mock<ITmdbClient>(MockBehavior.Strict);
         _channel = new PhantomShowsChannel(
-            _db, _tmdb.Object, _splash, _state,
+            _db, _tmdb.Object, _splash, _state, _enumerator,
             NullLogger<PhantomShowsChannel>.Instance,
             () => null);
     }
@@ -52,6 +56,7 @@ public class PhantomShowsChannelTests : IDisposable
         SqliteConnection.ClearAllPools();
         try { if (File.Exists(_dbPath)) File.Delete(_dbPath); } catch { }
         try { if (Directory.Exists(_splashHome)) Directory.Delete(_splashHome, true); } catch { }
+        try { if (_enumerator.ShowsRootOverride is not null && Directory.Exists(_enumerator.ShowsRootOverride)) Directory.Delete(_enumerator.ShowsRootOverride, true); } catch { }
     }
 
     private static void AssertOpeningSource(MediaSourceInfo src, string externalId)
@@ -564,6 +569,35 @@ public class PhantomShowsChannelTests : IDisposable
         Assert.Equal(2, got.Count);
         Assert.Equal("episode_1399_s01e02", got[0].Id);
         Assert.Equal("episode_1399_s01e01", got[1].Id);
+    }
+
+    [Fact]
+    public async Task GostreamOnlyTvFiles_AppearAsOrphanSeriesSeasonsAndEpisodes()
+    {
+        var seasonDir = Path.Combine(_enumerator.ShowsRootOverride!, "56_Days (2026)", "Season.01");
+        Directory.CreateDirectory(seasonDir);
+        var episodePath = Path.Combine(seasonDir, "56_Days_S01E01_72a275d4.mkv");
+        await File.WriteAllTextAsync(episodePath, "x", CancellationToken.None);
+
+        var top = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var series = Assert.Single(top.Items, i => string.Equals(i.Name, "56 Days", StringComparison.Ordinal));
+        Assert.StartsWith("orphanseries_", series.Id, StringComparison.Ordinal);
+        Assert.Equal(2026, series.ProductionYear);
+
+        var seasons = await _channel.GetChannelItems(new InternalChannelItemQuery { FolderId = series.Id }, CancellationToken.None);
+        var season = Assert.Single(seasons.Items);
+        Assert.Equal("Season 1", season.Name);
+        Assert.StartsWith("orphanseason_", season.Id, StringComparison.Ordinal);
+
+        var episodes = await _channel.GetChannelItems(new InternalChannelItemQuery { FolderId = season.Id }, CancellationToken.None);
+        var episode = Assert.Single(episodes.Items);
+        Assert.StartsWith("orphanepisode_", episode.Id, StringComparison.Ordinal);
+        Assert.Equal(1, episode.ParentIndexNumber);
+        Assert.Equal(1, episode.IndexNumber);
+        Assert.Equal(episodePath, Assert.Single(episode.MediaSources).Path);
+
+        var media = await _channel.GetChannelItemMediaInfo(episode.Id, CancellationToken.None);
+        Assert.Equal(episodePath, Assert.Single(media).Path);
     }
 
     private static IApplicationPaths MockPaths(string root)

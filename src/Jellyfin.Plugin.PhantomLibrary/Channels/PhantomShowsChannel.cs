@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
@@ -37,13 +38,21 @@ namespace Jellyfin.Plugin.PhantomLibrary.Channels;
 ///
 /// Stage 5.1 implementation per <c>docs/plans/channel-handoff.md</c>.
 /// </summary>
-public sealed class PhantomShowsChannel
+public sealed partial class PhantomShowsChannel
     : IChannel, ISupportsLatestMedia, IChannelItemRefresh, ISupportsMediaProbe
 {
+    private const string OrphanSeriesPrefix = "orphanseries_";
+    private const string OrphanSeasonPrefix = "orphanseason_";
+    private const string OrphanEpisodePrefix = "orphanepisode_";
+
+    [GeneratedRegex(@"[sS](?<season>\d{1,3})[eE](?<episode>\d{1,4})")]
+    private static partial Regex EpisodeNumberRegex();
+
     private readonly PhantomDb _db;
     private readonly ITmdbClient _tmdb;
     private readonly SplashSourceProvider _splashSource;
     private readonly ChannelStateProvider _state;
+    private readonly GostreamFilesystemEnumerator _enumerator;
     private readonly ILogger<PhantomShowsChannel> _logger;
     private readonly Func<string?> _languageProvider;
 
@@ -52,8 +61,9 @@ public sealed class PhantomShowsChannel
         ITmdbClient tmdb,
         SplashSourceProvider splashSource,
         ChannelStateProvider state,
+        GostreamFilesystemEnumerator enumerator,
         ILogger<PhantomShowsChannel> logger)
-        : this(db, tmdb, splashSource, state, logger,
+        : this(db, tmdb, splashSource, state, enumerator, logger,
                () => Plugin.Instance?.Configuration?.DiscoveryLanguage)
     {
     }
@@ -63,6 +73,7 @@ public sealed class PhantomShowsChannel
         ITmdbClient tmdb,
         SplashSourceProvider splashSource,
         ChannelStateProvider state,
+        GostreamFilesystemEnumerator enumerator,
         ILogger<PhantomShowsChannel> logger,
         Func<string?> languageProvider)
     {
@@ -70,6 +81,7 @@ public sealed class PhantomShowsChannel
         _tmdb = tmdb ?? throw new ArgumentNullException(nameof(tmdb));
         _splashSource = splashSource ?? throw new ArgumentNullException(nameof(splashSource));
         _state = state ?? throw new ArgumentNullException(nameof(state));
+        _enumerator = enumerator ?? throw new ArgumentNullException(nameof(enumerator));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _languageProvider = languageProvider ?? throw new ArgumentNullException(nameof(languageProvider));
     }
@@ -112,6 +124,16 @@ public sealed class PhantomShowsChannel
             return await GetTopLevelSeriesAsync(cancellationToken).ConfigureAwait(false);
         }
 
+        if (TryParseOrphanSeriesId(query.FolderId, out var orphanSeriesHash))
+        {
+            return await GetOrphanSeasonsAsync(orphanSeriesHash, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (TryParseOrphanSeasonId(query.FolderId, out var orphanSeasonSeriesHash, out var orphanSeason))
+        {
+            return await GetOrphanEpisodesAsync(orphanSeasonSeriesHash, orphanSeason, cancellationToken).ConfigureAwait(false);
+        }
+
         if (!ChannelItemId.TryParse(query.FolderId, out var parsed))
         {
             return EmptyResult();
@@ -131,6 +153,12 @@ public sealed class PhantomShowsChannel
     public async Task<IEnumerable<MediaSourceInfo>> GetChannelItemMediaInfo(string id, CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(id);
+        if (TryParseOrphanEpisodeId(id, out var orphanEpisodeHash))
+        {
+            var orphan = await _enumerator.LookupOrphanEpisodeByHashAsync(orphanEpisodeHash, cancellationToken).ConfigureAwait(false);
+            return orphan is null ? Array.Empty<MediaSourceInfo>() : new[] { FuseMediaSource(orphan.Path) };
+        }
+
         if (!ChannelItemId.TryParse(id, out var parsed))
         {
             return Array.Empty<MediaSourceInfo>();
@@ -191,6 +219,25 @@ public sealed class PhantomShowsChannel
     /// <inheritdoc />
     public async Task<ChannelItemInfo> GetChannelItemAsync(string channelItemExternalId, CancellationToken cancellationToken)
     {
+        if (TryParseOrphanEpisodeId(channelItemExternalId, out var orphanEpisodeHash))
+        {
+            var orphan = await _enumerator.LookupOrphanEpisodeByHashAsync(orphanEpisodeHash, cancellationToken).ConfigureAwait(false);
+            return orphan is null ? null! : BuildOrphanEpisodeItem(orphan) ?? null!;
+        }
+
+        if (TryParseOrphanSeriesId(channelItemExternalId, out var orphanSeriesHash))
+        {
+            var series = await FindOrphanSeriesAsync(orphanSeriesHash, cancellationToken).ConfigureAwait(false);
+            return series is null ? null! : BuildOrphanSeriesItem(series);
+        }
+
+        if (TryParseOrphanSeasonId(channelItemExternalId, out var orphanSeasonSeriesHash, out var orphanSeason))
+        {
+            var series = await FindOrphanSeriesAsync(orphanSeasonSeriesHash, cancellationToken).ConfigureAwait(false);
+            var season = series?.Seasons.FirstOrDefault(s => s.SeasonNumber == orphanSeason);
+            return series is null || season is null ? null! : BuildOrphanSeasonItem(series, season);
+        }
+
         // Critic round 3 IMPORTANT 5 fix: explicit per-kind branching so
         // the patched RefreshChannelItemAsync post-flight refresh
         // resolves the exact external id the materialiser asked about,
@@ -255,6 +302,28 @@ public sealed class PhantomShowsChannel
             }
 
             items.Add(BuildSeriesItemFromMetadata(row.Metadata));
+        }
+
+        IReadOnlyList<GostreamSeriesEntry> orphanSeries;
+        try
+        {
+            orphanSeries = await _enumerator.EnumerateSeriesAsync(ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Orphan TV enumeration failed; skipping gostream-only TV series this tick");
+            orphanSeries = Array.Empty<GostreamSeriesEntry>();
+        }
+
+        foreach (var series in orphanSeries)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (series.Seasons.Count == 0 || series.Seasons.All(s => s.Episodes.Count == 0))
+            {
+                continue;
+            }
+
+            items.Add(BuildOrphanSeriesItem(series));
         }
 
         return new ChannelItemResult
@@ -354,6 +423,56 @@ public sealed class PhantomShowsChannel
             Items = items,
             TotalRecordCount = items.Count,
         };
+    }
+
+    private async Task<ChannelItemResult> GetOrphanSeasonsAsync(string seriesHash, CancellationToken ct)
+    {
+        var series = await FindOrphanSeriesAsync(seriesHash, ct).ConfigureAwait(false);
+        if (series is null)
+        {
+            return EmptyResult();
+        }
+
+        var items = series.Seasons
+            .Where(s => s.Episodes.Count > 0)
+            .OrderBy(s => s.SeasonNumber)
+            .Select(s => BuildOrphanSeasonItem(series, s))
+            .ToList();
+        return new ChannelItemResult { Items = items, TotalRecordCount = items.Count };
+    }
+
+    private async Task<ChannelItemResult> GetOrphanEpisodesAsync(string seriesHash, int seasonNumber, CancellationToken ct)
+    {
+        var series = await FindOrphanSeriesAsync(seriesHash, ct).ConfigureAwait(false);
+        var season = series?.Seasons.FirstOrDefault(s => s.SeasonNumber == seasonNumber);
+        if (series is null || season is null)
+        {
+            return EmptyResult();
+        }
+
+        var items = season.Episodes
+            .Select(BuildOrphanEpisodeItem)
+            .Where(i => i is not null)
+            .OrderBy(i => i!.IndexNumber ?? int.MaxValue)
+            .ThenBy(i => i!.Name, StringComparer.OrdinalIgnoreCase)
+            .Cast<ChannelItemInfo>()
+            .ToList();
+        return new ChannelItemResult { Items = items, TotalRecordCount = items.Count };
+    }
+
+    private async Task<GostreamSeriesEntry?> FindOrphanSeriesAsync(string seriesHash, CancellationToken ct)
+    {
+        foreach (var series in await _enumerator.EnumerateSeriesAsync(ct).ConfigureAwait(false))
+        {
+            ct.ThrowIfCancellationRequested();
+            var id = ChannelItemId.ForOrphanPath(series.DirectoryPath);
+            if (string.Equals(id.OrphanHash, seriesHash, StringComparison.Ordinal))
+            {
+                return series;
+            }
+        }
+
+        return null;
     }
 
     // ----------------------------------------------------------------
@@ -526,6 +645,150 @@ public sealed class PhantomShowsChannel
 
         item.ProviderIds["Tmdb"] = row.SeriesTmdbId.ToString(CultureInfo.InvariantCulture);
         return item;
+    }
+
+    private static ChannelItemInfo BuildOrphanSeriesItem(GostreamSeriesEntry series)
+    {
+        var (title, year) = ParseSeriesDirectoryName(Path.GetFileName(series.DirectoryPath));
+        return new ChannelItemInfo
+        {
+            Id = OrphanSeriesPrefix + ChannelItemId.ForOrphanPath(series.DirectoryPath).OrphanHash,
+            Name = title,
+            Type = ChannelItemType.Folder,
+            FolderType = ChannelFolderType.Container,
+            ProductionYear = year,
+            PremiereDate = year is { } y ? new DateTime(y, 1, 1, 0, 0, 0, DateTimeKind.Utc) : null,
+            Tags = new List<string> { "orphan" },
+        };
+    }
+
+    private static ChannelItemInfo BuildOrphanSeasonItem(GostreamSeriesEntry series, GostreamSeasonEntry season)
+    {
+        var (title, _) = ParseSeriesDirectoryName(Path.GetFileName(series.DirectoryPath));
+        var hash = ChannelItemId.ForOrphanPath(series.DirectoryPath).OrphanHash;
+        return new ChannelItemInfo
+        {
+            Id = $"{OrphanSeasonPrefix}{hash}_s{season.SeasonNumber:00}",
+            Name = "Season " + season.SeasonNumber.ToString(CultureInfo.InvariantCulture),
+            SeriesName = title,
+            IndexNumber = season.SeasonNumber,
+            Type = ChannelItemType.Folder,
+            FolderType = ChannelFolderType.Container,
+            Tags = new List<string> { "orphan" },
+        };
+    }
+
+    private static ChannelItemInfo? BuildOrphanEpisodeItem(GostreamFileEntry episode)
+    {
+        var fileName = Path.GetFileNameWithoutExtension(episode.Path);
+        if (!TryParseEpisodeNumber(fileName, out var season, out var episodeNumber))
+        {
+            return null;
+        }
+
+        var seriesDir = Directory.GetParent(Directory.GetParent(episode.Path)!.FullName)!.FullName;
+        var (seriesName, _) = ParseSeriesDirectoryName(Path.GetFileName(seriesDir));
+        var name = HumanizeFileName(fileName);
+        return new ChannelItemInfo
+        {
+            Id = OrphanEpisodePrefix + ChannelItemId.ForOrphanPath(episode.Path).OrphanHash,
+            Name = name,
+            Type = ChannelItemType.Media,
+            ContentType = ChannelMediaContentType.Episode,
+            MediaType = ChannelMediaType.Video,
+            ParentIndexNumber = season,
+            IndexNumber = episodeNumber,
+            SeriesName = seriesName,
+            Tags = new List<string> { "orphan" },
+            MediaSources = new List<MediaSourceInfo> { FuseMediaSource(episode.Path) },
+        };
+    }
+
+    private static (string Title, int? Year) ParseSeriesDirectoryName(string dirName)
+    {
+        var title = dirName.Replace('_', ' ').Trim();
+        int? year = null;
+        var open = title.LastIndexOf('(');
+        var close = title.LastIndexOf(')');
+        if (open >= 0 && close > open && int.TryParse(title.AsSpan(open + 1, close - open - 1), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedYear))
+        {
+            year = parsedYear;
+            title = title[..open].Trim();
+        }
+
+        return (string.IsNullOrWhiteSpace(title) ? dirName : title, year);
+    }
+
+    private static string HumanizeFileName(string fileName)
+    {
+        var withoutHash = fileName;
+        var lastUnderscore = withoutHash.LastIndexOf('_');
+        if (lastUnderscore > 0 && lastUnderscore + 1 < withoutHash.Length)
+        {
+            var suffix = withoutHash[(lastUnderscore + 1)..];
+            if (suffix.Length is >= 7 and <= 16 && suffix.All(Uri.IsHexDigit))
+            {
+                withoutHash = withoutHash[..lastUnderscore];
+            }
+        }
+
+        return withoutHash.Replace('_', ' ').Trim();
+    }
+
+    private static bool TryParseEpisodeNumber(string fileName, out int season, out int episode)
+    {
+        season = 0;
+        episode = 0;
+        var match = EpisodeNumberRegex().Match(fileName);
+        return match.Success
+            && int.TryParse(match.Groups["season"].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out season)
+            && int.TryParse(match.Groups["episode"].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out episode);
+    }
+
+    private static bool TryParseOrphanSeriesId(string? id, out string hash)
+    {
+        hash = string.Empty;
+        if (string.IsNullOrWhiteSpace(id) || !id.StartsWith(OrphanSeriesPrefix, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        hash = id[OrphanSeriesPrefix.Length..];
+        return hash.Length > 0 && hash.All(Uri.IsHexDigit);
+    }
+
+    private static bool TryParseOrphanSeasonId(string? id, out string hash, out int season)
+    {
+        hash = string.Empty;
+        season = 0;
+        if (string.IsNullOrWhiteSpace(id) || !id.StartsWith(OrphanSeasonPrefix, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var rest = id[OrphanSeasonPrefix.Length..];
+        var sep = rest.LastIndexOf("_s", StringComparison.Ordinal);
+        if (sep <= 0)
+        {
+            return false;
+        }
+
+        hash = rest[..sep];
+        return hash.Length > 0
+            && hash.All(Uri.IsHexDigit)
+            && int.TryParse(rest[(sep + 2)..], NumberStyles.Integer, CultureInfo.InvariantCulture, out season);
+    }
+
+    private static bool TryParseOrphanEpisodeId(string? id, out string hash)
+    {
+        hash = string.Empty;
+        if (string.IsNullOrWhiteSpace(id) || !id.StartsWith(OrphanEpisodePrefix, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        hash = id[OrphanEpisodePrefix.Length..];
+        return hash.Length > 0 && hash.All(Uri.IsHexDigit);
     }
 
     // ----------------------------------------------------------------
