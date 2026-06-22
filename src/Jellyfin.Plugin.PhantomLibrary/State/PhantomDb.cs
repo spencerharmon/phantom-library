@@ -1196,7 +1196,15 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
                     WHERE (next_check_at <= $now OR probe_policy_hash IS NULL OR probe_policy_hash <> $policy)
                       AND (lease_until IS NULL OR lease_until < $now)
                       AND ($preferred IS NULL OR type=$preferred)
-                    ORDER BY CASE WHEN checked_at IS NULL THEN 0 WHEN status='available' THEN 1 WHEN status='unavailable' THEN 2 ELSE 3 END,
+                    ORDER BY CASE
+                                 WHEN $preferred='episode' AND type='episode' THEN
+                                   (SELECT COUNT(*) FROM availability_items peer
+                                    WHERE peer.type='episode'
+                                      AND peer.tmdb_id=availability_items.tmdb_id
+                                      AND peer.checked_at IS NOT NULL)
+                                 ELSE 0
+                             END ASC,
+                             CASE WHEN checked_at IS NULL THEN 0 WHEN status='available' THEN 1 WHEN status='unavailable' THEN 2 ELSE 3 END,
                              next_check_at ASC
                     LIMIT 1;";
                 cmd.Parameters.AddWithValue("$now", now.ToUnixTimeSeconds());

@@ -652,6 +652,37 @@ public class PhantomDbTests : IDisposable
     }
 
     [Fact]
+    public async Task ClaimDueAvailability_PreferredEpisodeSpreadsAcrossSeriesBeforeDeepeningOneSeries()
+    {
+        using var db = await NewDbAsync();
+        await using var conn = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
+        await conn.OpenAsync();
+        await using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = @"INSERT INTO availability_items
+                (tmdb_id,type,season,episode,status,checked_at,next_check_at)
+                VALUES
+                (100,'episode',1,1,'available',1000,900),
+                (100,'episode',1,2,'unknown',NULL,900),
+                (200,'episode',1,1,'unknown',NULL,950);";
+            await cmd.ExecuteNonQueryAsync(CancellationToken.None);
+        }
+
+        var lease = await db.ClaimDueAvailabilityAsync(
+            "test-owner",
+            TimeSpan.FromMinutes(5),
+            DateTimeOffset.FromUnixTimeSeconds(1000),
+            "policy",
+            CancellationToken.None,
+            preferredType: "episode");
+
+        Assert.NotNull(lease);
+        Assert.Equal(200, lease!.TmdbId);
+        Assert.Equal(1, lease.Season);
+        Assert.Equal(1, lease.Episode);
+    }
+
+    [Fact]
     public async Task TmdbEpisodeCache_GetMissing_ReturnsNull()
     {
         using var db = await NewDbAsync();
