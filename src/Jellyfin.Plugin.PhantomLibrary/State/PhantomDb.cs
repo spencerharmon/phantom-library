@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
@@ -1675,8 +1676,9 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
         return list;
     }
 
-    public async Task<IReadOnlyList<VisibleSeriesRow>> ListVisibleSeriesRowsAsync(CancellationToken ct)
+    public async Task<IReadOnlyList<VisibleSeriesRow>> ListVisibleSeriesRowsAsync(int minAvailableEpisodes, CancellationToken ct)
     {
+        minAvailableEpisodes = Math.Max(1, minAvailableEpisodes);
         await using var conn = await OpenAsync(ct).ConfigureAwait(false);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = @"SELECT m.tmdb_id,m.type,m.title,m.year,m.overview,m.poster_url,m.backdrop_url,
@@ -1693,8 +1695,18 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
                 WHERE type='episode'
                 GROUP BY tmdb_id
             ) mat ON mat.tmdb_id=m.tmdb_id
-            WHERE m.type='series' AND (COALESCE(av.available_count,0) > 0 OR COALESCE(mat.materialised_count,0) > 0)
+            LEFT JOIN (
+                SELECT tmdb_id, COUNT(*) AS display_count FROM (
+                    SELECT tmdb_id, season, episode FROM availability_items
+                    WHERE type='episode' AND status='available'
+                    UNION
+                    SELECT tmdb_id, season, episode FROM materialised_state
+                    WHERE type='episode'
+                ) GROUP BY tmdb_id
+            ) display ON display.tmdb_id=m.tmdb_id
+            WHERE m.type='series' AND COALESCE(display.display_count,0) >= $min
             ORDER BY m.fetched_at DESC;";
+        cmd.Parameters.AddWithValue("$min", minAvailableEpisodes);
         var list = new List<VisibleSeriesRow>();
         await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
         while (await r.ReadAsync(ct).ConfigureAwait(false))
@@ -1707,6 +1719,9 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
 
         return list;
     }
+
+    public Task<IReadOnlyList<VisibleSeriesRow>> ListVisibleSeriesRowsAsync(CancellationToken ct)
+        => ListVisibleSeriesRowsAsync(1, ct);
 
     public async Task<IReadOnlyList<VisibleSeasonRow>> ListVisibleSeasonsAsync(int seriesTmdbId, CancellationToken ct)
     {
@@ -1735,6 +1750,42 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
         return list;
     }
 
+    public async Task<IReadOnlyList<(int SeriesTmdbId, int Season, int Episode)>> ListDisplayEpisodeIdsForVisibleSeriesAsync(int minAvailableEpisodes, CancellationToken ct)
+    {
+        minAvailableEpisodes = Math.Max(1, minAvailableEpisodes);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"WITH visible_series AS (
+                SELECT tmdb_id FROM (
+                    SELECT tmdb_id, season, episode FROM availability_items
+                    WHERE type='episode' AND status='available'
+                    UNION
+                    SELECT tmdb_id, season, episode FROM materialised_state
+                    WHERE type='episode'
+                )
+                GROUP BY tmdb_id
+                HAVING COUNT(*) >= $min
+            )
+            SELECT series_tmdb_id, season, episode FROM tmdb_episode_cache
+                WHERE series_tmdb_id IN (SELECT tmdb_id FROM visible_series)
+            UNION
+            SELECT tmdb_id, season, episode FROM availability_items
+                WHERE type='episode' AND tmdb_id IN (SELECT tmdb_id FROM visible_series)
+            UNION
+            SELECT tmdb_id, season, episode FROM materialised_state
+                WHERE type='episode' AND tmdb_id IN (SELECT tmdb_id FROM visible_series)
+            ORDER BY series_tmdb_id, season, episode;";
+        cmd.Parameters.AddWithValue("$min", minAvailableEpisodes);
+        var list = new List<(int SeriesTmdbId, int Season, int Episode)>();
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            list.Add((r.GetInt32(0), r.GetInt32(1), r.GetInt32(2)));
+        }
+
+        return list;
+    }
+
     public async Task<IReadOnlyList<(int SeriesTmdbId, int Season, int Episode)>> ListVisibleEpisodeIdsAsync(CancellationToken ct)
     {
         await using var conn = await OpenAsync(ct).ConfigureAwait(false);
@@ -1753,6 +1804,42 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
         }
 
         return list;
+    }
+
+    public async Task<bool> IsSeriesVisibleAsync(int seriesTmdbId, int minAvailableEpisodes, CancellationToken ct)
+    {
+        minAvailableEpisodes = Math.Max(1, minAvailableEpisodes);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT COUNT(*) FROM (
+                SELECT season, episode FROM availability_items
+                WHERE tmdb_id=$series AND type='episode' AND status='available'
+                UNION
+                SELECT season, episode FROM materialised_state
+                WHERE tmdb_id=$series AND type='episode'
+            );";
+        cmd.Parameters.AddWithValue("$series", seriesTmdbId);
+        var v = await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
+        return Convert.ToInt64(v, CultureInfo.InvariantCulture) >= minAvailableEpisodes;
+    }
+
+    public async Task<AvailabilityItemRow?> GetAvailabilityItemAsync(int tmdbId, string type, int season, int episode, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT tmdb_id,type,season,episode,status,checked_at,next_check_at,
+                   candidate_magnet,candidate_info_hash,candidate_size,candidate_seeders,
+                   candidate_indexer,candidate_source,probe_generation,lease_owner
+            FROM availability_items
+            WHERE tmdb_id=$tmdb AND type=$type AND season=$season AND episode=$episode
+            LIMIT 1;";
+        cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+        cmd.Parameters.AddWithValue("$type", type);
+        cmd.Parameters.AddWithValue("$season", season);
+        cmd.Parameters.AddWithValue("$episode", episode);
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        return await r.ReadAsync(ct).ConfigureAwait(false) ? ReadAvailability(r) : null;
     }
 
     public async Task<bool> IsEpisodeVisibleAsync(int seriesTmdbId, int season, int episode, CancellationToken ct)

@@ -79,7 +79,10 @@ public class PhantomShowsChannelTests : IDisposable
             CancellationToken.None);
     }
 
-    private async Task SeedAvailableEpisodeAsync(int seriesTmdb, int season, int episode)
+    private Task SeedAvailableEpisodeAsync(int seriesTmdb, int season, int episode)
+        => SeedAvailabilityEpisodeAsync(seriesTmdb, season, episode, "available");
+
+    private async Task SeedAvailabilityEpisodeAsync(int seriesTmdb, int season, int episode, string status)
     {
         await _db.SetMetaAsync("__test_schema__", "1", CancellationToken.None);
         await using var conn = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
@@ -87,11 +90,12 @@ public class PhantomShowsChannelTests : IDisposable
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = @"INSERT OR REPLACE INTO availability_items
             (tmdb_id,type,season,episode,status,checked_at,next_check_at)
-            VALUES ($tmdb,'episode',$season,$episode,'available',$now,$next);";
+            VALUES ($tmdb,'episode',$season,$episode,$status,$now,$next);";
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         cmd.Parameters.AddWithValue("$tmdb", seriesTmdb);
         cmd.Parameters.AddWithValue("$season", season);
         cmd.Parameters.AddWithValue("$episode", episode);
+        cmd.Parameters.AddWithValue("$status", status);
         cmd.Parameters.AddWithValue("$now", now);
         cmd.Parameters.AddWithValue("$next", DateTimeOffset.UtcNow.AddDays(7).ToUnixTimeSeconds());
         await cmd.ExecuteNonQueryAsync(CancellationToken.None);
@@ -287,6 +291,39 @@ public class PhantomShowsChannelTests : IDisposable
         var cached = await _db.ListEpisodesForSeasonAsync(1399, 1, CancellationToken.None);
         Assert.Equal(3, cached.Count);
         Assert.Equal("Episode 1 of Season 1", cached[0].Title);
+    }
+
+    [Fact]
+    public async Task GetChannelItems_SeasonFolder_OneAvailableEpisode_EmitsUnknownAndUnavailableSiblings()
+    {
+        await SeedSeriesMetaAsync(1399, "Game of Thrones");
+        await SeedAvailableEpisodeAsync(1399, 1, 1);
+        await SeedAvailabilityEpisodeAsync(1399, 1, 3, "unavailable");
+        _tmdb.Setup(t => t.GetSeasonAsync(1399, 1, null, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MakeSeasonDetails(1399, 1, 3));
+
+        var result = await _channel.GetChannelItems(
+            new InternalChannelItemQuery { FolderId = "season_1399_s01" },
+            CancellationToken.None);
+
+        Assert.Equal(new int?[] { 1, 2, 3 }, result.Items.Select(i => i.IndexNumber).ToArray());
+        Assert.All(result.Items, i => Assert.Contains("phantom", i.Tags));
+        Assert.All(result.Items, i => AssertOpeningSource(i.MediaSources[0], i.Id));
+    }
+
+    [Fact]
+    public async Task GetChannelItems_SeriesFolder_OneAvailableEpisode_EmitsAllTmdbSeasons()
+    {
+        await SeedSeriesMetaAsync(1399, "Game of Thrones");
+        await SeedAvailableEpisodeAsync(1399, 1, 1);
+        _tmdb.Setup(t => t.GetSeriesAsync(1399, null, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MakeSeriesDetails(1399, 3));
+
+        var result = await _channel.GetChannelItems(
+            new InternalChannelItemQuery { FolderId = "series_1399" },
+            CancellationToken.None);
+
+        Assert.Equal(new[] { "season_1399_s01", "season_1399_s02", "season_1399_s03" }, result.Items.Select(i => i.Id).ToArray());
     }
 
     [Fact]

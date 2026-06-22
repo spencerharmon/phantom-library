@@ -147,7 +147,7 @@ for the full list. Highlights:
 - **Eviction policy** (default: 7 idle days; favourites protected
   per-user via a toggle in user preferences)
 - **Materialisation concurrency** (global + per-indexer caps)
-- **Series autopilot** (enabled, prefetch window)
+- **Series autopilot** (enabled, prefetch window, minimum available/materialised episodes before showing a series; default 1)
 - **Eager pre-resolve** (background indexer queries on Phantom items
   before user clicks)
 

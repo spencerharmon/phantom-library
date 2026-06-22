@@ -32,11 +32,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TMDB discovery can fill incrementally instead of stampeding Jellyfin.
 - Added Phantom Prometheus metrics on Jellyfin's normal `/metrics` endpoint when
   Jellyfin metrics are enabled.
+- Added `SeriesMinAvailableEpisodes` (default `1`) so TV series appear after a
+  configurable number of distinct available/materialised episodes; once visible,
+  all known episodes in the series are shown.
 
 ### Fixed
 
 - Fixed the admin settings "Enable availability probing" checkbox markup so
   Jellyfin's `emby-checkbox` initializer can attach and the setting can be toggled.
+- TV season browse now displays unknown and unavailable sibling episodes for any
+  series that meets the availability threshold; unknown siblings stay normal
+  phantoms and unavailable siblings report the `Unavailable` badge state
+  (REQ-M14-UNAVAILABLE-UX).
 - Indexer probing now distinguishes successful empty 2xx source results from transient failures (transport errors, timeouts, 5xx, malformed upstream responses, and unavailable indexers), preventing transient Prowlarr/Torrentio outages from poisoning availability, unavailable markers, or magnet failure cache state.
 - Concurrent materialise/open requests for the same movie or episode now use an atomic in-flight claim, so only one request calls gostream and losers return already-in-progress without deleting the winner's in-flight row.
 - Phantom badge visibility settings are enforced server-side: `Off` returns no badge states, `HideForNonAdmins` hides badges from non-admin users, and `AlwaysShow` preserves existing badge behavior.

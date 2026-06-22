@@ -8,6 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
 using Jellyfin.Plugin.PhantomLibrary.Clients.Models;
+using Jellyfin.Plugin.PhantomLibrary.Configuration;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Controller.Channels;
 using MediaBrowser.Controller.Drawing;
@@ -57,6 +58,7 @@ public sealed partial class PhantomShowsChannel
     private readonly Dictionary<string, int> _gostreamSeriesTmdbByPath = new(StringComparer.Ordinal);
     private readonly ILogger<PhantomShowsChannel> _logger;
     private readonly Func<string?> _languageProvider;
+    private readonly Func<PluginConfiguration> _configProvider;
 
     public PhantomShowsChannel(
         PhantomDb db,
@@ -86,6 +88,7 @@ public sealed partial class PhantomShowsChannel
         _enumerator = enumerator ?? throw new ArgumentNullException(nameof(enumerator));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _languageProvider = languageProvider ?? throw new ArgumentNullException(nameof(languageProvider));
+        _configProvider = () => Plugin.Instance?.Configuration ?? new PluginConfiguration();
     }
 
     /// <inheritdoc />
@@ -282,6 +285,9 @@ public sealed partial class PhantomShowsChannel
         }
     }
 
+    private int SeriesMinAvailableEpisodes()
+        => Math.Max(1, _configProvider().SeriesMinAvailableEpisodes);
+
     // ----------------------------------------------------------------
     // Browse paths
     // ----------------------------------------------------------------
@@ -294,7 +300,7 @@ public sealed partial class PhantomShowsChannel
         // Visible series are derived from available episode phantoms plus
         // materialised episodes. Raw discovery-only series stay hidden until
         // the availability worker finds at least one playable episode.
-        var visible = await _db.ListVisibleSeriesRowsAsync(ct).ConfigureAwait(false);
+        var visible = await _db.ListVisibleSeriesRowsAsync(SeriesMinAvailableEpisodes(), ct).ConfigureAwait(false);
         foreach (var row in visible)
         {
             ct.ThrowIfCancellationRequested();
@@ -353,21 +359,22 @@ public sealed partial class PhantomShowsChannel
         var visibleSeasons = await _db.ListVisibleSeasonsAsync(seriesTmdb, ct).ConfigureAwait(false);
         var externalSeries = await FindExternalSeriesByTmdbAsync(seriesTmdb, ct).ConfigureAwait(false);
         var externalSeasonNumbers = await ListExternalSeasonNumbersAsync(externalSeries, ct).ConfigureAwait(false);
-        var capacity = visibleSeasons.Count + externalSeasonNumbers.Count;
-        var items = new List<ChannelItemInfo>(capacity);
-        var emitted = new HashSet<int>();
-        foreach (var row in visibleSeasons)
+        var seasonNumbers = visibleSeasons.Select(s => s.Season).Concat(externalSeasonNumbers).ToHashSet();
+        if (await _db.IsSeriesVisibleAsync(seriesTmdb, SeriesMinAvailableEpisodes(), ct).ConfigureAwait(false))
         {
-            ct.ThrowIfCancellationRequested();
-            var built = await BuildSeasonItemAsync(seriesTmdb, row.Season, ct).ConfigureAwait(false);
-            if (built is not null)
+            var details = await SafeGetSeriesAsync(seriesTmdb, ct).ConfigureAwait(false);
+            if (details is not null)
             {
-                items.Add(built);
-                emitted.Add(row.Season);
+                for (var seasonNumber = 1; seasonNumber <= details.NumberOfSeasons; seasonNumber++)
+                {
+                    seasonNumbers.Add(seasonNumber);
+                }
             }
         }
 
-        foreach (var seasonNumber in externalSeasonNumbers.Order())
+        var items = new List<ChannelItemInfo>(seasonNumbers.Count);
+        var emitted = new HashSet<int>();
+        foreach (var seasonNumber in seasonNumbers.Order())
         {
             if (emitted.Contains(seasonNumber))
             {
@@ -375,14 +382,24 @@ public sealed partial class PhantomShowsChannel
             }
 
             var external = externalSeries.FirstOrDefault(e => e.Series.Seasons.Any(s => s.SeasonNumber == seasonNumber));
-            var seasonEntry = external?.Series.Seasons.FirstOrDefault(s => s.SeasonNumber == seasonNumber)
-                ?? new GostreamSeasonEntry(seasonNumber, Array.Empty<GostreamFileEntry>());
-            var meta = external?.Metadata ?? await _db.GetTmdbMetadataAsync(seriesTmdb, "series", ct).ConfigureAwait(false);
-            if (meta is not null)
+            if (external is not null)
             {
-                items.Add(BuildExternalSeasonItem(meta, seasonEntry));
-                emitted.Add(seasonNumber);
+                var seasonEntry = external.Series.Seasons.FirstOrDefault(s => s.SeasonNumber == seasonNumber)
+                    ?? new GostreamSeasonEntry(seasonNumber, Array.Empty<GostreamFileEntry>());
+                items.Add(BuildExternalSeasonItem(external.Metadata, seasonEntry));
             }
+            else
+            {
+                var built = await BuildSeasonItemAsync(seriesTmdb, seasonNumber, ct).ConfigureAwait(false);
+                if (built is null)
+                {
+                    continue;
+                }
+
+                items.Add(built);
+            }
+
+            emitted.Add(seasonNumber);
         }
 
         return new ChannelItemResult
@@ -447,13 +464,14 @@ public sealed partial class PhantomShowsChannel
             .GroupBy(e => e.Episode)
             .ToDictionary(g => g.Key, g => g.First().Entry);
         var hasExternalSeries = externalSeries.Count > 0;
+        var exposeFullSeries = hasExternalSeries || await _db.IsSeriesVisibleAsync(seriesTmdb, SeriesMinAvailableEpisodes(), ct).ConfigureAwait(false);
         var externalSeriesName = hasExternalSeries ? externalSeries[0].Metadata.Title : null;
         var items = new List<ChannelItemInfo>(rows.Count + externalEpisodes.Count);
         var emittedEpisodes = new HashSet<int>();
         foreach (var row in rows)
         {
             ct.ThrowIfCancellationRequested();
-            if (!hasExternalSeries && !await _db.IsEpisodeVisibleAsync(seriesTmdb, season, row.Episode, ct).ConfigureAwait(false))
+            if (!exposeFullSeries)
             {
                 continue;
             }

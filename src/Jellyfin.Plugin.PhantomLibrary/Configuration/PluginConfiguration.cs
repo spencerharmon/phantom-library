@@ -51,6 +51,7 @@ public class PluginConfiguration : BasePluginConfiguration
 
         SeriesAutopilotEnabled = true;
         SeriesAutopilotPrefetchEpisodes = 1;
+        SeriesMinAvailableEpisodes = 1;
 
         PhantomBadgeVisibility = PhantomBadgeVisibility.AlwaysShow;
 
@@ -195,6 +196,14 @@ public class PluginConfiguration : BasePluginConfiguration
 
     /// <summary>Gets or sets the autopilot prefetch window in episodes ahead of the current cursor.</summary>
     public int SeriesAutopilotPrefetchEpisodes { get; set; }
+
+    /// <summary>
+    /// Gets or sets how many distinct available/materialised episodes are
+    /// required before a TV series appears. Once threshold is met, all known
+    /// episodes in the series display; unknown episodes behave as phantoms and
+    /// unavailable episodes receive the unavailable badge.
+    /// </summary>
+    public int SeriesMinAvailableEpisodes { get; set; }
 
     /// <summary>Gets or sets the visibility policy for the "phantom" badge in client UIs.</summary>
     public PhantomBadgeVisibility PhantomBadgeVisibility { get; set; }

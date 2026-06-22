@@ -156,6 +156,11 @@
                             <label class="inputLabel inputLabelUnfocused" for="SeriesAutopilotPrefetchEpisodes">Prefetch episodes ahead</label>
                             <input id="SeriesAutopilotPrefetchEpisodes" name="SeriesAutopilotPrefetchEpisodes" type="number" min="0" is="emby-input" />
                         </div>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="SeriesMinAvailableEpisodes">Minimum available/materialised episodes before showing series</label>
+                            <input id="SeriesMinAvailableEpisodes" name="SeriesMinAvailableEpisodes" type="number" min="1" is="emby-input" />
+                            <div class="fieldDescription">Once a TV series reaches this threshold, all known episodes display; unknown episodes are phantoms and unavailable episodes get the unavailable badge.</div>
+                        </div>
                     </fieldset>
 
                     <fieldset class="verticalSection">
@@ -281,6 +286,7 @@
                             document.querySelector('#EagerResolveMaxConcurrent').value = cfg.EagerResolveMaxConcurrent;
                             document.querySelector('#SeriesAutopilotEnabled').checked = !!cfg.SeriesAutopilotEnabled;
                             document.querySelector('#SeriesAutopilotPrefetchEpisodes').value = cfg.SeriesAutopilotPrefetchEpisodes;
+                            document.querySelector('#SeriesMinAvailableEpisodes').value = cfg.SeriesMinAvailableEpisodes || 1;
                             document.querySelector('#PhantomBadgeVisibility').value = cfg.PhantomBadgeVisibility || 'AlwaysShow';
                             document.querySelector('#SplashLoopAssetPath').value = cfg.SplashLoopAssetPath || '';
                             document.querySelector('#PhantomTargetLibraryId').value = cfg.PhantomTargetLibraryId || '';
@@ -329,6 +335,7 @@
                             cfg.EagerResolveMaxConcurrent = parseInt(document.querySelector('#EagerResolveMaxConcurrent').value, 10);
                             cfg.SeriesAutopilotEnabled = document.querySelector('#SeriesAutopilotEnabled').checked;
                             cfg.SeriesAutopilotPrefetchEpisodes = parseInt(document.querySelector('#SeriesAutopilotPrefetchEpisodes').value, 10);
+                            cfg.SeriesMinAvailableEpisodes = Math.max(1, parseInt(document.querySelector('#SeriesMinAvailableEpisodes').value, 10) || 1);
                             cfg.PhantomBadgeVisibility = document.querySelector('#PhantomBadgeVisibility').value;
                             cfg.SplashLoopAssetPath = document.querySelector('#SplashLoopAssetPath').value;
                             cfg.PhantomTargetLibraryId = document.querySelector('#PhantomTargetLibraryId').value;

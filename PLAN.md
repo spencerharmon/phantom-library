@@ -185,11 +185,13 @@ contributors can see the rationale.
    favourite protection is server-wide (`ProtectFavourites`), not per-user.
    Phantom/catalogue retention is configured but not enforced in M14; catalogue
    rows are append-only until a retention sweeper is implemented.
-6. **Unavailable titles.** ⚠ Superseded by M14 availability-gated channels.
-   Pre-M14 design surfaced unavailable items with an explicit badge. Current
-   M14 behavior hides unmaterialised items whose `availability_items.status`
-   is `unavailable`; unavailable-badge surfacing is deferred until a deliberate
-   diagnostics/source-management UI exists.
+6. **Unavailable titles.** M14 availability-gated channels keep movie browse
+   uncluttered by hiding unavailable unmaterialised movies. TV uses a series-
+   scoped compromise: a series appears after `SeriesMinAvailableEpisodes`
+   distinct available/materialised episodes (default `1`), then all known
+   episodes in that series display. Unknown episodes display as normal
+   phantoms; unavailable episodes display the red `Unavailable` badge
+   (REQ-M14-UNAVAILABLE-UX).
 7. **Play-press UX.** ⚠ Superseded by M14 native-open playback. Earlier
    milestones used a fake splash media source. Current M14 emits Jellyfin
    native `RequiresOpening` media sources for unmaterialised channel items;

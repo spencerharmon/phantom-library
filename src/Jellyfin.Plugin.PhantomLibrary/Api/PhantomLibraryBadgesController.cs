@@ -55,6 +55,7 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
     public const string StatePhantom = "Phantom";
     public const string StateMaterialising = "Materialising";
     public const string StateMaterialised = "Materialised";
+    public const string StateUnavailable = "Unavailable";
 
     public PhantomLibraryBadgesController(ILibraryManager libraryManager, PhantomDb db, IUserManager userManager)
         : this(libraryManager, db, userManager, () => Plugin.Instance?.Configuration ?? new PluginConfiguration())
@@ -203,6 +204,10 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
             {
                 state = StateMaterialising;
             }
+            else if ((await _db.GetAvailabilityItemAsync(tmdbId.Value, type, sSentinel, eSentinel, ct).ConfigureAwait(false))?.Status == "unavailable")
+            {
+                state = StateUnavailable;
+            }
             else
             {
                 state = StatePhantom;
@@ -325,7 +330,7 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
             }
         }
 
-        foreach (var row in await _db.ListVisibleEpisodeIdsAsync(ct).ConfigureAwait(false))
+        foreach (var row in await _db.ListDisplayEpisodeIdsForVisibleSeriesAsync(Math.Max(1, _configProvider().SeriesMinAvailableEpisodes), ct).ConfigureAwait(false))
         {
             ct.ThrowIfCancellationRequested();
             var id = ChannelItemId.ForEpisode(row.SeriesTmdbId, row.Season, row.Episode);

@@ -73,6 +73,25 @@ public class PhantomLibraryBadgesControllerTests : IDisposable
             ChannelId = ChannelIds.Shows,
         };
 
+    private async Task SeedAvailabilityAsync(PhantomDb db, int tmdb, string type, int season, int episode, string status)
+    {
+        await db.SetMetaAsync("__availability_seed__", "1", CancellationToken.None);
+        await using var conn = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"INSERT OR REPLACE INTO availability_items
+            (tmdb_id,type,season,episode,status,checked_at,next_check_at)
+            VALUES ($tmdb,$type,$season,$episode,$status,$now,$next);";
+        cmd.Parameters.AddWithValue("$tmdb", tmdb);
+        cmd.Parameters.AddWithValue("$type", type);
+        cmd.Parameters.AddWithValue("$season", season);
+        cmd.Parameters.AddWithValue("$episode", episode);
+        cmd.Parameters.AddWithValue("$status", status);
+        cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        cmd.Parameters.AddWithValue("$next", DateTimeOffset.UtcNow.AddDays(7).ToUnixTimeSeconds());
+        await cmd.ExecuteNonQueryAsync(CancellationToken.None);
+    }
+
     private static Dictionary<string, string> Cast(IActionResult r)
     {
         var ok = Assert.IsType<OkObjectResult>(r);
@@ -193,6 +212,38 @@ public class PhantomLibraryBadgesControllerTests : IDisposable
         var ctrl = MakeController(lib.Object, db);
         var res = await ctrl.States(new PhantomLibraryStatesRequest { Ids = new() { id.ToString() } }, CancellationToken.None);
         Assert.Equal("Materialised", Cast(res)[id.ToString()]);
+    }
+
+    [Fact]
+    public async Task PhantomEpisode_UnavailableAvailability_ReturnsUnavailable()
+    {
+        using var db = await NewDbAsync();
+        var id = Guid.NewGuid();
+        var item = MakePhantomShowItem(id, "episode_99100001_s01e03");
+        var lib = new Mock<ILibraryManager>(MockBehavior.Loose);
+        lib.Setup(l => l.GetItemById(id)).Returns(item);
+        await SeedAvailabilityAsync(db, 99100001, "episode", 1, 3, "unavailable");
+
+        var ctrl = MakeController(lib.Object, db);
+        var res = await ctrl.States(new PhantomLibraryStatesRequest { Ids = new() { id.ToString() } }, CancellationToken.None);
+
+        Assert.Equal("Unavailable", Cast(res)[id.ToString()]);
+    }
+
+    [Fact]
+    public async Task PhantomEpisode_UnknownAvailability_ReturnsPhantom()
+    {
+        using var db = await NewDbAsync();
+        var id = Guid.NewGuid();
+        var item = MakePhantomShowItem(id, "episode_99100001_s01e02");
+        var lib = new Mock<ILibraryManager>(MockBehavior.Loose);
+        lib.Setup(l => l.GetItemById(id)).Returns(item);
+        await SeedAvailabilityAsync(db, 99100001, "episode", 1, 2, "unknown");
+
+        var ctrl = MakeController(lib.Object, db);
+        var res = await ctrl.States(new PhantomLibraryStatesRequest { Ids = new() { id.ToString() } }, CancellationToken.None);
+
+        Assert.Equal("Phantom", Cast(res)[id.ToString()]);
     }
 
     [Fact]
