@@ -61,40 +61,23 @@ public sealed class ProwlarrClient : IIndexerClient
         var cat = isEpisode ? "5000" : "2000";
         var seriesImdb = query.SeriesImdb ?? (isEpisode ? query.Imdb : null);
 
-        string url;
-        if (isEpisode && !string.IsNullOrWhiteSpace(seriesImdb) && query.Season is int se && query.Episode is int ep)
-        {
-            // Newznab-style TV search keyed by series IMDB + season + ep.
-            var trimmedImdb = seriesImdb!.StartsWith("tt", StringComparison.OrdinalIgnoreCase)
-                ? seriesImdb[2..]
-                : seriesImdb;
-            url = string.Format(
-                CultureInfo.InvariantCulture,
-                "{0}/api/v1/search?type=tvsearch&imdbid={1}&season={2}&ep={3}&categories={4}",
-                baseUrl.TrimEnd('/'),
-                Uri.EscapeDataString(trimmedImdb),
-                se.ToString(CultureInfo.InvariantCulture),
-                ep.ToString(CultureInfo.InvariantCulture),
-                cat);
-        }
-        else
-        {
-            var queryStr = !string.IsNullOrWhiteSpace(query.Imdb)
+        var queryStr = isEpisode
+            ? BuildTextQuery(query)
+            : !string.IsNullOrWhiteSpace(query.Imdb)
                 ? query.Imdb!
                 : BuildTextQuery(query);
 
-            if (string.IsNullOrWhiteSpace(queryStr))
-            {
-                return Array.Empty<IndexerCandidate>();
-            }
-
-            url = string.Format(
-                CultureInfo.InvariantCulture,
-                "{0}/api/v1/search?query={1}&type=search&categories={2}",
-                baseUrl.TrimEnd('/'),
-                Uri.EscapeDataString(queryStr),
-                cat);
+        if (string.IsNullOrWhiteSpace(queryStr))
+        {
+            return Array.Empty<IndexerCandidate>();
         }
+
+        var url = string.Format(
+            CultureInfo.InvariantCulture,
+            "{0}/api/v1/search?query={1}&type=search&categories={2}",
+            baseUrl.TrimEnd('/'),
+            Uri.EscapeDataString(queryStr),
+            cat);
 
         using var req = new HttpRequestMessage(HttpMethod.Get, url);
         req.Headers.Add("X-Api-Key", apiKey);
@@ -149,7 +132,7 @@ public sealed class ProwlarrClient : IIndexerClient
             var results = new List<IndexerCandidate>(items.Count);
             foreach (var it in items)
             {
-                var candidate = MapItem(it);
+                var candidate = await MapItemAsync(it, ct).ConfigureAwait(false);
                 if (candidate is not null)
                 {
                     results.Add(candidate);
@@ -164,17 +147,22 @@ public sealed class ProwlarrClient : IIndexerClient
         }
     }
 
-    private IndexerCandidate? MapItem(ProwlarrItemDto it)
+    private async Task<IndexerCandidate?> MapItemAsync(ProwlarrItemDto it, CancellationToken ct)
     {
-        // Prefer magnetUrl. If absent, accept downloadUrl iff it is a magnet:
-        // URI. http(s) .torrent links are skipped — we don't fetch .torrent
-        // files in v0.1. (Follow-up: support .torrent → magnet conversion.)
+        // Prefer magnetUrl. If absent, accept magnet downloadUrl. Some
+        // Prowlarr indexers (notably LimeTorrents) expose a Prowlarr
+        // /download URL that 301-redirects to the real magnet; resolve
+        // that header without following the non-HTTP magnet redirect.
         var magnet = it.MagnetUrl;
         if (string.IsNullOrWhiteSpace(magnet))
         {
             if (!string.IsNullOrWhiteSpace(it.DownloadUrl) && it.DownloadUrl!.StartsWith("magnet:", StringComparison.OrdinalIgnoreCase))
             {
                 magnet = it.DownloadUrl;
+            }
+            else if (!string.IsNullOrWhiteSpace(it.DownloadUrl))
+            {
+                magnet = await TryResolveMagnetRedirectAsync(it.DownloadUrl!, ct).ConfigureAwait(false);
             }
         }
 
@@ -201,6 +189,44 @@ public sealed class ProwlarrClient : IIndexerClient
             Source = it.Indexer,
             IndexerName = Name,
         };
+    }
+
+    private async Task<string?> TryResolveMagnetRedirectAsync(string downloadUrl, CancellationToken ct)
+    {
+        if (!Uri.TryCreate(downloadUrl, UriKind.Absolute, out var uri)
+            || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+        {
+            return null;
+        }
+
+        using var req = new HttpRequestMessage(HttpMethod.Get, uri);
+        HttpResponseMessage resp;
+        try
+        {
+            resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+        }
+        catch (HttpRequestException ex)
+        {
+            _logger.LogDebug(ex, "Prowlarr download URL {Url} could not be resolved to magnet", downloadUrl);
+            return null;
+        }
+        catch (TaskCanceledException ex) when (!ct.IsCancellationRequested)
+        {
+            _logger.LogDebug(ex, "Prowlarr download URL {Url} timed out resolving magnet", downloadUrl);
+            return null;
+        }
+
+        using (resp)
+        {
+            var location = resp.Headers.Location?.ToString();
+            if (!string.IsNullOrWhiteSpace(location)
+                && location.StartsWith("magnet:", StringComparison.OrdinalIgnoreCase))
+            {
+                return location;
+            }
+        }
+
+        return null;
     }
 
     private static string BuildTextQuery(IndexerQuery q)

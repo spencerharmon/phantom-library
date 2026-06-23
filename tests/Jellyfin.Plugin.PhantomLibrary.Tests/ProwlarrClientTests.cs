@@ -28,12 +28,15 @@ public class ProwlarrClientTests
     }
 
     [Fact]
-    public async Task Skips_Http_Only_DownloadUrl()
+    public async Task Resolves_Http_DownloadUrl_MagnetRedirect()
     {
         var body = "[{\"title\":\"X\",\"size\":1,\"seeders\":1,\"downloadUrl\":\"https://t.example/x.torrent\"}]";
-        var c = Make(new QueuedHandler().Enqueue(HttpStatusCode.OK, body));
+        var c = Make(new QueuedHandler()
+            .Enqueue(HttpStatusCode.OK, body)
+            .Enqueue(HttpStatusCode.MovedPermanently, mutate: r => r.Headers.Location = new Uri("magnet:?xt=urn:btih:FACEFEED&dn=X")));
         var res = await c.SearchAsync(new IndexerQuery { Type = "movie", Imdb = "tt1" }, CancellationToken.None);
-        Assert.Empty(res);
+        Assert.Single(res);
+        Assert.Equal("FACEFEED", res[0].InfoHash);
     }
 
     [Fact]
@@ -44,6 +47,29 @@ public class ProwlarrClientTests
         var res = await c.SearchAsync(new IndexerQuery { Type = "movie", Imdb = "tt1" }, CancellationToken.None);
         Assert.Single(res);
         Assert.Equal("CAFEBABE", res[0].InfoHash);
+    }
+
+    [Fact]
+    public async Task Episode_Search_Uses_Text_Query_Not_Imdb_Tvsearch()
+    {
+        var body = "[]";
+        var handler = new QueuedHandler().Enqueue(HttpStatusCode.OK, body);
+        var c = Make(handler);
+
+        _ = await c.SearchAsync(new IndexerQuery
+        {
+            Type = "episode",
+            Title = "Avatar the Last Airbender",
+            SeriesImdb = "tt9018736",
+            Season = 1,
+            Episode = 5,
+        }, CancellationToken.None);
+
+        var uri = handler.Requests.Single().RequestUri!.ToString();
+        Assert.Contains("type=search", uri);
+        Assert.Contains("Avatar the Last Airbender S01E05", uri);
+        Assert.DoesNotContain("tvsearch", uri);
+        Assert.DoesNotContain("imdbid", uri);
     }
 
     [Fact]

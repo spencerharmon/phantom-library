@@ -60,6 +60,10 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         serviceCollection.AddHttpClient<ProwlarrClient>(c =>
         {
             c.Timeout = TimeSpan.FromSeconds(30);
+        })
+        .ConfigurePrimaryHttpMessageHandler(() => new System.Net.Http.HttpClientHandler
+        {
+            AllowAutoRedirect = false,
         });
         serviceCollection.AddHttpClient<TorrentioClient>(c =>
         {
