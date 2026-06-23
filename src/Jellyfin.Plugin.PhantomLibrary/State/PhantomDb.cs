@@ -73,6 +73,8 @@ public sealed record VisibleSeriesRow(TmdbMetadataRow Metadata, int AvailableEpi
 
 public sealed record VisibleSeasonRow(int SeriesTmdbId, int Season, int AvailableEpisodeCount, int MaterialisedEpisodeCount);
 
+public sealed record SeasonAvailabilitySummary(int KnownCount, int PlayableCount, int UnknownCount, int UnavailableCount);
+
 public sealed record DueSeriesExpansionRow(int SeriesTmdbId, int ProbeGeneration, string LeaseOwner);
 
 /// <summary>
@@ -1804,6 +1806,59 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
         }
 
         return list;
+    }
+
+    public async Task<SeasonAvailabilitySummary> GetSeasonAvailabilitySummaryAsync(int seriesTmdbId, int season, CancellationToken ct)
+    {
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"WITH
+            known AS (
+                SELECT season, episode FROM tmdb_episode_cache
+                WHERE series_tmdb_id=$series AND season=$season
+                UNION
+                SELECT season, episode FROM availability_items
+                WHERE tmdb_id=$series AND type='episode' AND season=$season
+                UNION
+                SELECT season, episode FROM materialised_state
+                WHERE tmdb_id=$series AND type='episode' AND season=$season
+            ),
+            playable AS (
+                SELECT season, episode FROM availability_items
+                WHERE tmdb_id=$series AND type='episode' AND season=$season AND status='available'
+                UNION
+                SELECT season, episode FROM materialised_state
+                WHERE tmdb_id=$series AND type='episode' AND season=$season
+            ),
+            unavailable_only AS (
+                SELECT season, episode FROM availability_items
+                WHERE tmdb_id=$series AND type='episode' AND season=$season AND status='unavailable'
+                EXCEPT
+                SELECT season, episode FROM playable
+            ),
+            resolved AS (
+                SELECT season, episode FROM playable
+                UNION
+                SELECT season, episode FROM unavailable_only
+            )
+            SELECT
+                (SELECT COUNT(*) FROM known),
+                (SELECT COUNT(*) FROM playable),
+                (SELECT COUNT(*) FROM (SELECT season, episode FROM known EXCEPT SELECT season, episode FROM resolved)),
+                (SELECT COUNT(*) FROM unavailable_only);";
+        cmd.Parameters.AddWithValue("$series", seriesTmdbId);
+        cmd.Parameters.AddWithValue("$season", season);
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (!await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            return new SeasonAvailabilitySummary(0, 0, 0, 0);
+        }
+
+        return new SeasonAvailabilitySummary(
+            Convert.ToInt32(r.GetInt64(0)),
+            Convert.ToInt32(r.GetInt64(1)),
+            Convert.ToInt32(r.GetInt64(2)),
+            Convert.ToInt32(r.GetInt64(3)));
     }
 
     public async Task<bool> IsSeriesVisibleAsync(int seriesTmdbId, int minAvailableEpisodes, CancellationToken ct)

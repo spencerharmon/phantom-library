@@ -8,7 +8,7 @@
 # - materialised episode stream opens
 set -euo pipefail
 
-ROOT=/home/spencer/git-repos/spencerharmon/phantom-library
+ROOT=${PHANTOM_REPO_ROOT:-/home/spencer/git-repos/spencerharmon/phantom-library}
 RIG=/tmp/jf-rig
 API=http://localhost:18096
 TOK=testtoken00000000000000000000000
@@ -196,7 +196,8 @@ PY
 }
 
 echo '[0] build plugin + start reset rig'
-dotnet build -c Release >/tmp/phantom-episode-e2e-build.log
+read -r -a BUILD_ARGS <<< "${PHANTOM_DOTNET_BUILD_ARGS:-}"
+dotnet build -c Release "${BUILD_ARGS[@]}" >/tmp/phantom-episode-e2e-build.log
 bash tools/rig-scenarios/rig-up.sh --reset
 
 for _ in $(seq 1 60); do
@@ -253,16 +254,24 @@ raise SystemExit(1)
 PY
 ) || fail 'Delta series not found'
 
-api "$API/Channels/$SHOWS_CH/Items?FolderId=$SERIES_ID&Fields=Tags,ProviderIds,MediaSources,Path,Overview,ExternalId&Limit=50" -o /tmp/seasons.json
+api "$API/Channels/$SHOWS_CH/Items?FolderId=$SERIES_ID&Fields=Tags,ProviderIds,MediaSources,Path,Overview,ExternalId,ProductionYear&Limit=50" -o /tmp/seasons.json
 SEASON_ID=$(python3 - <<'PY'
-import json
+import json, sys
 j=json.load(open('/tmp/seasons.json'))
 for x in j.get('Items', []):
     if x.get('Name') == 'Season 1':
+        overview = x.get('Overview') or ''
+        if 'Season 1 overview for Phantom Rig Delta.' not in overview:
+            raise SystemExit('season overview missing')
+        if '8 episodes' not in overview or '1 available/materialised' not in overview or '7 unknown' not in overview:
+            raise SystemExit('season availability summary missing: ' + overview)
+        if x.get('ProductionYear') != 2024:
+            raise SystemExit('season production year missing')
+        print('SEASON_ITEM', x.get('Name'), x.get('Id'), overview.replace('\n', ' | '), x.get('ProductionYear'), file=sys.stderr)
         print(x['Id']); raise SystemExit(0)
 raise SystemExit(1)
 PY
-) || fail 'Delta season 1 not found'
+) || fail 'Delta season 1 not found or not enriched'
 api "$API/Channels/$SHOWS_CH/Items?FolderId=$SEASON_ID&Fields=Tags,ProviderIds,MediaSources,Path,Overview,ExternalId&Limit=50" -o /tmp/episodes.json
 EP_ID=$(python3 - <<'PY'
 import json

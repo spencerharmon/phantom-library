@@ -386,7 +386,7 @@ public sealed partial class PhantomShowsChannel
             {
                 var seasonEntry = external.Series.Seasons.FirstOrDefault(s => s.SeasonNumber == seasonNumber)
                     ?? new GostreamSeasonEntry(seasonNumber, Array.Empty<GostreamFileEntry>());
-                items.Add(BuildExternalSeasonItem(external.Metadata, seasonEntry));
+                items.Add(await BuildExternalSeasonItemAsync(external.Metadata, seasonEntry, ct).ConfigureAwait(false));
             }
             else
             {
@@ -524,13 +524,16 @@ public sealed partial class PhantomShowsChannel
         if (enriched is not null)
         {
             var seasonNumbers = await ListExternalSeasonNumbersAsync(new[] { enriched }, ct).ConfigureAwait(false);
-            var enrichedItems = seasonNumbers
-                .Order()
-                .Select(seasonNumber => BuildExternalSeasonItem(
+            var enrichedItems = new List<ChannelItemInfo>();
+            foreach (var seasonNumber in seasonNumbers.Order())
+            {
+                enrichedItems.Add(await BuildExternalSeasonItemAsync(
                     enriched.Metadata,
                     series.Seasons.FirstOrDefault(s => s.SeasonNumber == seasonNumber)
-                        ?? new GostreamSeasonEntry(seasonNumber, Array.Empty<GostreamFileEntry>())))
-                .ToList();
+                        ?? new GostreamSeasonEntry(seasonNumber, Array.Empty<GostreamFileEntry>()),
+                    ct).ConfigureAwait(false));
+            }
+
             return new ChannelItemResult { Items = enrichedItems, TotalRecordCount = enrichedItems.Count };
         }
 
@@ -723,16 +726,71 @@ public sealed partial class PhantomShowsChannel
 
     private async Task<ChannelItemInfo?> BuildSeasonItemAsync(int seriesTmdb, int season, CancellationToken ct)
     {
-        // Season tiles share the parent series poster — fine for Stage
-        // 5.1; per-season posters are a follow-up enrichment.
         var seriesMeta = await _db.GetTmdbMetadataAsync(seriesTmdb, "series", ct).ConfigureAwait(false);
+        var details = await SafeGetSeasonAsync(seriesTmdb, season, ct).ConfigureAwait(false);
+        if (details is not null)
+        {
+            await UpsertSeasonEpisodeRowsAsync(details, ct).ConfigureAwait(false);
+        }
+
+        var summary = await _db.GetSeasonAvailabilitySummaryAsync(seriesTmdb, season, ct).ConfigureAwait(false);
+        return BuildSeasonItemCore(seriesTmdb, season, seriesMeta, details, summary, tags: Array.Empty<string>());
+    }
+
+    private async Task<ChannelItemInfo> BuildExternalSeasonItemAsync(TmdbMetadataRow meta, GostreamSeasonEntry season, CancellationToken ct)
+    {
+        var details = await SafeGetSeasonAsync(meta.TmdbId, season.SeasonNumber, ct).ConfigureAwait(false);
+        if (details is not null)
+        {
+            await UpsertSeasonEpisodeRowsAsync(details, ct).ConfigureAwait(false);
+        }
+
+        var summary = await _db.GetSeasonAvailabilitySummaryAsync(meta.TmdbId, season.SeasonNumber, ct).ConfigureAwait(false);
+        if (season.Episodes.Count > 0 && season.Episodes.Count > summary.PlayableCount)
+        {
+            var playable = season.Episodes.Count;
+            var unknown = Math.Max(0, summary.KnownCount - playable - summary.UnavailableCount);
+            summary = summary with { PlayableCount = playable, UnknownCount = unknown };
+        }
+
+        return BuildSeasonItemCore(meta.TmdbId, season.SeasonNumber, meta, details, summary, tags: new[] { "external" });
+    }
+
+    private static ChannelItemInfo BuildSeasonItemCore(
+        int seriesTmdb,
+        int season,
+        TmdbMetadataRow? seriesMeta,
+        TmdbSeasonDetails? details,
+        SeasonAvailabilitySummary summary,
+        IReadOnlyList<string> tags)
+    {
         var id = ChannelItemId.ForSeason(seriesTmdb, season).Encode();
+        var name = !string.IsNullOrWhiteSpace(details?.Name)
+            ? details!.Name!
+            : "Season " + season.ToString(CultureInfo.InvariantCulture);
+        var overviewParts = new List<string>();
+        if (!string.IsNullOrWhiteSpace(details?.Overview))
+        {
+            overviewParts.Add(details!.Overview!);
+        }
+
+        var counts = FormatSeasonSummary(summary);
+        if (!string.IsNullOrWhiteSpace(counts))
+        {
+            overviewParts.Add(counts);
+        }
+        else if (!string.IsNullOrWhiteSpace(seriesMeta?.Overview))
+        {
+            overviewParts.Add(seriesMeta!.Overview!);
+        }
+
+        var premiere = ParseSeasonAirDate(details?.AirDate);
         return new ChannelItemInfo
         {
             Id = id,
-            Name = "Season " + season.ToString(CultureInfo.InvariantCulture),
+            Name = name,
             SeriesName = seriesMeta?.Title,
-            Overview = seriesMeta?.Overview,
+            Overview = overviewParts.Count == 0 ? null : string.Join("\n\n", overviewParts),
             IndexNumber = season,
             Type = ChannelItemType.Folder,
             // Use a generic channel container instead of ChannelFolderType.Season.
@@ -743,9 +801,38 @@ public sealed partial class PhantomShowsChannel
             // this as a channel container forces child browse back through
             // IChannel.GetChannelItems where episodes are synthesised on demand.
             FolderType = ChannelFolderType.Container,
-            ImageUrl = seriesMeta?.PosterUrl,
-            Tags = new List<string>(),
+            ImageUrl = BuildImageUrl(details?.PosterPath) ?? seriesMeta?.PosterUrl,
+            PremiereDate = premiere,
+            ProductionYear = premiere?.Year ?? seriesMeta?.Year,
+            Tags = tags.ToList(),
         };
+    }
+
+    private static string FormatSeasonSummary(SeasonAvailabilitySummary summary)
+    {
+        if (summary.KnownCount <= 0 && summary.PlayableCount <= 0 && summary.UnavailableCount <= 0)
+        {
+            return string.Empty;
+        }
+
+        var known = summary.KnownCount > 0 ? summary.KnownCount : summary.PlayableCount + summary.UnknownCount + summary.UnavailableCount;
+        var parts = new List<string> { known.ToString(CultureInfo.InvariantCulture) + (known == 1 ? " episode" : " episodes") };
+        if (summary.PlayableCount > 0)
+        {
+            parts.Add(summary.PlayableCount.ToString(CultureInfo.InvariantCulture) + " available/materialised");
+        }
+
+        if (summary.UnknownCount > 0)
+        {
+            parts.Add(summary.UnknownCount.ToString(CultureInfo.InvariantCulture) + " unknown");
+        }
+
+        if (summary.UnavailableCount > 0)
+        {
+            parts.Add(summary.UnavailableCount.ToString(CultureInfo.InvariantCulture) + " unavailable");
+        }
+
+        return string.Join(" · ", parts);
     }
 
     /// <summary>
@@ -854,22 +941,6 @@ public sealed partial class PhantomShowsChannel
         var item = BuildSeriesItemFromMetadata(meta);
         item.Tags = new List<string> { "external" };
         return item;
-    }
-
-    private static ChannelItemInfo BuildExternalSeasonItem(TmdbMetadataRow meta, GostreamSeasonEntry season)
-    {
-        return new ChannelItemInfo
-        {
-            Id = ChannelItemId.ForSeason(meta.TmdbId, season.SeasonNumber).Encode(),
-            Name = "Season " + season.SeasonNumber.ToString(CultureInfo.InvariantCulture),
-            SeriesName = meta.Title,
-            Overview = meta.Overview,
-            IndexNumber = season.SeasonNumber,
-            Type = ChannelItemType.Folder,
-            FolderType = ChannelFolderType.Container,
-            ImageUrl = meta.PosterUrl,
-            Tags = new List<string> { "external" },
-        };
     }
 
     private ChannelItemInfo BuildExternalEpisodeItemFromRow(TmdbEpisodeRow row, GostreamFileEntry externalEpisode, string? seriesName)
@@ -1083,11 +1154,14 @@ public sealed partial class PhantomShowsChannel
     private async Task WarmSeasonCacheAsync(int seriesTmdb, int season, CancellationToken ct)
     {
         var seasonDetails = await SafeGetSeasonAsync(seriesTmdb, season, ct).ConfigureAwait(false);
-        if (seasonDetails is null)
+        if (seasonDetails is not null)
         {
-            return;
+            await UpsertSeasonEpisodeRowsAsync(seasonDetails, ct).ConfigureAwait(false);
         }
+    }
 
+    private async Task UpsertSeasonEpisodeRowsAsync(TmdbSeasonDetails seasonDetails, CancellationToken ct)
+    {
         foreach (var e in seasonDetails.Episodes)
         {
             if (e.EpisodeNumber <= 0)
@@ -1100,8 +1174,8 @@ public sealed partial class PhantomShowsChannel
                 : e.Name;
             await _db.UpsertTmdbEpisodeAsync(
                 new TmdbEpisodeRow(
-                    SeriesTmdbId: seriesTmdb,
-                    Season: season,
+                    SeriesTmdbId: seasonDetails.SeriesTmdbId,
+                    Season: seasonDetails.SeasonNumber,
                     Episode: e.EpisodeNumber,
                     Title: title,
                     Overview: e.Overview,
@@ -1155,6 +1229,12 @@ public sealed partial class PhantomShowsChannel
 
     private static int? ParseYear(string? date)
         => !string.IsNullOrWhiteSpace(date) && date.Length >= 4 && int.TryParse(date[..4], NumberStyles.Integer, CultureInfo.InvariantCulture, out var y) ? y : null;
+
+    private static DateTime? ParseSeasonAirDate(string? date)
+        => !string.IsNullOrWhiteSpace(date)
+           && DateTime.TryParse(date, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var parsed)
+            ? DateTime.SpecifyKind(parsed, DateTimeKind.Utc)
+            : null;
 
     private static string? BuildImageUrl(string? path)
     {

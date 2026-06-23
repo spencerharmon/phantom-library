@@ -223,6 +223,10 @@ public sealed record TmdbSeasonDetails
 {
     public required int SeriesTmdbId { get; init; }
     public required int SeasonNumber { get; init; }
+    public string? Name { get; init; }
+    public string? Overview { get; init; }
+    public string? PosterPath { get; init; }
+    public string? AirDate { get; init; }
     public required System.Collections.Generic.IReadOnlyList<TmdbEpisodeSummary> Episodes { get; init; }
 }
 
@@ -249,6 +253,10 @@ public sealed record TmdbEpisodeDetails : TmdbEpisodeSummary
 internal sealed class TmdbSeasonDetailsDto
 {
     public int Id { get; set; }
+    public string? Name { get; set; }
+    public string? Overview { get; set; }
+    public string? PosterPath { get; set; }
+    public string? AirDate { get; set; }
     public int? SeasonNumber { get; set; }
     public TmdbEpisodeDto[]? Episodes { get; set; }
 }

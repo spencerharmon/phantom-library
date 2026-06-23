@@ -357,6 +357,10 @@ public sealed class TmdbClient : ITmdbClient
         {
             SeriesTmdbId = seriesTmdbId,
             SeasonNumber = seasonNo,
+            Name = dto.Name,
+            Overview = dto.Overview,
+            PosterPath = dto.PosterPath,
+            AirDate = dto.AirDate,
             Episodes = episodes,
         };
     }

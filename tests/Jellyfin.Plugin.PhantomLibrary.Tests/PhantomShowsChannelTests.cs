@@ -139,6 +139,10 @@ public class PhantomShowsChannelTests : IDisposable
         {
             SeriesTmdbId = seriesTmdb,
             SeasonNumber = season,
+            Name = $"Season {season}",
+            Overview = $"Season {season} overview.",
+            PosterPath = $"/season_s{season}.jpg",
+            AirDate = $"2011-04-{season:D2}",
             Episodes = eps,
         };
     }
@@ -242,6 +246,31 @@ public class PhantomShowsChannelTests : IDisposable
             Assert.Equal("Game of Thrones", i.SeriesName);
         });
         Assert.Equal(1, result.Items[0].IndexNumber);
+    }
+
+    [Fact]
+    public async Task GetChannelItems_SeriesFolder_EnrichesSeasonTilesFromTmdbSeasonDetails()
+    {
+        await SeedSeriesMetaAsync(1399, "Game of Thrones");
+        await SeedAvailableEpisodeAsync(1399, 1, 1);
+        await SeedAvailabilityEpisodeAsync(1399, 1, 3, "unavailable");
+        _tmdb.Setup(t => t.GetSeriesAsync(1399, null, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MakeSeriesDetails(1399, 1));
+        _tmdb.Setup(t => t.GetSeasonAsync(1399, 1, null, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MakeSeasonDetails(1399, 1, 3));
+
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery { FolderId = "series_1399" }, CancellationToken.None);
+
+        var season = Assert.Single(result.Items);
+        Assert.Equal("Season 1", season.Name);
+        Assert.Equal("Game of Thrones", season.SeriesName);
+        Assert.Equal("https://image.tmdb.org/t/p/w500/season_s1.jpg", season.ImageUrl);
+        Assert.Contains("Season 1 overview.", season.Overview, StringComparison.Ordinal);
+        Assert.Contains("3 episodes", season.Overview, StringComparison.Ordinal);
+        Assert.Contains("1 available/materialised", season.Overview, StringComparison.Ordinal);
+        Assert.Contains("1 unknown", season.Overview, StringComparison.Ordinal);
+        Assert.Contains("1 unavailable", season.Overview, StringComparison.Ordinal);
+        Assert.Equal(2011, season.ProductionYear);
     }
 
     [Fact]

@@ -78,6 +78,9 @@ def _season(series_tmdb_id: int, season: int):
     return {
         "id": series_tmdb_id + season,
         "name": "Season 1",
+        "overview": f"Season {season} overview for {title}.",
+        "poster_path": f"/{series_tmdb_id}-s{season:02d}-poster.jpg",
+        "air_date": "2024-04-01",
         "season_number": season,
         "episodes": [
             {

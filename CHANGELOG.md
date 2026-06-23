@@ -37,6 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `SeriesMinAvailableEpisodes` (default `1`) so TV series appear after a
   configurable number of distinct available/materialised episodes; once visible,
   all known episodes in the series are shown.
+- Phantom Shows season folders now use TMDB season details when browsing a
+  series, adding season poster/overview/air year plus episode availability
+  counts while staying on generic channel containers so episode navigation
+  remains channel-backed.
 
 ### Fixed
 
