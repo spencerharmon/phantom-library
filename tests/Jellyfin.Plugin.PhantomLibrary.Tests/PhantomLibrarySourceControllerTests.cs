@@ -191,7 +191,8 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
             paths.Object,
             users.Object,
             db,
-            sourceManager);
+            sourceManager,
+            libMgr.Object);
     }
 
     [Fact]

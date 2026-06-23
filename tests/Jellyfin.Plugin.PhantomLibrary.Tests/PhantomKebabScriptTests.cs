@@ -12,6 +12,8 @@ public class PhantomKebabScriptTests
         Assert.Contains("getPlayablePhantomItem", js);
         Assert.Contains("item.ExternalId", js);
         Assert.Contains("fetchSources(ctx.externalId)", js);
+        Assert.Contains("resolveExternalId(currentItemId())", js);
+        Assert.Contains("Plugins/PhantomLibrary/Items/ResolveExternalId/", js);
         Assert.Contains("Plugins/PhantomLibrary/Items/", js);
         Assert.Contains("/Sources", js);
         Assert.Contains("encodeURIComponent(externalId)", js);
@@ -42,6 +44,19 @@ public class PhantomKebabScriptTests
         Assert.Contains("item.Type !== 'Movie' && item.Type !== 'Episode'", js);
         Assert.DoesNotContain("KindSeries", js);
         Assert.DoesNotContain("KindSeason", js);
+    }
+
+    [Fact]
+    public void SeasonDetails_PrehydratesChannelChildrenWithoutJellyfinPatch()
+    {
+        var js = ReadScript();
+
+        Assert.Contains("getPhantomSeasonItem", js);
+        Assert.Contains("/^season_\\d+_s\\d+$/.test(item.ExternalId)", js);
+        Assert.Contains("prehydratePhantomSeasonChildren", js);
+        Assert.Contains("Channels/", js);
+        Assert.Contains("FolderId: item.Id", js);
+        Assert.Contains("refreshVisibleItemContainers", js);
     }
 
     [Fact]

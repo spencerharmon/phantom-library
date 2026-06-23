@@ -83,12 +83,61 @@
 
     function getPlayablePhantomItem() {
         return getCurrentItem().then(function (item) {
-            if (!item || !item.ExternalId) { return null; }
-            var parsed = parsePhantomExternalId(item.ExternalId);
-            if (!parsed) { return null; }
+            if (!item) { return null; }
             if (item.Type && item.Type !== 'Movie' && item.Type !== 'Episode') { return null; }
-            return { item: item, externalId: item.ExternalId, parsed: parsed };
+            var parsed = parsePhantomExternalId(item.ExternalId);
+            if (parsed) {
+                return { item: item, externalId: item.ExternalId, parsed: parsed };
+            }
+
+            return resolveExternalId(currentItemId()).then(function (externalId) {
+                parsed = parsePhantomExternalId(externalId);
+                return parsed ? { item: item, externalId: externalId, parsed: parsed } : null;
+            });
         });
+    }
+
+    function getPhantomSeasonItem() {
+        return getCurrentItem().then(function (item) {
+            if (!item || item.Type !== 'Season' || !item.ChannelId || !item.ExternalId) { return null; }
+            if (!/^season_\d+_s\d+$/.test(item.ExternalId)) { return null; }
+            return item;
+        });
+    }
+
+    function prehydratePhantomSeasonChildren() {
+        return getPhantomSeasonItem().then(function (item) {
+            if (!item) { return; }
+            var key = 'phantom-season-prehydrated:' + item.Id;
+            if (window.sessionStorage && window.sessionStorage.getItem(key)) { return; }
+            var api = getApiClient();
+            if (!api || typeof api.getUrl !== 'function' || typeof api.ajax !== 'function') { return; }
+            var url = api.getUrl('Channels/' + item.ChannelId + '/Items', {
+                FolderId: item.Id,
+                Fields: 'Tags,ProviderIds,Overview,ExternalId,ProductionYear,PremiereDate',
+                Limit: 300
+            });
+            return api.ajax({ type: 'GET', url: url, dataType: 'json' }).then(function () {
+                if (window.sessionStorage) { window.sessionStorage.setItem(key, '1'); }
+                refreshVisibleItemContainers();
+            }, function (err) {
+                warn('season child prehydrate failed', err);
+            });
+        });
+    }
+
+    function refreshVisibleItemContainers() {
+        var containers = document.querySelectorAll('.itemsContainer, [is="emby-itemscontainer"]');
+        for (var i = 0; i < containers.length; i++) {
+            var c = containers[i];
+            try {
+                if (typeof c.notifyRefreshNeeded === 'function') {
+                    c.notifyRefreshNeeded(true);
+                } else if (typeof c.refreshItems === 'function') {
+                    c.refreshItems();
+                }
+            } catch (_) { /* best-effort */ }
+        }
     }
 
     function apiUrl(path) {
@@ -103,6 +152,22 @@
             return Promise.reject(new Error('ApiClient not found'));
         }
         return api.ajax(options);
+    }
+
+    function resolveExternalId(itemId) {
+        if (!itemId) { return Promise.resolve(null); }
+        var url = apiUrl('Plugins/PhantomLibrary/Items/ResolveExternalId/' + encodeURIComponent(itemId));
+        if (!url) { return Promise.resolve(null); }
+        return ajaxJson({
+            type: 'GET',
+            url: url,
+            dataType: 'json'
+        }).then(function (result) {
+            return (result && (result.ExternalId || result.externalId)) || null;
+        }, function (err) {
+            warn('external id resolve failed', err);
+            return null;
+        });
     }
 
     function fetchSources(externalId) {
@@ -538,8 +603,11 @@
     function start() {
         ensureStyles();
         refreshSourceSection();
+        prehydratePhantomSeasonChildren();
         window.addEventListener('hashchange', function () {
             window.setTimeout(refreshSourceSection, 50);
+            window.setTimeout(prehydratePhantomSeasonChildren, 50);
+            window.setTimeout(prehydratePhantomSeasonChildren, 500);
         });
         var scheduled = false;
         var observer = new MutationObserver(function (mutations) {
@@ -572,6 +640,7 @@
                 window.setTimeout(function () {
                     scheduled = false;
                     refreshSourceSection();
+                    prehydratePhantomSeasonChildren();
                 }, 150);
             }
         });

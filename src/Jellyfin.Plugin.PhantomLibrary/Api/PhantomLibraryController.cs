@@ -36,6 +36,7 @@ public sealed class PhantomLibraryController : ControllerBase
     private readonly IUserManager _userManager;
     private readonly PhantomDb _db;
     private readonly PhantomSourceManager _sourceManager;
+    private readonly ILibraryManager _libraryManager;
 
     public PhantomLibraryController(
         IMaterialiser materialiser,
@@ -44,7 +45,8 @@ public sealed class PhantomLibraryController : ControllerBase
         IApplicationPaths paths,
         IUserManager userManager,
         PhantomDb db,
-        PhantomSourceManager sourceManager)
+        PhantomSourceManager sourceManager,
+        ILibraryManager libraryManager)
     {
         _materialiser = materialiser;
         _queue = queue;
@@ -53,6 +55,7 @@ public sealed class PhantomLibraryController : ControllerBase
         _userManager = userManager;
         _db = db;
         _sourceManager = sourceManager;
+        _libraryManager = libraryManager;
     }
 
     /// <summary>
@@ -105,6 +108,20 @@ public sealed class PhantomLibraryController : ControllerBase
     {
         _queue.EnqueueUser(itemId, trigger);
         return Accepted();
+    }
+
+    [HttpGet("Items/ResolveExternalId/{itemId}")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public IActionResult ResolveExternalId([FromRoute] Guid itemId)
+    {
+        var item = _libraryManager.GetItemById(itemId);
+        if (item is null || string.IsNullOrWhiteSpace(item.ExternalId))
+        {
+            return NotFound(new { code = "not_found" });
+        }
+
+        return Ok(new { externalId = item.ExternalId });
     }
 
     [HttpGet("Items/{externalId}/Sources")]
