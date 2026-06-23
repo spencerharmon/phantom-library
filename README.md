@@ -136,11 +136,11 @@ After installing v0.3.0+:
 If a user can see normal libraries but cannot see Phantom Movies / Phantom
 Shows, check this channel-access setting first.
 
-Phantom Shows season folders intentionally remain generic channel containers
-rather than native Jellyfin Season folders, so episode browse stays channel-
-backed. Season tiles still include TMDB season poster/overview/year and
-available/materialised/unknown/unavailable episode counts when that metadata is
-available.
+Phantom Shows season folders use native Jellyfin `Season` channel items so web
+opens the rich season details view. Patched Jellyfin prehydrates channel episode
+children when creating season items, so the native episode list is populated on
+first open while episodes still use Phantom's channel-backed playback and badge
+state.
 
 ## Configuration
 

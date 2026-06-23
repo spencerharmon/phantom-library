@@ -1,0 +1,33 @@
+diff --git a/src/Jellyfin.LiveTv/Channels/ChannelManager.cs b/src/Jellyfin.LiveTv/Channels/ChannelManager.cs
+index af6042b490..2f3758abed 100644
+--- a/src/Jellyfin.LiveTv/Channels/ChannelManager.cs
++++ b/src/Jellyfin.LiveTv/Channels/ChannelManager.cs
+@@ -727,12 +727,26 @@ namespace Jellyfin.LiveTv.Channels
+                 var internalItems = new Guid[itemsLen];
+                 for (int i = 0; i < itemsLen; i++)
+                 {
+-                    internalItems[i] = (await GetChannelItemEntityAsync(
++                    var channelItemEntity = await GetChannelItemEntityAsync(
+                         items[i],
+                         channelProvider,
+                         channel.Id,
+                         parentItem,
+-                        cancellationToken).ConfigureAwait(false)).Id;
++                        cancellationToken).ConfigureAwait(false);
++                    internalItems[i] = channelItemEntity.Id;
++
++                    if (items[i].Type == ChannelItemType.Folder && items[i].FolderType == ChannelFolderType.Season)
++                    {
++                        await GetChannelItemsInternal(
++                            new InternalItemsQuery
++                            {
++                                Parent = channelItemEntity,
++                                EnableTotalRecordCount = false,
++                                ChannelIds = new Guid[] { channel.Id }
++                            },
++                            progress,
++                            cancellationToken).ConfigureAwait(false);
++                    }
+                 }
+ 
+                 var existingIds = _libraryManager.GetItemIds(query);

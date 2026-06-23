@@ -40,9 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   all known episodes in the series are shown.
 - Phantom Shows season folders now use TMDB season details when browsing a
   series, adding season poster/overview/air year plus episode availability
-  counts while staying on generic channel containers so episode navigation
-  remains channel-backed. The Shows channel cache salt was bumped so existing
-  cached season folders refresh to the richer shape after restart.
+  counts, and now emit Jellyfin `Season` channel items so web opens the rich
+  native season details view. Patched Jellyfin prehydrates channel season
+  children when creating season items so the native episode list is populated
+  on first open.
 
 ### Fixed
 
@@ -76,10 +77,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejected candidates only remove unreferenced torrent hashes.
 - Show season browse now falls back to cached episode rows when TMDB season
   refresh fails or rate-limits, so known episodes do not disappear from a
-  season folder during transient TMDB outages. Season folders are emitted as
-  generic channel containers rather than Jellyfin `Season` folders so client
-  navigation stays on the channel browse path instead of standard TV-season
-  endpoints that can show empty cached BaseItems.
+  season folder during transient TMDB outages. Channel season folders now use
+  Jellyfin `Season` items with prehydrated channel episode children, so client
+  navigation can use the native rich season details view without showing empty
+  cached BaseItems.
 - Materialisation no longer persists `materialised_state` for a gostream
   result whose FUSE path never appears; that candidate is marked failed and
   the next ranked magnet is tried instead.
