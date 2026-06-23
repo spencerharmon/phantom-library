@@ -309,6 +309,40 @@ If the change requires *no* operator action beyond the next install,
 say so explicitly: "No operator steps needed; `./install.sh` is
 sufficient." Silence on this question costs the operator time.
 
+## Planning / handoff scope ledger (always)
+
+When the operator asks for planning, plan review, or handoff prompt, create
+or update a requirements ledger before producing the final plan/handoff. The
+ledger is the scope authority.
+
+Required ledger columns:
+
+- Requirement ID
+- Original operator wording or source
+- Disposition: `IMPLEMENT`, `EVALUATE`, `DEFER`, or `DROP`
+- Acceptance evidence required
+- Notes / operator approval link for anything not `IMPLEMENT`
+
+Rules:
+
+- Every operator-requested feature starts as `IMPLEMENT` unless the operator
+  explicitly says it is optional, already done, or only needs evaluation.
+- Critic/reviewer agents may find contradictions or missing code, but must
+  not convert requirements to `DEFER`/`DROP`. They can only mark "code does
+  not implement this yet" and recommend either implementation or operator
+  disposition.
+- Do not rewrite PLAN.md to match incomplete code by silently deferring the
+  missing behavior. That is scope laundering.
+- Only the operator can approve `DEFER` or `DROP`. Record that approval in
+  the ledger; absent approval means still `IMPLEMENT`.
+- Handoff prompts must include a traceability check mapping every
+  `IMPLEMENT` row to implementation scope, tests, and runtime evidence.
+- `EVALUATE` rows are not done until there is written evaluation against the
+  current architecture and either an implementation plan or operator-approved
+  disposition.
+- Final responses for plan/handoff work must state whether every ledger row
+  is covered. If not, say `NOT DONE` and list gaps.
+
 ## Version handoff / intended-test manifest (always)
 
 When handing off a build for operator testing, include an **INTENDED

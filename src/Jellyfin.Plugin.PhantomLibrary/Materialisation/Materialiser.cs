@@ -151,8 +151,25 @@ public sealed class Materialiser : IMaterialiser
         };
     }
 
-    public async Task<MaterialisationOutcome> MaterialiseAsync(
+    public Task<MaterialisationOutcome> MaterialiseAsync(
         int tmdbId, string type, int? season, int? episode,
+        MaterialiseTrigger trigger,
+        CancellationToken ct)
+        => MaterialiseCoreAsync(tmdbId, type, season, episode, selectedCandidate: null, trigger, ct);
+
+    public Task<MaterialisationOutcome> MaterialiseAsync(
+        int tmdbId, string type, int? season, int? episode,
+        MagnetCandidate selectedCandidate,
+        MaterialiseTrigger trigger,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(selectedCandidate);
+        return MaterialiseCoreAsync(tmdbId, type, season, episode, selectedCandidate, trigger, ct);
+    }
+
+    private async Task<MaterialisationOutcome> MaterialiseCoreAsync(
+        int tmdbId, string type, int? season, int? episode,
+        MagnetCandidate? selectedCandidate,
         MaterialiseTrigger trigger,
         CancellationToken ct)
     {
@@ -277,7 +294,7 @@ public sealed class Materialiser : IMaterialiser
             }
 
             var candidates = await BuildGostreamRequestsAsync(
-                tmdbId, type, season, episode, imdb, unavailKey, ct).ConfigureAwait(false);
+                tmdbId, type, season, episode, imdb, unavailKey, selectedCandidate, ct).ConfigureAwait(false);
             var addResult = await AddWithCandidateRetryAsync(
                 candidates, tmdbId, type, season, episode, imdb, unavailKey, ct).ConfigureAwait(false);
 
@@ -396,6 +413,7 @@ public sealed class Materialiser : IMaterialiser
         int? episode,
         string? imdb,
         UnavailableKey unavailableKey,
+        MagnetCandidate? selectedCandidate,
         CancellationToken ct)
     {
         var metadataType = type == "movie" ? "movie" : "series";
@@ -428,6 +446,12 @@ public sealed class Materialiser : IMaterialiser
             Preset: cfg.SourcePickerPreset);
 
         var candidates = new List<CandidateAddRequest>();
+        if (selectedCandidate is not null)
+        {
+            candidates.Add(BuildCandidateRequest(meta, type, tmdbId, imdb, season, episode, selectedCandidate, cfg, fromCache: false));
+            return candidates;
+        }
+
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var cached = await _db.GetCachedMagnetAsync(magnetKey, ct).ConfigureAwait(false);
         if (cached is not null)

@@ -352,4 +352,48 @@ case "$row" in
   *) fail "bad Alpha BaseItem row: $row" ;;
 esac
 
+echo '[8] source-management reject current source chooses next ranked availability candidate and playback still works'
+old_stub=$(sqlite3 "$PHDB" "SELECT stub_path FROM materialised_state WHERE tmdb_id=$ALPHA AND type='movie' AND season=-1 AND episode=-1;")
+alt_magnet='magnet:?xt=urn:btih:2222222222222222222222222222222222222222&dn=Phantom+Rig+Alpha+Alternate'
+sqlite3 "$PHDB" <<SQL
+UPDATE availability_items
+SET candidate_magnet='$alt_magnet',
+    candidate_info_hash='2222222222222222222222222222222222222222',
+    candidate_size=20971520,
+    candidate_seeders=55,
+    candidate_indexer='rig-alt',
+    candidate_source='rig-alt',
+    status='available',
+    checked_at=$now,
+    next_check_at=$((now + 604800))
+WHERE tmdb_id=$ALPHA AND type='movie' AND season=-1 AND episode=-1;
+SQL
+api "$API/Plugins/PhantomLibrary/Items/movie_$ALPHA/Sources" -o /tmp/sources-before-reject.json
+python3 - <<'PY'
+import json
+j=json.load(open('/tmp/sources-before-reject.json'))
+print('SOURCES_BEFORE=', j.get('Status') or j.get('status'), j.get('CurrentSource') or j.get('currentSource'), j.get('Candidates') or j.get('candidates'))
+cands=j.get('Candidates') or j.get('candidates') or []
+if not any((c.get('Magnet') or c.get('magnet')) == 'magnet:?xt=urn:btih:2222222222222222222222222222222222222222&dn=Phantom+Rig+Alpha+Alternate' for c in cands):
+    raise SystemExit('alternate source candidate not exposed before reject')
+PY
+api_post "$API/Plugins/PhantomLibrary/Items/movie_$ALPHA/Sources/RejectCurrent" -o /tmp/reject-source.json || fail 'RejectCurrent source API failed'
+python3 - <<'PY'
+import json
+j=json.load(open('/tmp/reject-source.json'))
+print('REJECT_RESULT=', j)
+code=j.get('Code') or j.get('code')
+status=str(j.get('Status') or j.get('status'))
+if code != 'materialised' and 'Success' not in status and status != '0':
+    raise SystemExit(f'reject did not materialise alternate: code={code!r} status={status!r}')
+PY
+new_stub=$(sqlite3 "$PHDB" "SELECT stub_path FROM materialised_state WHERE tmdb_id=$ALPHA AND type='movie' AND season=-1 AND episode=-1;")
+[ -n "$new_stub" ] || fail 'Alpha missing materialised_state after RejectCurrent'
+[ "$new_stub" != "$old_stub" ] || fail "RejectCurrent did not switch stub path (still $new_stub)"
+reject_reason=$(sqlite3 "$PHDB" "SELECT reason FROM magnet_failure_cache WHERE tmdb_id=$ALPHA AND type='movie' AND magnet LIKE 'magnet:%1111111111111111111111111111111111111111%' LIMIT 1;")
+[ "$reject_reason" = "operator_rejected" ] || fail "expected operator_rejected failure row, got $reject_reason"
+api "$API/Channels/$MOVIES_CH/Items?Fields=Tags,ProviderIds,MediaSources,Path,Overview,ProductionYear&Limit=50" -o /tmp/movies.json
+assert_playback_info "$ALPHA_ID" '/tmp/jf-rig/gostream/movies/' 'materialised-alpha-after-source-reject' 1
+assert_stream_opens "$ALPHA_ID" 'mkv' 'materialised-alpha-after-source-reject'
+
 echo 'CHANNEL_E2E_PLAYBACK_OK'

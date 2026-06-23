@@ -186,7 +186,16 @@ public sealed class MaterialisationQueue : IMaterialisationQueue, IHostedService
             {
                 using var scope = _services.CreateScope();
                 var materialiser = scope.ServiceProvider.GetRequiredService<IMaterialiser>();
-                await materialiser.MaterialiseAsync(item.Id, item.Trigger, ct).ConfigureAwait(false);
+                var indexerLimit = GetIndexerLimit("all-indexers");
+                await indexerLimit.WaitAsync(ct).ConfigureAwait(false);
+                try
+                {
+                    await materialiser.MaterialiseAsync(item.Id, item.Trigger, ct).ConfigureAwait(false);
+                }
+                finally
+                {
+                    indexerLimit.Release();
+                }
             }
             catch (OperationCanceledException)
             {

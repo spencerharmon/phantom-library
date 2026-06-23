@@ -2113,6 +2113,47 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
         }
     }
 
+    public async Task<int> CountOtherMaterialisedReferencesAsync(
+        int tmdbId,
+        string type,
+        int season,
+        int episode,
+        string stubPath,
+        string? infoHash,
+        CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        ArgumentException.ThrowIfNullOrWhiteSpace(stubPath);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT COUNT(*)
+            FROM materialised_state ms
+            WHERE NOT (ms.tmdb_id=$tmdb AND ms.type=$type AND ms.season=$season AND ms.episode=$episode)
+              AND (
+                    ms.stub_path=$stub
+                    OR (
+                        $hash <> ''
+                        AND EXISTS (
+                            SELECT 1
+                            FROM magnet_cache mc
+                            WHERE mc.tmdb_id=ms.tmdb_id
+                              AND mc.type=ms.type
+                              AND mc.season=CASE WHEN ms.season < 0 THEN 0 ELSE ms.season END
+                              AND mc.episode=CASE WHEN ms.episode < 0 THEN 0 ELSE ms.episode END
+                              AND mc.info_hash=$hash
+                        )
+                    )
+                  );";
+        cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+        cmd.Parameters.AddWithValue("$type", type);
+        cmd.Parameters.AddWithValue("$season", season);
+        cmd.Parameters.AddWithValue("$episode", episode);
+        cmd.Parameters.AddWithValue("$stub", stubPath);
+        cmd.Parameters.AddWithValue("$hash", string.IsNullOrWhiteSpace(infoHash) ? string.Empty : infoHash);
+        var count = await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
+        return Convert.ToInt32(count, CultureInfo.InvariantCulture);
+    }
+
     // ---- tmdb_external_ids ----
 
     /// <summary>

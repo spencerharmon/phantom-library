@@ -3,6 +3,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
 using Jellyfin.Plugin.PhantomLibrary.Materialisation;
+using Jellyfin.Plugin.PhantomLibrary.Sources;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.Library;
@@ -34,6 +35,7 @@ public sealed class PhantomLibraryController : ControllerBase
     private readonly IApplicationPaths _paths;
     private readonly IUserManager _userManager;
     private readonly PhantomDb _db;
+    private readonly PhantomSourceManager _sourceManager;
 
     public PhantomLibraryController(
         IMaterialiser materialiser,
@@ -41,7 +43,8 @@ public sealed class PhantomLibraryController : ControllerBase
         IGostreamClient gostream,
         IApplicationPaths paths,
         IUserManager userManager,
-        PhantomDb db)
+        PhantomDb db,
+        PhantomSourceManager sourceManager)
     {
         _materialiser = materialiser;
         _queue = queue;
@@ -49,6 +52,7 @@ public sealed class PhantomLibraryController : ControllerBase
         _paths = paths;
         _userManager = userManager;
         _db = db;
+        _sourceManager = sourceManager;
     }
 
     /// <summary>
@@ -103,6 +107,41 @@ public sealed class PhantomLibraryController : ControllerBase
         return Accepted();
     }
 
+    [HttpGet("Items/{externalId}/Sources")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> Sources([FromRoute] string externalId, CancellationToken ct = default)
+    {
+        var response = await _sourceManager.GetSourcesAsync(externalId, ct).ConfigureAwait(false);
+        return response is null ? NotFound(new { code = "not_found" }) : Ok(response);
+    }
+
+    [HttpPost("Items/{externalId}/Sources/RejectCurrent")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status409Conflict)]
+    [ProducesResponseType(StatusCodes.Status422UnprocessableEntity)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+    public async Task<IActionResult> RejectCurrent([FromRoute] string externalId, CancellationToken ct = default)
+    {
+        var result = await _sourceManager.RejectCurrentAsync(externalId, ct).ConfigureAwait(false);
+        return ToActionResult(result);
+    }
+
+    [HttpPost("Items/{externalId}/Sources/MaterialiseCandidate")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status409Conflict)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+    public async Task<IActionResult> MaterialiseCandidate(
+        [FromRoute] string externalId,
+        [FromBody] PhantomMaterialiseCandidateRequest? request,
+        CancellationToken ct = default)
+    {
+        var result = await _sourceManager.MaterialiseCandidateAsync(externalId, request, ct).ConfigureAwait(false);
+        return ToActionResult(result);
+    }
+
     /// <summary>Returns queue + gostream-reachability status for the admin debug page.</summary>
     [HttpGet("Status")]
     [ProducesResponseType(StatusCodes.Status200OK)]
@@ -128,4 +167,14 @@ public sealed class PhantomLibraryController : ControllerBase
             gostreamReachable = reachable,
         });
     }
+
+    private ObjectResult ToActionResult(PhantomSourceOperationResult result)
+        => result.Status switch
+        {
+            PhantomSourceOperationStatus.Success => Ok(result),
+            PhantomSourceOperationStatus.NotFound or PhantomSourceOperationStatus.CandidateNotFound => NotFound(result),
+            PhantomSourceOperationStatus.NoCurrent or PhantomSourceOperationStatus.InFlight => Conflict(result),
+            PhantomSourceOperationStatus.NoAlternate => UnprocessableEntity(result),
+            _ => StatusCode(StatusCodes.Status500InternalServerError, result),
+        };
 }

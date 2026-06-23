@@ -4,6 +4,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Configuration;
 using Jellyfin.Plugin.PhantomLibrary.Materialisation;
+using Jellyfin.Plugin.PhantomLibrary.Sources;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
@@ -35,6 +36,9 @@ public class MaterialisationQueueTests
         }
 
         public Task<MaterialisationOutcome> MaterialiseAsync(int tmdbId, string type, int? season, int? episode, MaterialiseTrigger trigger, CancellationToken ct)
+            => Task.FromResult(new MaterialisationOutcome { Status = MaterialisationStatus.Success });
+
+        public Task<MaterialisationOutcome> MaterialiseAsync(int tmdbId, string type, int? season, int? episode, MagnetCandidate selectedCandidate, MaterialiseTrigger trigger, CancellationToken ct)
             => Task.FromResult(new MaterialisationOutcome { Status = MaterialisationStatus.Success });
     }
 

@@ -62,13 +62,117 @@ fixed before handoff.
 | REQ-M14-MOBILE | Source-management UX is usable in mobile browser; native mobile limitations must have diagnostics/channel fallback or explicit operator-approved limitation. | IMPLEMENT | Mobile-browser DOM/API evidence or documented fallback with test coverage. |
 | REQ-M14-FAV-MATERIALISE | Favourite-triggered materialisation/prewarming behavior must be implemented or explicitly re-approved by operator as not desired after channel refactor. | IMPLEMENT | UserData/favourite tests showing materialise/prewarm trigger, or operator-approved disposition change. |
 | REQ-M14-PER-USER | Per-user preferences/favourite eviction protection/show-hide/source-probing controls must be implemented or re-evaluated with operator after channel refactor. | IMPLEMENT | API/UI/tests for per-user behavior, or operator-approved disposition change. |
-| REQ-M14-UNAVAILABLE-UX | Unavailable-title UX must be intentionally implemented: visible badge/diagnostics/source-management state, not silent plan deferral. | IMPLEMENT | Badge/API/UI tests proving unavailable state behavior. |
 | REQ-M14-RECOMMENDATIONS | Favourite-similar/recommendation ingestion must be re-evaluated after channel refactor; do not silently drop it. | EVALUATE | Written evaluation against current channel surfaces + operator disposition. |
 | REQ-M14-RETENTION | Phantom/catalogue retention must be re-evaluated after schema v11 append-only catalogue design; config must not imply active pruning unless implemented. | EVALUATE | Written evaluation + either implementation/tests or operator-approved no-op/defer. |
 | REQ-M14-VAULT | Vault Mode/prestage/favourite-driven persistence must be re-evaluated against current gostream and eviction model. | EVALUATE | Written evaluation + implementation/tests or operator-approved disposition. |
 | REQ-M14-CONCURRENCY | Per-indexer concurrency cap must be implemented or removed/renamed so config does not overpromise. | EVALUATE | Concurrency tests or config/UI cleanup with operator-approved disposition. |
 | REQ-M14-SEARCH-GATING | Native remote-search availability gating must be evaluated against channel-only availability gating. | EVALUATE | Written evaluation + operator disposition. |
 | REQ-M14-SPLASH | Splash/fake-button/dynamic overlay remnants must be evaluated after native-open refactor and either removed, repurposed, or operator-approved as historical. | EVALUATE | Written evaluation + code/UI cleanup if still exposed. |
+
+### M14 source-management implementation contract
+
+Source-management work must use the current channel architecture and stable
+`BaseItem.ExternalId` values (`movie_<tmdbId>` and
+`episode_<seriesTmdbId>_sXXeYY`). Do not key operator actions on file paths,
+Jellyfin item GUIDs, or current materialised state.
+
+#### Backend API
+
+Add API routes under the existing Phantom Library plugin API surface:
+
+- `GET /Plugins/PhantomLibrary/Items/{externalId}/Sources`
+  - Auth: same authenticated-user/admin policy as other Phantom Library item
+    actions; return 404 for non-Phantom or unparseable `externalId`.
+  - Response includes:
+    - `externalId`, parsed type/TMDB/season/episode, current status
+      (`unmaterialised`, `materialised`, `materialising`, `unavailable`).
+    - `currentSource` when materialised: `magnet`, `infoHash`, `indexer`,
+      `seeders`, `size`, `stubPath`, `fusePath`, `materialisedAt`. If old
+      rows lack magnet metadata, return real stored fields and explicit nulls;
+      do not invent values.
+    - `candidates`: fresh ranked candidates from `MagnetSelector` plus cached
+      winner where applicable, each with `magnet`, `infoHash`, `indexer`,
+      `title`, `seeders`, `size`, `rank`, `isCurrent`, `isRejected`,
+      `failureReason`, `retryAfter`.
+    - `canRejectCurrent`, `canMaterialiseSelected`, and human-readable
+      `message` for disabled actions.
+- `POST /Plugins/PhantomLibrary/Items/{externalId}/Sources/RejectCurrent`
+  - Requires current `materialised_state`; 409 if already in flight.
+  - Records current source as rejected in `magnet_failure_cache` with reason
+    `operator_rejected` and long retry window unless operator later chooses
+    a shorter policy.
+  - Removes only target `materialised_state`. Call gostream remove only when
+    no other materialised row references the same `stub_path`/`infoHash`;
+    shared hashes must not be removed.
+  - Immediately attempts materialisation with next ranked non-rejected
+    candidate. If none exists, leave item unmaterialised and return clear
+    `no_alternate_source` state; do not silently reselect rejected source.
+  - Refresh exact channel item after state changes.
+- `POST /Plugins/PhantomLibrary/Items/{externalId}/Sources/MaterialiseCandidate`
+  - Body requires exact `magnet` and may include `infoHash`, `indexer`,
+    `title`, `size`, `seeders` from the candidate list.
+  - Uses same atomic in-flight claim as normal materialisation.
+  - Attempts that exact candidate first; if it is operator-selected, bypass
+    stale ranking but not existing hard rejection unless request explicitly
+    includes `overrideRejected=true`.
+  - On success, writes real `materialised_state`, refreshes exact channel
+    item, and returns final source details.
+
+Persistence default: avoid schema bump if honest implementation is possible.
+Use existing `materialised_state`, `magnet_cache`, and
+`magnet_failure_cache`. If exact selected-candidate history cannot be
+implemented honestly with those tables, propose schema v12 and the required
+wipe/changelog/handoff before editing schema.
+
+#### Web UI
+
+Implement web controls in embedded Phantom Library web assets:
+
+- Extend or replace `Configuration/phantomKebab.js` so item action sheets on
+  Phantom movie/episode details show:
+  - `Materialise (Phantom Library)` for unmaterialised materialisable items.
+  - `Reject current source (Phantom Library)` for materialised Phantom items.
+  - No source actions for non-Phantom items, series folders, or season
+    folders.
+- Add a details-panel injection (same JS file or a new embedded resource)
+  that calls `GET .../Sources` for the current details item and renders a
+  `Phantom Source` section with:
+  - current source summary and rejection status,
+  - candidate dropdown populated from API candidates,
+  - `Materialise selected source` button,
+  - `Reject current source` button when allowed,
+  - loading, success, and error states that expose API messages.
+- Mobile browser must use the same DOM flow with touch-sized controls. If
+  native Jellyfin mobile apps cannot execute custom JS, implement a server-
+  rendered diagnostics/channel fallback or bring the limitation back to the
+  operator for disposition before claiming done.
+
+#### Tests / rig evidence
+
+Required coverage:
+
+- API tests for all three routes, including non-Phantom 404, no-current-source,
+  already-in-flight, no-alternate-source, and selected-candidate success.
+- Safety tests proving RejectCurrent skips rejected candidate and does not call
+  gostream remove when another materialised row references the same source.
+- UI/markup/JS tests or DOM evidence proving `Phantom Source`, candidate
+  dropdown, and reject action appear only where valid.
+- Live rig scenario proving reject current source → next ranked source →
+  playback through real Jellyfin channel/native-open flow.
+
+### M14 remaining-deferral evaluation plan
+
+Rows marked `EVALUATE` in the ledger are not approved deferrals. For each row,
+inspect current channel-refactor code, write a short finding in PLAN.md or a
+companion plan doc, and either implement the still-relevant behavior or obtain
+operator disposition. Evaluation must cover user-visible behavior, current code
+entry points, risks, and exact tests needed if implemented.
+
+Current written evaluation lives in `docs/plans/m14-ledger-evaluation.md`.
+
+Unavailable-title badge UX is no longer in this ledger because the operator
+reported it was implemented in another session; future agents should verify it
+by tests, not re-defer it.
 
 ### Documented partials
 
@@ -190,8 +294,9 @@ contributors can see the rationale.
    scoped compromise: a series appears after `SeriesMinAvailableEpisodes`
    distinct available/materialised episodes (default `1`), then all known
    episodes in that series display. Unknown episodes display as normal
-   phantoms; unavailable episodes display the red `Unavailable` badge
-   (REQ-M14-UNAVAILABLE-UX).
+   phantoms; unavailable episodes display the red `Unavailable` badge. This
+   badge UX was implemented in another session and removed from the open M14
+   ledger; keep tests green and do not re-defer it.
 7. **Play-press UX.** ⚠ Superseded by M14 native-open playback. Earlier
    milestones used a fake splash media source. Current M14 emits Jellyfin
    native `RequiresOpening` media sources for unmaterialised channel items;

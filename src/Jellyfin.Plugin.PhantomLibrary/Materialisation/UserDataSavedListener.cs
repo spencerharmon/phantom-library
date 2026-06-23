@@ -33,15 +33,18 @@ public sealed class UserDataSavedListener : IHostedService
 
     private readonly IUserDataManager _userData;
     private readonly ISeriesAutopilot _autopilot;
+    private readonly IMaterialiser _materialiser;
     private readonly ILogger<UserDataSavedListener> _logger;
 
     public UserDataSavedListener(
         IUserDataManager userData,
         ISeriesAutopilot autopilot,
+        IMaterialiser materialiser,
         ILogger<UserDataSavedListener> logger)
     {
         _userData = userData ?? throw new ArgumentNullException(nameof(userData));
         _autopilot = autopilot ?? throw new ArgumentNullException(nameof(autopilot));
+        _materialiser = materialiser ?? throw new ArgumentNullException(nameof(materialiser));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
@@ -67,46 +70,94 @@ public sealed class UserDataSavedListener : IHostedService
                 return;
             }
 
-            var played = ComputePlayedPercentage(item, e.UserData);
-            if (played < PlayedPercentageThreshold)
-            {
-                return;
-            }
-
-            if (item.SourceType != SourceType.Channel || !ChannelIds.IsPhantom(item.ChannelId))
-            {
-                return;
-            }
-
-            // Splash guard: while the item is still phantom-tagged, the
-            // play happened against the splash placeholder. Ignore.
-            if (item.Tags is not null
-                && item.Tags.Contains("phantom", StringComparer.OrdinalIgnoreCase))
-            {
-                return;
-            }
-
-            if (!ChannelItemId.TryParse(item.ExternalId, out var parsed)
-                || parsed.Kind != ChannelItemId.KindEpisode)
-            {
-                return;
-            }
-
-            if (item is not Episode episode)
-            {
-                return;
-            }
-
-            // Fire-and-forget; autopilot handles its own errors.
-            _ = _autopilot.OnEpisodePlaybackProgressAsync(
-                e.UserId,
-                episode,
-                played,
-                CancellationToken.None);
+            HandleSavedUserData(item, e.UserData, e.UserId);
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "UserDataSavedListener handler threw; swallowing");
+        }
+    }
+
+    internal void HandleSavedUserData(BaseItem item, MediaBrowser.Controller.Entities.UserItemData userData, Guid userId)
+    {
+        ArgumentNullException.ThrowIfNull(item);
+        ArgumentNullException.ThrowIfNull(userData);
+
+        if (!ChannelItemId.TryParse(item.ExternalId, out _))
+        {
+            return;
+        }
+
+        if (userData.IsFavorite)
+        {
+            TryTriggerFavouriteMaterialise(item);
+        }
+
+        var played = ComputePlayedPercentage(item, userData);
+        if (played < PlayedPercentageThreshold)
+        {
+            return;
+        }
+
+        if (!ChannelIds.IsPhantom(item.ChannelId))
+        {
+            return;
+        }
+
+        // Splash guard: while the item is still phantom-tagged, the
+        // play happened against the splash placeholder. Ignore.
+        if (item.Tags is not null
+            && item.Tags.Contains("phantom", StringComparer.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        if (!ChannelItemId.TryParse(item.ExternalId, out var parsed)
+            || parsed.Kind != ChannelItemId.KindEpisode)
+        {
+            return;
+        }
+
+        if (item is not Episode episode)
+        {
+            return;
+        }
+
+        // Fire-and-forget; autopilot handles its own errors.
+        _ = _autopilot.OnEpisodePlaybackProgressAsync(
+            userId,
+            episode,
+            played,
+            CancellationToken.None);
+    }
+
+    private void TryTriggerFavouriteMaterialise(BaseItem item)
+    {
+        if (!ChannelItemId.TryParse(item.ExternalId, out var parsed))
+        {
+            return;
+        }
+
+        switch (parsed.Kind)
+        {
+            case ChannelItemId.KindMovie when parsed.TmdbId.HasValue:
+                _ = _materialiser.MaterialiseAsync(
+                    parsed.TmdbId.Value,
+                    "movie",
+                    null,
+                    null,
+                    MaterialiseTrigger.Favourite,
+                    CancellationToken.None);
+                break;
+            case ChannelItemId.KindEpisode when parsed.TmdbId.HasValue && parsed.Season.HasValue && parsed.Episode.HasValue:
+                _ = _materialiser.MaterialiseAsync(
+                    parsed.TmdbId.Value,
+                    "episode",
+                    parsed.Season.Value,
+                    parsed.Episode.Value,
+                    MaterialiseTrigger.Favourite,
+                    CancellationToken.None);
+                break;
         }
     }
 

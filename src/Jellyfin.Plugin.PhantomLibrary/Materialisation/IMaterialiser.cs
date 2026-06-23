@@ -1,6 +1,7 @@
 using System;
 using System.Threading;
 using System.Threading.Tasks;
+using Jellyfin.Plugin.PhantomLibrary.Sources;
 
 namespace Jellyfin.Plugin.PhantomLibrary.Materialisation;
 
@@ -95,6 +96,15 @@ public interface IMaterialiser
         string type,
         int? season,
         int? episode,
+        MaterialiseTrigger trigger,
+        CancellationToken ct);
+
+    Task<MaterialisationOutcome> MaterialiseAsync(
+        int tmdbId,
+        string type,
+        int? season,
+        int? episode,
+        MagnetCandidate selectedCandidate,
         MaterialiseTrigger trigger,
         CancellationToken ct);
 }

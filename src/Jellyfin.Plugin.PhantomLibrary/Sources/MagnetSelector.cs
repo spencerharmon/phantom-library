@@ -21,7 +21,10 @@ public sealed record MagnetCandidate(
     string InfoHash,
     long Size,
     int Seeders,
-    string Indexer);
+    string Indexer)
+{
+    public string? Title { get; init; }
+}
 
 public enum MagnetProbeOutcome
 {
@@ -228,7 +231,10 @@ public sealed class MagnetSelector
                 ? picked.IndexerName!
                 : (enabled.FirstOrDefault()?.Name ?? "unknown");
 
-            return new MagnetCandidate(picked.Magnet, picked.InfoHash, picked.Size, picked.Seeders, indexerLabel);
+            return new MagnetCandidate(picked.Magnet, picked.InfoHash, picked.Size, picked.Seeders, indexerLabel)
+            {
+                Title = picked.Title,
+            };
         }).ToList();
 
         return MagnetProbeResult.Available(candidates);
