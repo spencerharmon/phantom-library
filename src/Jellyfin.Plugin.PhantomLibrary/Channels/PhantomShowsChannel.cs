@@ -46,7 +46,7 @@ public sealed partial class PhantomShowsChannel
     private const string OrphanSeriesPrefix = "orphanseries_";
     private const string OrphanSeasonPrefix = "orphanseason_";
     private const string OrphanEpisodePrefix = "orphanepisode_";
-    private const string DataVersionSalt = "rich-season-v2";
+    private const string DataVersionSalt = "rich-season-v1";
     private static readonly string[] ExternalTags = { "external" };
 
     [GeneratedRegex(@"[sS](?<season>\d{1,3})[eE](?<episode>\d{1,4})")]
@@ -795,7 +795,14 @@ public sealed partial class PhantomShowsChannel
             Overview = overviewParts.Count == 0 ? null : string.Join("\n\n", overviewParts),
             IndexNumber = season,
             Type = ChannelItemType.Folder,
-            FolderType = ChannelFolderType.Season,
+            // Use a generic channel container instead of ChannelFolderType.Season.
+            // Jellyfin web treats real Season BaseItems as normal TV seasons and
+            // routes episode browse through /Shows/{id}/Episodes, which reads
+            // already-materialised BaseItem children and can show an empty season
+            // before the channel has been asked for that season's episodes. Keeping
+            // this as a channel container forces child browse back through
+            // IChannel.GetChannelItems where episodes are synthesised on demand.
+            FolderType = ChannelFolderType.Container,
             ImageUrl = BuildImageUrl(details?.PosterPath) ?? seriesMeta?.PosterUrl,
             PremiereDate = premiere,
             ProductionYear = premiere?.Year ?? seriesMeta?.Year,
