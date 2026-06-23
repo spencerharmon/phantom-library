@@ -259,12 +259,14 @@ SEASON_ID=$(python3 - <<'PY'
 import json, sys
 j=json.load(open('/tmp/seasons.json'))
 for x in j.get('Items', []):
-    if x.get('Name') == 'Season 1':
+    if (x.get('Name') or '').startswith('Season 1'):
         overview = x.get('Overview') or ''
         if 'Season 1 overview for Phantom Rig Delta.' not in overview:
             raise SystemExit('season overview missing')
         if '8 episodes' not in overview or '1 available/materialised' not in overview or '7 unknown' not in overview:
             raise SystemExit('season availability summary missing: ' + overview)
+        if '8 episodes' not in (x.get('Name') or '') or '1 ready' not in (x.get('Name') or ''):
+            raise SystemExit('season title summary missing: ' + (x.get('Name') or ''))
         if x.get('ProductionYear') != 2024:
             raise SystemExit('season production year missing')
         print('SEASON_ITEM', x.get('Name'), x.get('Id'), overview.replace('\n', ' | '), x.get('ProductionYear'), file=sys.stderr)

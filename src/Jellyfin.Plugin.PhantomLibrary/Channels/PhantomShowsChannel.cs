@@ -767,9 +767,10 @@ public sealed partial class PhantomShowsChannel
         IReadOnlyList<string> tags)
     {
         var id = ChannelItemId.ForSeason(seriesTmdb, season).Encode();
-        var name = !string.IsNullOrWhiteSpace(details?.Name)
+        var baseName = !string.IsNullOrWhiteSpace(details?.Name)
             ? details!.Name!
             : "Season " + season.ToString(CultureInfo.InvariantCulture);
+        var name = FormatSeasonTitle(baseName, summary);
         var overviewParts = new List<string>();
         if (!string.IsNullOrWhiteSpace(details?.Overview))
         {
@@ -808,6 +809,30 @@ public sealed partial class PhantomShowsChannel
             ProductionYear = premiere?.Year ?? seriesMeta?.Year,
             Tags = tags.ToList(),
         };
+    }
+
+    private static string FormatSeasonTitle(string baseName, SeasonAvailabilitySummary summary)
+    {
+        if (summary.KnownCount <= 0 && summary.PlayableCount <= 0 && summary.UnavailableCount <= 0)
+        {
+            return baseName;
+        }
+
+        var known = summary.KnownCount > 0 ? summary.KnownCount : summary.PlayableCount + summary.UnknownCount + summary.UnavailableCount;
+        var ready = summary.PlayableCount;
+        var unavailable = summary.UnavailableCount;
+        var suffix = known.ToString(CultureInfo.InvariantCulture) + (known == 1 ? " episode" : " episodes");
+        if (ready > 0)
+        {
+            suffix += ", " + ready.ToString(CultureInfo.InvariantCulture) + " ready";
+        }
+
+        if (unavailable > 0)
+        {
+            suffix += ", " + unavailable.ToString(CultureInfo.InvariantCulture) + " unavailable";
+        }
+
+        return baseName + " (" + suffix + ")";
     }
 
     private static string FormatSeasonSummary(SeasonAvailabilitySummary summary)
