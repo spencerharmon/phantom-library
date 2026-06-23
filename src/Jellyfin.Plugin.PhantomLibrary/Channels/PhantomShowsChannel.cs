@@ -46,6 +46,7 @@ public sealed partial class PhantomShowsChannel
     private const string OrphanSeriesPrefix = "orphanseries_";
     private const string OrphanSeasonPrefix = "orphanseason_";
     private const string OrphanEpisodePrefix = "orphanepisode_";
+    private static readonly string[] ExternalTags = { "external" };
 
     [GeneratedRegex(@"[sS](?<season>\d{1,3})[eE](?<episode>\d{1,4})")]
     private static partial Regex EpisodeNumberRegex();
@@ -753,7 +754,7 @@ public sealed partial class PhantomShowsChannel
             summary = summary with { PlayableCount = playable, UnknownCount = unknown };
         }
 
-        return BuildSeasonItemCore(meta.TmdbId, season.SeasonNumber, meta, details, summary, tags: new[] { "external" });
+        return BuildSeasonItemCore(meta.TmdbId, season.SeasonNumber, meta, details, summary, tags: ExternalTags);
     }
 
     private static ChannelItemInfo BuildSeasonItemCore(
