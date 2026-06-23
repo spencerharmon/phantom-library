@@ -2017,10 +2017,16 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
 
     public async Task<bool> IsMaterialiseInFlightAsync(int tmdbId, string type, int season, int episode, CancellationToken ct)
     {
+        var started = await GetMaterialiseInFlightStartedAtAsync(tmdbId, type, season, episode, ct).ConfigureAwait(false);
+        return started.HasValue;
+    }
+
+    public async Task<DateTimeOffset?> GetMaterialiseInFlightStartedAtAsync(int tmdbId, string type, int season, int episode, CancellationToken ct)
+    {
         ArgumentException.ThrowIfNullOrWhiteSpace(type);
         await using var conn = await OpenAsync(ct).ConfigureAwait(false);
         await using var cmd = conn.CreateCommand();
-        cmd.CommandText = @"SELECT 1 FROM materialise_in_flight
+        cmd.CommandText = @"SELECT started_at FROM materialise_in_flight
             WHERE tmdb_id=$tmdb AND type=$type AND season=$season AND episode=$episode
             LIMIT 1;";
         cmd.Parameters.AddWithValue("$tmdb", tmdbId);
@@ -2028,7 +2034,12 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
         cmd.Parameters.AddWithValue("$season", season);
         cmd.Parameters.AddWithValue("$episode", episode);
         var v = await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
-        return v is not null and not DBNull;
+        if (v is null || v is DBNull)
+        {
+            return null;
+        }
+
+        return DateTimeOffset.FromUnixTimeSeconds(Convert.ToInt64(v, CultureInfo.InvariantCulture));
     }
 
     /// <summary>

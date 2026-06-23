@@ -188,6 +188,7 @@ public sealed class PhantomSourceManager
             return null;
         }
 
+        await ClearStaleInFlightAsync(key, ct).ConfigureAwait(false);
         var current = await GetCurrentAsync(key, imdb, ct).ConfigureAwait(false);
         var inFlight = await _db.IsMaterialiseInFlightAsync(
             key.TmdbId, key.Type, key.SeasonSentinel, key.EpisodeSentinel, ct).ConfigureAwait(false);
@@ -236,6 +237,7 @@ public sealed class PhantomSourceManager
             return Result(PhantomSourceOperationStatus.NotFound, "not_found", "Phantom movie or episode external id not found");
         }
 
+        await ClearStaleInFlightAsync(key, ct).ConfigureAwait(false);
         if (await _db.IsMaterialiseInFlightAsync(key.TmdbId, key.Type, key.SeasonSentinel, key.EpisodeSentinel, ct).ConfigureAwait(false))
         {
             return Result(PhantomSourceOperationStatus.InFlight, "in_flight", "Materialisation already in flight");
@@ -304,6 +306,7 @@ public sealed class PhantomSourceManager
             return Result(PhantomSourceOperationStatus.CandidateNotFound, "candidate_not_found", "Request must include a candidate magnet");
         }
 
+        await ClearStaleInFlightAsync(key, ct).ConfigureAwait(false);
         if (await _db.IsMaterialiseInFlightAsync(key.TmdbId, key.Type, key.SeasonSentinel, key.EpisodeSentinel, ct).ConfigureAwait(false))
         {
             return Result(PhantomSourceOperationStatus.InFlight, "in_flight", "Materialisation already in flight");
@@ -361,6 +364,25 @@ public sealed class PhantomSourceManager
             MaterialiseTrigger.Manual,
             ct).ConfigureAwait(false);
         return PhantomSourceOperationResult.FromOutcome(outcome, ToCandidateDto(selected));
+    }
+
+    private async Task ClearStaleInFlightAsync(SourceKey key, CancellationToken ct)
+    {
+        var started = await _db.GetMaterialiseInFlightStartedAtAsync(
+            key.TmdbId, key.Type, key.SeasonSentinel, key.EpisodeSentinel, ct).ConfigureAwait(false);
+        if (!started.HasValue)
+        {
+            return;
+        }
+
+        var staleAfter = TimeSpan.FromMinutes(Math.Max(1, _configProvider().MaterialiseInFlightStaleMinutes));
+        if (DateTimeOffset.UtcNow - started.Value <= staleAfter)
+        {
+            return;
+        }
+
+        await _db.DeleteMaterialiseInFlightAsync(
+            key.TmdbId, key.Type, key.SeasonSentinel, key.EpisodeSentinel, ct).ConfigureAwait(false);
     }
 
     private static MagnetCandidate? TryBuildRequestedCandidate(PhantomMaterialiseCandidateRequest request)
