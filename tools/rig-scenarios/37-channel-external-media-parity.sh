@@ -4,7 +4,7 @@
 # and do not receive Phantom/materialised badges.
 set -euo pipefail
 
-ROOT=/home/spencer/git-repos/spencerharmon/phantom-library
+ROOT=${PHANTOM_REPO_ROOT:-/home/spencer/git-repos/spencerharmon/phantom-library}
 RIG=/tmp/jf-rig
 API=http://localhost:18096
 TOK=testtoken00000000000000000000000
@@ -111,7 +111,8 @@ assert_stream_opens() {
 }
 
 echo '[0] build plugin + start reset rig'
-dotnet build -c Release >/tmp/phantom-external-parity-build.log
+read -r -a BUILD_ARGS <<< "${PHANTOM_DOTNET_BUILD_ARGS:-}"
+dotnet build -c Release "${BUILD_ARGS[@]}" >/tmp/phantom-external-parity-build.log
 bash tools/rig-scenarios/rig-up.sh --reset
 
 for _ in $(seq 1 60); do

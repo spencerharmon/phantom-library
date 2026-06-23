@@ -279,7 +279,11 @@ if [ "$DO_BUILD" -eq 1 ]; then
   yellow "        See docs/operator-deploy.md for the procedure - this"
   yellow "        script will print the exact commands at the end."
   echo
-  dotnet build -c Release
+  read -r -a dotnet_build_args <<< "${PHANTOM_DOTNET_BUILD_ARGS:-}"
+  if [ ${#dotnet_build_args[@]} -gt 0 ]; then
+    yellow "  extra dotnet build args: ${dotnet_build_args[*]}"
+  fi
+  dotnet build -c Release "${dotnet_build_args[@]}"
 
   # Also build the patched Jellyfin assemblies the plugin links against
   # at runtime. Building Jellyfin.Server pulls in MediaBrowser.Controller
@@ -290,7 +294,7 @@ if [ "$DO_BUILD" -eq 1 ]; then
   if [ ! -f "$jf_server_csproj" ]; then
     die "jellyfin/Jellyfin.Server/Jellyfin.Server.csproj missing; expected a v10.11.9 clone at $REPO_ROOT/jellyfin (base commit $(cat "$REPO_ROOT/scripts/jellyfin-patches/REBASE.md" 2>/dev/null | grep -oE '[0-9a-f]{10,}' | head -1 || echo e83a7e62f2))"
   fi
-  dotnet build -c Release "$jf_server_csproj"
+  dotnet build -c Release "$jf_server_csproj" "${dotnet_build_args[@]}"
 
   jf_controller_dll="$REPO_ROOT/jellyfin/MediaBrowser.Controller/bin/Release/net9.0/MediaBrowser.Controller.dll"
   jf_livetv_dll="$REPO_ROOT/jellyfin/src/Jellyfin.LiveTv/bin/Release/net9.0/Jellyfin.LiveTv.dll"
