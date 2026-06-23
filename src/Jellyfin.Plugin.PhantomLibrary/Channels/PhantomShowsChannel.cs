@@ -46,6 +46,7 @@ public sealed partial class PhantomShowsChannel
     private const string OrphanSeriesPrefix = "orphanseries_";
     private const string OrphanSeasonPrefix = "orphanseason_";
     private const string OrphanEpisodePrefix = "orphanepisode_";
+    private const string DataVersionSalt = "rich-season-v1";
     private static readonly string[] ExternalTags = { "external" };
 
     [GeneratedRegex(@"[sS](?<season>\d{1,3})[eE](?<episode>\d{1,4})")]
@@ -99,7 +100,7 @@ public sealed partial class PhantomShowsChannel
     public string Description => "Phantom Library — TV discovery + on-demand materialise via gostream.";
 
     /// <inheritdoc />
-    public string DataVersion => _state.DataVersion(ChannelStateProvider.KindShows) + ":fs:" + _enumerator.ShowsVersion();
+    public string DataVersion => _state.DataVersion(ChannelStateProvider.KindShows) + ":fs:" + _enumerator.ShowsVersion() + ":" + DataVersionSalt;
 
     /// <inheritdoc />
     public string HomePageUrl => string.Empty;

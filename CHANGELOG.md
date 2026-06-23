@@ -40,7 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Phantom Shows season folders now use TMDB season details when browsing a
   series, adding season poster/overview/air year plus episode availability
   counts while staying on generic channel containers so episode navigation
-  remains channel-backed.
+  remains channel-backed. The Shows channel cache salt was bumped so existing
+  cached season folders refresh to the richer shape after restart.
 
 ### Fixed
 
