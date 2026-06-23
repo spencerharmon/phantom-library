@@ -91,6 +91,49 @@
         });
     }
 
+    function getPhantomSeasonItem() {
+        return getCurrentItem().then(function (item) {
+            if (!item || item.Type !== 'Season' || !item.ChannelId || !item.ExternalId) { return null; }
+            if (!/^season_\d+_s\d+$/.test(item.ExternalId)) { return null; }
+            return item;
+        });
+    }
+
+    function prehydratePhantomSeasonChildren() {
+        return getPhantomSeasonItem().then(function (item) {
+            if (!item) { return; }
+            var key = 'phantom-season-prehydrated:' + item.Id;
+            if (window.sessionStorage && window.sessionStorage.getItem(key)) { return; }
+            var api = getApiClient();
+            if (!api || typeof api.getUrl !== 'function' || typeof api.ajax !== 'function') { return; }
+            var url = api.getUrl('Channels/' + item.ChannelId + '/Items', {
+                FolderId: item.Id,
+                Fields: 'Tags,ProviderIds,Overview,ExternalId,ProductionYear,PremiereDate',
+                Limit: 300
+            });
+            return api.ajax({ type: 'GET', url: url, dataType: 'json' }).then(function () {
+                if (window.sessionStorage) { window.sessionStorage.setItem(key, '1'); }
+                refreshVisibleItemContainers();
+            }, function (err) {
+                warn('season child prehydrate failed', err);
+            });
+        });
+    }
+
+    function refreshVisibleItemContainers() {
+        var containers = document.querySelectorAll('.itemsContainer, [is="emby-itemscontainer"]');
+        for (var i = 0; i < containers.length; i++) {
+            var c = containers[i];
+            try {
+                if (typeof c.notifyRefreshNeeded === 'function') {
+                    c.notifyRefreshNeeded(true);
+                } else if (typeof c.refreshItems === 'function') {
+                    c.refreshItems();
+                }
+            } catch (_) { /* best-effort */ }
+        }
+    }
+
     function apiUrl(path) {
         var api = getApiClient();
         if (!api || typeof api.getUrl !== 'function') { return null; }
@@ -538,8 +581,11 @@
     function start() {
         ensureStyles();
         refreshSourceSection();
+        prehydratePhantomSeasonChildren();
         window.addEventListener('hashchange', function () {
             window.setTimeout(refreshSourceSection, 50);
+            window.setTimeout(prehydratePhantomSeasonChildren, 50);
+            window.setTimeout(prehydratePhantomSeasonChildren, 500);
         });
         var scheduled = false;
         var observer = new MutationObserver(function (mutations) {
@@ -572,6 +618,7 @@
                 window.setTimeout(function () {
                     scheduled = false;
                     refreshSourceSection();
+                    prehydratePhantomSeasonChildren();
                 }, 150);
             }
         });

@@ -242,7 +242,7 @@ public class PhantomShowsChannelTests : IDisposable
         Assert.All(result.Items, i =>
         {
             Assert.Equal(ChannelItemType.Folder, i.Type);
-            Assert.Equal(ChannelFolderType.Container, i.FolderType);
+            Assert.Equal(ChannelFolderType.Season, i.FolderType);
             Assert.Equal("Game of Thrones", i.SeriesName);
         });
         Assert.Equal(1, result.Items[0].IndexNumber);
@@ -474,7 +474,7 @@ public class PhantomShowsChannelTests : IDisposable
         var got = await _channel.GetChannelItemAsync("season_1399_s02", CancellationToken.None);
         Assert.NotNull(got);
         Assert.Equal("season_1399_s02", got.Id);
-        Assert.Equal(ChannelFolderType.Container, got.FolderType);
+        Assert.Equal(ChannelFolderType.Season, got.FolderType);
         Assert.Equal(2, got.IndexNumber);
     }
 

@@ -45,6 +45,19 @@ public class PhantomKebabScriptTests
     }
 
     [Fact]
+    public void SeasonDetails_PrehydratesChannelChildrenWithoutJellyfinPatch()
+    {
+        var js = ReadScript();
+
+        Assert.Contains("getPhantomSeasonItem", js);
+        Assert.Contains("/^season_\\d+_s\\d+$/.test(item.ExternalId)", js);
+        Assert.Contains("prehydratePhantomSeasonChildren", js);
+        Assert.Contains("Channels/", js);
+        Assert.Contains("FolderId: item.Id", js);
+        Assert.Contains("refreshVisibleItemContainers", js);
+    }
+
+    [Fact]
     public void ActionSheet_ShowsRejectForMaterialisedAndMaterialiseForUnmaterialised()
     {
         var js = ReadScript();

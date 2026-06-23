@@ -260,6 +260,8 @@ import json, sys
 j=json.load(open('/tmp/seasons.json'))
 for x in j.get('Items', []):
     if x.get('Name') == 'Season 1':
+        if x.get('Type') != 'Season':
+            raise SystemExit('season item did not use native Season type: ' + str(x.get('Type')))
         overview = x.get('Overview') or ''
         if 'Season 1 overview for Phantom Rig Delta.' not in overview:
             raise SystemExit('season overview missing')
@@ -282,6 +284,14 @@ for x in j.get('Items', []):
 raise SystemExit(1)
 PY
 ) || fail 'Delta S01E01 episode not found'
+api "$API/Users/$(sqlite3 $JDB 'select Id from Users limit 1')/Items?ParentId=$SEASON_ID&Fields=Tags,IndexNumber,ParentIndexNumber,Overview&Limit=20" -o /tmp/season-parent-children.json
+python3 - <<'PY'
+import json
+j=json.load(open('/tmp/season-parent-children.json'))
+if j.get('TotalRecordCount') != 8 or len(j.get('Items', [])) != 8:
+    raise SystemExit('native season child list not populated after channel prehydrate')
+print('SEASON_CHILDREN', j.get('TotalRecordCount'))
+PY
 
 python3 - "$EP_ID" <<'PY'
 import json,sys
