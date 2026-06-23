@@ -262,7 +262,7 @@ public class PhantomShowsChannelTests : IDisposable
         var result = await _channel.GetChannelItems(new InternalChannelItemQuery { FolderId = "series_1399" }, CancellationToken.None);
 
         var season = Assert.Single(result.Items);
-        Assert.Equal("Season 1 (3 episodes, 1 ready, 1 unavailable)", season.Name);
+        Assert.Equal("Season 1", season.Name);
         Assert.Equal("Game of Thrones", season.SeriesName);
         Assert.Equal("https://image.tmdb.org/t/p/w500/season_s1.jpg", season.ImageUrl);
         Assert.Contains("Season 1 overview.", season.Overview, StringComparison.Ordinal);

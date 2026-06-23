@@ -42,9 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   series, adding season poster/overview/air year plus episode availability
   counts while staying on generic channel containers so episode navigation
   remains channel-backed. The Shows channel cache salt was bumped so existing
-  cached season folders refresh to the richer shape after restart, and season
-  names now include episode/ready/unavailable counts because Jellyfin's grid
-  view does not surface season overview text.
+  cached season folders refresh to the richer shape after restart.
 
 ### Fixed
 
