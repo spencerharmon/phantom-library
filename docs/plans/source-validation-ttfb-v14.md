@@ -110,9 +110,12 @@ Required contract:
    - channel count,
    - default flag if available.
 2. gostream must validate that the plugin-requested preferred audio language is present before returning `valid`, and must return the matching preferred-language ffprobe stream index. If Polish and English are both present and Polish is container-default, a request with preferred English still returns the English stream index.
-3. Plugin must set Jellyfin playback selection at playback/open time from the actual file Jellyfin is about to read:
-   - after materialise, plugin uses the file path/FUSE path and Jellyfin-visible media streams (or a plugin-side bounded media probe if streams are not yet populated) to find preferred-language audio,
-   - `MediaSourceInfo.DefaultAudioStreamIndex` must be set to the preferred-language Jellyfin `MediaStream.Index`,
+3. Plugin must mirror Jellyfin's native audio-selection rules at playback/open time from the actual file Jellyfin is about to read:
+   - preferred-language matching follows Jellyfin `MediaSourceManager.NormalizeLanguage(user.AudioLanguagePreference)` semantics: empty preference means any language; known language names/codes expand through Jellyfin localization to three-letter ISO names unless culture name contains a region; unknown values compare literally,
+   - stream choice follows Jellyfin `MediaStreamSelector.GetDefaultAudioStreamIndex`: sort audio streams by language preference score, forced flag, default flag, external-stream support, text-subtitle flag, external flag; if `user.PlayDefaultAudioTrack` is true, choose the first default stream from that sorted list; otherwise choose the first sorted stream,
+   - remembered per-item user selection wins only when `user.RememberAudioSelections` is true, item permits remembering, and saved `UserItemData.AudioStreamIndex` exists in current audio streams,
+   - after materialise, plugin uses the file path/FUSE path and Jellyfin-visible media streams (or a plugin-side bounded media probe that produces equivalent `MediaStream` fields if streams are not yet populated),
+   - `MediaSourceInfo.DefaultAudioStreamIndex` must be set to the Jellyfin-selected `MediaStream.Index`, not a persisted gostream index,
    - if stream indexes differ between ffprobe/gostream and Jellyfin, plugin uses Jellyfin's index for Jellyfin selection,
    - plugin must pass selected audio intent through any `/PlaybackInfo` / `/LiveStreams/Open` path it controls and must not leave default audio to container order.
 4. Audio index persistence is explicitly not required for SV14:
@@ -425,7 +428,8 @@ Implement all:
 - Parallel validation waits for slower higher-ranked valid before picking lower-ranked valid.
 - Invalid candidates persisted/disabled with reasons.
 - English validation failure maps to `magnet_failure_cache` reason.
-- Plugin builds materialised movie and episode `MediaSourceInfo` with audio `MediaStreams` and English `DefaultAudioStreamIndex` from current file/stream inspection, not persisted gostream audio index.
+- Plugin builds materialised movie and episode `MediaSourceInfo` with audio `MediaStreams` and Jellyfin-mirrored `DefaultAudioStreamIndex` from current file/stream inspection, not persisted gostream audio index.
+- Plugin mirrors Jellyfin `MediaSourceManager` / `MediaStreamSelector` audio selection, including remembered user selection, `AudioLanguagePreference`, and `PlayDefaultAudioTrack` behavior.
 - Plugin uses Jellyfin `MediaStream.Index` for `DefaultAudioStreamIndex` even if gostream/ffprobe reported different indexes during validation.
 - Bulk favourite schedules all episodes durably and respects concurrency.
 - Bulk favourite pending work survives Jellyfin/plugin restart or is reconciled from persisted favourite season/series intent at startup.
