@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `scripts/prestage-materialised.sh`, an operator dry-run/commit helper that reads `materialised_state` and asks gostream Vault Mode to prestage existing materialised movies and episodes.
 - BREAKING: requires offline migration. Phantom DB schema is now v12 to persist ranked source candidates in `source_candidates`; run `scripts/migrate-source-candidates-v12.sh` with Jellyfin stopped before starting this build.
 - Added Phantom source-management APIs and web controls for listing candidates, rejecting the current source, and materialising a selected candidate from stable channel external IDs.
-- Favourite saves on Phantom movie/episode channel items now trigger materialisation/prewarm using the existing materialiser pipeline.
+- Favourite saves on Phantom movie/episode channel items now trigger materialisation/prewarm using the existing materialiser pipeline; favouriting a Phantom season or series now materialises every episode in that season or series.
 - Phantom DB retention remains deferred/no-op and is now labelled that way in the admin UI instead of presenting an active retention policy.
 - Legacy per-user preferences admin page/link is hidden until a real per-user preferences API is reintroduced.
 - BREAKING: requires wipe. Phantom DB schema is now v11 to split append-only

@@ -3,6 +3,9 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Channels;
+using Jellyfin.Plugin.PhantomLibrary.Clients;
+using Jellyfin.Plugin.PhantomLibrary.Configuration;
+using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.TV;
 using MediaBrowser.Controller.Library;
@@ -34,18 +37,39 @@ public sealed class UserDataSavedListener : IHostedService
     private readonly IUserDataManager _userData;
     private readonly ISeriesAutopilot _autopilot;
     private readonly IMaterialiser _materialiser;
+    private readonly PhantomDb _db;
+    private readonly ITmdbClient _tmdb;
+    private readonly Func<PluginConfiguration> _configProvider;
     private readonly ILogger<UserDataSavedListener> _logger;
 
     public UserDataSavedListener(
         IUserDataManager userData,
         ISeriesAutopilot autopilot,
         IMaterialiser materialiser,
+        PhantomDb db,
+        ITmdbClient tmdb,
         ILogger<UserDataSavedListener> logger)
+        : this(userData, autopilot, materialiser, db, tmdb, logger,
+            () => Plugin.Instance?.Configuration ?? new PluginConfiguration())
+    {
+    }
+
+    internal UserDataSavedListener(
+        IUserDataManager userData,
+        ISeriesAutopilot autopilot,
+        IMaterialiser materialiser,
+        PhantomDb db,
+        ITmdbClient tmdb,
+        ILogger<UserDataSavedListener> logger,
+        Func<PluginConfiguration> configProvider)
     {
         _userData = userData ?? throw new ArgumentNullException(nameof(userData));
         _autopilot = autopilot ?? throw new ArgumentNullException(nameof(autopilot));
         _materialiser = materialiser ?? throw new ArgumentNullException(nameof(materialiser));
+        _db = db ?? throw new ArgumentNullException(nameof(db));
+        _tmdb = tmdb ?? throw new ArgumentNullException(nameof(tmdb));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _configProvider = configProvider ?? throw new ArgumentNullException(nameof(configProvider));
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -158,7 +182,100 @@ public sealed class UserDataSavedListener : IHostedService
                     MaterialiseTrigger.Favourite,
                     CancellationToken.None);
                 break;
+            case ChannelItemId.KindSeason when parsed.TmdbId.HasValue && parsed.Season.HasValue:
+                _ = MaterialiseSeasonFavouriteAsync(parsed.TmdbId.Value, parsed.Season.Value, CancellationToken.None);
+                break;
+            case ChannelItemId.KindSeries when parsed.TmdbId.HasValue:
+                _ = MaterialiseSeriesFavouriteAsync(parsed.TmdbId.Value, CancellationToken.None);
+                break;
         }
+    }
+
+    private async Task MaterialiseSeriesFavouriteAsync(int seriesTmdbId, CancellationToken ct)
+    {
+        var cfg = _configProvider();
+        var lang = string.IsNullOrWhiteSpace(cfg.DiscoveryLanguage) ? null : cfg.DiscoveryLanguage;
+        var details = await _tmdb.GetSeriesAsync(seriesTmdbId, lang, ct).ConfigureAwait(false);
+        var seasons = details is null || details.NumberOfSeasons <= 0
+            ? await ListKnownSeasonsAsync(seriesTmdbId, ct).ConfigureAwait(false)
+            : Enumerable.Range(1, details.NumberOfSeasons).ToArray();
+
+        foreach (var season in seasons)
+        {
+            ct.ThrowIfCancellationRequested();
+            await MaterialiseSeasonFavouriteAsync(seriesTmdbId, season, ct).ConfigureAwait(false);
+        }
+    }
+
+    private async Task<int[]> ListKnownSeasonsAsync(int seriesTmdbId, CancellationToken ct)
+    {
+        var visible = await _db.ListVisibleSeasonsAsync(seriesTmdbId, ct).ConfigureAwait(false);
+        if (visible.Count > 0)
+        {
+            return visible.Select(s => s.Season).Distinct().OrderBy(s => s).ToArray();
+        }
+
+        var episodes = await _db.ListVisibleEpisodeIdsAsync(ct).ConfigureAwait(false);
+        return episodes
+            .Where(e => e.SeriesTmdbId == seriesTmdbId)
+            .Select(e => e.Season)
+            .Distinct()
+            .OrderBy(s => s)
+            .ToArray();
+    }
+
+    private async Task MaterialiseSeasonFavouriteAsync(int seriesTmdbId, int season, CancellationToken ct)
+    {
+        var episodes = await EnsureSeasonEpisodesAsync(seriesTmdbId, season, ct).ConfigureAwait(false);
+        foreach (var ep in episodes)
+        {
+            ct.ThrowIfCancellationRequested();
+            _ = _materialiser.MaterialiseAsync(
+                seriesTmdbId,
+                "episode",
+                ep.Season,
+                ep.Episode,
+                MaterialiseTrigger.Favourite,
+                CancellationToken.None);
+        }
+    }
+
+    private async Task<IReadOnlyList<TmdbEpisodeRow>> EnsureSeasonEpisodesAsync(int seriesTmdbId, int season, CancellationToken ct)
+    {
+        var cached = await _db.ListEpisodesForSeasonAsync(seriesTmdbId, season, ct).ConfigureAwait(false);
+        if (cached.Count > 0)
+        {
+            return cached;
+        }
+
+        var cfg = _configProvider();
+        var lang = string.IsNullOrWhiteSpace(cfg.DiscoveryLanguage) ? null : cfg.DiscoveryLanguage;
+        var details = await _tmdb.GetSeasonAsync(seriesTmdbId, season, lang, ct).ConfigureAwait(false);
+        if (details is null || details.Episodes.Count == 0)
+        {
+            return Array.Empty<TmdbEpisodeRow>();
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var rows = details.Episodes
+            .Where(e => e.EpisodeNumber > 0)
+            .Select(e => new TmdbEpisodeRow(
+                seriesTmdbId,
+                e.SeasonNumber <= 0 ? season : e.SeasonNumber,
+                e.EpisodeNumber,
+                string.IsNullOrWhiteSpace(e.Name) ? $"Episode {e.EpisodeNumber.ToString(System.Globalization.CultureInfo.InvariantCulture)}" : e.Name,
+                e.Overview,
+                string.IsNullOrWhiteSpace(e.StillPath) ? null : "https://image.tmdb.org/t/p/w500" + e.StillPath,
+                e.AirDate,
+                e.Runtime,
+                now))
+            .ToArray();
+
+        foreach (var row in rows)
+        {
+            await _db.UpsertTmdbEpisodeAsync(row, ct).ConfigureAwait(false);
+        }
+        return rows;
     }
 
     private static double ComputePlayedPercentage(BaseItem item, MediaBrowser.Controller.Entities.UserItemData userData)
