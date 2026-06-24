@@ -2,7 +2,7 @@
 
 Date: 2026-06-24
 
-Scope authority: operator request to fix audio-language correctness, parallel candidate validation, season/series pack sanity, empirical materialise timing evidence, and gostream iowait mitigation. Latest main includes server-advertised Phantom item actions (`PhantomItemActionProvider`) for materialise/reset/reject/candidate selection; SV14 must keep those action paths behaviorally identical to REST+kebab paths. No requirement in this plan is deferred or dropped. v14 offline migration is operator-approved.
+Scope authority: operator request to fix audio-language correctness, parallel candidate validation, season/series pack sanity, empirical materialise timing evidence, and gostream iowait mitigation. Latest main includes server-advertised Phantom item actions (`PhantomItemActionProvider`) for materialise/reset/reject/candidate selection and Reset clears existing candidate failure rows; SV14 must keep those action paths behaviorally identical to REST+kebab paths and preserve Reset as the operator escape hatch for stale validation/failure state. No requirement in this plan is deferred or dropped. v14 offline migration is operator-approved.
 
 ## Requirements ledger
 
@@ -426,6 +426,7 @@ Implement all:
 - Candidate API returns cached candidates when indexers down.
 - `PhantomItemActionProvider` advertises only validation-eligible candidate actions; rejected/invalid candidates are omitted or disabled consistently with REST+kebab source list.
 - `PhantomItemActionProvider.InvokeAsync` materialise/reset/reject/candidate paths use the same validation, failure-cache, stale-in-flight, and gostream limiter paths as REST+kebab operations.
+- Reset clears persisted candidate validation/failure state for the item (including SV14 validation failures and legacy candidate failure rows) and returns it to revalidation-eligible base availability.
 - Parallel validation picks top valid after higher-ranked invalid.
 - Parallel validation waits for slower higher-ranked valid before picking lower-ranked valid.
 - Invalid candidates persisted/disabled with reasons.
