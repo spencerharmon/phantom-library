@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -47,7 +48,7 @@ public class PhantomDbTests : IDisposable
     // ----------------------------------------------------------------
 
     [Fact]
-    public async Task FreshDb_CreatesSchemaV13_WithAllExpectedTables()
+    public async Task FreshDb_CreatesSchemaV14_WithAllExpectedTables()
     {
         using var db = await NewDbAsync();
 
@@ -66,7 +67,7 @@ public class PhantomDbTests : IDisposable
             version = Convert.ToInt32(await v.ExecuteScalarAsync());
         }
 
-        Assert.Equal(13, version);
+        Assert.Equal(14, version);
 
         var expectedTables = new[]
         {
@@ -84,6 +85,8 @@ public class PhantomDbTests : IDisposable
             "magnet_cache",
             "magnet_failure_cache",
             "source_candidates",
+            "bulk_materialise_requests",
+            "bulk_materialise_items",
             "unavailable_marker",
             "plugin_meta",
         };
@@ -98,32 +101,61 @@ public class PhantomDbTests : IDisposable
         }
     }
 
+
+    [Fact]
+    public async Task FreshDb_SourceCandidates_HaveValidationColumnsAndNoAudioColumns()
+    {
+        using var db = await NewDbAsync();
+        await using var conn = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = _dbPath, Mode = SqliteOpenMode.ReadOnly }.ToString());
+        await conn.OpenAsync();
+
+        async Task<bool> HasColumn(string name)
+        {
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM pragma_table_info('source_candidates') WHERE name=$name;";
+            cmd.Parameters.AddWithValue("$name", name);
+            return Convert.ToInt32(await cmd.ExecuteScalarAsync()) == 1;
+        }
+
+        Assert.True(await HasColumn("validation_status"));
+        Assert.True(await HasColumn("validation_reason"));
+        Assert.True(await HasColumn("validation_duration_ms"));
+        Assert.True(await HasColumn("validation_policy_version"));
+        Assert.True(await HasColumn("selected_file_path"));
+        Assert.False(await HasColumn("selected_audio_index"));
+        Assert.False(await HasColumn("selected_audio_language"));
+        Assert.False(await HasColumn("audio_tracks_json"));
+    }
+
     [Theory]
     [InlineData(5)]
     [InlineData(7)]
     [InlineData(8)]
     [InlineData(9)]
-    public async Task HardRefuse_OldSchemaVersion_ThrowsWithWipePointer(int oldVersion)
+    [InlineData(12)]
+    public async Task HardRefuse_PreV13SchemaVersion_ThrowsWithWipePointer(int oldVersion)
     {
-        // Pre-create a DB with an older user_version (v5 = pre-channel-arch,
-        // v7/v8 = intermediate channel-arch schemas without tmdb_episode_cache).
-        var cs = new SqliteConnectionStringBuilder { DataSource = _dbPath, Mode = SqliteOpenMode.ReadWriteCreate }.ToString();
-        await using (var conn = new SqliteConnection(cs))
-        {
-            await conn.OpenAsync();
-            await using var cmd = conn.CreateCommand();
-            cmd.CommandText = $"PRAGMA user_version = {oldVersion};";
-            await cmd.ExecuteNonQueryAsync();
-        }
-
-        SqliteConnection.ClearAllPools();
+        await CreateDbWithUserVersionAsync(oldVersion);
 
         using var db = new PhantomDb(_dbPath);
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => db.SetMetaAsync("test", "1", CancellationToken.None));
 
-        Assert.Contains("version 13", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("wipe", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("version 14", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("phantom-wipe.sh", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task HardRefuse_V13SchemaVersion_ThrowsWithMigrationPointer()
+    {
+        await CreateDbWithUserVersionAsync(13);
+
+        using var db = new PhantomDb(_dbPath);
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => db.SetMetaAsync("test", "1", CancellationToken.None));
+
+        Assert.Contains("version 14", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("migrate-source-validation-v14.sh", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -444,6 +476,222 @@ public class PhantomDbTests : IDisposable
         Assert.Equal(0, purged);
     }
 
+
+    [Fact]
+    public async Task SourceCandidates_ValidationColumns_Roundtrip()
+    {
+        using var db = await NewDbAsync();
+        await db.UpsertSourceCandidatesAsync(
+            42,
+            "episode",
+            2,
+            1,
+            "preset",
+            new[] { new Jellyfin.Plugin.PhantomLibrary.Sources.MagnetCandidate("magnet:?xt=urn:btih:abc", "abc", 1234, 10, "idx") { Title = "Candidate" } },
+            "test",
+            TimeSpan.FromHours(1),
+            CancellationToken.None);
+
+        var now = DateTimeOffset.FromUnixTimeSeconds(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        await db.UpdateSourceCandidateValidationAsync(new SourceCandidateValidationUpdate(
+            42,
+            "episode",
+            2,
+            1,
+            "preset",
+            "magnet:?xt=urn:btih:abc",
+            "valid",
+            null,
+            now,
+            now.AddHours(12),
+            3456,
+            "sv14-parser-audio-v1",
+            7,
+            "Season 02/E01.mkv",
+            1234), CancellationToken.None);
+
+        var rows = await db.ListSourceCandidatesAsync(42, "episode", 2, 1, "preset", includeExpired: true, CancellationToken.None);
+        var row = Assert.Single(rows);
+        Assert.Equal("valid", row.ValidationStatus);
+        Assert.Null(row.ValidationReason);
+        Assert.Equal(now, row.ValidatedAt);
+        Assert.Equal(now.AddHours(12), row.ValidationExpiresAt);
+        Assert.Equal(3456, row.ValidationDurationMs);
+        Assert.Equal("sv14-parser-audio-v1", row.ValidationPolicyVersion);
+        Assert.Equal(7, row.SelectedFileId);
+        Assert.Equal("Season 02/E01.mkv", row.SelectedFilePath);
+        Assert.Equal(1234, row.SelectedFileSize);
+    }
+
+    [Fact]
+    public async Task SourceCandidates_ClearValidation_ResetsSv14StateForItemPreset()
+    {
+        using var db = await NewDbAsync();
+        await db.UpsertSourceCandidatesAsync(
+            42,
+            "episode",
+            2,
+            1,
+            "preset",
+            new[]
+            {
+                new Jellyfin.Plugin.PhantomLibrary.Sources.MagnetCandidate("magnet:?xt=urn:btih:abc", "abc", 1234, 10, "idx") { Title = "Candidate A" },
+                new Jellyfin.Plugin.PhantomLibrary.Sources.MagnetCandidate("magnet:?xt=urn:btih:def", "def", 4567, 5, "idx") { Title = "Candidate B" },
+            },
+            "test",
+            TimeSpan.FromHours(1),
+            CancellationToken.None);
+
+        var now = DateTimeOffset.FromUnixTimeSeconds(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        foreach (var magnet in new[] { "magnet:?xt=urn:btih:abc", "magnet:?xt=urn:btih:def" })
+        {
+            await db.UpdateSourceCandidateValidationAsync(new SourceCandidateValidationUpdate(
+                42,
+                "episode",
+                2,
+                1,
+                "preset",
+                magnet,
+                "invalid",
+                "no_english_audio",
+                now,
+                now.AddHours(1),
+                100,
+                "sv14-parser-audio-v1",
+                12,
+                "S02E01.mkv",
+                1234), CancellationToken.None);
+        }
+
+        Assert.Equal(2, await db.ClearSourceCandidateValidationAsync(42, "episode", 2, 1, "preset", CancellationToken.None));
+
+        var rows = await db.ListSourceCandidatesAsync(42, "episode", 2, 1, "preset", includeExpired: true, CancellationToken.None);
+        Assert.All(rows, row =>
+        {
+            Assert.Equal("unknown", row.ValidationStatus);
+            Assert.Null(row.ValidationReason);
+            Assert.Null(row.ValidatedAt);
+            Assert.Null(row.ValidationExpiresAt);
+            Assert.Null(row.ValidationDurationMs);
+            Assert.Equal("unknown", row.ValidationPolicyVersion);
+            Assert.Null(row.SelectedFileId);
+            Assert.Null(row.SelectedFilePath);
+            Assert.Null(row.SelectedFileSize);
+        });
+    }
+
+    [Fact]
+    public async Task MagnetFailure_PolicySensitiveLegacyFailureIgnored_CurrentPolicyReturned_OperatorRejectionPersists()
+    {
+        using var db = await NewDbAsync();
+        var now = DateTimeOffset.UtcNow;
+        var key = new MagnetFailureKey(42, "tt0000042", "episode", 2, 1, "preset", "magnet:?xt=urn:btih:bad");
+        await db.MarkMagnetFailedAsync(key, new MagnetFailureEntry
+        {
+            InfoHash = "bad",
+            Reason = "target_episode_not_found",
+            FailedAt = now,
+            RetryAfter = now.AddHours(1),
+            ValidationPolicyVersion = "legacy",
+        }, CancellationToken.None);
+
+        Assert.Null(await db.GetMagnetFailureAsync(key, "sv14-parser-audio-v1", CancellationToken.None));
+
+        await db.MarkMagnetFailedAsync(key, new MagnetFailureEntry
+        {
+            InfoHash = "bad",
+            Reason = "target_episode_not_found",
+            FailedAt = now,
+            RetryAfter = now.AddHours(1),
+            ValidationPolicyVersion = "sv14-parser-audio-v1",
+        }, CancellationToken.None);
+        Assert.NotNull(await db.GetMagnetFailureAsync(key, "sv14-parser-audio-v1", CancellationToken.None));
+
+        var op = key with { Magnet = "magnet:?xt=urn:btih:operator" };
+        await db.MarkMagnetFailedAsync(op, new MagnetFailureEntry
+        {
+            InfoHash = "operator",
+            Reason = "operator_rejected",
+            FailedAt = now,
+            RetryAfter = now.AddHours(1),
+            ValidationPolicyVersion = "legacy",
+        }, CancellationToken.None);
+        Assert.NotNull(await db.GetMagnetFailureAsync(op, "sv14-parser-audio-v1", CancellationToken.None));
+    }
+
+    [Fact]
+    public void BulkMaterialiseRequestId_IsDeterministicSha256LowerHex()
+    {
+        var a = PhantomDb.ComputeBulkMaterialiseRequestId("user1", "season_42_s02");
+        var b = PhantomDb.ComputeBulkMaterialiseRequestId("user1", "season_42_s02");
+        var c = PhantomDb.ComputeBulkMaterialiseRequestId("user1", "series_42");
+
+        Assert.Equal(64, a.Length);
+        Assert.Equal(a.ToLowerInvariant(), a);
+        Assert.Equal(a, b);
+        Assert.NotEqual(a, c);
+    }
+
+    [Fact]
+    public async Task BulkMaterialiseQueue_CRUD_Claim_Complete_StaleReset()
+    {
+        using var db = await NewDbAsync();
+        var now = DateTimeOffset.FromUnixTimeSeconds(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        var request = new BulkMaterialiseRequestRow(
+            "req1", "user1", "season_42_s02", "season", 42, 2, "favourite", "pending", now, now, null, null, 0);
+        await db.UpsertBulkMaterialiseRequestAsync(request, CancellationToken.None);
+        Assert.Equal("season_42_s02", (await db.GetBulkMaterialiseRequestAsync("req1", CancellationToken.None))!.ParentExternalId);
+
+        await db.UpsertBulkMaterialiseItemAsync(new BulkMaterialiseItemRow(
+            "req1", 42, "episode", 2, 1, "pending", 0, null, 0, now, now, null), CancellationToken.None);
+        await db.UpsertBulkMaterialiseItemAsync(new BulkMaterialiseItemRow(
+            "req1", 42, "episode", 2, 2, "pending", 0, null, 0, now.AddHours(1), now, null), CancellationToken.None);
+
+        var due = await db.PeekDueBulkMaterialiseItemsAsync(now, 10, CancellationToken.None);
+        var onlyDue = Assert.Single(due);
+        Assert.Equal(1, onlyDue.Episode);
+
+        Assert.True(await db.TryClaimBulkMaterialiseItemAsync("req1", 42, "episode", 2, 1, 0, "claim-a", now, CancellationToken.None));
+        Assert.False(await db.TryClaimBulkMaterialiseItemAsync("req1", 42, "episode", 2, 1, 0, "claim-b", now, CancellationToken.None));
+        var running = Assert.Single(await db.ListBulkMaterialiseItemsAsync("req1", CancellationToken.None), i => i.Episode == 1);
+        Assert.Equal("running", running.Status);
+        Assert.Equal("claim-a", running.ClaimToken);
+        Assert.Equal(1, running.Attempts);
+
+        Assert.False(await db.CompleteBulkMaterialiseItemAsync("req1", 42, "episode", 2, 1, 0, "wrong", "done", now, null, now, CancellationToken.None));
+        Assert.True(await db.CompleteBulkMaterialiseItemAsync("req1", 42, "episode", 2, 1, 0, "claim-a", "done", now, null, now, CancellationToken.None));
+
+        await db.UpsertBulkMaterialiseItemAsync(new BulkMaterialiseItemRow(
+            "req1", 42, "episode", 2, 3, "running", 0, "stale", 1, now, now.AddHours(-2), "old"), CancellationToken.None);
+        var reset = await db.ResetStaleBulkMaterialiseItemsAsync(TimeSpan.FromMinutes(30), now, CancellationToken.None);
+        Assert.Equal(1, reset);
+        var stale = Assert.Single(await db.ListBulkMaterialiseItemsAsync("req1", CancellationToken.None), i => i.Episode == 3);
+        Assert.Equal("retry", stale.Status);
+        Assert.Null(stale.ClaimToken);
+        Assert.Equal("stale_running_reset", stale.LastError);
+    }
+
+    [Fact]
+    public async Task MigrationScript_V13ToV14_PreservesCandidates_DeletesSensitiveEpisodeFailures_Idempotent()
+    {
+        await CreateMinimalV13DbAsync();
+        var script = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../scripts/migrate-source-validation-v14.sh"));
+
+        var first = await RunProcessAsync(script, _dbPath);
+        Assert.Equal(0, first.ExitCode);
+        var second = await RunProcessAsync(script, _dbPath);
+        Assert.Equal(0, second.ExitCode);
+
+        await using var conn = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
+        await conn.OpenAsync();
+        Assert.Equal(14, Convert.ToInt32(await ScalarAsync(conn, "PRAGMA user_version;")));
+        Assert.Equal(1, Convert.ToInt32(await ScalarAsync(conn, "SELECT COUNT(*) FROM source_candidates;")));
+        Assert.Equal(0, Convert.ToInt32(await ScalarAsync(conn, "SELECT COUNT(*) FROM magnet_failure_cache WHERE reason='target_episode_not_found';")));
+        Assert.Equal(1, Convert.ToInt32(await ScalarAsync(conn, "SELECT COUNT(*) FROM magnet_failure_cache WHERE reason='operator_rejected' AND validation_policy_version='legacy';")));
+        Assert.Equal(1, Convert.ToInt32(await ScalarAsync(conn, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='bulk_materialise_requests';")));
+        Assert.Equal(1, Convert.ToInt32(await ScalarAsync(conn, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='bulk_materialise_items';")));
+    }
+
     [Fact]
     public async Task UnavailableMarker_MarkAndCheck_Roundtrips()
     {
@@ -720,5 +968,63 @@ public class PhantomDbTests : IDisposable
         using var db = await NewDbAsync();
         var got = await db.ListEpisodesForSeasonAsync(999, 1, CancellationToken.None);
         Assert.Empty(got);
+    }
+    private async Task CreateDbWithUserVersionAsync(int version)
+    {
+        var cs = new SqliteConnectionStringBuilder { DataSource = _dbPath, Mode = SqliteOpenMode.ReadWriteCreate }.ToString();
+        await using (var conn = new SqliteConnection(cs))
+        {
+            await conn.OpenAsync();
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = $"PRAGMA user_version = {version};";
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        SqliteConnection.ClearAllPools();
+    }
+
+    private async Task CreateMinimalV13DbAsync()
+    {
+        await using var conn = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = _dbPath, Mode = SqliteOpenMode.ReadWriteCreate }.ToString());
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"
+CREATE TABLE source_candidates (
+    tmdb_id INTEGER NOT NULL, type TEXT NOT NULL, season INTEGER NOT NULL DEFAULT -1, episode INTEGER NOT NULL DEFAULT -1,
+    preset TEXT NOT NULL DEFAULT '', magnet TEXT NOT NULL, info_hash TEXT NOT NULL, indexer TEXT NOT NULL, title TEXT NOT NULL,
+    seeders INTEGER, size INTEGER, rank INTEGER NOT NULL, source TEXT NOT NULL, fetched_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+    PRIMARY KEY (tmdb_id,type,season,episode,preset,magnet)
+);
+CREATE TABLE magnet_failure_cache (
+    tmdb_id INTEGER NOT NULL DEFAULT 0, imdb_id TEXT NOT NULL DEFAULT '', type TEXT NOT NULL, season INTEGER NOT NULL DEFAULT 0,
+    episode INTEGER NOT NULL DEFAULT 0, preset TEXT NOT NULL DEFAULT '', magnet TEXT NOT NULL, info_hash TEXT NOT NULL, reason TEXT NOT NULL,
+    failed_at INTEGER NOT NULL, retry_after INTEGER NOT NULL, PRIMARY KEY (tmdb_id,imdb_id,type,season,episode,preset,magnet)
+);
+INSERT INTO source_candidates VALUES (42,'episode',2,1,'preset','magnet:?xt=urn:btih:abc','abc','idx','title',10,1234,1,'test',100,200);
+INSERT INTO magnet_failure_cache VALUES (42,'tt42','episode',2,1,'preset','magnet:?xt=urn:btih:bad','bad','target_episode_not_found',100,9999999999);
+INSERT INTO magnet_failure_cache VALUES (42,'tt42','episode',2,1,'preset','magnet:?xt=urn:btih:op','op','operator_rejected',100,9999999999);
+PRAGMA user_version=13;";
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<object?> ScalarAsync(SqliteConnection conn, string sql)
+    {
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = sql;
+        return await cmd.ExecuteScalarAsync();
+    }
+
+    private static async Task<(int ExitCode, string Output, string Error)> RunProcessAsync(string fileName, string argument)
+    {
+        var psi = new ProcessStartInfo(fileName, argument)
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        using var process = Process.Start(psi) ?? throw new InvalidOperationException("failed to start migration script");
+        var stdout = await process.StandardOutput.ReadToEndAsync();
+        var stderr = await process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        return (process.ExitCode, stdout, stderr);
     }
 }

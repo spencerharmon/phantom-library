@@ -581,7 +581,7 @@ public sealed class Materialiser : IMaterialiser
             fromCache);
 
     private async Task<bool> IsCandidateAllowedAsync(MagnetCacheKey key, MagnetCandidate magnet, CancellationToken ct)
-        => await _db.GetMagnetFailureAsync(ToFailureKey(key, magnet), ct).ConfigureAwait(false) is null;
+        => await _db.GetMagnetFailureAsync(ToFailureKey(key, magnet), _configProvider().SourceValidationPolicyVersion, ct).ConfigureAwait(false) is null;
 
     private async Task<CandidateAddResult> AddWithCandidateRetryAsync(
         IReadOnlyList<CandidateAddRequest> candidates,
@@ -706,6 +706,7 @@ public sealed class Materialiser : IMaterialiser
                 Reason = reason,
                 FailedAt = now,
                 RetryAfter = now.Add(ttl),
+                ValidationPolicyVersion = cfg.SourceValidationPolicyVersion,
             },
             ct).ConfigureAwait(false);
 

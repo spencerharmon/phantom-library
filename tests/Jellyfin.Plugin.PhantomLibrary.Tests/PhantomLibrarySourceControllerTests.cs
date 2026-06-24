@@ -282,6 +282,33 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
                 RetryAfter = DateTimeOffset.UtcNow.AddHours(24),
             },
             CancellationToken.None);
+        await db.UpsertSourceCandidatesAsync(
+            42,
+            "movie",
+            -1,
+            -1,
+            "test",
+            new[] { current },
+            "test",
+            TimeSpan.FromHours(1),
+            CancellationToken.None);
+        var validationTime = DateTimeOffset.FromUnixTimeSeconds(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        await db.UpdateSourceCandidateValidationAsync(new SourceCandidateValidationUpdate(
+            42,
+            "movie",
+            -1,
+            -1,
+            "test",
+            current.Magnet,
+            "invalid",
+            "fuse_path_missing",
+            validationTime,
+            validationTime.AddHours(1),
+            123,
+            "sv14-parser-audio-v1",
+            1,
+            "Movie.mkv",
+            current.Size), CancellationToken.None);
         var gostream = new Mock<IGostreamClient>(MockBehavior.Loose);
         var ctrl = BuildController(db, new[] { current }, gostream);
 
@@ -299,6 +326,12 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
         Assert.Null(await db.GetMagnetFailureAsync(
             new MagnetFailureKey(42, "tt0000042", "movie", null, null, "test", current.Magnet),
             CancellationToken.None));
+        var resetCandidate = Assert.Single(await db.ListSourceCandidatesAsync(42, "movie", -1, -1, "test", includeExpired: true, CancellationToken.None));
+        Assert.Equal("unknown", resetCandidate.ValidationStatus);
+        Assert.Null(resetCandidate.ValidationReason);
+        Assert.Null(resetCandidate.ValidatedAt);
+        Assert.Equal("unknown", resetCandidate.ValidationPolicyVersion);
+        Assert.Null(resetCandidate.SelectedFilePath);
         gostream.Verify(g => g.RemoveAsync("/stub/current.mkv", It.IsAny<CancellationToken>()), Times.Once);
     }
 

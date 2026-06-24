@@ -261,6 +261,13 @@ public sealed class PhantomSourceManager
         await _db.DeleteMagnetFailuresAsync(
             CacheKey(key, imdb, cfg.SourcePickerPreset),
             ct).ConfigureAwait(false);
+        await _db.ClearSourceCandidateValidationAsync(
+            key.TmdbId,
+            key.Type,
+            key.SeasonSentinel,
+            key.EpisodeSentinel,
+            cfg.SourcePickerPreset,
+            ct).ConfigureAwait(false);
         await _db.DeleteUnavailableAsync(
             new UnavailableKey(key.TmdbId, imdb, key.Type, key.Season, key.Episode),
             ct).ConfigureAwait(false);
@@ -305,6 +312,7 @@ public sealed class PhantomSourceManager
                 Reason = "operator_rejected",
                 FailedAt = now,
                 RetryAfter = now.Add(OperatorRejectedRetry),
+                ValidationPolicyVersion = cfg.SourceValidationPolicyVersion,
             },
             ct).ConfigureAwait(false);
 
@@ -373,8 +381,10 @@ public sealed class PhantomSourceManager
                 return Result(PhantomSourceOperationStatus.CandidateNotFound, "candidate_not_found", "Selected candidate is not in the current list and request did not include exact candidate metadata");
             }
 
+            var cfg = _configProvider();
             var failure = await _db.GetMagnetFailureAsync(
-                new MagnetFailureKey(key.TmdbId, imdb, key.Type, key.Season, key.Episode, _configProvider().SourcePickerPreset, requested.Magnet),
+                new MagnetFailureKey(key.TmdbId, imdb, key.Type, key.Season, key.Episode, cfg.SourcePickerPreset, requested.Magnet),
+                cfg.SourceValidationPolicyVersion,
                 ct).ConfigureAwait(false);
             selected = new CandidateWithFailure(requested, failure, 1, false);
         }
@@ -511,6 +521,7 @@ public sealed class PhantomSourceManager
             var candidate = ToMagnetCandidate(cached);
             var failure = await _db.GetMagnetFailureAsync(
                 new MagnetFailureKey(cacheKey.TmdbId, cacheKey.ImdbId, cacheKey.Type, cacheKey.Season, cacheKey.Episode, cacheKey.Preset, candidate.Magnet),
+                cfg.SourceValidationPolicyVersion,
                 ct).ConfigureAwait(false);
             if ((failure is null || includeRejected) && seen.Add(candidate.Magnet))
             {
@@ -566,6 +577,7 @@ public sealed class PhantomSourceManager
             };
             var failure = await _db.GetMagnetFailureAsync(
                 new MagnetFailureKey(cacheKey.TmdbId, cacheKey.ImdbId, cacheKey.Type, cacheKey.Season, cacheKey.Episode, cacheKey.Preset, candidate.Magnet),
+                cfg.SourceValidationPolicyVersion,
                 ct).ConfigureAwait(false);
             if ((failure is null || includeRejected) && seen.Add(candidate.Magnet))
             {
@@ -585,6 +597,7 @@ public sealed class PhantomSourceManager
                 rank++;
                 var failure = await _db.GetMagnetFailureAsync(
                     new MagnetFailureKey(cacheKey.TmdbId, cacheKey.ImdbId, cacheKey.Type, cacheKey.Season, cacheKey.Episode, cacheKey.Preset, candidate.Magnet),
+                    cfg.SourceValidationPolicyVersion,
                     ct).ConfigureAwait(false);
                 if ((failure is null || includeRejected) && seen.Add(candidate.Magnet))
                 {

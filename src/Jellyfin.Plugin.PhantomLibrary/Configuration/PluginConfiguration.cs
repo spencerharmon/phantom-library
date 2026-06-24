@@ -15,6 +15,19 @@ namespace Jellyfin.Plugin.PhantomLibrary.Configuration;
 /// </remarks>
 public class PluginConfiguration : BasePluginConfiguration
 {
+    private int _sourceValidationParallelism;
+    private int _sourceValidationWindowSize;
+    private int _sourceValidationTimeoutSeconds;
+    private int _sourceValidationDetailsBudgetSeconds;
+    private int _sourceValidationTtlHours;
+    private int _sourceValidationTransientRetryMinutes;
+    private int _sourceValidationLeaseMinutes;
+    private int _bulkMaterialiseRunningStaleMinutes;
+    private int _bulkMaterialiseWorkerCount;
+    private int _bulkMaterialiseMaxAttempts;
+    private int _gostreamHeavyConcurrency;
+    private string _sourceValidationPolicyVersion = "sv14-parser-audio-v1";
+
     /// <summary>
     /// Initializes a new instance of the <see cref="PluginConfiguration"/> class
     /// with PLAN-defaults applied.
@@ -94,6 +107,20 @@ public class PluginConfiguration : BasePluginConfiguration
         GostreamMinQuality = string.Empty;
         FusePathWaitTimeoutSeconds = 60;
         FusePathPollIntervalMilliseconds = 500;
+
+        SourceValidationParallelism = 2;
+        SourceValidationWindowSize = 4;
+        SourceValidationTimeoutSeconds = 45;
+        SourceValidationDetailsBudgetSeconds = 8;
+        SourceValidationTtlHours = 168;
+        SourceValidationTransientRetryMinutes = 30;
+        SourceValidationLeaseMinutes = 10;
+        BulkMaterialiseRunningStaleMinutes = 30;
+        BulkMaterialiseWorkerCount = 2;
+        BulkMaterialiseMaxAttempts = 5;
+        SourceValidationPolicyVersion = "sv14-parser-audio-v1";
+        GostreamHeavyConcurrency = 2;
+        GostreamToken = string.Empty;
     }
 
     /// <summary>Gets or sets the TMDB v3 API key used by the plugin's TMDB client.</summary>
@@ -380,6 +407,93 @@ public class PluginConfiguration : BasePluginConfiguration
     /// Polling interval for the FUSE-path wait loop.
     /// </summary>
     public int FusePathPollIntervalMilliseconds { get; set; }
+
+    /// <summary>Maximum parallel candidate validation tasks launched per materialise pass.</summary>
+    public int SourceValidationParallelism
+    {
+        get => _sourceValidationParallelism;
+        set => _sourceValidationParallelism = Math.Clamp(value, 1, 6);
+    }
+
+    /// <summary>Rank-window size for candidate validation.</summary>
+    public int SourceValidationWindowSize
+    {
+        get => _sourceValidationWindowSize;
+        set => _sourceValidationWindowSize = Math.Clamp(value, 1, 12);
+    }
+
+    /// <summary>Absolute source-validation budget for one materialise pass.</summary>
+    public int SourceValidationTimeoutSeconds
+    {
+        get => _sourceValidationTimeoutSeconds;
+        set => _sourceValidationTimeoutSeconds = Math.Clamp(value, 5, 300);
+    }
+
+    /// <summary>Foreground details-page validation budget.</summary>
+    public int SourceValidationDetailsBudgetSeconds
+    {
+        get => _sourceValidationDetailsBudgetSeconds;
+        set => _sourceValidationDetailsBudgetSeconds = Math.Clamp(value, 1, 30);
+    }
+
+    /// <summary>TTL for valid/invalid source-validation results.</summary>
+    public int SourceValidationTtlHours
+    {
+        get => _sourceValidationTtlHours;
+        set => _sourceValidationTtlHours = Math.Clamp(value, 1, 720);
+    }
+
+    /// <summary>Retry delay for transient source-validation results.</summary>
+    public int SourceValidationTransientRetryMinutes
+    {
+        get => _sourceValidationTransientRetryMinutes;
+        set => _sourceValidationTransientRetryMinutes = Math.Clamp(value, 1, 1440);
+    }
+
+    /// <summary>gostream validation lease lifetime.</summary>
+    public int SourceValidationLeaseMinutes
+    {
+        get => _sourceValidationLeaseMinutes;
+        set => _sourceValidationLeaseMinutes = Math.Clamp(value, 1, 60);
+    }
+
+    /// <summary>Age after which running bulk items are reset to retry on startup.</summary>
+    public int BulkMaterialiseRunningStaleMinutes
+    {
+        get => _bulkMaterialiseRunningStaleMinutes;
+        set => _bulkMaterialiseRunningStaleMinutes = Math.Clamp(value, 1, 1440);
+    }
+
+    /// <summary>Maximum active bulk materialise workers.</summary>
+    public int BulkMaterialiseWorkerCount
+    {
+        get => _bulkMaterialiseWorkerCount;
+        set => _bulkMaterialiseWorkerCount = Math.Clamp(value, 1, 8);
+    }
+
+    /// <summary>Maximum attempts before a bulk materialise item fails permanently.</summary>
+    public int BulkMaterialiseMaxAttempts
+    {
+        get => _bulkMaterialiseMaxAttempts;
+        set => _bulkMaterialiseMaxAttempts = Math.Clamp(value, 1, 20);
+    }
+
+    /// <summary>Validation policy version persisted with candidate/failure state.</summary>
+    public string SourceValidationPolicyVersion
+    {
+        get => _sourceValidationPolicyVersion;
+        set => _sourceValidationPolicyVersion = string.IsNullOrWhiteSpace(value) ? "sv14-parser-audio-v1" : value;
+    }
+
+    /// <summary>Global cap for heavy gostream validate/add HTTP calls.</summary>
+    public int GostreamHeavyConcurrency
+    {
+        get => _gostreamHeavyConcurrency;
+        set => _gostreamHeavyConcurrency = Math.Clamp(value, 1, 4);
+    }
+
+    /// <summary>Optional shared secret sent to gostream mutation/validation endpoints.</summary>
+    public string GostreamToken { get; set; }
 }
 
 /// <summary>Quality-scoring preset chooser.</summary>
