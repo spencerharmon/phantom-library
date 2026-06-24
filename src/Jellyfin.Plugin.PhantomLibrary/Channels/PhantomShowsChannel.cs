@@ -12,6 +12,7 @@ using Jellyfin.Plugin.PhantomLibrary.Configuration;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Controller.Channels;
 using MediaBrowser.Controller.Drawing;
+using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Controller.Providers;
 using MediaBrowser.Model.Channels;
 using MediaBrowser.Model.Dto;
@@ -58,6 +59,7 @@ public sealed partial class PhantomShowsChannel
     private readonly ChannelStateProvider _state;
     private readonly GostreamFilesystemEnumerator _enumerator;
     private readonly Dictionary<string, int> _gostreamSeriesTmdbByPath = new(StringComparer.Ordinal);
+    private readonly IMediaEncoder? _mediaEncoder;
     private readonly ILogger<PhantomShowsChannel> _logger;
     private readonly Func<string?> _languageProvider;
     private readonly Func<PluginConfiguration> _configProvider;
@@ -69,7 +71,20 @@ public sealed partial class PhantomShowsChannel
         ChannelStateProvider state,
         GostreamFilesystemEnumerator enumerator,
         ILogger<PhantomShowsChannel> logger)
-        : this(db, tmdb, splashSource, state, enumerator, logger,
+        : this(db, tmdb, splashSource, state, enumerator, null, logger,
+               () => Plugin.Instance?.Configuration?.DiscoveryLanguage)
+    {
+    }
+
+    public PhantomShowsChannel(
+        PhantomDb db,
+        ITmdbClient tmdb,
+        SplashSourceProvider splashSource,
+        ChannelStateProvider state,
+        GostreamFilesystemEnumerator enumerator,
+        IMediaEncoder mediaEncoder,
+        ILogger<PhantomShowsChannel> logger)
+        : this(db, tmdb, splashSource, state, enumerator, mediaEncoder, logger,
                () => Plugin.Instance?.Configuration?.DiscoveryLanguage)
     {
     }
@@ -82,12 +97,26 @@ public sealed partial class PhantomShowsChannel
         GostreamFilesystemEnumerator enumerator,
         ILogger<PhantomShowsChannel> logger,
         Func<string?> languageProvider)
+        : this(db, tmdb, splashSource, state, enumerator, null, logger, languageProvider)
+    {
+    }
+
+    internal PhantomShowsChannel(
+        PhantomDb db,
+        ITmdbClient tmdb,
+        SplashSourceProvider splashSource,
+        ChannelStateProvider state,
+        GostreamFilesystemEnumerator enumerator,
+        IMediaEncoder? mediaEncoder,
+        ILogger<PhantomShowsChannel> logger,
+        Func<string?> languageProvider)
     {
         _db = db ?? throw new ArgumentNullException(nameof(db));
         _tmdb = tmdb ?? throw new ArgumentNullException(nameof(tmdb));
         _splashSource = splashSource ?? throw new ArgumentNullException(nameof(splashSource));
         _state = state ?? throw new ArgumentNullException(nameof(state));
         _enumerator = enumerator ?? throw new ArgumentNullException(nameof(enumerator));
+        _mediaEncoder = mediaEncoder;
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _languageProvider = languageProvider ?? throw new ArgumentNullException(nameof(languageProvider));
         _configProvider = () => Plugin.Instance?.Configuration ?? new PluginConfiguration();
@@ -163,7 +192,7 @@ public sealed partial class PhantomShowsChannel
         if (TryParseOrphanEpisodeId(id, out var orphanEpisodeHash))
         {
             var orphan = await _enumerator.LookupOrphanEpisodeByHashAsync(orphanEpisodeHash, cancellationToken).ConfigureAwait(false);
-            return orphan is null ? Array.Empty<MediaSourceInfo>() : new[] { FuseMediaSource(orphan.Path) };
+            return orphan is null ? Array.Empty<MediaSourceInfo>() : new[] { await FuseMediaSourceAsync(orphan.Path, cancellationToken).ConfigureAwait(false) };
         }
 
         if (!ChannelItemId.TryParse(id, out var parsed))
@@ -189,7 +218,7 @@ public sealed partial class PhantomShowsChannel
 
         var path = GostreamPathResolver.ResolveEpisodePath(state.FusePath);
         return File.Exists(path)
-            ? new[] { FuseMediaSource(path) }
+            ? new[] { await FuseMediaSourceAsync(path, cancellationToken).ConfigureAwait(false) }
             : Array.Empty<MediaSourceInfo>();
     }
 
@@ -229,7 +258,7 @@ public sealed partial class PhantomShowsChannel
         if (TryParseOrphanEpisodeId(channelItemExternalId, out var orphanEpisodeHash))
         {
             var orphan = await _enumerator.LookupOrphanEpisodeByHashAsync(orphanEpisodeHash, cancellationToken).ConfigureAwait(false);
-            return orphan is null ? null! : BuildOrphanEpisodeItem(orphan) ?? null!;
+            return orphan is null ? null! : await BuildOrphanEpisodeItemAsync(orphan, cancellationToken).ConfigureAwait(false) ?? null!;
         }
 
         if (TryParseOrphanSeriesId(channelItemExternalId, out var orphanSeriesHash))
@@ -480,13 +509,13 @@ public sealed partial class PhantomShowsChannel
 
             if (externalByEpisode.TryGetValue(row.Episode, out var externalEpisode))
             {
-                items.Add(BuildExternalEpisodeItemFromRow(row, externalEpisode, seriesName ?? externalSeriesName));
+                items.Add(await BuildExternalEpisodeItemFromRowAsync(row, externalEpisode, seriesName ?? externalSeriesName, ct).ConfigureAwait(false));
             }
             else
             {
                 var materialised = await _db.GetMaterialisedStateAsync(
                     seriesTmdb, "episode", season, row.Episode, ct).ConfigureAwait(false);
-                items.Add(BuildEpisodeItemFromRow(row, materialised, seriesName));
+                items.Add(await BuildEpisodeItemFromRowAsync(row, materialised, seriesName, ct).ConfigureAwait(false));
             }
 
             emittedEpisodes.Add(row.Episode);
@@ -500,7 +529,7 @@ public sealed partial class PhantomShowsChannel
                 continue;
             }
 
-            items.Add(BuildOrphanEpisodeItem(externalEpisode));
+            items.Add(await BuildOrphanEpisodeItemAsync(externalEpisode, ct).ConfigureAwait(false));
             if (hasEpisodeNumber)
             {
                 emittedEpisodes.Add(episodeNumber);
@@ -562,8 +591,13 @@ public sealed partial class PhantomShowsChannel
             return await GetEpisodesForSeasonAsync(enriched.TmdbId, seasonNumber, ct).ConfigureAwait(false);
         }
 
-        var items = SelectExternalEpisodeVariants(season.Episodes)
-            .Select(BuildOrphanEpisodeItem)
+        var items = new List<ChannelItemInfo>();
+        foreach (var episode in SelectExternalEpisodeVariants(season.Episodes))
+        {
+            items.Add(await BuildOrphanEpisodeItemAsync(episode, ct).ConfigureAwait(false));
+        }
+
+        items = items
             .OrderBy(i => i.IndexNumber ?? int.MaxValue)
             .ThenBy(i => i.Name, StringComparer.OrdinalIgnoreCase)
             .ToList();
@@ -866,11 +900,11 @@ public sealed partial class PhantomShowsChannel
             return null;
         }
 
-        return BuildEpisodeItemFromRow(row, materialised, seriesMeta?.Title);
+        return await BuildEpisodeItemFromRowAsync(row, materialised, seriesMeta?.Title, ct).ConfigureAwait(false);
     }
 
-    private ChannelItemInfo BuildEpisodeItemFromRow(
-        TmdbEpisodeRow row, MaterialisedStateRow? materialised, string? seriesName)
+    private async Task<ChannelItemInfo> BuildEpisodeItemFromRowAsync(
+        TmdbEpisodeRow row, MaterialisedStateRow? materialised, string? seriesName, CancellationToken ct)
     {
         var id = ChannelItemId.ForEpisode(row.SeriesTmdbId, row.Season, row.Episode).Encode();
         MediaSourceInfo source;
@@ -880,7 +914,7 @@ public sealed partial class PhantomShowsChannel
             var materialisedPath = GostreamPathResolver.ResolveEpisodePath(materialised.FusePath);
             if (File.Exists(materialisedPath))
             {
-                source = FuseMediaSource(materialisedPath);
+                source = await FuseMediaSourceAsync(materialisedPath, ct).ConfigureAwait(false);
             }
             else
             {
@@ -938,11 +972,15 @@ public sealed partial class PhantomShowsChannel
         return item;
     }
 
-    private ChannelItemInfo BuildExternalEpisodeItemFromRow(TmdbEpisodeRow row, GostreamFileEntry externalEpisode, string? seriesName)
+    private async Task<ChannelItemInfo> BuildExternalEpisodeItemFromRowAsync(
+        TmdbEpisodeRow row,
+        GostreamFileEntry externalEpisode,
+        string? seriesName,
+        CancellationToken ct)
     {
-        var item = BuildEpisodeItemFromRow(row, materialised: null, seriesName);
+        var item = await BuildEpisodeItemFromRowAsync(row, null, seriesName, ct).ConfigureAwait(false);
         item.Tags = new List<string> { "external" };
-        item.MediaSources = new List<MediaSourceInfo> { FuseMediaSource(externalEpisode.Path) };
+        item.MediaSources = new List<MediaSourceInfo> { await FuseMediaSourceAsync(externalEpisode.Path, ct).ConfigureAwait(false) };
         return item;
     }
 
@@ -1005,7 +1043,7 @@ public sealed partial class PhantomShowsChannel
         return score;
     }
 
-    private static ChannelItemInfo BuildOrphanEpisodeItem(GostreamFileEntry episode)
+    private async Task<ChannelItemInfo> BuildOrphanEpisodeItemAsync(GostreamFileEntry episode, CancellationToken ct)
     {
         var fileName = Path.GetFileNameWithoutExtension(episode.Path);
         var hasEpisodeNumber = TryParseEpisodeNumber(fileName, out var season, out var episodeNumber);
@@ -1032,7 +1070,7 @@ public sealed partial class PhantomShowsChannel
             IndexNumber = hasEpisodeNumber ? episodeNumber : null,
             SeriesName = seriesName,
             Tags = new List<string> { "external" },
-            MediaSources = new List<MediaSourceInfo> { FuseMediaSource(episode.Path) },
+            MediaSources = new List<MediaSourceInfo> { await FuseMediaSourceAsync(episode.Path, ct).ConfigureAwait(false) },
         };
     }
 
@@ -1244,22 +1282,6 @@ public sealed partial class PhantomShowsChannel
         return "https://image.tmdb.org/t/p/w500" + prefixed;
     }
 
-    private static MediaSourceInfo FuseMediaSource(string path)
-    {
-        var ext = Path.GetExtension(path).TrimStart('.');
-#pragma warning disable CA1308
-        var container = string.IsNullOrEmpty(ext) ? "mkv" : ext.ToLowerInvariant();
-#pragma warning restore CA1308
-        return new MediaSourceInfo
-        {
-            Id = MediaSourceIds.ForFilePath(path),
-            Path = path,
-            Container = container,
-            Protocol = MediaProtocol.File,
-            SupportsDirectPlay = true,
-            SupportsDirectStream = true,
-            IsRemote = false,
-            MediaStreams = new List<MediaStream>(),
-        };
-    }
+    private Task<MediaSourceInfo> FuseMediaSourceAsync(string path, CancellationToken ct)
+        => PhantomMediaSourceBuilder.CreateFileMediaSourceAsync(path, _mediaEncoder, _logger, ct);
 }

@@ -10,8 +10,11 @@ using Jellyfin.Plugin.PhantomLibrary.Clients.Models;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.Channels;
+using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Model.Channels;
 using MediaBrowser.Model.Dto;
+using MediaBrowser.Model.Entities;
+using MediaBrowser.Model.MediaInfo;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
@@ -576,6 +579,34 @@ public class PhantomShowsChannelTests : IDisposable
         var got = await _channel.GetChannelItemMediaInfo("episode_1399_s01e01", CancellationToken.None);
         var src = Assert.Single(got);
         Assert.Equal(fusePath, src.Path);
+    }
+
+    [Fact]
+    public async Task GetChannelItemMediaInfo_MaterialisedEpisode_ProbesAudioStreams()
+    {
+        var fusePath = Path.Combine(_splashHome, "media-info-audio.mkv");
+        await File.WriteAllTextAsync(fusePath, "x", CancellationToken.None);
+        await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 2, "/stub", fusePath, CancellationToken.None);
+        var encoder = new Mock<IMediaEncoder>(MockBehavior.Loose);
+        encoder.Setup(e => e.GetMediaInfo(It.IsAny<MediaInfoRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new MediaInfo
+            {
+                MediaStreams = new List<MediaStream>
+                {
+                    new() { Index = 0, Type = MediaStreamType.Video, IsDefault = true },
+                    new() { Index = 1, Type = MediaStreamType.Audio, Language = "pol", IsDefault = true },
+                    new() { Index = 2, Type = MediaStreamType.Audio, Language = "eng" },
+                },
+            });
+        var channel = new PhantomShowsChannel(
+            _db, _tmdb.Object, _splash, _state, _enumerator, encoder.Object,
+            NullLogger<PhantomShowsChannel>.Instance);
+
+        var got = await channel.GetChannelItemMediaInfo("episode_1399_s01e02", CancellationToken.None);
+
+        var src = Assert.Single(got);
+        Assert.Equal(new[] { 1, 2 }, src.MediaStreams.Where(s => s.Type == MediaStreamType.Audio).Select(s => s.Index));
+        Assert.Equal(1, src.DefaultAudioStreamIndex);
     }
 
     [Fact]

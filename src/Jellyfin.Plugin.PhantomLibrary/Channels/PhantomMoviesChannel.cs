@@ -10,6 +10,7 @@ using Jellyfin.Plugin.PhantomLibrary.Clients.Models;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Controller.Channels;
 using MediaBrowser.Controller.Drawing;
+using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Controller.Providers;
 using MediaBrowser.Model.Channels;
 using MediaBrowser.Model.Dto;
@@ -38,6 +39,7 @@ public sealed class PhantomMoviesChannel
     private readonly SplashSourceProvider _splashSource;
     private readonly ChannelStateProvider _state;
     private readonly ITmdbClient _tmdbClient;
+    private readonly IMediaEncoder? _mediaEncoder;
     private readonly ILogger<PhantomMoviesChannel> _logger;
     private readonly Dictionary<string, int> _gostreamMovieTmdbByPath = new(StringComparer.Ordinal);
 
@@ -48,12 +50,25 @@ public sealed class PhantomMoviesChannel
         ChannelStateProvider state,
         ITmdbClient tmdbClient,
         ILogger<PhantomMoviesChannel> logger)
+        : this(db, enumerator, splashSource, state, tmdbClient, null, logger)
+    {
+    }
+
+    public PhantomMoviesChannel(
+        PhantomDb db,
+        GostreamFilesystemEnumerator enumerator,
+        SplashSourceProvider splashSource,
+        ChannelStateProvider state,
+        ITmdbClient tmdbClient,
+        IMediaEncoder? mediaEncoder,
+        ILogger<PhantomMoviesChannel> logger)
     {
         _db = db ?? throw new ArgumentNullException(nameof(db));
         _enumerator = enumerator ?? throw new ArgumentNullException(nameof(enumerator));
         _splashSource = splashSource ?? throw new ArgumentNullException(nameof(splashSource));
         _state = state ?? throw new ArgumentNullException(nameof(state));
         _tmdbClient = tmdbClient ?? throw new ArgumentNullException(nameof(tmdbClient));
+        _mediaEncoder = mediaEncoder;
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
@@ -155,7 +170,7 @@ public sealed class PhantomMoviesChannel
                 var materialisedPath = GostreamPathResolver.ResolveMoviePath(row.Materialised.FusePath);
                 if (File.Exists(materialisedPath))
                 {
-                    sources.Add(FuseMediaSource(materialisedPath));
+                    sources.Add(await FuseMediaSourceAsync(materialisedPath, cancellationToken).ConfigureAwait(false));
                 }
                 else
                 {
@@ -196,7 +211,7 @@ public sealed class PhantomMoviesChannel
         foreach (var o in unresolvedOrphans)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            items.Add(BuildOrphanMovieItem(o));
+            items.Add(await BuildOrphanMovieItemAsync(o, cancellationToken).ConfigureAwait(false));
         }
 
         return new ChannelItemResult
@@ -226,7 +241,7 @@ public sealed class PhantomMoviesChannel
                         var path = GostreamPathResolver.ResolveMoviePath(state.FusePath);
                         if (File.Exists(path))
                         {
-                            return new[] { FuseMediaSource(path) };
+                            return new[] { await FuseMediaSourceAsync(path, cancellationToken).ConfigureAwait(false) };
                         }
                     }
 
@@ -242,7 +257,7 @@ public sealed class PhantomMoviesChannel
                         return Array.Empty<MediaSourceInfo>();
                     }
 
-                    return new[] { FuseMediaSource(orphan.Path) };
+                    return new[] { await FuseMediaSourceAsync(orphan.Path, cancellationToken).ConfigureAwait(false) };
                 }
 
             default:
@@ -304,7 +319,7 @@ public sealed class PhantomMoviesChannel
                 {
                     var orphan = await _enumerator.LookupOrphanByHashAsync(
                         parsed.OrphanHash!, cancellationToken).ConfigureAwait(false);
-                    return orphan is null ? null! : BuildOrphanMovieItem(orphan);
+                    return orphan is null ? null! : await BuildOrphanMovieItemAsync(orphan, cancellationToken).ConfigureAwait(false);
                 }
 
             default:
@@ -336,7 +351,7 @@ public sealed class PhantomMoviesChannel
             var materialisedPath = GostreamPathResolver.ResolveMoviePath(materialised.FusePath);
             if (File.Exists(materialisedPath))
             {
-                sources.Add(FuseMediaSource(materialisedPath));
+                sources.Add(await FuseMediaSourceAsync(materialisedPath, ct).ConfigureAwait(false));
             }
             else
             {
@@ -419,7 +434,7 @@ public sealed class PhantomMoviesChannel
             }
         }
 
-        return new EnrichedGostreamMovie(details.TmdbId, details, FuseMediaSource(path));
+        return new EnrichedGostreamMovie(details.TmdbId, details, await FuseMediaSourceAsync(path, ct).ConfigureAwait(false));
     }
 
     private static MediaSourceInfo SelectDefaultVariant(IReadOnlyList<MediaSourceInfo> sources)
@@ -522,7 +537,7 @@ public sealed class PhantomMoviesChannel
     private static string? BuildPosterUrl(string? path)
         => string.IsNullOrWhiteSpace(path) ? null : "https://image.tmdb.org/t/p/w500" + path;
 
-    private static ChannelItemInfo BuildOrphanMovieItem(GostreamFileEntry o)
+    private async Task<ChannelItemInfo> BuildOrphanMovieItemAsync(GostreamFileEntry o, CancellationToken ct)
     {
         var id = ChannelItemId.ForOrphanPath(o.Path).Encode();
         return new ChannelItemInfo
@@ -533,27 +548,10 @@ public sealed class PhantomMoviesChannel
             ContentType = ChannelMediaContentType.Movie,
             MediaType = ChannelMediaType.Video,
             Tags = new List<string> { "external" },
-            MediaSources = new List<MediaSourceInfo> { FuseMediaSource(o.Path) },
+            MediaSources = new List<MediaSourceInfo> { await FuseMediaSourceAsync(o.Path, ct).ConfigureAwait(false) },
         };
     }
 
-    private static MediaSourceInfo FuseMediaSource(string path)
-    {
-        var ext = Path.GetExtension(path).TrimStart('.');
-        // Container is a lowercased extension by Jellyfin convention.
-#pragma warning disable CA1308
-        var container = string.IsNullOrEmpty(ext) ? "mkv" : ext.ToLowerInvariant();
-#pragma warning restore CA1308
-        return new MediaSourceInfo
-        {
-            Id = MediaSourceIds.ForFilePath(path),
-            Path = path,
-            Container = container,
-            Protocol = MediaProtocol.File,
-            SupportsDirectPlay = true,
-            SupportsDirectStream = true,
-            IsRemote = false,
-            MediaStreams = new List<MediaStream>(),
-        };
-    }
+    private Task<MediaSourceInfo> FuseMediaSourceAsync(string path, CancellationToken ct)
+        => PhantomMediaSourceBuilder.CreateFileMediaSourceAsync(path, _mediaEncoder, _logger, ct);
 }
