@@ -65,22 +65,23 @@ To rebase:
    mechanical and the patch's design needs re-evaluation. Stop and
    ask the operator.
 
-4. **Re-run the affected test class.**
+4. **Re-run the affected tests/builds.**
 
    ```bash
    cd jellyfin
    dotnet test tests/Jellyfin.LiveTv.Tests/ -p:AllowMissingPrunePackageData=true
+   dotnet build -c Release Jellyfin.Server/Jellyfin.Server.csproj
    ```
 
-   All eight `ChannelManagerRefreshTests.*` cases must pass.
+   All `ChannelManagerRefreshTests.*` cases must pass, and the server
+   build must compile the patched item-action API.
 
 5. **Re-export the patches.** Determine how many commits the rebased
-   series produced (should still be 3 unless you intentionally
-   restructured):
+   series produced (currently 5 unless you intentionally restructured):
 
    ```bash
    cd jellyfin
-   git format-patch -3 -o ../scripts/jellyfin-patches/
+   git format-patch -5 -o ../scripts/jellyfin-patches/
    ```
 
    The output filenames stay numbered `0001-`/`0002-`/`0003-` —

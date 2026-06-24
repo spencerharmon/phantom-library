@@ -362,7 +362,7 @@ dirty files: <git status --short, plus git -C gostream status --short>
 plugin schema source: <PhantomDb CurrentSchemaVersion>
 plugin built sha256: <sha256sum src/.../Jellyfin.Plugin.PhantomLibrary.dll>
 plugin deployed sha256: <sha256sum /var/lib/jellyfin/plugins/.../Jellyfin.Plugin.PhantomLibrary.dll>
-patched Jellyfin sha256: <MediaBrowser.Controller.dll + Jellyfin.LiveTv.dll>
+patched Jellyfin sha256: <MediaBrowser.Controller.dll + MediaBrowser.Model.dll + Jellyfin.Api.dll + Jellyfin.LiveTv.dll>
 gostream commit/dirty: <git -C gostream rev-parse HEAD + status>
 gostream deployed version/hash: <image id or binary sha, if known>
 phantom.db schema: <sqlite PRAGMA user_version>
@@ -432,12 +432,14 @@ This plugin depends on patches applied to Jellyfin core, stored at
 build time (idempotently — second run reports `already applied`)
 against the `jellyfin/` source clone at exact tag v10.11.9 (base SHA
 `e83a7e62f2`). The patches add `IChannelItemRefresh` (an opt-in
-channel-side interface) and `IChannelItemRefreshManager` (a new
-service sibling to `IChannelManager`) — both purely additive. No
-existing API is modified.
+channel-side interface), `IChannelItemRefreshManager` (a new
+service sibling to `IChannelManager`), and a server-advertised
+item-action API (`IItemActionProvider` + `/Items/{itemId}/Actions`) —
+all purely additive. No existing API is modified.
 
 The plugin DLL alone is **not sufficient** at runtime; the patched
-`MediaBrowser.Controller.dll` + `Jellyfin.LiveTv.dll` must also be
+`MediaBrowser.Controller.dll` + `MediaBrowser.Model.dll` +
+`Jellyfin.Api.dll` + `Jellyfin.LiveTv.dll` must also be
 deployed into the operator's Jellyfin install dir (default
 `/usr/lib/jellyfin/`). `install.sh --build` prints the exact
 `sudo cp` commands at the end of its output, pre-filled for the

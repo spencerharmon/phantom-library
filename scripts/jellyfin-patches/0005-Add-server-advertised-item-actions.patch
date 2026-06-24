@@ -1,0 +1,285 @@
+From 985822e6e84612380ebd220998d58dbab4f380e0 Mon Sep 17 00:00:00 2001
+From: spencer <the.spencer.harmon@gmail.com>
+Date: Wed, 24 Jun 2026 11:58:14 -0500
+Subject: [PATCH] Add server-advertised item actions
+
+---
+ .../Controllers/ItemActionsController.cs      | 163 ++++++++++++++++++
+ .../Library/IItemActionProvider.cs            |  19 ++
+ MediaBrowser.Model/Dto/ItemActionInfo.cs      |  24 +++
+ MediaBrowser.Model/Dto/ItemActionRequest.cs   |  12 ++
+ MediaBrowser.Model/Dto/ItemActionResult.cs    |  16 ++
+ 5 files changed, 234 insertions(+)
+ create mode 100644 Jellyfin.Api/Controllers/ItemActionsController.cs
+ create mode 100644 MediaBrowser.Controller/Library/IItemActionProvider.cs
+ create mode 100644 MediaBrowser.Model/Dto/ItemActionInfo.cs
+ create mode 100644 MediaBrowser.Model/Dto/ItemActionRequest.cs
+ create mode 100644 MediaBrowser.Model/Dto/ItemActionResult.cs
+
+diff --git a/Jellyfin.Api/Controllers/ItemActionsController.cs b/Jellyfin.Api/Controllers/ItemActionsController.cs
+new file mode 100644
+index 0000000000..4d1c630c91
+--- /dev/null
++++ b/Jellyfin.Api/Controllers/ItemActionsController.cs
+@@ -0,0 +1,163 @@
++using System;
++using System.Collections.Generic;
++using System.ComponentModel.DataAnnotations;
++using System.Linq;
++using System.Threading;
++using System.Threading.Tasks;
++using Jellyfin.Api.Extensions;
++using MediaBrowser.Controller.Entities;
++using MediaBrowser.Controller.Library;
++using MediaBrowser.Model.Dto;
++using Microsoft.AspNetCore.Authorization;
++using Microsoft.AspNetCore.Http;
++using Microsoft.AspNetCore.Mvc;
++
++namespace Jellyfin.Api.Controllers;
++
++/// <summary>
++/// Server-advertised item actions supplied by plugins and core providers.
++/// </summary>
++[ApiController]
++[Authorize]
++[Route("Items/{itemId}/Actions")]
++[Produces("application/json")]
++public class ItemActionsController : BaseJellyfinApiController
++{
++    private readonly ILibraryManager _libraryManager;
++    private readonly IUserManager _userManager;
++    private readonly IEnumerable<IItemActionProvider> _providers;
++
++    /// <summary>
++    /// Initializes a new instance of the <see cref="ItemActionsController"/> class.
++    /// </summary>
++    /// <param name="libraryManager">Library manager.</param>
++    /// <param name="userManager">User manager.</param>
++    /// <param name="providers">Registered item action providers.</param>
++    public ItemActionsController(
++        ILibraryManager libraryManager,
++        IUserManager userManager,
++        IEnumerable<IItemActionProvider> providers)
++    {
++        _libraryManager = libraryManager;
++        _userManager = userManager;
++        _providers = providers;
++    }
++
++    /// <summary>
++    /// Gets item actions available to the current user.
++    /// </summary>
++    /// <param name="itemId">The item id.</param>
++    /// <param name="cancellationToken">Cancellation token.</param>
++    /// <returns>Available actions.</returns>
++    [HttpGet]
++    [ProducesResponseType(StatusCodes.Status200OK)]
++    [ProducesResponseType(StatusCodes.Status404NotFound)]
++    public async Task<ActionResult<IReadOnlyList<ItemActionInfo>>> GetActions(
++        [FromRoute, Required] Guid itemId,
++        CancellationToken cancellationToken = default)
++    {
++        var userId = User.GetUserId();
++        var user = _userManager.GetUserById(userId);
++        if (user is null)
++        {
++            return NotFound();
++        }
++
++        var item = _libraryManager.GetItemById<BaseItem>(itemId, userId);
++        if (item is null)
++        {
++            return NotFound();
++        }
++
++        var actions = new List<ItemActionInfo>();
++        foreach (var provider in _providers)
++        {
++            cancellationToken.ThrowIfCancellationRequested();
++            var provided = await provider.GetActionsAsync(item, user, cancellationToken).ConfigureAwait(false);
++            if (provided.Count > 0)
++            {
++                actions.AddRange(provided);
++            }
++        }
++
++        return Ok((IReadOnlyList<ItemActionInfo>)actions.ToArray());
++    }
++
++    /// <summary>
++    /// Invokes an item action.
++    /// </summary>
++    /// <param name="itemId">The item id.</param>
++    /// <param name="actionId">The action id.</param>
++    /// <param name="request">Optional action payload.</param>
++    /// <param name="cancellationToken">Cancellation token.</param>
++    /// <returns>Action result.</returns>
++    [HttpPost("{actionId}")]
++    [ProducesResponseType(StatusCodes.Status200OK)]
++    [ProducesResponseType(StatusCodes.Status404NotFound)]
++    [ProducesResponseType(StatusCodes.Status409Conflict)]
++    [ProducesResponseType(StatusCodes.Status422UnprocessableEntity)]
++    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
++    public async Task<ActionResult<ItemActionResult>> InvokeAction(
++        [FromRoute, Required] Guid itemId,
++        [FromRoute, Required] string actionId,
++        [FromBody] ItemActionRequest? request,
++        CancellationToken cancellationToken = default)
++    {
++        var userId = User.GetUserId();
++        var user = _userManager.GetUserById(userId);
++        if (user is null)
++        {
++            return NotFound();
++        }
++
++        var item = _libraryManager.GetItemById<BaseItem>(itemId, userId);
++        if (item is null)
++        {
++            return NotFound();
++        }
++
++        foreach (var provider in _providers)
++        {
++            cancellationToken.ThrowIfCancellationRequested();
++            var actions = await provider.GetActionsAsync(item, user, cancellationToken).ConfigureAwait(false);
++            if (!actions.Any(a => string.Equals(a.Id, actionId, StringComparison.Ordinal)))
++            {
++                continue;
++            }
++
++            var action = actions.First(a => string.Equals(a.Id, actionId, StringComparison.Ordinal));
++            if (!action.IsEnabled)
++            {
++                return Conflict(new ItemActionResult
++                {
++                    Success = false,
++                    Code = "action_disabled",
++                    Message = "Action is currently disabled",
++                    RefreshItem = false,
++                });
++            }
++
++            var result = await provider.InvokeAsync(item, user, actionId, request ?? new ItemActionRequest(), cancellationToken).ConfigureAwait(false);
++            if (result.Success)
++            {
++                return Ok(result);
++            }
++
++            return result.Code switch
++            {
++                "not_found" or "candidate_not_found" => NotFound(result),
++                "in_flight" or "no_current" or "action_disabled" => Conflict(result),
++                "no_alternate" or "unavailable" => UnprocessableEntity(result),
++                _ => StatusCode(StatusCodes.Status500InternalServerError, result),
++            };
++        }
++
++        return NotFound(new ItemActionResult
++        {
++            Success = false,
++            Code = "action_not_found",
++            Message = "Action not found",
++            RefreshItem = false,
++        });
++    }
++}
+diff --git a/MediaBrowser.Controller/Library/IItemActionProvider.cs b/MediaBrowser.Controller/Library/IItemActionProvider.cs
+new file mode 100644
+index 0000000000..b8abeb0746
+--- /dev/null
++++ b/MediaBrowser.Controller/Library/IItemActionProvider.cs
+@@ -0,0 +1,19 @@
++#nullable disable
++
++#pragma warning disable CS1591
++
++using System.Collections.Generic;
++using System.Threading;
++using System.Threading.Tasks;
++using Jellyfin.Database.Implementations.Entities;
++using MediaBrowser.Controller.Entities;
++using MediaBrowser.Model.Dto;
++
++namespace MediaBrowser.Controller.Library;
++
++public interface IItemActionProvider
++{
++    Task<IReadOnlyList<ItemActionInfo>> GetActionsAsync(BaseItem item, User user, CancellationToken cancellationToken);
++
++    Task<ItemActionResult> InvokeAsync(BaseItem item, User user, string actionId, ItemActionRequest request, CancellationToken cancellationToken);
++}
+diff --git a/MediaBrowser.Model/Dto/ItemActionInfo.cs b/MediaBrowser.Model/Dto/ItemActionInfo.cs
+new file mode 100644
+index 0000000000..82ff41dd04
+--- /dev/null
++++ b/MediaBrowser.Model/Dto/ItemActionInfo.cs
+@@ -0,0 +1,24 @@
++#nullable disable
++
++#pragma warning disable CS1591
++
++namespace MediaBrowser.Model.Dto;
++
++public class ItemActionInfo
++{
++    public string Id { get; set; }
++
++    public string Name { get; set; }
++
++    public string Description { get; set; }
++
++    public string Icon { get; set; }
++
++    public bool IsEnabled { get; set; } = true;
++
++    public bool RequiresConfirmation { get; set; }
++
++    public string ConfirmationText { get; set; }
++
++    public bool RefreshItemAfterInvoke { get; set; } = true;
++}
+diff --git a/MediaBrowser.Model/Dto/ItemActionRequest.cs b/MediaBrowser.Model/Dto/ItemActionRequest.cs
+new file mode 100644
+index 0000000000..459a5c0545
+--- /dev/null
++++ b/MediaBrowser.Model/Dto/ItemActionRequest.cs
+@@ -0,0 +1,12 @@
++#nullable disable
++
++#pragma warning disable CS1591
++
++using System.Text.Json.Nodes;
++
++namespace MediaBrowser.Model.Dto;
++
++public class ItemActionRequest
++{
++    public JsonObject Payload { get; set; }
++}
+diff --git a/MediaBrowser.Model/Dto/ItemActionResult.cs b/MediaBrowser.Model/Dto/ItemActionResult.cs
+new file mode 100644
+index 0000000000..a1a2c28e21
+--- /dev/null
++++ b/MediaBrowser.Model/Dto/ItemActionResult.cs
+@@ -0,0 +1,16 @@
++#nullable disable
++
++#pragma warning disable CS1591
++
++namespace MediaBrowser.Model.Dto;
++
++public class ItemActionResult
++{
++    public bool Success { get; set; }
++
++    public string Code { get; set; }
++
++    public string Message { get; set; }
++
++    public bool RefreshItem { get; set; } = true;
++}
+-- 
+2.54.0
+

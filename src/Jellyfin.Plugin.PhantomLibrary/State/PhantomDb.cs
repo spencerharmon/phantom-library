@@ -1583,6 +1583,56 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
         }
     }
 
+    public async Task MarkAvailabilityAvailableAsync(int tmdbId, string type, int season, int episode, MagnetCacheEntry? candidate, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        var now = DateTimeOffset.UtcNow;
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"INSERT INTO availability_items
+                    (tmdb_id, type, season, episode, status, checked_at, next_check_at,
+                     candidate_magnet, candidate_info_hash, candidate_size, candidate_seeders,
+                     candidate_indexer, candidate_source, last_error_kind, last_error_message,
+                     lease_owner, lease_until)
+                VALUES ($tmdb,$type,$season,$episode,'available',$checked,$next,
+                    $magnet,$hash,$size,$seeders,$indexer,$source,NULL,NULL,NULL,NULL)
+                ON CONFLICT(tmdb_id, type, season, episode) DO UPDATE SET
+                    status='available',
+                    checked_at=excluded.checked_at,
+                    next_check_at=excluded.next_check_at,
+                    candidate_magnet=COALESCE(excluded.candidate_magnet, availability_items.candidate_magnet),
+                    candidate_info_hash=COALESCE(excluded.candidate_info_hash, availability_items.candidate_info_hash),
+                    candidate_size=COALESCE(excluded.candidate_size, availability_items.candidate_size),
+                    candidate_seeders=COALESCE(excluded.candidate_seeders, availability_items.candidate_seeders),
+                    candidate_indexer=COALESCE(excluded.candidate_indexer, availability_items.candidate_indexer),
+                    candidate_source=COALESCE(excluded.candidate_source, availability_items.candidate_source),
+                    last_error_kind=NULL,
+                    last_error_message=NULL,
+                    lease_owner=NULL,
+                    lease_until=NULL;";
+            cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+            cmd.Parameters.AddWithValue("$type", type);
+            cmd.Parameters.AddWithValue("$season", season);
+            cmd.Parameters.AddWithValue("$episode", episode);
+            cmd.Parameters.AddWithValue("$checked", now.ToUnixTimeSeconds());
+            cmd.Parameters.AddWithValue("$next", now.ToUnixTimeSeconds());
+            cmd.Parameters.AddWithValue("$magnet", (object?)candidate?.Magnet ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$hash", (object?)candidate?.InfoHash ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$size", (object?)candidate?.Size ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$seeders", (object?)candidate?.Seeders ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$indexer", (object?)candidate?.Indexer ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$source", (object?)candidate?.Source ?? DBNull.Value);
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public async Task<bool> RescheduleAvailabilityTransientAsync(AvailabilityItemRow lease, DateTimeOffset nextCheckAt, string errorKind, string? errorMessage, CancellationToken ct)
     {
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);

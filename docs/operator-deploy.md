@@ -2,14 +2,13 @@
 
 **Audience:** the single operator running Phantom Library on their own
 box. This guide explains the one piece of the v0.3.0+ deploy that
-`./install.sh` cannot do for you: replacing two of your Jellyfin
-runtime DLLs with patched builds.
+`./install.sh` must do outside the plugin directory: replacing patched
+Jellyfin runtime DLLs with builds that match the plugin.
 
 ## Why this is required
 
 Phantom Library v0.3.0 is built against a small additive patch to
-Jellyfin core (`scripts/jellyfin-patches/0001..0003*.patch`). The
-patch adds:
+Jellyfin core (`scripts/jellyfin-patches/*.patch`). The patch stack adds:
 
 - `IChannelItemRefresh` — an opt-in interface a channel implementation
   declares to expose per-item refresh semantics. (new file under
@@ -18,19 +17,25 @@ patch adds:
   (new file under `MediaBrowser.Controller/Channels/`, registered in
   `Jellyfin.LiveTv/Extensions/LiveTvServiceCollectionExtensions.cs`,
   implemented in `Jellyfin.LiveTv/Channels/ChannelManager.cs`)
+- `IItemActionProvider` + `/Items/{itemId}/Actions` — a server-advertised
+  item-action contract that lets Phantom expose Materialise / Reset /
+  Reject actions through normal item menus instead of web-only DOM shims.
 
 The patch is purely additive — no existing API is mutated. But the
 plugin DLL references these new types, so the runtime Jellyfin must
 contain the corresponding patched assemblies. The unpatched
 distro-package DLLs will produce a `TypeLoadException` when Jellyfin
-tries to load the plugin.
+tries to load the plugin, and unpatched API/model DLLs will not expose
+native item actions.
 
-Two DLLs need swapping:
+Four DLLs need swapping:
 
 - `MediaBrowser.Controller.dll`
+- `MediaBrowser.Model.dll`
+- `Jellyfin.Api.dll`
 - `Jellyfin.LiveTv.dll`
 
-`./install.sh --build` builds the patched versions of both and, by
+`./install.sh --build` builds the patched versions and, by
 default, deploys them alongside the plugin DLL. The install script also
 verifies the destination DLL hashes after copy. Use
 `--no-deploy-jellyfin-dlls` only when you intentionally want to build but
@@ -46,9 +51,10 @@ alignment:
   rebased.
 - The runtime Jellyfin installed on the operator box must also be
   `10.11.9` when installing this patch stack.
-- The plugin DLL alone is not enough: `MediaBrowser.Controller.dll` and
-  `Jellyfin.LiveTv.dll` in the runtime install dir must be the patched
-  build outputs that correspond to the plugin.
+- The plugin DLL alone is not enough: `MediaBrowser.Controller.dll`,
+  `MediaBrowser.Model.dll`, `Jellyfin.Api.dll`, and `Jellyfin.LiveTv.dll`
+  in the runtime install dir must be the patched build outputs that
+  correspond to the plugin.
 - `./install.sh --build` is the expected deploy path for normal
   operator installs because it builds plugin + patched Jellyfin and
   deploys the patched runtime DLLs by default.
@@ -75,11 +81,21 @@ sudo systemctl stop jellyfin
 # against these to detect clobber.
 sudo cp -p /usr/lib/jellyfin/MediaBrowser.Controller.dll \
         /usr/lib/jellyfin/MediaBrowser.Controller.dll.pre-phantom-bak
+sudo cp -p /usr/lib/jellyfin/MediaBrowser.Model.dll \
+        /usr/lib/jellyfin/MediaBrowser.Model.dll.pre-phantom-bak
+sudo cp -p /usr/lib/jellyfin/Jellyfin.Api.dll \
+        /usr/lib/jellyfin/Jellyfin.Api.dll.pre-phantom-bak
 sudo cp -p /usr/lib/jellyfin/Jellyfin.LiveTv.dll \
         /usr/lib/jellyfin/Jellyfin.LiveTv.dll.pre-phantom-bak
 
 sudo install -m 644 \
   /path/to/repo/jellyfin/MediaBrowser.Controller/bin/Release/net9.0/MediaBrowser.Controller.dll \
+  /usr/lib/jellyfin/
+sudo install -m 644 \
+  /path/to/repo/jellyfin/MediaBrowser.Model/bin/Release/net9.0/MediaBrowser.Model.dll \
+  /usr/lib/jellyfin/
+sudo install -m 644 \
+  /path/to/repo/jellyfin/Jellyfin.Api/bin/Release/net9.0/Jellyfin.Api.dll \
   /usr/lib/jellyfin/
 sudo install -m 644 \
   /path/to/repo/jellyfin/src/Jellyfin.LiveTv/bin/Release/net9.0/Jellyfin.LiveTv.dll \
@@ -139,6 +155,10 @@ normally:
 ```
 md5sum /usr/lib/jellyfin/MediaBrowser.Controller.dll \
        /usr/lib/jellyfin/MediaBrowser.Controller.dll.pre-phantom-bak \
+       /usr/lib/jellyfin/MediaBrowser.Model.dll \
+       /usr/lib/jellyfin/MediaBrowser.Model.dll.pre-phantom-bak \
+       /usr/lib/jellyfin/Jellyfin.Api.dll \
+       /usr/lib/jellyfin/Jellyfin.Api.dll.pre-phantom-bak \
        /usr/lib/jellyfin/Jellyfin.LiveTv.dll \
        /usr/lib/jellyfin/Jellyfin.LiveTv.dll.pre-phantom-bak
 ```
