@@ -68,6 +68,8 @@ public class PhantomKebabScriptTests
         Assert.Contains("Items/", js);
         Assert.Contains("/Actions", js);
         Assert.Contains("fireItemAction(itemId, actionId)", js);
+        Assert.Contains("refreshClientAfterAction", js);
+        Assert.Contains("window.location.reload()", js);
         Assert.Contains("ConfirmationText", js);
         Assert.Contains("phantom-action-", js);
     }

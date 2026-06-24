@@ -349,13 +349,31 @@
 
     function reportOutcome(action, result) {
         log(action, result);
-        var status = (result && (result.Status || result.status)) || 'Unknown';
+        var status = (result && (result.Status || result.status || result.Code || result.code)) || 'Unknown';
         var fuse = (result && (result.FusePath || result.fusePath)) || '';
-        var err = (result && (result.Error || result.error)) || '';
+        var err = (result && (result.Error || result.error || result.Message || result.message)) || '';
         var msg = 'Phantom Library: ' + action + ' — ' + status;
         if (err) { msg += '\n' + err; }
         if (fuse) { msg += '\n' + fuse; }
         alert(msg);
+    }
+
+    function shouldRefreshItem(result) {
+        if (!result) { return false; }
+        if (result.RefreshItem !== undefined) { return !!result.RefreshItem; }
+        if (result.refreshItem !== undefined) { return !!result.refreshItem; }
+        if (result.RefreshItemAfterInvoke !== undefined) { return !!result.RefreshItemAfterInvoke; }
+        if (result.refreshItemAfterInvoke !== undefined) { return !!result.refreshItemAfterInvoke; }
+        return false;
+    }
+
+    function refreshClientAfterAction(result) {
+        return refreshSourceSection().then(function () {
+            if (!shouldRefreshItem(result)) { return; }
+            window.setTimeout(function () {
+                window.location.reload();
+            }, 150);
+        });
     }
 
     function ensureStyles() {
@@ -629,7 +647,7 @@
                 injectButton(sheet, content, label, 'phantom-action-' + actionId.replace(/[^a-zA-Z0-9_-]/g, '-'), icon, function () {
                     closeSheet(sheet);
                     if (confirmText && !window.confirm(confirmText)) { return; }
-                    fireItemAction(itemId, actionId).then(refreshSourceSection, function () { /* alert already shown */ });
+                    fireItemAction(itemId, actionId).then(refreshClientAfterAction, function () { /* alert already shown */ });
                 });
             });
             sheet.dataset.phantomInjected = '1';
