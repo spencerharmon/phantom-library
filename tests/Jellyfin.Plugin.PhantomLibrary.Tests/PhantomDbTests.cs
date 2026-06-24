@@ -47,7 +47,7 @@ public class PhantomDbTests : IDisposable
     // ----------------------------------------------------------------
 
     [Fact]
-    public async Task FreshDb_CreatesSchemaV11_WithAllExpectedTables()
+    public async Task FreshDb_CreatesSchemaV13_WithAllExpectedTables()
     {
         using var db = await NewDbAsync();
 
@@ -66,7 +66,7 @@ public class PhantomDbTests : IDisposable
             version = Convert.ToInt32(await v.ExecuteScalarAsync());
         }
 
-        Assert.Equal(12, version);
+        Assert.Equal(13, version);
 
         var expectedTables = new[]
         {
@@ -122,7 +122,7 @@ public class PhantomDbTests : IDisposable
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => db.SetMetaAsync("test", "1", CancellationToken.None));
 
-        Assert.Contains("version 12", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("version 13", ex.Message, StringComparison.Ordinal);
         Assert.Contains("wipe", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -489,7 +489,8 @@ public class PhantomDbTests : IDisposable
             OfficialRating: "PG",
             CommunityRating: 7.5,
             OriginalTitle: "La Réponse",
-            FetchedAt: fetched);
+            FetchedAt: fetched,
+            RuntimeMinutes: 136);
 
         await db.UpsertTmdbMetadataAsync(row, CancellationToken.None);
         var got = await db.GetTmdbMetadataAsync(42, "movie", CancellationToken.None);
@@ -507,6 +508,7 @@ public class PhantomDbTests : IDisposable
         Assert.Equal(7.5, got.CommunityRating);
         Assert.Equal("La Réponse", got.OriginalTitle);
         Assert.Equal(fetched, got.FetchedAt);
+        Assert.Equal(136, got.RuntimeMinutes);
     }
 
     [Fact]
@@ -539,6 +541,7 @@ public class PhantomDbTests : IDisposable
         Assert.Null(got.OfficialRating);
         Assert.Null(got.CommunityRating);
         Assert.Null(got.OriginalTitle);
+        Assert.Null(got.RuntimeMinutes);
     }
 
     [Fact]

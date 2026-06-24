@@ -74,13 +74,13 @@ public class PhantomMoviesChannelTests : IDisposable
         Assert.True(Guid.TryParse(src.Id, out _));
     }
 
-    private async Task SeedMetaAsync(int tmdb, string title)
+    private async Task SeedMetaAsync(int tmdb, string title, int? runtimeMinutes = 95)
     {
         await _db.UpsertTmdbMetadataAsync(
             new TmdbMetadataRow(tmdb, "movie", title, 2020, "Overview " + tmdb,
                 "https://image.tmdb.org/t/p/w500/p.jpg",
                 "https://image.tmdb.org/t/p/w500/b.jpg",
-                new[] { "Drama" }, null, 7.5, title, DateTimeOffset.UtcNow),
+                new[] { "Drama" }, null, 7.5, title, DateTimeOffset.UtcNow, runtimeMinutes),
             CancellationToken.None);
     }
 
@@ -120,6 +120,7 @@ public class PhantomMoviesChannelTests : IDisposable
         var item = result.Items[0];
         Assert.Equal("movie_101", item.Id);
         Assert.Equal("Discovery Movie", item.Name);
+        Assert.Equal(TimeSpan.FromMinutes(95).Ticks, item.RunTimeTicks);
         Assert.Contains("phantom", item.Tags);
         var src = Assert.Single(item.MediaSources);
         AssertOpeningSource(src, "movie_101");
@@ -139,6 +140,7 @@ public class PhantomMoviesChannelTests : IDisposable
         var item = result.Items[0];
         Assert.Equal("movie_202", item.Id);
         Assert.DoesNotContain("phantom", item.Tags);
+        Assert.Equal(TimeSpan.FromMinutes(95).Ticks, item.RunTimeTicks);
         Assert.Equal(fusePath, item.MediaSources[0].Path);
         Assert.True(Guid.TryParse(item.MediaSources[0].Id, out _));
         Assert.Equal("202", item.ProviderIds["Tmdb"]);
@@ -228,6 +230,7 @@ public class PhantomMoviesChannelTests : IDisposable
         Assert.Equal(path, item.MediaSources[0].Path);
         Assert.True(Guid.TryParse(item.MediaSources[0].Id, out _));
         Assert.Equal(2026, item.ProductionYear);
+        Assert.Equal(TimeSpan.FromMinutes(100).Ticks, item.RunTimeTicks);
     }
 
     [Fact]

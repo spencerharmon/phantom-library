@@ -137,7 +137,8 @@ public sealed record TmdbMetadataRow(
     string? OfficialRating,
     double? CommunityRating,
     string? OriginalTitle,
-    DateTimeOffset FetchedAt);
+    DateTimeOffset FetchedAt,
+    int? RuntimeMinutes = null);
 
 /// <summary>
 /// Row of the <c>tmdb_episode_cache</c> table. Per-(series_tmdb_id,
@@ -159,24 +160,25 @@ public sealed record TmdbEpisodeRow(
 
 /// <summary>
 /// SQLite-backed persistence for the plugin's private state under the
-/// channel architecture (schema v11). Single writer, serialised via a
+/// channel architecture (schema v13). Single writer, serialised via a
 /// process-wide <see cref="SemaphoreSlim"/>; concurrent readers
 /// permitted via separate short-lived connections.
 ///
-/// Schema v11 is a clean break from the v5 file-on-disk schema (v6/v7/v8
+/// Schema v13 is a clean break from the v5 file-on-disk schema (v6/v7/v8
 /// were intermediate channel-arch revisions that never reached prod;
 /// v9 adds the <c>tmdb_episode_cache</c> table the shows channel needs
 /// for per-episode display metadata at refresh time; v10 adds
 /// <c>magnet_failure_cache</c> so rejected pack candidates do not
 /// block viable alternatives; v11 adds append-only catalogue and
-/// availability scheduler state). Per
+/// availability scheduler state; v12 adds ranked source candidates;
+/// v13 persists movie runtime minutes for resume eligibility). Per
 /// AGENTS.md "No database migrations until v1.0", existing databases
-/// at any pre-v11 user_version are HARD-REFUSED and the operator must
+/// at any pre-v13 user_version are HARD-REFUSED and the operator must
 /// run <c>scripts/phantom-wipe.sh</c> before restart.
 /// </summary>
 public sealed class PhantomDb : IDisposable
 {
-    private const int CurrentSchemaVersion = 12;
+    private const int CurrentSchemaVersion = 13;
 
     private readonly string _connectionString;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
@@ -273,7 +275,7 @@ public sealed class PhantomDb : IDisposable
                 + $" version {CurrentSchemaVersion}. Downgrade is not supported. Wipe and rebuild.");
         }
 
-        // version == 0: fresh / never-initialised DB. Create the v11 schema.
+        // version == 0: fresh / never-initialised DB. Create the current schema.
         using var tx = conn.BeginTransaction();
         using (var cmd = conn.CreateCommand())
         {
@@ -550,6 +552,7 @@ CREATE TABLE IF NOT EXISTS tmdb_metadata (
     official_rating  TEXT,
     community_rating REAL,
     original_title   TEXT,
+    runtime_minutes  INTEGER,
     fetched_at       INTEGER NOT NULL,
     PRIMARY KEY (tmdb_id, type)
 );
@@ -1282,11 +1285,22 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
                 await using (var cmd = conn.CreateCommand())
                 {
                     cmd.Transaction = (SqliteTransaction)tx;
-                    cmd.CommandText = @"INSERT OR IGNORE INTO tmdb_metadata
+                    cmd.CommandText = @"INSERT INTO tmdb_metadata
                         (tmdb_id, type, title, year, overview, poster_url, backdrop_url,
-                         genres_json, official_rating, community_rating, original_title, fetched_at)
+                         genres_json, official_rating, community_rating, original_title, runtime_minutes, fetched_at)
                         VALUES ($tmdb,$type,$title,$year,$overview,$poster,$backdrop,
-                                $genres,$rating,$community,$origtitle,$fetched);";
+                                $genres,$rating,$community,$origtitle,$runtime,$fetched)
+                        ON CONFLICT(tmdb_id, type) DO UPDATE SET
+                            runtime_minutes=excluded.runtime_minutes,
+                            genres_json=COALESCE(tmdb_metadata.genres_json, excluded.genres_json),
+                            official_rating=COALESCE(tmdb_metadata.official_rating, excluded.official_rating),
+                            community_rating=COALESCE(tmdb_metadata.community_rating, excluded.community_rating),
+                            original_title=COALESCE(tmdb_metadata.original_title, excluded.original_title),
+                            overview=COALESCE(tmdb_metadata.overview, excluded.overview),
+                            poster_url=COALESCE(tmdb_metadata.poster_url, excluded.poster_url),
+                            backdrop_url=COALESCE(tmdb_metadata.backdrop_url, excluded.backdrop_url)
+                        WHERE tmdb_metadata.runtime_minutes IS NULL
+                          AND excluded.runtime_minutes IS NOT NULL;";
                     BindMetadata(cmd, row);
                     metaChange = await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
                 }
@@ -1345,6 +1359,7 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
         cmd.Parameters.AddWithValue("$rating", (object?)row.OfficialRating ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$community", (object?)row.CommunityRating ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$origtitle", (object?)row.OriginalTitle ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$runtime", (object?)row.RuntimeMinutes ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$fetched", row.FetchedAt.ToUnixTimeSeconds());
     }
 
@@ -1823,7 +1838,7 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
         await using var conn = await OpenAsync(ct).ConfigureAwait(false);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = @"SELECT m.tmdb_id,m.type,m.title,m.year,m.overview,m.poster_url,m.backdrop_url,
-                   m.genres_json,m.official_rating,m.community_rating,m.original_title,m.fetched_at,
+                   m.genres_json,m.official_rating,m.community_rating,m.original_title,m.fetched_at,m.runtime_minutes,
                    ms.tmdb_id,ms.type,ms.season,ms.episode,ms.stub_path,ms.fuse_path,ms.materialised_at,
                    a.tmdb_id,a.type,a.season,a.episode,a.status,a.checked_at,a.next_check_at,
                    a.candidate_magnet,a.candidate_info_hash,a.candidate_size,a.candidate_seeders,
@@ -1838,9 +1853,9 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
         while (await r.ReadAsync(ct).ConfigureAwait(false))
         {
             var meta = ReadTmdbMetadata(r, 0);
-            MaterialisedStateRow? mat = r.IsDBNull(12) ? null : new MaterialisedStateRow(
-                r.GetInt32(12), r.GetString(13), r.GetInt32(14), r.GetInt32(15), r.GetString(16), r.GetString(17), DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(18)));
-            AvailabilityItemRow? av = r.IsDBNull(19) ? null : ReadAvailability(r, 19);
+            MaterialisedStateRow? mat = r.IsDBNull(13) ? null : new MaterialisedStateRow(
+                r.GetInt32(13), r.GetString(14), r.GetInt32(15), r.GetInt32(16), r.GetString(17), r.GetString(18), DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(19)));
+            AvailabilityItemRow? av = r.IsDBNull(20) ? null : ReadAvailability(r, 20);
             list.Add(new VisibleMovieRow(meta, mat, av));
         }
 
@@ -1853,7 +1868,7 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
         await using var conn = await OpenAsync(ct).ConfigureAwait(false);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = @"SELECT m.tmdb_id,m.type,m.title,m.year,m.overview,m.poster_url,m.backdrop_url,
-                   m.genres_json,m.official_rating,m.community_rating,m.original_title,m.fetched_at,
+                   m.genres_json,m.official_rating,m.community_rating,m.original_title,m.fetched_at,m.runtime_minutes,
                    COALESCE(av.available_count,0), COALESCE(mat.materialised_count,0)
             FROM tmdb_metadata m
             LEFT JOIN (
@@ -1884,8 +1899,8 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
         {
             list.Add(new VisibleSeriesRow(
                 ReadTmdbMetadata(r, 0),
-                Convert.ToInt32(r.GetInt64(12)),
-                Convert.ToInt32(r.GetInt64(13))));
+                Convert.ToInt32(r.GetInt64(13)),
+                Convert.ToInt32(r.GetInt64(14))));
         }
 
         return list;
@@ -2110,7 +2125,8 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
             r.IsDBNull(offset + 8) ? null : r.GetString(offset + 8),
             r.IsDBNull(offset + 9) ? null : r.GetDouble(offset + 9),
             r.IsDBNull(offset + 10) ? null : r.GetString(offset + 10),
-            DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(offset + 11)));
+            DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(offset + 11)),
+            r.IsDBNull(offset + 12) ? null : r.GetInt32(offset + 12));
     }
 
     private static AvailabilityItemRow ReadAvailability(SqliteDataReader r, int offset = 0)
@@ -2467,9 +2483,9 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
             await using var cmd = conn.CreateCommand();
             cmd.CommandText = @"INSERT OR REPLACE INTO tmdb_metadata
                 (tmdb_id, type, title, year, overview, poster_url, backdrop_url,
-                 genres_json, official_rating, community_rating, original_title, fetched_at)
+                 genres_json, official_rating, community_rating, original_title, runtime_minutes, fetched_at)
                 VALUES ($tmdb,$type,$title,$year,$overview,$poster,$backdrop,
-                        $genres,$rating,$community,$origtitle,$fetched);";
+                        $genres,$rating,$community,$origtitle,$runtime,$fetched);";
             cmd.Parameters.AddWithValue("$tmdb", row.TmdbId);
             cmd.Parameters.AddWithValue("$type", row.Type);
             cmd.Parameters.AddWithValue("$title", row.Title);
@@ -2484,6 +2500,7 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
             cmd.Parameters.AddWithValue("$rating", (object?)row.OfficialRating ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$community", (object?)row.CommunityRating ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$origtitle", (object?)row.OriginalTitle ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$runtime", (object?)row.RuntimeMinutes ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$fetched", row.FetchedAt.ToUnixTimeSeconds());
             await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
@@ -2500,7 +2517,7 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
         await using var conn = await OpenAsync(ct).ConfigureAwait(false);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = @"SELECT tmdb_id, type, title, year, overview, poster_url, backdrop_url,
-                   genres_json, official_rating, community_rating, original_title, fetched_at
+                   genres_json, official_rating, community_rating, original_title, fetched_at, runtime_minutes
             FROM tmdb_metadata
             WHERE type=$type AND ($year IS NULL OR year=$year)
             ORDER BY fetched_at DESC;";
@@ -2527,7 +2544,7 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
         await using var conn = await OpenAsync(ct).ConfigureAwait(false);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = @"SELECT tmdb_id, type, title, year, overview, poster_url, backdrop_url,
-                   genres_json, official_rating, community_rating, original_title, fetched_at
+                   genres_json, official_rating, community_rating, original_title, fetched_at, runtime_minutes
             FROM tmdb_metadata WHERE tmdb_id=$tmdb AND type=$type LIMIT 1;";
         cmd.Parameters.AddWithValue("$tmdb", tmdbId);
         cmd.Parameters.AddWithValue("$type", type);
@@ -2567,7 +2584,8 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
             r.IsDBNull(8) ? null : r.GetString(8),
             r.IsDBNull(9) ? null : r.GetDouble(9),
             r.IsDBNull(10) ? null : r.GetString(10),
-            DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(11)));
+            DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(11)),
+            r.IsDBNull(12) ? null : r.GetInt32(12));
     }
 
     private static string NormalizeTitle(string? title)
