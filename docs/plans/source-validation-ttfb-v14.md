@@ -1,37 +1,37 @@
-# Source validation + TTFB hardening plan (schema v13)
+# Source validation + TTFB hardening plan (schema v14)
 
 Date: 2026-06-24
 
-Scope authority: operator request to fix audio-language correctness, parallel candidate validation, season/series pack sanity, empirical materialise timing evidence, and gostream iowait mitigation. No requirement in this plan is deferred or dropped. v13 offline migration is operator-approved.
+Scope authority: operator request to fix audio-language correctness, parallel candidate validation, season/series pack sanity, empirical materialise timing evidence, and gostream iowait mitigation. No requirement in this plan is deferred or dropped. v14 offline migration is operator-approved.
 
 ## Requirements ledger
 
 | ID | Requirement | Disposition | Acceptance evidence required | Notes |
 |---|---|---|---|---|
-| REQ-SV13-AUDIO-ENGLISH | A source file is valid only if English audio is available; when English is available it must be selected for playback. | IMPLEMENT | gostream unit tests with Polish-default+English-present selects English; no-English rejects; plugin/gostream integration evidence showing selected English track in response/stub/playback. | No fallback to non-English without explicit future operator approval. |
-| REQ-SV13-PARALLEL-VALIDATION | Check candidate viability in bounded parallel so the top working candidate can be picked without serially trying every bad candidate. | IMPLEMENT | Unit tests proving bounded parallelism, stop condition, top-ranked-valid selection, and failure caching; rig evidence with multiple bad candidates before a good exact episode candidate. | Parallelism must be bounded to protect disk/network. |
-| REQ-SV13-CANDIDATE-PRUNE | Non-working candidates are removed from or clearly disabled in the list after validation failure. | IMPLEMENT | API/UI tests showing failed candidates get `isRejected=true` / failure reason and are not selectable unless override path exists; DB assertions for persisted failure/validation state. | Existing `magnet_failure_cache` remains source of hard rejection. |
-| REQ-SV13-PACK-SANITY | Rejected season/series packs must be sanity-checked with real file-list evidence; parser must handle common valid pack layouts. | IMPLEMENT | Captured file-list fixtures from rejected Avatar packs; parser tests for Season/Book/Chapter/SxxExx/2x01/201 patterns; rig/source validation evidence showing valid packs accepted and invalid packs rejected with reason. | Do not assume all packs are bad. |
-| REQ-SV13-TIMING-EVIDENCE | Produce empirical timing evidence for materialise time-to-first-byte phases before/with optimisations. | IMPLEMENT | Structured plugin + gostream timing logs/metrics; documented run commands; before/after table for indexer probe, validation, gostream add, metadata wait, file selection, audio probe, stub write, FUSE wait, channel refresh, PlaybackInfo/open. | Evidence required before claiming speedup. |
-| REQ-SV13-IOWAIT-MITIGATION | Reduce or bound gostream-driven iowait during materialisation and bulk favourite flows. | IMPLEMENT | iostat/pidstat evidence; bounded validation/materialise concurrency; service/cgroup or queue controls tested; no unbounded favourite-season/series fanout. | Mitigation must not silently skip requested materialisations. |
-| REQ-SV13-BULK-FAV-THROTTLE | Favourite season/series materialisation must be queued/throttled rather than firing all episodes at once. | IMPLEMENT | Unit tests for queueing all episodes with bounded active materialisations; live/rig evidence bulk favourite does not create unbounded concurrent gostream adds. | All episodes still scheduled; none dropped. |
-| REQ-SV13-SOURCE-CANDIDATE-V13 | Persist validation state for source candidates in schema v13 via offline migration. | IMPLEMENT | Clone-tested migration; idempotency; backup creation; `PRAGMA user_version=13`; migration seeds existing v12 rows; rollback guidance. | Offline migration explicitly approved by operator. |
+| REQ-SV14-AUDIO-ENGLISH | A source file is valid only if English audio is available; when English is available it must be selected for playback. | IMPLEMENT | gostream unit tests with Polish-default+English-present selects English; no-English rejects; plugin/gostream integration evidence showing selected English track in response/stub/playback. | No fallback to non-English without explicit future operator approval. |
+| REQ-SV14-PARALLEL-VALIDATION | Check candidate viability in bounded parallel so the top working candidate can be picked without serially trying every bad candidate. | IMPLEMENT | Unit tests proving bounded parallelism, stop condition, top-ranked-valid selection, and failure caching; rig evidence with multiple bad candidates before a good exact episode candidate. | Parallelism must be bounded to protect disk/network. |
+| REQ-SV14-CANDIDATE-PRUNE | Non-working candidates are removed from or clearly disabled in the list after validation failure. | IMPLEMENT | API/UI tests showing failed candidates get `isRejected=true` / failure reason and are not selectable unless override path exists; DB assertions for persisted failure/validation state. | Existing `magnet_failure_cache` remains source of hard rejection. |
+| REQ-SV14-PACK-SANITY | Rejected season/series packs must be sanity-checked with real file-list evidence; parser must handle common valid pack layouts. | IMPLEMENT | Captured file-list fixtures from rejected Avatar packs; parser tests for Season/Book/Chapter/SxxExx/2x01/201 patterns; rig/source validation evidence showing valid packs accepted and invalid packs rejected with reason. | Do not assume all packs are bad. |
+| REQ-SV14-TIMING-EVIDENCE | Produce empirical timing evidence for materialise time-to-first-byte phases before/with optimisations. | IMPLEMENT | Structured plugin + gostream timing logs/metrics; documented run commands; before/after table for indexer probe, validation, gostream add, metadata wait, file selection, audio probe, stub write, FUSE wait, channel refresh, PlaybackInfo/open. | Evidence required before claiming speedup. |
+| REQ-SV14-IOWAIT-MITIGATION | Reduce or bound gostream-driven iowait during materialisation and bulk favourite flows. | IMPLEMENT | iostat/pidstat evidence; bounded validation/materialise concurrency; service/cgroup or queue controls tested; no unbounded favourite-season/series fanout. | Mitigation must not silently skip requested materialisations. |
+| REQ-SV14-BULK-FAV-THROTTLE | Favourite season/series materialisation must be queued/throttled rather than firing all episodes at once. | IMPLEMENT | Unit tests for queueing all episodes with bounded active materialisations; live/rig evidence bulk favourite does not create unbounded concurrent gostream adds. | All episodes still scheduled; none dropped. |
+| REQ-SV14-SOURCE-CANDIDATE-V14 | Persist validation state for source candidates in schema v14 via offline migration. | IMPLEMENT | Clone-tested migration; idempotency; backup creation; `PRAGMA user_version=14`; migration seeds existing v13 `source_candidates` rows; rollback guidance. | Offline migration explicitly approved by operator. |
 
 ## Current observed failure modes
 
 1. **Wrong audio selected**: gostream selects a video file but does not validate/select audio language. Playback can default to Polish even when English exists.
 2. **Candidate validation is serial and expensive**: materialiser attempts candidates one at a time through full `/api/library/add`; bad packs can hold `materialise_in_flight` and delay exact candidates.
 3. **Pack rejection may be parser failure**: Avatar season/series packs were rejected with `target_episode_not_found`, `no_valid_files`, and `fuse_path_missing`; several likely contain requested episodes but use naming patterns not parsed today.
-4. **Source list / validation state partially durable**: v12 persists candidates, but not validation details such as selected file id/path/audio track or validation timing.
+4. **Source list / validation state partially durable**: current schema v13 persists candidates and movie runtime minutes, but not validation details such as selected file id/path/audio track or validation timing.
 5. **Bulk favourite can stampede**: season/series favourite currently fires materialisation for every episode; materialiser has per-item in-flight guard but no bulk backpressure at listener level.
 6. **Empirical timing incomplete**: we have anecdotal 30+ second source API/materialise waits but no phase timing across plugin+gostream.
 
-## v13 persistence design
+## v14 persistence design
 
 No foreign keys. Add validation columns to `source_candidates` rather than separate FK table, because validation state is per `(item,preset,magnet)`.
 
 ```sql
-ALTER-equivalent v13 create-from-scratch / offline migration target:
+ALTER-equivalent v14 create-from-scratch / offline migration target:
 
 source_candidates (
     tmdb_id    INTEGER NOT NULL,
@@ -77,25 +77,25 @@ idx_source_candidates_expiry(expires_at)
 idx_source_candidates_hash(info_hash)
 ```
 
-Offline migration script `scripts/migrate-source-candidates-v13.sh`:
+Offline migration script `scripts/migrate-source-validation-v14.sh`:
 
 1. Requires Jellyfin stopped for production DB paths.
 2. Backs up `phantom.db`, `-wal`, `-shm`.
-3. Accepts v12 only; idempotent if already v13 with target columns.
-4. Creates new table, copies all v12 rows with validation fields `unknown` and null selected-file/audio fields.
+3. Accepts v13 only; idempotent if already v14 with target columns.
+4. Creates new table, copies all existing v13 `source_candidates` rows with validation fields `unknown` and null selected-file/audio fields.
 5. Rebuilds indexes.
-6. Marks pre-SV13 episode hard failures for pack/file-selection reasons as stale by expiring or deleting matching `magnet_failure_cache` rows so they are revalidated under `SourceValidationPolicyVersion=sv13-parser-audio-v1`.
-7. Sets `PRAGMA user_version=13`.
+6. Marks pre-SV14 episode hard failures for pack/file-selection reasons as stale by expiring or deleting matching `magnet_failure_cache` rows so they are revalidated under `SourceValidationPolicyVersion=sv14-parser-audio-v1`.
+7. Sets `PRAGMA user_version=14`.
 8. Verifies row counts and idempotency against clone before handoff.
 
 Plugin startup/fresh-DB requirements:
 
-- `PhantomDb.CurrentSchemaVersion` must be 13.
-- fresh empty DB must create v13 `source_candidates` with validation columns including `validation_policy_version`.
-- fresh empty DB must create v13 `magnet_failure_cache.validation_policy_version`.
+- `PhantomDb.CurrentSchemaVersion` must be 14.
+- fresh empty DB must create v14 `source_candidates` with validation columns including `validation_policy_version`.
+- fresh empty DB must create v14 `magnet_failure_cache.validation_policy_version`.
 - fresh empty DB must create `bulk_materialise_requests` and `bulk_materialise_items` with indexes.
-- startup on v12 must hard-refuse with explicit instruction to stop Jellyfin and run the v13 offline migration script, not generic wipe guidance.
-- tests must cover fresh v13 schema, v12 refusal message, migration idempotency, query/write against every new validation column, policy-version stale failure ignore/revalidate behavior, and query/write/recovery against bulk materialise tables.
+- startup on v13 must hard-refuse with explicit instruction to stop Jellyfin and run the v14 offline migration script, not generic wipe guidance.
+- tests must cover fresh v14 schema, v13 refusal message with migration-script pointer, migration idempotency, query/write against every new validation column, policy-version stale failure ignore/revalidate behavior, and query/write/recovery against bulk materialise tables.
 
 ## gostream API changes
 
@@ -113,7 +113,7 @@ Required contract:
    - channel count,
    - default flag if available.
 2. gostream must choose an English audio track before returning `valid`.
-3. Audio index semantics are fixed for SV13:
+3. Audio index semantics are fixed for SV14:
    - `selected_audio_index` means ffprobe `streams[].index` for the selected video file.
    - gostream stream URLs/stubs must use query key `audio_stream_index=<ffprobe stream index>`.
    - gostream must map `audio_stream_index` to the correct container/demuxer stream internally; callers never pass Matroska track number.
@@ -125,14 +125,14 @@ Required contract:
    - add response/stub includes selected audio contract,
    - Jellyfin `PlaybackInfo.MediaSources[0].MediaStreams` exposes English audio as selected/default or stream playback starts with English according to available API evidence.
 
-No implementation may claim REQ-SV13-AUDIO-ENGLISH done by merely detecting English without proving playback uses it.
+No implementation may claim REQ-SV14-AUDIO-ENGLISH done by merely detecting English without proving playback uses it.
 
 ### `POST /api/library/validate`
 
 Access-control contract:
 
 - `/api/library/validate`, `/api/library/validate/release`, `/api/library/add`, and `/api/library/remove` must share the same protection.
-- SV13 must add `X-Gostream-Token` shared-secret support for these mutation/validation endpoints.
+- SV14 must add `X-Gostream-Token` shared-secret support for these mutation/validation endpoints.
 - If token is configured, every request must present the correct token, including loopback clients; loopback does not bypass configured token auth.
 - If token is not configured, endpoints must accept only loopback clients (`127.0.0.1` / `::1`) and reject non-loopback with HTTP `403`.
 - Plugin config/install must pass token when configured.
@@ -213,7 +213,7 @@ Rules:
 - English track required for `valid`.
 - If English exists, `selected_audio_index` must point to English ffprobe stream index.
 - Non-English-only files are invalid.
-- Transient metadata/indexer/audio failures must not be cached as hard invalid; plugin persists v13 `validation_status='transient'`, `validation_reason`, and `validation_expires_at=now+SourceValidationTransientRetryMinutes`. Plugin ignores gostream retry hints for persistence except for logging.
+- Transient metadata/indexer/audio failures must not be cached as hard invalid; plugin persists v14 `validation_status='transient'`, `validation_reason`, and `validation_expires_at=now+SourceValidationTransientRetryMinutes`. Plugin ignores gostream retry hints for persistence except for logging.
 - Validate must not write a stub and must not leave losing/invalid torrents in an active downloading state.
 - Plugin generates `validation_session_id` as a UUID per candidate validation attempt and sends it in `/validate`.
 - gostream echoes `validation_session_id` and `validation_lease_expires_at` in `/validate` response.
@@ -276,8 +276,8 @@ For movie/episode materialise:
    - if all higher-ranked candidates are `invalid`, selected lower valid candidate may win;
    - if higher-ranked candidates are `transient`, response must state selected winner was chosen over transient higher-ranked candidates and persist transient status with short retry, not hard reject;
    - if timeout expires before any valid candidate and unvalidated candidates remain, materialise returns `validation_timeout` with candidates left unmodified except transient validation state.
-7. Persist validation result to v13 columns.
-8. Mark invalid hard failures in `magnet_failure_cache` when appropriate. Scope is per item because `MagnetFailureKey` includes `tmdb_id,type,season,episode,preset,magnet`; a pack invalid for S02E01 must remain eligible for S02E02 unless separately failed for that episode. TTL for hard validation failures uses `SourceValidationTtlHours`; operator override can bypass only for the exact item/magnet key. SV13 introduces `SourceValidationPolicyVersion`; pre-SV13 hard failures for `target_episode_not_found`, `no_valid_files`, `fuse_path_missing`, and audio-related reasons must be treated as stale for episode candidates and revalidated under the new parser/audio policy before disabling the candidate.
+7. Persist validation result to v14 columns.
+8. Mark invalid hard failures in `magnet_failure_cache` when appropriate. Scope is per item because `MagnetFailureKey` includes `tmdb_id,type,season,episode,preset,magnet`; a pack invalid for S02E01 must remain eligible for S02E02 unless separately failed for that episode. TTL for hard validation failures uses `SourceValidationTtlHours`; operator override can bypass only for the exact item/magnet key. SV14 introduces `SourceValidationPolicyVersion`; pre-SV14 hard failures for `target_episode_not_found`, `no_valid_files`, `fuse_path_missing`, and audio-related reasons must be treated as stale for episode candidates and revalidated under the new parser/audio policy before disabling the candidate.
 9. Call `/api/library/add` with selected file/audio hints.
 10. Persist materialised state only after FUSE path exists.
 
@@ -292,7 +292,7 @@ Config/time budget contract:
 - `SourceValidationLeaseMinutes` default `10`, min `1`, max `60`; gostream validation lease expiry.
 - `BulkMaterialiseRunningStaleMinutes` default `30`, min `1`, max `1440`; stale `running` bulk items reset to `retry` on startup.
 - `BulkMaterialiseWorkerCount` default `2`, min `1`, max `8`; maximum claimed/running bulk items, still subject to `GostreamHeavyConcurrency` for gostream I/O.
-- `SourceValidationPolicyVersion` default `sv13-parser-audio-v1`; persisted with validation state and used to ignore/revalidate stale failures from older parser/audio policies.
+- `SourceValidationPolicyVersion` default `sv14-parser-audio-v1`; persisted with validation state and used to ignore/revalidate stale failures from older parser/audio policies.
 - If config fields are absent, these exact defaults apply; tests must prove defaulting and bounds.
 
 Required race tests:
@@ -418,9 +418,9 @@ Implement all:
 
 ### plugin unit tests
 
-- v13 migration creates validation columns and preserves v12 rows.
-- Fresh DB creates v13 table/columns.
-- Startup on v12 refuses with v13 migration-script pointer.
+- v14 migration creates validation columns and preserves existing v13 source candidate rows.
+- Fresh DB creates v14 table/columns.
+- Startup on v12 refuses with v14 migration-script pointer.
 - Candidate API returns cached candidates when indexers down.
 - Parallel validation picks top valid after higher-ranked invalid.
 - Parallel validation waits for slower higher-ranked valid before picking lower-ranked valid.
@@ -435,12 +435,12 @@ Implement all:
 - Avatar S02E01 exact candidate materialises without trying bad packs first.
 - Season pack fixture validates if parser supports actual layout.
 - Playback starts with English audio selected.
-- Candidate list loads from v13 cache with indexers disabled/down.
+- Candidate list loads from v14 cache with indexers disabled/down.
 - iowait evidence captured before/after.
 
-## Durable bulk favourite queue requirement
+## Magnet failure policy version
 
-### v13 `magnet_failure_cache` extension
+### v14 `magnet_failure_cache` extension
 
 Add column:
 
@@ -453,13 +453,13 @@ Rules:
 - New hard validation failures write current `SourceValidationPolicyVersion`.
 - Failure lookup ignores rows whose `validation_policy_version` differs from current policy for parser/audio-sensitive reasons (`target_episode_not_found`, `no_valid_files`, `fuse_path_missing`, `no_english_audio`, `no_main_english_audio`, `audio_probe_unsupported_format`).
 - Operator rejections (`operator_rejected`) remain valid across policy versions unless operator override is requested.
-- v13 migration sets existing rows to `legacy`, then expires/deletes parser/audio-sensitive episode failures so they are revalidated under SV13.
+- v14 migration sets existing rows to `legacy`, then expires/deletes parser/audio-sensitive episode failures so they are revalidated under SV14.
 
 ## Durable bulk favourite queue requirement
 
-The current fire-and-forget season/series favourite behavior is not sufficient for SV13. Implement a durable queue.
+The current fire-and-forget season/series favourite behavior is not sufficient for SV14. Implement a durable queue.
 
-### v13 table: `bulk_materialise_requests`
+### v14 table: `bulk_materialise_requests`
 
 ```sql
 CREATE TABLE bulk_materialise_requests (
@@ -484,7 +484,7 @@ CREATE UNIQUE INDEX idx_bulk_materialise_requests_active_parent
     WHERE status IN ('pending','running');
 ```
 
-### v13 table: `bulk_materialise_items`
+### v14 table: `bulk_materialise_items`
 
 ```sql
 CREATE TABLE bulk_materialise_items (
@@ -543,7 +543,7 @@ No FK per operator no-FK direction; request/item relationship is enforced by cod
 
 ### Migration/fresh-schema/test requirements
 
-- v13 offline migration creates both bulk tables and indexes along with source-candidate validation columns.
+- v14 offline migration creates both bulk tables and indexes along with source-candidate validation columns.
 - Fresh DB creates both bulk tables.
 - Idempotency check verifies both bulk tables and source-candidate validation columns.
 - Startup validation/query tests cover both bulk tables.
@@ -552,7 +552,7 @@ No FK per operator no-FK direction; request/item relationship is enforced by cod
 ## Handoff / migration steps
 
 1. Stop Jellyfin.
-2. Run clone-tested `scripts/migrate-source-candidates-v13.sh`.
+2. Run clone-tested `scripts/migrate-source-validation-v14.sh`.
 3. Install plugin and gostream build.
 4. Restart gostream if gostream changed.
 5. Restart Jellyfin.
@@ -571,7 +571,7 @@ After checkpoint, backup artifact is the main `phantom.db`; `-wal` and `-shm` ar
 
 - migration exits non-zero;
 - post-migration verification row counts mismatch;
-- plugin refuses v13 DB on startup;
+- plugin refuses v14 DB on startup;
 - source candidate queries fail due missing validation/bulk columns.
 
 Rollback steps:
@@ -592,6 +592,6 @@ Rollback steps:
 4. Verify `PRAGMA user_version=12` on restored DB.
 5. Start Jellyfin.
 
-Compatibility rule: once v13 plugin has successfully written validation/bulk rows, rollback requires restoring the pre-v13 backup; v12 plugin must not run against v13 DB.
+Compatibility rule: once v14 plugin has successfully written validation/bulk rows, rollback requires restoring the pre-v14 backup; v12 plugin must not run against v14 DB.
 
 No requirement above is deferred. If any item cannot be implemented honestly, stop and request operator disposition before marking done.
