@@ -2,7 +2,7 @@
 
 Date: 2026-06-24
 
-Scope authority: operator request to fix audio-language correctness, parallel candidate validation, season/series pack sanity, empirical materialise timing evidence, and gostream iowait mitigation. No requirement in this plan is deferred or dropped. v14 offline migration is operator-approved.
+Scope authority: operator request to fix audio-language correctness, parallel candidate validation, season/series pack sanity, empirical materialise timing evidence, and gostream iowait mitigation. Latest main includes server-advertised Phantom item actions (`PhantomItemActionProvider`) for materialise/reset/reject/candidate selection; SV14 must keep those action paths behaviorally identical to REST+kebab paths. No requirement in this plan is deferred or dropped. v14 offline migration is operator-approved.
 
 ## Requirements ledger
 
@@ -10,7 +10,7 @@ Scope authority: operator request to fix audio-language correctness, parallel ca
 |---|---|---|---|---|
 | REQ-SV14-AUDIO-ENGLISH | A source file is valid only if English audio is available; when English is available the plugin must select it for Jellyfin playback. | IMPLEMENT | gostream unit tests with Polish-default+English-present validates/returns English index; no-English rejects; plugin/Jellyfin tests prove `DefaultAudioStreamIndex` / playback `AudioStreamIndex` is English even when Polish is container-default. | No fallback to non-English without explicit future operator approval. |
 | REQ-SV14-PARALLEL-VALIDATION | Check candidate viability in bounded parallel so the top working candidate can be picked without serially trying every bad candidate. | IMPLEMENT | Unit tests proving bounded parallelism, stop condition, top-ranked-valid selection, and failure caching; rig evidence with multiple bad candidates before a good exact episode candidate. | Parallelism must be bounded to protect disk/network. |
-| REQ-SV14-CANDIDATE-PRUNE | Non-working candidates are removed from or clearly disabled in the list after validation failure. | IMPLEMENT | API/UI tests showing failed candidates get `isRejected=true` / failure reason and are not selectable unless override path exists; DB assertions for persisted failure/validation state. | Existing `magnet_failure_cache` remains source of hard rejection. |
+| REQ-SV14-CANDIDATE-PRUNE | Non-working candidates are removed from or clearly disabled in the list/action surfaces after validation failure. | IMPLEMENT | API/UI/item-action tests showing failed candidates get `isRejected=true` / failure reason and are not selectable/advertised unless override path exists; DB assertions for persisted failure/validation state. | Existing `magnet_failure_cache` remains source of hard rejection. |
 | REQ-SV14-PACK-SANITY | Rejected season/series packs must be sanity-checked with real file-list evidence; parser must handle common valid pack layouts. | IMPLEMENT | Captured file-list fixtures from rejected Avatar packs; parser tests for Season/Book/Chapter/SxxExx/2x01/201 patterns; rig/source validation evidence showing valid packs accepted and invalid packs rejected with reason. | Do not assume all packs are bad. |
 | REQ-SV14-TIMING-EVIDENCE | Produce empirical timing evidence for materialise time-to-first-byte phases before/with optimisations. | IMPLEMENT | Structured plugin + gostream timing logs/metrics; documented run commands; before/after table for indexer probe, validation, gostream add, metadata wait, file selection, audio probe, stub write, FUSE wait, channel refresh, PlaybackInfo/open. | Evidence required before claiming speedup. |
 | REQ-SV14-IOWAIT-MITIGATION | Reduce or bound gostream-driven iowait during materialisation and bulk favourite flows. | IMPLEMENT | iostat/pidstat evidence; bounded validation/materialise concurrency; service/cgroup or queue controls tested; no unbounded favourite-season/series fanout. | Mitigation must not silently skip requested materialisations. |
@@ -389,7 +389,7 @@ Acceptance report must include before/after table for at least:
 
 Implement all:
 
-1. Add one global plugin-side `GostreamHeavyLimiter` covering every gostream `/validate` and `/add` call from bulk favourite, manual materialise, selected-source materialise, and reject-current re-materialise. Config key `GostreamHeavyConcurrency` default `2`, min `1`, max `4`. Acquisition boundary is each individual gostream HTTP call, not the whole materialise orchestration; every validate/add helper acquires before HTTP call and releases in `finally`. `SourceValidationParallelism` controls attempted parallel tasks, but actual concurrent gostream calls can never exceed `GostreamHeavyConcurrency`. Tests assert `GostreamHeavyConcurrency=1` has no self-deadlock and combined concurrent validate+add calls never exceed configured cap.
+1. Add one global plugin-side `GostreamHeavyLimiter` covering every gostream `/validate` and `/add` call from bulk favourite, manual materialise, selected-source materialise, item-action materialise/candidate selection, and reject-current re-materialise. Config key `GostreamHeavyConcurrency` default `2`, min `1`, max `4`. Acquisition boundary is each individual gostream HTTP call, not the whole materialise orchestration; every validate/add helper acquires before HTTP call and releases in `finally`. `SourceValidationParallelism` controls attempted parallel tasks, but actual concurrent gostream calls can never exceed `GostreamHeavyConcurrency`. Tests assert `GostreamHeavyConcurrency=1` has no self-deadlock and combined concurrent validate+add calls never exceed configured cap.
 2. Throttle favourite season/series bulk flow through queue; all episodes scheduled durably, but active gostream adds bounded.
 3. Prefer exact episode releases before packs to avoid huge pack metadata/file walks unless needed.
 4. Cache validation state to avoid repeated metadata/audio probes.
@@ -397,7 +397,7 @@ Implement all:
    - `IOSchedulingClass=best-effort`
    - `IOSchedulingPriority=7`
    - `IOWeight=100`
-6. Define global gostream-heavy concurrency boundary covering validate, add, bulk favourite, manual materialise, and selected-source materialise. Legacy gostream syncer interactions must be measured and documented; if not controllable by plugin, gostream-side limiter must be added.
+6. Define global gostream-heavy concurrency boundary covering validate, add, bulk favourite, manual materialise, selected-source materialise, and server-advertised item actions. Legacy gostream syncer interactions must be measured and documented; if not controllable by plugin, gostream-side limiter must be added.
 
 ## Test matrix
 
@@ -424,6 +424,8 @@ Implement all:
 - Fresh DB creates v14 table/columns.
 - Startup on v13 refuses with v14 migration-script pointer.
 - Candidate API returns cached candidates when indexers down.
+- `PhantomItemActionProvider` advertises only validation-eligible candidate actions; rejected/invalid candidates are omitted or disabled consistently with REST+kebab source list.
+- `PhantomItemActionProvider.InvokeAsync` materialise/reset/reject/candidate paths use the same validation, failure-cache, stale-in-flight, and gostream limiter paths as REST+kebab operations.
 - Parallel validation picks top valid after higher-ranked invalid.
 - Parallel validation waits for slower higher-ranked valid before picking lower-ranked valid.
 - Invalid candidates persisted/disabled with reasons.
