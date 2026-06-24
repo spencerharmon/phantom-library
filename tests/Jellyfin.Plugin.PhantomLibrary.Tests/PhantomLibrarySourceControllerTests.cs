@@ -272,6 +272,16 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
             new UnavailableKey(42, "tt0000042", "movie", null, null),
             TimeSpan.FromHours(24),
             CancellationToken.None);
+        await db.MarkMagnetFailedAsync(
+            new MagnetFailureKey(42, "tt0000042", "movie", null, null, "test", current.Magnet),
+            new MagnetFailureEntry
+            {
+                InfoHash = current.InfoHash,
+                Reason = "fuse_path_missing",
+                FailedAt = DateTimeOffset.UtcNow,
+                RetryAfter = DateTimeOffset.UtcNow.AddHours(24),
+            },
+            CancellationToken.None);
         var gostream = new Mock<IGostreamClient>(MockBehavior.Loose);
         var ctrl = BuildController(db, new[] { current }, gostream);
 

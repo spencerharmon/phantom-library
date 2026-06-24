@@ -257,6 +257,10 @@ public sealed class PhantomSourceManager
             await DeleteCurrentStateAndMaybeRemoveAsync(key, current.Value.State, current.Value.Entry?.InfoHash, ct).ConfigureAwait(false);
         }
 
+        var cfg = _configProvider();
+        await _db.DeleteMagnetFailuresAsync(
+            CacheKey(key, imdb, cfg.SourcePickerPreset),
+            ct).ConfigureAwait(false);
         await _db.DeleteUnavailableAsync(
             new UnavailableKey(key.TmdbId, imdb, key.Type, key.Season, key.Episode),
             ct).ConfigureAwait(false);

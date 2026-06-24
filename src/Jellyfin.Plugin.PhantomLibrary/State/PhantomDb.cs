@@ -749,6 +749,31 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
         }
     }
 
+    public async Task<int> DeleteMagnetFailuresAsync(MagnetCacheKey key, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"DELETE FROM magnet_failure_cache
+                WHERE tmdb_id=$tmdb
+                  AND imdb_id=$imdb
+                  AND type=$type
+                  AND season=$season
+                  AND episode=$episode
+                  AND preset=$preset;";
+            BindKey(cmd, key);
+            cmd.Parameters.AddWithValue("$preset", key.Preset);
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public async Task<int> PurgeExpiredMagnetFailuresAsync(CancellationToken ct)
     {
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
