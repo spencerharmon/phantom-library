@@ -467,6 +467,11 @@ public sealed class PhantomMoviesChannel
             item.Genres = meta.Genres.ToList();
         }
 
+        if (meta.RuntimeMinutes is { } rt && rt > 0)
+        {
+            item.RunTimeTicks = TimeSpan.FromMinutes(rt).Ticks;
+        }
+
         item.ProviderIds["Tmdb"] = meta.TmdbId.ToString(System.Globalization.CultureInfo.InvariantCulture);
         return item;
     }
@@ -487,7 +492,8 @@ public sealed class PhantomMoviesChannel
             null,
             movie.VoteAverage,
             movie.OriginalTitle,
-            DateTimeOffset.UtcNow);
+            DateTimeOffset.UtcNow,
+            movie.Runtime > 0 ? movie.Runtime : null);
     }
 
     private static bool TryParseGostreamMovieName(string path, out string title, out int? year)

@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- BREAKING: requires wipe. Phantom DB schema is now v13 to persist TMDB movie runtime minutes; this lets Phantom movie channel items expose `RunTimeTicks` so Jellyfin can save playback progress and list movies in Continue Watching.
+- Added rig coverage for Phantom movie and episode `RunTimeTicks`, playback-progress reporting, and `/Users/{userId}/Items/Resume` Continue Watching results.
 - Added `scripts/prestage-materialised.sh`, an operator dry-run/commit helper that reads `materialised_state` and asks gostream Vault Mode to prestage existing materialised movies and episodes.
 - BREAKING: requires offline migration. Phantom DB schema is now v12 to persist ranked source candidates in `source_candidates`; run `scripts/migrate-source-candidates-v12.sh` with Jellyfin stopped before starting this build.
 - Added Phantom source-management APIs and web controls for listing candidates, rejecting the current source, and materialising a selected candidate from stable channel external IDs.
