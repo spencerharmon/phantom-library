@@ -22,7 +22,7 @@ Scope authority: operator request to fix audio-language correctness, parallel ca
 1. **Wrong audio selected**: gostream/plugin path selects a video file but Jellyfin playback is left to container default audio. Playback can default to Polish even when English exists; plugin must set Jellyfin audio selection to English automatically.
 2. **Candidate validation is serial and expensive**: materialiser attempts candidates one at a time through full `/api/library/add`; bad packs can hold `materialise_in_flight` and delay exact candidates.
 3. **Pack rejection may be parser failure**: Avatar season/series packs were rejected with `target_episode_not_found`, `no_valid_files`, and `fuse_path_missing`; several likely contain requested episodes but use naming patterns not parsed today.
-4. **Source list / validation state partially durable**: current schema v13 persists candidates and movie runtime minutes, but not validation details such as selected file id/path/audio track or validation timing.
+4. **Source list / validation state partially durable**: current schema v13 persists candidates and movie runtime minutes, but not validation status/reason/timing or selected pack file hints. Audio-language indexes do not need durable schema; plugin selects preferred audio from Jellyfin-visible media streams at playback/open time.
 5. **Bulk favourite can stampede**: season/series favourite currently fires materialisation for every episode; materialiser has per-item in-flight guard but no bulk backpressure at listener level.
 6. **Empirical timing incomplete**: we have anecdotal 30+ second source API/materialise waits but no phase timing across plugin+gostream.
 
@@ -60,9 +60,6 @@ source_candidates (
     selected_file_id INTEGER,
     selected_file_path TEXT,
     selected_file_size INTEGER,
-    selected_audio_index INTEGER,
-    selected_audio_language TEXT,
-    audio_tracks_json TEXT,
 
     PRIMARY KEY (tmdb_id,type,season,episode,preset,magnet)
 )
@@ -82,7 +79,7 @@ Offline migration script `scripts/migrate-source-validation-v14.sh`:
 1. Requires Jellyfin stopped for production DB paths.
 2. Backs up `phantom.db`, `-wal`, `-shm`.
 3. Accepts v13 only; idempotent if already v14 with target columns.
-4. Creates new table, copies all existing v13 `source_candidates` rows with validation fields `unknown` and null selected-file/audio fields.
+4. Creates new table, copies all existing v13 `source_candidates` rows with validation fields `unknown` and null selected-file fields.
 5. Rebuilds indexes.
 6. Marks pre-SV14 episode hard failures for pack/file-selection reasons as stale by expiring or deleting matching `magnet_failure_cache` rows so they are revalidated under `SourceValidationPolicyVersion=sv14-parser-audio-v1`.
 7. Sets `PRAGMA user_version=14`.
@@ -91,7 +88,7 @@ Offline migration script `scripts/migrate-source-validation-v14.sh`:
 Plugin startup/fresh-DB requirements:
 
 - `PhantomDb.CurrentSchemaVersion` must be 14.
-- fresh empty DB must create v14 `source_candidates` with validation columns including `validation_policy_version`.
+- fresh empty DB must create v14 `source_candidates` with validation columns including `validation_policy_version`; no durable audio-index columns are required.
 - fresh empty DB must create v14 `magnet_failure_cache.validation_policy_version`.
 - fresh empty DB must create `bulk_materialise_requests` and `bulk_materialise_items` with indexes.
 - startup on v13 must hard-refuse with explicit instruction to stop Jellyfin and run the v14 offline migration script, not generic wipe guidance.
@@ -113,21 +110,18 @@ Required contract:
    - channel count,
    - default flag if available.
 2. gostream must validate that the plugin-requested preferred audio language is present before returning `valid`, and must return the matching preferred-language ffprobe stream index. If Polish and English are both present and Polish is container-default, a request with preferred English still returns the English stream index.
-3. Plugin must persist the preferred-language audio proof (`selected_audio_index`, `selected_audio_language`, `audio_tracks_json`) and must set Jellyfin playback selection from that proof:
-   - materialised/native-open `MediaSourceInfo` must include audio `MediaStreams` built from persisted validation tracks where Jellyfin can represent them,
-   - `MediaSourceInfo.DefaultAudioStreamIndex` must be set to the preferred-language stream index when Jellyfin exposes matching indices,
-   - if Jellyfin remaps indices, plugin must map persisted gostream/ffprobe index to Jellyfin `MediaStream.Index` before setting default,
+3. Plugin must set Jellyfin playback selection at playback/open time from the actual file Jellyfin is about to read:
+   - after materialise, plugin uses the file path/FUSE path and Jellyfin-visible media streams (or a plugin-side bounded media probe if streams are not yet populated) to find preferred-language audio,
+   - `MediaSourceInfo.DefaultAudioStreamIndex` must be set to the preferred-language Jellyfin `MediaStream.Index`,
+   - if stream indexes differ between ffprobe/gostream and Jellyfin, plugin uses Jellyfin's index for Jellyfin selection,
    - plugin must pass selected audio intent through any `/PlaybackInfo` / `/LiveStreams/Open` path it controls and must not leave default audio to container order.
-4. Audio index semantics are fixed for SV14:
-   - `selected_audio_index` means ffprobe `streams[].index` for the selected video file.
-   - gostream stream URLs/stubs may carry query key `audio_stream_index=<ffprobe stream index>` as a downstream hint, but this is not sufficient by itself; plugin still sets Jellyfin selection.
-   - gostream must map `audio_stream_index` to the correct container/demuxer stream internally; callers never pass Matroska track number.
-   - Jellyfin evidence must compare against `MediaSourceInfo.DefaultAudioStreamIndex`, `MediaStream.Index`, and playback/open request `AudioStreamIndex` where available.
-5. `/api/library/add` must persist or return selected-audio metadata so the plugin can build Jellyfin media sources with the preferred-language default. Live validation lease is an optimisation, not the only correctness path; `/add` remains authoritative and revalidates preferred-language/file hints when lease is absent or expired.
-6. If current gostream stream/stub format cannot preserve selected-audio metadata for plugin source construction, changing gostream responses/stub metadata is in scope and required.
-7. Plugin/Jellyfin evidence must prove preferred-language selection end-to-end:
-   - gostream validate response shows preferred language present and identifies matching stream index,
-   - add response/stub returns selected-audio metadata,
+4. Audio index persistence is explicitly not required for SV14:
+   - validation response may include `selected_audio_index` for evidence/logging, but source-of-truth playback selection is the plugin's current file/stream inspection,
+   - `source_candidates` does not need `selected_audio_index`, `selected_audio_language`, or `audio_tracks_json`,
+   - gostream stream URL `audio_stream_index` support is optional secondary defense, not acceptance criteria for plugin correctness.
+5. `/api/library/add` must revalidate preferred-language/file constraints when lease is absent or expired, but it does not need to persist selected audio metadata. Live validation lease is an optimisation, not the only correctness path.
+6. Plugin/Jellyfin evidence must prove preferred-language selection end-to-end:
+   - gostream validate response shows preferred language present,
    - plugin-created `MediaSourceInfo` has preferred-language `DefaultAudioStreamIndex`,
    - Jellyfin `PlaybackInfo` / `OpenLiveStream` / playback-progress evidence shows `AudioStreamIndex` is preferred language even when another language is container-default.
 
@@ -190,7 +184,7 @@ Response:
 
 Response status/HTTP contract:
 
-- HTTP `200` with `status="valid"`: file and preferred English audio track identified; plugin remains responsible for setting Jellyfin playback selection to that track.
+- HTTP `200` with `status="valid"`: file selected and preferred English audio proven present; plugin remains responsible for choosing the English track from current Jellyfin-visible streams at playback/open time.
 - HTTP `200` with `status="invalid"`: candidate is a hard failure for this item until normal retry/override; includes `reason`.
 - HTTP `200` with `status="transient"`: candidate was not proven valid or invalid; includes `reason`. gostream may include `retry_after_hint`, but plugin config is source of truth for persisted retry.
 - HTTP `400`: caller/request bug; plugin logs configuration/error and does not mark candidate transient.
@@ -217,7 +211,7 @@ Transient reasons:
 Rules:
 
 - English track required for `valid`.
-- If English exists, `selected_audio_index` must point to English ffprobe stream index, and plugin must later map/set that index as Jellyfin playback default.
+- If English exists, validation should report the matching ffprobe stream index when available for evidence/logging; plugin must not depend on this persisted value and must choose English from current Jellyfin-visible streams for playback.
 - Non-English-only files are invalid.
 - Transient metadata/indexer/audio failures must not be cached as hard invalid; plugin persists v14 `validation_status='transient'`, `validation_reason`, and `validation_expires_at=now+SourceValidationTransientRetryMinutes`. Plugin ignores gostream retry hints for persistence except for logging.
 - Validate must not write a stub and must not leave losing/invalid torrents in an active downloading state.
@@ -242,7 +236,6 @@ Extend request to accept validation result hints:
 {
   "selected_file_id": 12,
   "selected_file_path": "...",
-  "selected_audio_index": 2,
   "required_audio_languages": ["eng", "en", "english"],
   "preferred_audio_language": "eng",
   "validation_session_id": "winner-token-from-validate"
@@ -253,7 +246,7 @@ Rules:
 
 - Revalidate selected file/audio before writing stub.
 - If hint stale, fail with explicit reason or reselect same constraints.
-- `/add` response/stub metadata must preserve selected English audio index and track list. Plugin must use that metadata to set Jellyfin `MediaSourceInfo.DefaultAudioStreamIndex`; gostream stream parameter/default-track support is secondary defense, not replacement for plugin-side selection.
+- `/add` must ensure selected file still satisfies preferred-language constraints. Plugin then inspects the materialised file/media streams and sets Jellyfin `MediaSourceInfo.DefaultAudioStreamIndex`; no gostream audio-index persistence is required.
 
 ## Plugin validation/materialise algorithm
 
@@ -432,8 +425,8 @@ Implement all:
 - Parallel validation waits for slower higher-ranked valid before picking lower-ranked valid.
 - Invalid candidates persisted/disabled with reasons.
 - English validation failure maps to `magnet_failure_cache` reason.
-- Plugin builds materialised movie and episode `MediaSourceInfo` with audio `MediaStreams` and English `DefaultAudioStreamIndex` from persisted validation metadata.
-- Plugin maps gostream/ffprobe selected audio index to Jellyfin `MediaStream.Index` when Jellyfin remaps stream indices.
+- Plugin builds materialised movie and episode `MediaSourceInfo` with audio `MediaStreams` and English `DefaultAudioStreamIndex` from current file/stream inspection, not persisted gostream audio index.
+- Plugin uses Jellyfin `MediaStream.Index` for `DefaultAudioStreamIndex` even if gostream/ffprobe reported different indexes during validation.
 - Bulk favourite schedules all episodes durably and respects concurrency.
 - Bulk favourite pending work survives Jellyfin/plugin restart or is reconciled from persisted favourite season/series intent at startup.
 - Completed favourite series/season is periodically reconciled while still favourited: newly discovered/missing episodes are upserted into the same deterministic request and scheduled without requiring unfavourite/refavourite.
