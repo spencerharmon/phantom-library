@@ -39,6 +39,11 @@
                             <div class="fieldDescription">Target for POST /api/library/add (primary patch).</div>
                         </div>
                         <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="GostreamApiToken">Library-control shared token</label>
+                            <input id="GostreamApiToken" name="GostreamApiToken" type="password" is="emby-input" autocomplete="off" />
+                            <div class="fieldDescription">Optional shared secret sent as X-Gostream-Token to gostream library add/remove endpoints.</div>
+                        </div>
+                        <div class="inputContainer">
                             <label class="inputLabel inputLabelUnfocused" for="GostreamDiagnosticsBaseUrl">Diagnostics base URL (port 8090)</label>
                             <input id="GostreamDiagnosticsBaseUrl" name="GostreamDiagnosticsBaseUrl" type="url" is="emby-input" />
                         </div>
@@ -265,6 +270,7 @@
                         ApiClient.getPluginConfiguration(PluginId).then(function (cfg) {
                             document.querySelector('#TmdbApiKey').value = cfg.TmdbApiKey || '';
                             document.querySelector('#GostreamBaseUrl').value = cfg.GostreamBaseUrl || '';
+                            document.querySelector('#GostreamApiToken').value = cfg.GostreamApiToken || '';
                             document.querySelector('#GostreamDiagnosticsBaseUrl').value = cfg.GostreamDiagnosticsBaseUrl || '';
                             document.querySelector('#ProwlarrBaseUrl').value = cfg.ProwlarrBaseUrl || '';
                             document.querySelector('#ProwlarrApiKey').value = cfg.ProwlarrApiKey || '';
@@ -313,6 +319,7 @@
                         ApiClient.getPluginConfiguration(PluginId).then(function (cfg) {
                             cfg.TmdbApiKey = document.querySelector('#TmdbApiKey').value;
                             cfg.GostreamBaseUrl = document.querySelector('#GostreamBaseUrl').value;
+                            cfg.GostreamApiToken = document.querySelector('#GostreamApiToken').value;
                             cfg.GostreamDiagnosticsBaseUrl = document.querySelector('#GostreamDiagnosticsBaseUrl').value;
                             cfg.ProwlarrBaseUrl = document.querySelector('#ProwlarrBaseUrl').value;
                             cfg.ProwlarrApiKey = document.querySelector('#ProwlarrApiKey').value;

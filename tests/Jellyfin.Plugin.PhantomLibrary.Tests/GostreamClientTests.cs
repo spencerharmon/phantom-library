@@ -9,10 +9,10 @@ namespace Jellyfin.Plugin.PhantomLibrary.Tests;
 
 public class GostreamClientTests
 {
-    private static GostreamClient MakeClient(QueuedHandler h)
+    private static GostreamClient MakeClient(QueuedHandler h, string token = "")
     {
         var http = new HttpClient(h) { BaseAddress = null };
-        return new GostreamClient(http, NullLogger<GostreamClient>.Instance, () => "http://gs.test:9080");
+        return new GostreamClient(http, NullLogger<GostreamClient>.Instance, () => "http://gs.test:9080", () => token);
     }
 
     private const string OkBody = "{\"stub_path\":\"/r/x.mkv\",\"fuse_path\":\"/f/x.mkv\",\"hash\":\"abc\",\"size\":123}";
@@ -37,6 +37,28 @@ public class GostreamClientTests
         var r = await c.AddAsync(new GostreamAddRequest { Type = "movie", Title = "X", Magnet = "magnet:?xt=urn:btih:abc" }, CancellationToken.None);
         Assert.True(r.AlreadyExisted);
         Assert.Equal("/f/x.mkv", r.FusePath);
+    }
+
+    [Fact]
+    public async Task Add_Sends_Configured_Gostream_Token()
+    {
+        var h = new QueuedHandler().Enqueue(HttpStatusCode.OK, OkBody);
+        var c = MakeClient(h, "secret-token");
+
+        await c.AddAsync(new GostreamAddRequest { Type = "movie", Title = "X", Magnet = "magnet:?xt=urn:btih:abc" }, CancellationToken.None);
+
+        Assert.Equal("secret-token", h.Requests[0].Headers.GetValues("X-Gostream-Token").Single());
+    }
+
+    [Fact]
+    public async Task Remove_Sends_Configured_Gostream_Token()
+    {
+        var h = new QueuedHandler().Enqueue(HttpStatusCode.NoContent);
+        var c = MakeClient(h, "secret-token");
+
+        await c.RemoveAsync("/r/x.mkv", CancellationToken.None);
+
+        Assert.Equal("secret-token", h.Requests[0].Headers.GetValues("X-Gostream-Token").Single());
     }
 
     [Fact]

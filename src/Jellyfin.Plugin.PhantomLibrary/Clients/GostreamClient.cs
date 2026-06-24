@@ -27,20 +27,31 @@ public sealed class GostreamClient : IGostreamClient
     private readonly HttpClient _http;
     private readonly ILogger<GostreamClient> _logger;
     private readonly Func<string> _baseUrlProvider;
+    private readonly Func<string> _tokenProvider;
     private Lazy<Task<bool>>? _vaultModeProbe;
     private readonly object _vaultProbeLock = new();
 
     public GostreamClient(HttpClient http, ILogger<GostreamClient> logger)
-        : this(http, logger, () => Plugin.Instance?.Configuration.GostreamBaseUrl ?? string.Empty)
+        : this(
+            http,
+            logger,
+            () => Plugin.Instance?.Configuration.GostreamBaseUrl ?? string.Empty,
+            () => Plugin.Instance?.Configuration.GostreamApiToken ?? string.Empty)
     {
     }
 
     // Test-friendly ctor: internal so ActivatorUtilities ignores it during DI resolution.
     internal GostreamClient(HttpClient http, ILogger<GostreamClient> logger, Func<string> baseUrlProvider)
+        : this(http, logger, baseUrlProvider, () => string.Empty)
+    {
+    }
+
+    internal GostreamClient(HttpClient http, ILogger<GostreamClient> logger, Func<string> baseUrlProvider, Func<string> tokenProvider)
     {
         _http = http;
         _logger = logger;
         _baseUrlProvider = baseUrlProvider;
+        _tokenProvider = tokenProvider;
     }
 
     public async Task<GostreamAddResult> AddAsync(GostreamAddRequest request, CancellationToken ct)
@@ -98,8 +109,7 @@ public sealed class GostreamClient : IGostreamClient
         }
 
         var url = BuildUrl("/api/library/remove");
-        using var content = JsonContent.Create(new { stub_path = stubPath });
-        using var response = await _http.PostAsync(url, content, ct).ConfigureAwait(false);
+        using var response = await PostJsonAsync(url, new { stub_path = stubPath }, ct).ConfigureAwait(false);
         var status = (int)response.StatusCode;
         if (status == 204 || status == 200)
         {
@@ -292,10 +302,23 @@ public sealed class GostreamClient : IGostreamClient
         return response;
     }
 
-    private Task<HttpResponseMessage> PostJsonAsync(string url, GostreamAddRequest request, CancellationToken ct)
+    private async Task<HttpResponseMessage> PostJsonAsync(string url, object request, CancellationToken ct)
     {
-        var content = JsonContent.Create(request, options: JsonOpts);
-        return _http.PostAsync(url, content, ct);
+        using var message = new HttpRequestMessage(HttpMethod.Post, url)
+        {
+            Content = JsonContent.Create(request, options: JsonOpts),
+        };
+        AddLibraryAuthHeader(message);
+        return await _http.SendAsync(message, ct).ConfigureAwait(false);
+    }
+
+    private void AddLibraryAuthHeader(HttpRequestMessage message)
+    {
+        var token = _tokenProvider();
+        if (!string.IsNullOrWhiteSpace(token))
+        {
+            message.Headers.TryAddWithoutValidation("X-Gostream-Token", token);
+        }
     }
 
     private static async Task<string> SafeReadErrorAsync(HttpResponseMessage response, CancellationToken ct)

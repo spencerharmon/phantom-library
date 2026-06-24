@@ -36,6 +36,7 @@ public class PluginConfiguration : BasePluginConfiguration
     {
         TmdbApiKey = string.Empty;
         GostreamBaseUrl = "http://127.0.0.1:9080";
+        GostreamApiToken = string.Empty;
         GostreamDiagnosticsBaseUrl = "http://127.0.0.1:8090";
         ProwlarrBaseUrl = string.Empty;
         ProwlarrApiKey = string.Empty;
@@ -140,6 +141,12 @@ public class PluginConfiguration : BasePluginConfiguration
     /// (default port 9080).
     /// </summary>
     public string GostreamBaseUrl { get; set; }
+
+    /// <summary>
+    /// Gets or sets the optional shared secret sent as <c>X-Gostream-Token</c>
+    /// to protected gostream library-control endpoints.
+    /// </summary>
+    public string GostreamApiToken { get; set; }
 
     /// <summary>
     /// Gets or sets the gostream diagnostics / streaming base URL
