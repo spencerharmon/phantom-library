@@ -489,7 +489,7 @@ body, or responses to review comments.
 ## Build
 
 ```bash
-dotnet build -c Release
+MSBUILDDISABLENODEREUSE=1 dotnet build -c Release -p:UseSharedCompilation=false
 ```
 
 Output DLL:
@@ -497,10 +497,60 @@ Output DLL:
 
 ## Test
 
+### Build/test process cleanup is mandatory
+
+Agents must not leave `dotnet`, `MSBuild.dll`, `VBCSCompiler`,
+`testhost`, or rig Jellyfin processes running after any build,
+test, install, or rig scenario. This box is memory-constrained;
+orphaned build servers and rig servers have caused OOMs.
+
+Always run builds/tests with reusable build servers disabled unless a
+specific command cannot work that way:
+
+```bash
+MSBUILDDISABLENODEREUSE=1 dotnet build -c Release -p:UseSharedCompilation=false
+MSBUILDDISABLENODEREUSE=1 dotnet test -p:UseSharedCompilation=false
+```
+
+Every shell invocation that starts `dotnet build`, `dotnet test`,
+`install.sh --build`, or a rig Jellyfin instance must include cleanup
+on exit:
+
+```bash
+cleanup_dotnet() {
+  dotnet build-server shutdown >/dev/null 2>&1 || true
+  pkill -u "$USER" -f 'jellyfin.dll --datadir /tmp/jf-test' || true
+}
+trap cleanup_dotnet EXIT INT TERM
+```
+
+At end of task, verify no agent-owned leftovers remain:
+
+```bash
+ps -u "$USER" -o pid,ppid,pgid,stat,etime,rss,cmd \
+  | grep -E 'dotnet|MSBuild.dll|VBCSCompiler|testhost|jellyfin.dll --datadir /tmp/jf-test' \
+  | grep -v grep || true
+ss -ltnp | grep ':18096' || true
+```
+
+If leftovers exist, clean them before handoff:
+
+```bash
+dotnet build-server shutdown || true
+pkill -u "$USER" -f 'MSBuild.dll /noautoresponse' || true
+pkill -u "$USER" -f VBCSCompiler || true
+pkill -u "$USER" -f testhost || true
+pkill -u "$USER" -f 'jellyfin.dll --datadir /tmp/jf-test' || true
+```
+
+Never kill production Jellyfin (`/usr/bin/jellyfin`, user `jellyfin`,
+port `:8096`) as part of agent cleanup. Only clean agent-owned rig
+Jellyfin bound to `:18096` / `/tmp/jf-test`.
+
 ### Unit tests are necessary but not sufficient
 
 ```bash
-dotnet test
+MSBUILDDISABLENODEREUSE=1 dotnet test -p:UseSharedCompilation=false
 ```
 
 Always keep unit tests green. If you need to weaken a test to
