@@ -4,24 +4,12 @@ Date: Wed, 24 Jun 2026 11:58:14 -0500
 Subject: [PATCH] Add server-advertised item actions
 
 ---
- .../Controllers/ItemActionsController.cs      | 163 ++++++++++++++++++
- .../Library/IItemActionProvider.cs            |  19 ++
- MediaBrowser.Model/Dto/ItemActionInfo.cs      |  24 +++
- MediaBrowser.Model/Dto/ItemActionRequest.cs   |  12 ++
- MediaBrowser.Model/Dto/ItemActionResult.cs    |  16 ++
- 5 files changed, 234 insertions(+)
- create mode 100644 Jellyfin.Api/Controllers/ItemActionsController.cs
- create mode 100644 MediaBrowser.Controller/Library/IItemActionProvider.cs
- create mode 100644 MediaBrowser.Model/Dto/ItemActionInfo.cs
- create mode 100644 MediaBrowser.Model/Dto/ItemActionRequest.cs
- create mode 100644 MediaBrowser.Model/Dto/ItemActionResult.cs
-
 diff --git a/Jellyfin.Api/Controllers/ItemActionsController.cs b/Jellyfin.Api/Controllers/ItemActionsController.cs
 new file mode 100644
-index 0000000000..4d1c630c91
+index 0000000000..d5c054f139
 --- /dev/null
 +++ b/Jellyfin.Api/Controllers/ItemActionsController.cs
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,179 @@
 +using System;
 +using System.Collections.Generic;
 +using System.ComponentModel.DataAnnotations;
@@ -75,11 +63,17 @@ index 0000000000..4d1c630c91
 +    /// <returns>Available actions.</returns>
 +    [HttpGet]
 +    [ProducesResponseType(StatusCodes.Status200OK)]
++    [ProducesResponseType(StatusCodes.Status400BadRequest)]
 +    [ProducesResponseType(StatusCodes.Status404NotFound)]
 +    public async Task<ActionResult<IReadOnlyList<ItemActionInfo>>> GetActions(
-+        [FromRoute, Required] Guid itemId,
++        [FromRoute, Required] string itemId,
 +        CancellationToken cancellationToken = default)
 +    {
++        if (!TryParseItemId(itemId, out var parsedItemId))
++        {
++            return BadRequest("Invalid item id");
++        }
++
 +        var userId = User.GetUserId();
 +        var user = _userManager.GetUserById(userId);
 +        if (user is null)
@@ -87,7 +81,7 @@ index 0000000000..4d1c630c91
 +            return NotFound();
 +        }
 +
-+        var item = _libraryManager.GetItemById<BaseItem>(itemId, userId);
++        var item = _libraryManager.GetItemById<BaseItem>(parsedItemId, userId);
 +        if (item is null)
 +        {
 +            return NotFound();
@@ -117,16 +111,22 @@ index 0000000000..4d1c630c91
 +    /// <returns>Action result.</returns>
 +    [HttpPost("{actionId}")]
 +    [ProducesResponseType(StatusCodes.Status200OK)]
++    [ProducesResponseType(StatusCodes.Status400BadRequest)]
 +    [ProducesResponseType(StatusCodes.Status404NotFound)]
 +    [ProducesResponseType(StatusCodes.Status409Conflict)]
 +    [ProducesResponseType(StatusCodes.Status422UnprocessableEntity)]
 +    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
 +    public async Task<ActionResult<ItemActionResult>> InvokeAction(
-+        [FromRoute, Required] Guid itemId,
++        [FromRoute, Required] string itemId,
 +        [FromRoute, Required] string actionId,
 +        [FromBody] ItemActionRequest? request,
 +        CancellationToken cancellationToken = default)
 +    {
++        if (!TryParseItemId(itemId, out var parsedItemId))
++        {
++            return BadRequest("Invalid item id");
++        }
++
 +        var userId = User.GetUserId();
 +        var user = _userManager.GetUserById(userId);
 +        if (user is null)
@@ -134,7 +134,7 @@ index 0000000000..4d1c630c91
 +            return NotFound();
 +        }
 +
-+        var item = _libraryManager.GetItemById<BaseItem>(itemId, userId);
++        var item = _libraryManager.GetItemById<BaseItem>(parsedItemId, userId);
 +        if (item is null)
 +        {
 +            return NotFound();
@@ -184,6 +184,10 @@ index 0000000000..4d1c630c91
 +            RefreshItem = false,
 +        });
 +    }
++
++    private static bool TryParseItemId(string itemId, out Guid parsedItemId)
++        => Guid.TryParse(itemId, out parsedItemId)
++            || Guid.TryParseExact(itemId, "N", out parsedItemId);
 +}
 diff --git a/MediaBrowser.Controller/Library/IItemActionProvider.cs b/MediaBrowser.Controller/Library/IItemActionProvider.cs
 new file mode 100644
@@ -280,6 +284,3 @@ index 0000000000..a1a2c28e21
 +
 +    public bool RefreshItem { get; set; } = true;
 +}
--- 
-2.54.0
-
