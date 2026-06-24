@@ -16,8 +16,10 @@
 
     var TAG = '[PhantomLibrary]';
     var MATERIALISE_LABEL = 'Materialise (Phantom Library)';
+    var RESET_LABEL = 'Reset Phantom';
     var REJECT_LABEL = 'Reject current source (Phantom Library)';
     var MATERIALISE_DATA_ID = 'phantom-materialise';
+    var RESET_DATA_ID = 'phantom-reset';
     var REJECT_DATA_ID = 'phantom-reject-current-source';
     var SECTION_ID = 'phantom-source-section';
     var STYLE_ID = 'phantom-source-styles';
@@ -170,6 +172,43 @@
         });
     }
 
+    function fetchItemActions(itemId) {
+        var url = apiUrl('Items/' + encodeURIComponent(itemId) + '/Actions');
+        if (!url) { return Promise.resolve([]); }
+        return ajaxJson({
+            type: 'GET',
+            url: url,
+            dataType: 'json'
+        }).then(function (result) {
+            return Array.isArray(result) ? result : [];
+        }, function (err) {
+            warn('item actions lookup failed', err);
+            return [];
+        });
+    }
+
+    function fireItemAction(itemId, actionId) {
+        var url = apiUrl('Items/' + encodeURIComponent(itemId) + '/Actions/' + encodeURIComponent(actionId));
+        if (!url) {
+            alert('Phantom Library: ApiClient not found. Reload page and try again.');
+            return Promise.reject(new Error('ApiClient not found'));
+        }
+        return ajaxJson({
+            type: 'POST',
+            url: url,
+            dataType: 'json',
+            contentType: 'application/json',
+            data: JSON.stringify({})
+        }).then(function (result) {
+            reportOutcome(actionId, result);
+            return result;
+        }, function (err) {
+            warn('item action failed', actionId, err);
+            alert('Phantom Library: action failed\n' + extractErrorMessage(err));
+            throw err;
+        });
+    }
+
     function fetchSources(externalId) {
         var url = apiUrl('Plugins/PhantomLibrary/Items/' + encodeURIComponent(externalId) + '/Sources');
         if (!url) { return Promise.resolve(null); }
@@ -251,6 +290,27 @@
         }, function (err) {
             warn('materialise candidate failed', err);
             alert('Phantom Library: materialise selected source failed\n' + extractErrorMessage(err));
+            throw err;
+        });
+    }
+
+    function fireReset(externalId) {
+        var url = apiUrl('Plugins/PhantomLibrary/Items/' + encodeURIComponent(externalId) + '/Sources/Reset');
+        if (!url) {
+            alert('Phantom Library: ApiClient not found. Reload page and try again.');
+            return Promise.reject(new Error('ApiClient not found'));
+        }
+        return ajaxJson({
+            type: 'POST',
+            url: url,
+            dataType: 'json',
+            contentType: 'application/json'
+        }).then(function (result) {
+            reportOutcome('reset phantom', result);
+            return result;
+        }, function (err) {
+            warn('reset phantom failed', err);
+            alert('Phantom Library: reset phantom failed\n' + extractErrorMessage(err));
             throw err;
         });
     }
@@ -361,6 +421,12 @@
         return !!(state && (state.CanRejectCurrent || state.canRejectCurrent || isMaterialisedState(state)));
     }
 
+    function canResetState(state) {
+        if (!state) { return false; }
+        var status = state.Status || state.status || '';
+        return isMaterialisedState(state) || status === 'materialised' || status === 'unavailable';
+    }
+
     function canMaterialiseState(state) {
         if (!state) { return false; }
         if (state.CanMaterialiseSelected !== undefined) { return !!state.CanMaterialiseSelected; }
@@ -450,6 +516,20 @@
         });
         actions.appendChild(materialise);
 
+        var reset = document.createElement('button');
+        reset.type = 'button';
+        reset.className = 'raised phantom-source-button';
+        reset.textContent = 'Reset Phantom';
+        reset.disabled = !canResetState(state);
+        reset.addEventListener('click', function () {
+            if (!window.confirm('Reset Phantom state for this item? This does not reject the current source.')) { return; }
+            reset.disabled = true;
+            fireReset(ctx.externalId).then(refreshSourceSection, function () {
+                reset.disabled = false;
+            });
+        });
+        actions.appendChild(reset);
+
         var reject = document.createElement('button');
         reject.type = 'button';
         reject.className = 'raised phantom-source-button';
@@ -534,29 +614,25 @@
             return;
         }
 
-        getPlayablePhantomItem().then(function (ctx) {
-            if (!ctx) {
+        fetchItemActions(itemId).then(function (actions) {
+            if (!actions.length) {
                 sheet.dataset.phantomInjected = '1';
                 return;
             }
-            return fetchSources(ctx.externalId).then(function (state) {
-                if (!state) {
-                    sheet.dataset.phantomInjected = '1';
-                    return;
-                }
-                if (isMaterialisedState(state) && canRejectState(state)) {
-                    injectButton(sheet, content, REJECT_LABEL, REJECT_DATA_ID, 'block', function () {
-                        closeSheet(sheet);
-                        fireRejectCurrent(ctx.externalId).then(refreshSourceSection, function () { /* alert already shown */ });
-                    });
-                } else if (canMaterialiseState(state)) {
-                    injectButton(sheet, content, MATERIALISE_LABEL, MATERIALISE_DATA_ID, 'cloud_download', function () {
-                        closeSheet(sheet);
-                        fireMaterialise(itemId).then(refreshSourceSection, function () { /* alert already shown */ });
-                    });
-                }
-                sheet.dataset.phantomInjected = '1';
+            actions.forEach(function (action) {
+                var actionId = action.Id || action.id;
+                var label = action.Name || action.name || actionId;
+                var icon = action.Icon || action.icon || 'extension';
+                var enabled = action.IsEnabled !== false && action.isEnabled !== false;
+                var confirmText = action.ConfirmationText || action.confirmationText;
+                if (!actionId || !enabled) { return; }
+                injectButton(sheet, content, label, 'phantom-action-' + actionId.replace(/[^a-zA-Z0-9_-]/g, '-'), icon, function () {
+                    closeSheet(sheet);
+                    if (confirmText && !window.confirm(confirmText)) { return; }
+                    fireItemAction(itemId, actionId).then(refreshSourceSection, function () { /* alert already shown */ });
+                });
             });
+            sheet.dataset.phantomInjected = '1';
         });
     }
 

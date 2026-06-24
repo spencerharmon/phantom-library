@@ -11,13 +11,14 @@ Mascot: *Stygiomedusa gigantea*, the giant phantom jelly.
 
 > ⚠ **Requires patched Jellyfin.** v0.3.0+ depends on a small
 > additive patch to Jellyfin core (adds `IChannelItemRefresh` +
-> `IChannelItemRefreshManager`). Patches live at
+> `IChannelItemRefreshManager` and server-advertised item actions).
+> Patches live at
 > `scripts/jellyfin-patches/` and are applied automatically by
 > `./install.sh --build` against a `jellyfin/` source clone at
 > exact Jellyfin tag v10.11.9 (base SHA `e83a7e62f2`). The patches are purely
-> additive (no API mutation). After build, you must deploy two
-> patched DLLs (`MediaBrowser.Controller.dll`, `Jellyfin.LiveTv.dll`)
-> into your runtime Jellyfin install dir; `install.sh --build`
+> additive (no API mutation). After build, you must deploy four
+> patched DLLs (`MediaBrowser.Controller.dll`, `MediaBrowser.Model.dll`,
+> `Jellyfin.Api.dll`, `Jellyfin.LiveTv.dll`) into your runtime Jellyfin install dir; `install.sh --build`
 > prints the exact `sudo cp` commands. See
 > [`docs/operator-deploy.md`](docs/operator-deploy.md) for the
 > deploy procedure and

@@ -60,16 +60,16 @@ public class PhantomKebabScriptTests
     }
 
     [Fact]
-    public void ActionSheet_ShowsRejectForMaterialisedAndMaterialiseForUnmaterialised()
+    public void ActionSheet_UsesServerAdvertisedItemActions()
     {
         var js = ReadScript();
 
-        Assert.Contains("isMaterialisedState(state) && canRejectState(state)", js);
-        Assert.Contains("REJECT_DATA_ID", js);
-        Assert.Contains("canMaterialiseState(state)", js);
-        Assert.Contains("MATERIALISE_DATA_ID", js);
-        Assert.Contains("fireRejectCurrent(ctx.externalId)", js);
-        Assert.Contains("fireMaterialise(itemId)", js);
+        Assert.Contains("fetchItemActions(itemId)", js);
+        Assert.Contains("Items/", js);
+        Assert.Contains("/Actions", js);
+        Assert.Contains("fireItemAction(itemId, actionId)", js);
+        Assert.Contains("ConfirmationText", js);
+        Assert.Contains("phantom-action-", js);
     }
 
     private static string ReadScript()

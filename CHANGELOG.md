@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Patched Jellyfin now exposes server-advertised item actions through `GET/POST /Items/{itemId}/Actions`, and Phantom registers Materialise, Reset Phantom, and Reject current source actions for Phantom movie/episode items.
+- BREAKING: patched Jellyfin deploy now requires replacing `MediaBrowser.Model.dll` and `Jellyfin.Api.dll` in addition to `MediaBrowser.Controller.dll` and `Jellyfin.LiveTv.dll`, because native item actions add model DTOs and an API controller.
 - BREAKING: requires wipe. Phantom DB schema is now v13 to persist TMDB movie runtime minutes; this lets Phantom movie channel items expose `RunTimeTicks` so Jellyfin can save playback progress and list movies in Continue Watching.
 - Added rig coverage for Phantom movie and episode `RunTimeTicks`, playback-progress reporting, and `/Users/{userId}/Items/Resume` Continue Watching results.
 - Added `scripts/prestage-materialised.sh`, an operator dry-run/commit helper that reads `materialised_state` and asks gostream Vault Mode to prestage existing materialised movies and episodes.
@@ -51,6 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Added a Reset Phantom operation that clears materialised state and unavailable markers without rejecting the current source, allowing a bad/stale materialisation to be retried through the normal Phantom materialiser after gostream-side picker fixes.
 - Fixed the admin settings "Enable availability probing" checkbox markup so
   Jellyfin's `emby-checkbox` initializer can attach and the setting can be toggled.
 - TV season browse now displays unknown and unavailable sibling episodes for any

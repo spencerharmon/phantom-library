@@ -230,6 +230,46 @@ public sealed class PhantomSourceManager
         };
     }
 
+    public async Task<PhantomSourceOperationResult> ResetCurrentAsync(string externalId, CancellationToken ct)
+    {
+        if (!TryResolveKey(externalId, out var key))
+        {
+            return Result(PhantomSourceOperationStatus.NotFound, "not_found", "Phantom movie or episode external id not found");
+        }
+
+        await ClearStaleInFlightAsync(key, ct).ConfigureAwait(false);
+        if (await _db.IsMaterialiseInFlightAsync(key.TmdbId, key.Type, key.SeasonSentinel, key.EpisodeSentinel, ct).ConfigureAwait(false))
+        {
+            return Result(PhantomSourceOperationStatus.InFlight, "in_flight", "Materialisation already in flight");
+        }
+
+        var imdb = await ResolveImdbAsync(key, ct).ConfigureAwait(false);
+        var current = await GetCurrentAsync(key, imdb, ct).ConfigureAwait(false);
+        if (current is not null)
+        {
+            await _db.MarkAvailabilityAvailableAsync(
+                key.TmdbId,
+                key.Type,
+                key.SeasonSentinel,
+                key.EpisodeSentinel,
+                current.Value.Entry,
+                ct).ConfigureAwait(false);
+            await DeleteCurrentStateAndMaybeRemoveAsync(key, current.Value.State, current.Value.Entry?.InfoHash, ct).ConfigureAwait(false);
+        }
+
+        await _db.DeleteUnavailableAsync(
+            new UnavailableKey(key.TmdbId, imdb, key.Type, key.Season, key.Episode),
+            ct).ConfigureAwait(false);
+        await RefreshItemAsync(key, forceProbe: false, ct).ConfigureAwait(false);
+
+        return Result(
+            PhantomSourceOperationStatus.Success,
+            "reset",
+            current is null
+                ? "Phantom item was already in base state; unavailable marker cleared"
+                : "Phantom materialisation state reset");
+    }
+
     public async Task<PhantomSourceOperationResult> RejectCurrentAsync(string externalId, CancellationToken ct)
     {
         if (!TryResolveKey(externalId, out var key))

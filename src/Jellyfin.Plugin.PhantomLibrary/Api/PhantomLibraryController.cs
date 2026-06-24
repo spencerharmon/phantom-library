@@ -133,6 +133,17 @@ public sealed class PhantomLibraryController : ControllerBase
         return response is null ? NotFound(new { code = "not_found" }) : Ok(response);
     }
 
+    [HttpPost("Items/{externalId}/Sources/Reset")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status409Conflict)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+    public async Task<IActionResult> ResetCurrent([FromRoute] string externalId, CancellationToken ct = default)
+    {
+        var result = await _sourceManager.ResetCurrentAsync(externalId, ct).ConfigureAwait(false);
+        return ToActionResult(result);
+    }
+
     [HttpPost("Items/{externalId}/Sources/RejectCurrent")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]

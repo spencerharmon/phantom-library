@@ -80,6 +80,7 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         serviceCollection.AddSingleton<MagnetSelector>();
         serviceCollection.AddSingleton<TmdbExternalIdResolver>();
         serviceCollection.AddSingleton<PhantomSourceManager>();
+        serviceCollection.AddSingleton<IItemActionProvider, PhantomItemActionProvider>();
         serviceCollection.AddSingleton<IMaterialiser, Materialiser>();
         serviceCollection.AddHostedService<MaterialiseInFlightSweeper>();
         serviceCollection.AddSingleton<MaterialisationQueue>();

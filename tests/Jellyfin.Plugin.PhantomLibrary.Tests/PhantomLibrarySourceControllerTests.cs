@@ -262,6 +262,55 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
     }
 
     [Fact]
+    public async Task ResetCurrent_DeletesStateAndClearsUnavailableWithoutRejectingMagnet()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 42);
+        var current = Candidate("CURRENT", 100);
+        await CacheCurrentAsync(db, 42, current, "/stub/current.mkv", "/fuse/current.mkv");
+        await db.MarkUnavailableAsync(
+            new UnavailableKey(42, "tt0000042", "movie", null, null),
+            TimeSpan.FromHours(24),
+            CancellationToken.None);
+        var gostream = new Mock<IGostreamClient>(MockBehavior.Loose);
+        var ctrl = BuildController(db, new[] { current }, gostream);
+
+        var result = await ctrl.ResetCurrent("movie_42", CancellationToken.None);
+
+        var ok = Assert.IsType<OkObjectResult>(result);
+        var payload = Assert.IsType<PhantomSourceOperationResult>(ok.Value);
+        Assert.Equal(PhantomSourceOperationStatus.Success, payload.Status);
+        Assert.Equal("reset", payload.Code);
+        Assert.Null(await db.GetMaterialisedStateAsync(42, "movie", -1, -1, CancellationToken.None));
+        var availability = await db.GetAvailabilityItemAsync(42, "movie", -1, -1, CancellationToken.None);
+        Assert.NotNull(availability);
+        Assert.Equal("available", availability!.Status);
+        Assert.Null(await db.IsMarkedUnavailableAsync(new UnavailableKey(42, "tt0000042", "movie", null, null), CancellationToken.None));
+        Assert.Null(await db.GetMagnetFailureAsync(
+            new MagnetFailureKey(42, "tt0000042", "movie", null, null, "test", current.Magnet),
+            CancellationToken.None));
+        gostream.Verify(g => g.RemoveAsync("/stub/current.mkv", It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task ResetCurrent_InFlight_Returns409WithoutDeletingState()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 42);
+        var current = Candidate("CURRENT", 100);
+        await CacheCurrentAsync(db, 42, current, "/stub/current.mkv", "/fuse/current.mkv");
+        await db.UpsertMaterialiseInFlightAsync(42, "movie", -1, -1, CancellationToken.None);
+        var gostream = new Mock<IGostreamClient>(MockBehavior.Loose);
+        var ctrl = BuildController(db, new[] { current }, gostream);
+
+        var result = await ctrl.ResetCurrent("movie_42", CancellationToken.None);
+
+        Assert.IsType<ConflictObjectResult>(result);
+        Assert.NotNull(await db.GetMaterialisedStateAsync(42, "movie", -1, -1, CancellationToken.None));
+        gostream.Verify(g => g.RemoveAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
     public async Task MaterialiseCandidate_SelectedSuccess_UsesExactMagnet()
     {
         using var db = await NewDbAsync();
