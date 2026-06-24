@@ -211,6 +211,16 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
             {
                 case MagnetProbeOutcome.Available:
                     {
+                        await _db.UpsertSourceCandidatesAsync(
+                            lease.TmdbId,
+                            lease.Type,
+                            lease.Season,
+                            lease.Episode,
+                            cfg.SourcePickerPreset,
+                            probe.Candidates,
+                            "availability_probe",
+                            TimeSpan.FromHours(Math.Max(1, cfg.MagnetCacheTtlHours)),
+                            ct).ConfigureAwait(false);
                         var picked = probe.Candidates[0];
                         var entry = new MagnetCacheEntry
                         {

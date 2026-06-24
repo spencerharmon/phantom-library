@@ -66,7 +66,7 @@ public class PhantomDbTests : IDisposable
             version = Convert.ToInt32(await v.ExecuteScalarAsync());
         }
 
-        Assert.Equal(11, version);
+        Assert.Equal(12, version);
 
         var expectedTables = new[]
         {
@@ -83,6 +83,7 @@ public class PhantomDbTests : IDisposable
             "tmdb_episode_cache",
             "magnet_cache",
             "magnet_failure_cache",
+            "source_candidates",
             "unavailable_marker",
             "plugin_meta",
         };
@@ -121,7 +122,7 @@ public class PhantomDbTests : IDisposable
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => db.SetMetaAsync("test", "1", CancellationToken.None));
 
-        Assert.Contains("version 11", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("version 12", ex.Message, StringComparison.Ordinal);
         Assert.Contains("wipe", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 

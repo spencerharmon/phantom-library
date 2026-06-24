@@ -447,16 +447,60 @@ public sealed class PhantomSourceManager
         string? currentMagnet,
         CancellationToken ct)
     {
-        var probe = await _magnetSelector.ProbeAsync(
-            key.TmdbId, imdb, key.Type, key.Season, key.Episode,
-            meta.Title, meta.Year,
-            ct).ConfigureAwait(false);
-
         var cfg = _configProvider();
         var cacheKey = CacheKey(key, imdb, cfg.SourcePickerPreset);
         var result = new List<CandidateWithFailure>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var rank = 0;
+
+        var cachedCandidates = await _db.ListSourceCandidatesAsync(
+            key.TmdbId,
+            key.Type,
+            key.SeasonSentinel,
+            key.EpisodeSentinel,
+            cfg.SourcePickerPreset,
+            includeExpired: false,
+            ct).ConfigureAwait(false);
+        foreach (var cached in cachedCandidates)
+        {
+            rank++;
+            var candidate = ToMagnetCandidate(cached);
+            var failure = await _db.GetMagnetFailureAsync(
+                new MagnetFailureKey(cacheKey.TmdbId, cacheKey.ImdbId, cacheKey.Type, cacheKey.Season, cacheKey.Episode, cacheKey.Preset, candidate.Magnet),
+                ct).ConfigureAwait(false);
+            if ((failure is null || includeRejected) && seen.Add(candidate.Magnet))
+            {
+                result.Add(new CandidateWithFailure(
+                    candidate,
+                    failure,
+                    rank,
+                    string.Equals(candidate.Magnet, currentMagnet, StringComparison.Ordinal)));
+            }
+        }
+
+        if (result.Count > 0)
+        {
+            return (result, null, null);
+        }
+
+        var probe = await _magnetSelector.ProbeAsync(
+            key.TmdbId, imdb, key.Type, key.Season, key.Episode,
+            meta.Title, meta.Year,
+            ct).ConfigureAwait(false);
+
+        if (probe.Outcome == MagnetProbeOutcome.Available)
+        {
+            await _db.UpsertSourceCandidatesAsync(
+                key.TmdbId,
+                key.Type,
+                key.SeasonSentinel,
+                key.EpisodeSentinel,
+                cfg.SourcePickerPreset,
+                probe.Candidates,
+                "details_probe",
+                TimeSpan.FromHours(Math.Max(1, cfg.MagnetCacheTtlHours)),
+                ct).ConfigureAwait(false);
+        }
 
         var availability = await _db.GetAvailabilityItemAsync(key.TmdbId, key.Type, key.SeasonSentinel, key.EpisodeSentinel, ct)
             .ConfigureAwait(false);
@@ -513,6 +557,17 @@ public sealed class PhantomSourceManager
             ? (result, null, null)
             : (result, probe.ErrorKind, probe.ErrorMessage);
     }
+
+    private static MagnetCandidate ToMagnetCandidate(SourceCandidateRow row)
+        => new(
+            row.Magnet,
+            row.InfoHash,
+            row.Size ?? 0,
+            row.Seeders ?? 0,
+            row.Indexer)
+        {
+            Title = row.Title,
+        };
 
     private async Task<(MaterialisedStateRow State, MagnetCacheEntry? Entry)?> GetCurrentAsync(SourceKey key, string? imdb, CancellationToken ct)
     {

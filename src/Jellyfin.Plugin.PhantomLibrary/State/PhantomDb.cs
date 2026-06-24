@@ -34,6 +34,23 @@ public sealed record MagnetFailureEntry
     public required DateTimeOffset RetryAfter { get; init; }
 }
 
+public sealed record SourceCandidateRow(
+    int TmdbId,
+    string Type,
+    int Season,
+    int Episode,
+    string Preset,
+    string Magnet,
+    string InfoHash,
+    string Indexer,
+    string Title,
+    int? Seeders,
+    long? Size,
+    int Rank,
+    string Source,
+    DateTimeOffset FetchedAt,
+    DateTimeOffset ExpiresAt);
+
 /// <summary>
 /// Row of the <c>discovery_cache</c> table. Movies and series only;
 /// season/episode level discovery is not tracked here (those come
@@ -159,7 +176,7 @@ public sealed record TmdbEpisodeRow(
 /// </summary>
 public sealed class PhantomDb : IDisposable
 {
-    private const int CurrentSchemaVersion = 11;
+    private const int CurrentSchemaVersion = 12;
 
     private readonly string _connectionString;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
@@ -465,6 +482,35 @@ CREATE TABLE IF NOT EXISTS magnet_failure_cache (
 CREATE INDEX IF NOT EXISTS idx_magnet_failure_cache_retry_after
     ON magnet_failure_cache(retry_after);
 
+-- Ranked source candidates cached from availability probes and source
+-- details page probes. No FK by operator-approved design (2026-06-23):
+-- candidates are keyed by the same stable item tuple as availability /
+-- materialised state and may exist before/after either row.
+CREATE TABLE IF NOT EXISTS source_candidates (
+    tmdb_id    INTEGER NOT NULL,
+    type       TEXT NOT NULL,
+    season     INTEGER NOT NULL DEFAULT -1,
+    episode    INTEGER NOT NULL DEFAULT -1,
+    preset     TEXT NOT NULL DEFAULT '',
+    magnet     TEXT NOT NULL,
+    info_hash  TEXT NOT NULL,
+    indexer    TEXT NOT NULL,
+    title      TEXT NOT NULL,
+    seeders    INTEGER,
+    size       INTEGER,
+    rank       INTEGER NOT NULL,
+    source     TEXT NOT NULL,
+    fetched_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY (tmdb_id, type, season, episode, preset, magnet)
+);
+CREATE INDEX IF NOT EXISTS idx_source_candidates_item
+    ON source_candidates(tmdb_id, type, season, episode, preset, rank);
+CREATE INDEX IF NOT EXISTS idx_source_candidates_expiry
+    ON source_candidates(expires_at);
+CREATE INDEX IF NOT EXISTS idx_source_candidates_hash
+    ON source_candidates(info_hash);
+
 -- Surviving table from v1: indexers returned nothing for a key; back
 -- off until retry_after.
 CREATE TABLE IF NOT EXISTS unavailable_marker (
@@ -716,6 +762,129 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
             _writeLock.Release();
         }
     }
+
+    // ---- source_candidates ----
+
+    public async Task<IReadOnlyList<SourceCandidateRow>> ListSourceCandidatesAsync(
+        int tmdbId,
+        string type,
+        int season,
+        int episode,
+        string preset,
+        bool includeExpired,
+        CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        ArgumentNullException.ThrowIfNull(preset);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT tmdb_id,type,season,episode,preset,magnet,info_hash,indexer,title,seeders,size,rank,source,fetched_at,expires_at
+            FROM source_candidates
+            WHERE tmdb_id=$tmdb AND type=$type AND season=$season AND episode=$episode AND preset=$preset
+              AND ($includeExpired=1 OR expires_at >= $now)
+            ORDER BY rank ASC, seeders DESC, size DESC;";
+        cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+        cmd.Parameters.AddWithValue("$type", type);
+        cmd.Parameters.AddWithValue("$season", season);
+        cmd.Parameters.AddWithValue("$episode", episode);
+        cmd.Parameters.AddWithValue("$preset", preset);
+        cmd.Parameters.AddWithValue("$includeExpired", includeExpired ? 1 : 0);
+        cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        var list = new List<SourceCandidateRow>();
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            list.Add(ReadSourceCandidate(r));
+        }
+
+        return list;
+    }
+
+    public async Task UpsertSourceCandidatesAsync(
+        int tmdbId,
+        string type,
+        int season,
+        int episode,
+        string preset,
+        IReadOnlyList<Jellyfin.Plugin.PhantomLibrary.Sources.MagnetCandidate> candidates,
+        string source,
+        TimeSpan ttl,
+        CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        ArgumentNullException.ThrowIfNull(preset);
+        ArgumentNullException.ThrowIfNull(candidates);
+        ArgumentException.ThrowIfNullOrWhiteSpace(source);
+        if (candidates.Count == 0)
+        {
+            return;
+        }
+
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var tx = await conn.BeginTransactionAsync(ct).ConfigureAwait(false);
+            var now = DateTimeOffset.UtcNow;
+            var expires = now.Add(ttl <= TimeSpan.Zero ? TimeSpan.FromHours(1) : ttl);
+            var rank = 0;
+            foreach (var candidate in candidates)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (string.IsNullOrWhiteSpace(candidate.Magnet) || string.IsNullOrWhiteSpace(candidate.InfoHash))
+                {
+                    continue;
+                }
+
+                rank++;
+                await using var cmd = conn.CreateCommand();
+                cmd.Transaction = (SqliteTransaction)tx;
+                cmd.CommandText = @"INSERT OR REPLACE INTO source_candidates
+                    (tmdb_id,type,season,episode,preset,magnet,info_hash,indexer,title,seeders,size,rank,source,fetched_at,expires_at)
+                    VALUES ($tmdb,$type,$season,$episode,$preset,$magnet,$hash,$indexer,$title,$seeders,$size,$rank,$source,$fetched,$expires);";
+                cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+                cmd.Parameters.AddWithValue("$type", type);
+                cmd.Parameters.AddWithValue("$season", season);
+                cmd.Parameters.AddWithValue("$episode", episode);
+                cmd.Parameters.AddWithValue("$preset", preset);
+                cmd.Parameters.AddWithValue("$magnet", candidate.Magnet);
+                cmd.Parameters.AddWithValue("$hash", candidate.InfoHash);
+                cmd.Parameters.AddWithValue("$indexer", candidate.Indexer);
+                cmd.Parameters.AddWithValue("$title", candidate.Title ?? string.Empty);
+                cmd.Parameters.AddWithValue("$seeders", candidate.Seeders);
+                cmd.Parameters.AddWithValue("$size", candidate.Size);
+                cmd.Parameters.AddWithValue("$rank", rank);
+                cmd.Parameters.AddWithValue("$source", source);
+                cmd.Parameters.AddWithValue("$fetched", now.ToUnixTimeSeconds());
+                cmd.Parameters.AddWithValue("$expires", expires.ToUnixTimeSeconds());
+                await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            }
+
+            await tx.CommitAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    private static SourceCandidateRow ReadSourceCandidate(SqliteDataReader r)
+        => new(
+            r.GetInt32(0),
+            r.GetString(1),
+            r.GetInt32(2),
+            r.GetInt32(3),
+            r.GetString(4),
+            r.GetString(5),
+            r.GetString(6),
+            r.GetString(7),
+            r.GetString(8),
+            r.IsDBNull(9) ? null : r.GetInt32(9),
+            r.IsDBNull(10) ? null : r.GetInt64(10),
+            r.GetInt32(11),
+            r.GetString(12),
+            DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(13)),
+            DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(14)));
 
     // ---- unavailable_marker ----
 

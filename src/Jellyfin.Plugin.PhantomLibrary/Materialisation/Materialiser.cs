@@ -464,12 +464,60 @@ public sealed class Materialiser : IMaterialiser
             }
         }
 
+        var (sSentinel, eSentinel) = ChannelItemId.ToSentinels(season, episode);
+        var sourceCandidates = await _db.ListSourceCandidatesAsync(
+            tmdbId,
+            type,
+            sSentinel,
+            eSentinel,
+            cfg.SourcePickerPreset,
+            includeExpired: false,
+            ct).ConfigureAwait(false);
+        foreach (var sourceCandidate in sourceCandidates)
+        {
+            var magnet = new MagnetCandidate(
+                sourceCandidate.Magnet,
+                sourceCandidate.InfoHash,
+                sourceCandidate.Size ?? 0,
+                sourceCandidate.Seeders ?? 0,
+                sourceCandidate.Indexer)
+            {
+                Title = sourceCandidate.Title,
+            };
+            if (string.IsNullOrWhiteSpace(magnet.Magnet) || !seen.Add(magnet.Magnet))
+            {
+                continue;
+            }
+
+            if (!await IsCandidateAllowedAsync(magnetKey, magnet, ct).ConfigureAwait(false))
+            {
+                continue;
+            }
+
+            candidates.Add(BuildCandidateRequest(meta, type, tmdbId, imdb, season, episode, magnet, cfg, fromCache: false));
+        }
+
+        if (candidates.Count > 0)
+        {
+            return candidates;
+        }
+
         var probe = await _magnetSelector.ProbeAsync(
             tmdbId, imdb, type, season, episode,
             meta.Title, meta.Year,
             ct).ConfigureAwait(false);
         if (probe.Outcome == MagnetProbeOutcome.Available)
         {
+            await _db.UpsertSourceCandidatesAsync(
+                tmdbId,
+                type,
+                sSentinel,
+                eSentinel,
+                cfg.SourcePickerPreset,
+                probe.Candidates,
+                "materialise_probe",
+                TimeSpan.FromHours(Math.Max(1, cfg.MagnetCacheTtlHours)),
+                ct).ConfigureAwait(false);
             foreach (var magnet in probe.Candidates)
             {
                 if (string.IsNullOrWhiteSpace(magnet.Magnet) || !seen.Add(magnet.Magnet))
