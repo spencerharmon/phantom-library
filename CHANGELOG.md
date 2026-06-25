@@ -57,6 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Fixed Phantom Movies/Shows root browse regression introduced by audio stream selection: channel browse now emits unprobed file media sources and reserves FFprobe/audio-stream extraction for playback/media-info paths.
+- Patched Jellyfin audio stream selection now honors the user's preferred audio language ahead of the container default track, matching Phantom's selector and preventing non-preferred default tracks from winning at play time.
 - Phantom web now lets Jellyfin's native item-page kebab open for Phantom channel items by caching channel DTOs for Jellyfin's `/Users/{userId}/Items/{channelItemId}` refetch (including media-source ids selected by the detail page), then injects only Reset Phantom and Reject current Phantom source into the default command menu.
 - Fixed server-advertised item-action routes to accept Jellyfin web's dashless item ids, restoring Phantom kebab actions in the browser shim.
 - Phantom materialised/native-open movie and episode media sources now carry probed audio streams from the current gostream/FUSE file so Jellyfin can apply normal audio-language and remembered-track selection.
