@@ -267,6 +267,19 @@ if [ "$DO_BUILD" -eq 1 ]; then
           echo "    applied: $name"
         elif git apply --check -R "$patch" 2>/dev/null; then
           echo "    already applied: $name"
+        elif [ "$name" = "0005-Add-server-advertised-item-actions.patch" ] \
+          && [ -f Jellyfin.Api/Controllers/ItemActionsController.cs ] \
+          && [ -f MediaBrowser.Controller/Library/IItemActionProvider.cs ] \
+          && [ -f MediaBrowser.Model/Dto/ItemActionInfo.cs ] \
+          && [ -f MediaBrowser.Model/Dto/ItemActionRequest.cs ] \
+          && [ -f MediaBrowser.Model/Dto/ItemActionResult.cs ]; then
+          # 0007 mutates ItemActionsController after 0005. On a tree where
+          # 0005+0007 are already present, reverse-checking 0005 alone fails
+          # because the file no longer matches the original 0005 content.
+          # Since 0005 only creates these five files, their presence means the
+          # additive item-action API payload is already in the Jellyfin tree;
+          # let 0007 perform its own idempotency check next.
+          echo "    already applied: $name (content adjusted by follow-up patch)"
         else
           red "ERROR: patch $name does not apply cleanly to jellyfin/ at $(git -C "$REPO_ROOT/jellyfin" rev-parse --short HEAD)."
           red "       Likely cause: jellyfin/ source has drifted from the patch base."
