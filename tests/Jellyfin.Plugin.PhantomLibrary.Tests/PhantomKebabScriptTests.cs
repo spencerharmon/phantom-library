@@ -65,6 +65,7 @@ public class PhantomKebabScriptTests
         var js = ReadScript();
 
         Assert.Contains("fetchItemActions(itemId)", js);
+        Assert.Contains("currentUserQuery", js);
         Assert.Contains("Items/", js);
         Assert.Contains("/Actions", js);
         Assert.Contains("fireItemAction(itemId, actionId)", js);

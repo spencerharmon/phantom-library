@@ -6,17 +6,17 @@ Subject: [PATCH] Add server-advertised item actions
 ---
 diff --git a/Jellyfin.Api/Controllers/ItemActionsController.cs b/Jellyfin.Api/Controllers/ItemActionsController.cs
 new file mode 100644
-index 0000000000..d5c054f139
+index 0000000000..e372ac92d5
 --- /dev/null
 +++ b/Jellyfin.Api/Controllers/ItemActionsController.cs
-@@ -0,0 +1,179 @@
+@@ -0,0 +1,183 @@
 +using System;
 +using System.Collections.Generic;
 +using System.ComponentModel.DataAnnotations;
 +using System.Linq;
 +using System.Threading;
 +using System.Threading.Tasks;
-+using Jellyfin.Api.Extensions;
++using Jellyfin.Api.Helpers;
 +using MediaBrowser.Controller.Entities;
 +using MediaBrowser.Controller.Library;
 +using MediaBrowser.Model.Dto;
@@ -59,6 +59,7 @@ index 0000000000..d5c054f139
 +    /// Gets item actions available to the current user.
 +    /// </summary>
 +    /// <param name="itemId">The item id.</param>
++    /// <param name="userId">Optional user id, required when authenticated with an API key.</param>
 +    /// <param name="cancellationToken">Cancellation token.</param>
 +    /// <returns>Available actions.</returns>
 +    [HttpGet]
@@ -67,6 +68,7 @@ index 0000000000..d5c054f139
 +    [ProducesResponseType(StatusCodes.Status404NotFound)]
 +    public async Task<ActionResult<IReadOnlyList<ItemActionInfo>>> GetActions(
 +        [FromRoute, Required] string itemId,
++        [FromQuery] Guid? userId,
 +        CancellationToken cancellationToken = default)
 +    {
 +        if (!TryParseItemId(itemId, out var parsedItemId))
@@ -74,14 +76,14 @@ index 0000000000..d5c054f139
 +            return BadRequest("Invalid item id");
 +        }
 +
-+        var userId = User.GetUserId();
-+        var user = _userManager.GetUserById(userId);
++        var requestUserId = RequestHelpers.GetUserId(User, userId);
++        var user = _userManager.GetUserById(requestUserId);
 +        if (user is null)
 +        {
 +            return NotFound();
 +        }
 +
-+        var item = _libraryManager.GetItemById<BaseItem>(parsedItemId, userId);
++        var item = _libraryManager.GetItemById<BaseItem>(parsedItemId, requestUserId);
 +        if (item is null)
 +        {
 +            return NotFound();
@@ -106,6 +108,7 @@ index 0000000000..d5c054f139
 +    /// </summary>
 +    /// <param name="itemId">The item id.</param>
 +    /// <param name="actionId">The action id.</param>
++    /// <param name="userId">Optional user id, required when authenticated with an API key.</param>
 +    /// <param name="request">Optional action payload.</param>
 +    /// <param name="cancellationToken">Cancellation token.</param>
 +    /// <returns>Action result.</returns>
@@ -119,6 +122,7 @@ index 0000000000..d5c054f139
 +    public async Task<ActionResult<ItemActionResult>> InvokeAction(
 +        [FromRoute, Required] string itemId,
 +        [FromRoute, Required] string actionId,
++        [FromQuery] Guid? userId,
 +        [FromBody] ItemActionRequest? request,
 +        CancellationToken cancellationToken = default)
 +    {
@@ -127,14 +131,14 @@ index 0000000000..d5c054f139
 +            return BadRequest("Invalid item id");
 +        }
 +
-+        var userId = User.GetUserId();
-+        var user = _userManager.GetUserById(userId);
++        var requestUserId = RequestHelpers.GetUserId(User, userId);
++        var user = _userManager.GetUserById(requestUserId);
 +        if (user is null)
 +        {
 +            return NotFound();
 +        }
 +
-+        var item = _libraryManager.GetItemById<BaseItem>(parsedItemId, userId);
++        var item = _libraryManager.GetItemById<BaseItem>(parsedItemId, requestUserId);
 +        if (item is null)
 +        {
 +            return NotFound();

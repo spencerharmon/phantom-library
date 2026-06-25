@@ -172,8 +172,14 @@
         });
     }
 
+    function currentUserQuery() {
+        var api = getApiClient();
+        var userId = api && typeof api.getCurrentUserId === 'function' ? api.getCurrentUserId() : null;
+        return userId ? '?userId=' + encodeURIComponent(userId) : '';
+    }
+
     function fetchItemActions(itemId) {
-        var url = apiUrl('Items/' + encodeURIComponent(itemId) + '/Actions');
+        var url = apiUrl('Items/' + encodeURIComponent(itemId) + '/Actions' + currentUserQuery());
         if (!url) { return Promise.resolve([]); }
         return ajaxJson({
             type: 'GET',
@@ -188,7 +194,7 @@
     }
 
     function fireItemAction(itemId, actionId) {
-        var url = apiUrl('Items/' + encodeURIComponent(itemId) + '/Actions/' + encodeURIComponent(actionId));
+        var url = apiUrl('Items/' + encodeURIComponent(itemId) + '/Actions/' + encodeURIComponent(actionId) + currentUserQuery());
         if (!url) {
             alert('Phantom Library: ApiClient not found. Reload page and try again.');
             return Promise.reject(new Error('ApiClient not found'));
