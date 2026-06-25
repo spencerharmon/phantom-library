@@ -77,10 +77,11 @@ index 0000000000..e9d4b6ef99
 +        }
 +
 +        var requestUserId = ResolveUserId(userId);
-+        if (requestUserId == Guid.Empty)
++        if (requestUserId.Equals(Guid.Empty))
 +        {
 +            return BadRequest("userId query parameter is required when the authentication token is not user-scoped");
 +        }
++
 +        var user = _userManager.GetUserById(requestUserId);
 +        if (user is null)
 +        {
@@ -136,10 +137,11 @@ index 0000000000..e9d4b6ef99
 +        }
 +
 +        var requestUserId = ResolveUserId(userId);
-+        if (requestUserId == Guid.Empty)
++        if (requestUserId.Equals(Guid.Empty))
 +        {
 +            return BadRequest("userId query parameter is required when the authentication token is not user-scoped");
 +        }
++
 +        var user = _userManager.GetUserById(requestUserId);
 +        if (user is null)
 +        {
@@ -200,12 +202,12 @@ index 0000000000..e9d4b6ef99
 +    private Guid ResolveUserId(Guid? requestedUserId)
 +    {
 +        var authenticatedUserId = User.GetUserId();
-+        if (requestedUserId is null || requestedUserId == Guid.Empty)
++        if (requestedUserId is null || requestedUserId.Value.Equals(Guid.Empty))
 +        {
 +            return authenticatedUserId;
 +        }
 +
-+        if (authenticatedUserId != Guid.Empty && authenticatedUserId != requestedUserId.Value)
++        if (!authenticatedUserId.Equals(Guid.Empty) && !authenticatedUserId.Equals(requestedUserId.Value))
 +        {
 +            throw new UnauthorizedAccessException("Requested user id does not match authenticated user");
 +        }
