@@ -108,7 +108,7 @@ PLUGIN_NAME="Jellyfin.Plugin.PhantomLibrary"
 PLUGIN_DISPLAY_NAME="Phantom Library"
 PLUGIN_DIR_NAME="${PLUGIN_NAME}_${PLUGIN_VERSION}"
 DLL_OUT="src/${PLUGIN_NAME}/bin/Release/net9.0/${PLUGIN_NAME}.dll"
-EXPECTED_PHANTOM_SCHEMA="$(grep -R 'private const int CurrentSchemaVersion' -n src/${PLUGIN_NAME}/State/PhantomDb.cs 2>/dev/null | sed -E 's/.*= ([0-9]+);/\1/' | head -1)"
+EXPECTED_PHANTOM_SCHEMA="$(awk '/CurrentSchemaVersion/ { if (match($0, /[0-9]+/)) { print substr($0, RSTART, RLENGTH); exit } }' "src/${PLUGIN_NAME}/State/PhantomDb.cs" 2>/dev/null || true)"
 [ -n "$EXPECTED_PHANTOM_SCHEMA" ] || EXPECTED_PHANTOM_SCHEMA="unknown"
 
 # Detect Jellyfin data dir if not overridden. Order of preference:
