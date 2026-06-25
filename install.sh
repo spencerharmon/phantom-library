@@ -94,19 +94,34 @@ fi
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
 
-ensure_submodule_checkout() {
+prepare_submodule_checkout() {
   local path="$1"
-  if git -C "$REPO_ROOT/$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    return 0
-  fi
-
   if [ ! -f "$REPO_ROOT/.gitmodules" ]; then
     die "$path/ source checkout missing and .gitmodules is absent; cannot initialise dependency."
   fi
 
-  bold "Initialising submodule $path..."
-  git -C "$REPO_ROOT" submodule update --init --recursive "$path" \
+  bold "Preparing submodule $path at recorded commit..."
+  git -C "$REPO_ROOT" submodule sync -- "$path" >/dev/null \
+    || die "Failed to sync submodule $path."
+
+  # A previous interrupted install may have left generated patch files,
+  # modified tracked files, or build detritus inside the submodule. Build
+  # reproducibility must come from the superproject's recorded gitlink, not
+  # from local filesystem state, so reset/clean before and after checkout.
+  if git -C "$REPO_ROOT/$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git -C "$REPO_ROOT/$path" reset --hard >/dev/null \
+      || die "Failed to reset submodule $path."
+    git -C "$REPO_ROOT/$path" clean -fdx >/dev/null \
+      || die "Failed to clean submodule $path."
+  fi
+
+  git -C "$REPO_ROOT" submodule update --init --recursive --force "$path" \
     || die "Failed to initialise submodule $path. Check network/credentials and retry."
+
+  git -C "$REPO_ROOT/$path" reset --hard >/dev/null \
+    || die "Failed to reset submodule $path after checkout."
+  git -C "$REPO_ROOT/$path" clean -fdx >/dev/null \
+    || die "Failed to clean submodule $path after checkout."
 
   git -C "$REPO_ROOT/$path" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
     || die "$path/ submodule did not initialise to a git checkout."
@@ -258,7 +273,7 @@ if [ "$DO_BUILD" -eq 1 ]; then
   # assembly-load failures (MediaBrowser.Common version mismatch).
   patches_dir="$REPO_ROOT/scripts/jellyfin-patches"
   if [ -d "$patches_dir" ] && ls "$patches_dir"/*.patch >/dev/null 2>&1; then
-    ensure_submodule_checkout jellyfin
+    prepare_submodule_checkout jellyfin
 
     installed_version="$(installed_jellyfin_version || true)"
     if [ -z "$installed_version" ]; then
@@ -629,7 +644,7 @@ if [ "$DO_GOSTREAM" -eq 1 ]; then
     yellow "  podman not in PATH - skipping. Install podman or pass --no-gostream."
   else
     if [ "$DO_BUILD" -eq 1 ]; then
-      ensure_submodule_checkout gostream
+      prepare_submodule_checkout gostream
       if [ ! -f "$REPO_ROOT/gostream/docker/Dockerfile" ]; then
         die "gostream/docker/Dockerfile missing; cannot build $GOSTREAM_IMAGE."
       fi
