@@ -68,6 +68,12 @@ public class PhantomKebabScriptTests
         Assert.Contains("currentUserQuery", js);
         Assert.Contains("scanActionSheets", js);
         Assert.Contains("setInterval(scanActionSheets", js);
+        var injectStart = js.IndexOf("function injectIntoSheet", StringComparison.Ordinal);
+        var injectEnd = js.IndexOf("function scanActionSheets", StringComparison.Ordinal);
+        Assert.True(injectStart >= 0 && injectEnd > injectStart, "injectIntoSheet block not found");
+        var injectBlock = js[injectStart..injectEnd];
+        Assert.Contains("fetchItemActions(itemId)", injectBlock);
+        Assert.DoesNotContain("getPlayablePhantomItem", injectBlock);
         Assert.Contains("Items/", js);
         Assert.Contains("/Actions", js);
         Assert.Contains("fireItemAction(itemId, actionId)", js);
