@@ -742,10 +742,13 @@ public sealed class Materialiser : IMaterialiser
                         .Where(v => string.Equals(v.Result.Status, "valid", StringComparison.OrdinalIgnoreCase))
                         .ToDictionary(v => v.Candidate.Magnet.Magnet, StringComparer.Ordinal);
                     return ordered
-                        .Where(c => validByMagnet.ContainsKey(c.Magnet.Magnet))
                         .Select(c =>
                         {
-                            var v = validByMagnet[c.Magnet.Magnet];
+                            if (!validByMagnet.TryGetValue(c.Magnet.Magnet, out var v))
+                            {
+                                return c;
+                            }
+
                             return c with
                             {
                                 Request = c.Request with
@@ -780,21 +783,92 @@ public sealed class Materialiser : IMaterialiser
         CancellationToken ct)
     {
         var parallelism = Math.Clamp(cfg.SourceValidationParallelism, 1, 6);
+#pragma warning disable CA2025 // tasks are awaited/observed before semaphore and CTS leave scope
         using var semaphore = new SemaphoreSlim(parallelism, parallelism);
-        var tasks = window.Select(async candidate =>
+        using var winnerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var results = new List<CandidateValidation>();
+        var tasks = window.Select(candidate => ValidateOneCandidateWithSemaphoreAsync(
+                candidate,
+                tmdbId,
+                type,
+                season,
+                episode,
+                imdb,
+                cfg,
+                semaphore,
+                winnerCts.Token))
+            .ToList();
+#pragma warning restore CA2025
+
+        while (tasks.Count > 0)
         {
-            await semaphore.WaitAsync(ct).ConfigureAwait(false);
+            var completed = await Task.WhenAny(tasks).ConfigureAwait(false);
+            tasks.Remove(completed);
+
+            CandidateValidation validation;
             try
             {
-                return await ValidateOneCandidateAsync(candidate, tmdbId, type, season, episode, imdb, cfg, ct).ConfigureAwait(false);
+                validation = await completed.ConfigureAwait(false);
             }
-            finally
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                continue;
+            }
+
+            results.Add(validation);
+            if (string.Equals(validation.Result.Status, "valid", StringComparison.OrdinalIgnoreCase))
+            {
+                winnerCts.Cancel();
+                await ObserveCancelledValidationsAsync(tasks).ConfigureAwait(false);
+                return results;
+            }
+        }
+
+        return results;
+    }
+
+    private async Task<CandidateValidation> ValidateOneCandidateWithSemaphoreAsync(
+        CandidateAddRequest candidate,
+        int tmdbId,
+        string type,
+        int? season,
+        int? episode,
+        string? imdb,
+        PluginConfiguration cfg,
+        SemaphoreSlim semaphore,
+        CancellationToken ct)
+    {
+        var acquired = false;
+        try
+        {
+            await semaphore.WaitAsync(ct).ConfigureAwait(false);
+            acquired = true;
+            return await ValidateOneCandidateAsync(candidate, tmdbId, type, season, episode, imdb, cfg, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (acquired)
             {
                 semaphore.Release();
             }
-        }).ToArray();
+        }
+    }
 
-        return await Task.WhenAll(tasks).ConfigureAwait(false);
+    private static async Task ObserveCancelledValidationsAsync(IEnumerable<Task<CandidateValidation>> tasks)
+    {
+        try
+        {
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (GostreamException)
+        {
+        }
+        catch (HttpRequestException)
+        {
+        }
     }
 
     private async Task<CandidateValidation> ValidateOneCandidateAsync(
@@ -1057,6 +1131,40 @@ public sealed class Materialiser : IMaterialiser
     private static string TransientReason(Exception ex)
         => ex is GostreamTimeoutException ? "metadata_timeout" : "validation_transient";
 
+    private async Task<CandidateAddRequest?> EnsureCandidateValidatedForAddAsync(
+        CandidateAddRequest candidate,
+        int tmdbId,
+        string type,
+        int? season,
+        int? episode,
+        string? imdb,
+        PluginConfiguration cfg,
+        CancellationToken ct)
+    {
+        if (candidate.Request.SelectedFileId.HasValue
+            || !string.IsNullOrWhiteSpace(candidate.Request.SelectedFilePath)
+            || !string.IsNullOrWhiteSpace(candidate.Request.ValidationSessionId))
+        {
+            return candidate;
+        }
+
+        var validation = await ValidateOneCandidateAsync(candidate, tmdbId, type, season, episode, imdb, cfg, ct).ConfigureAwait(false);
+        if (!string.Equals(validation.Result.Status, "valid", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        return candidate with
+        {
+            Request = candidate.Request with
+            {
+                SelectedFileId = validation.Result.SelectedFile?.Id,
+                SelectedFilePath = validation.Result.SelectedFile?.Path,
+                ValidationSessionId = string.IsNullOrWhiteSpace(validation.SessionId) ? null : validation.SessionId,
+            },
+        };
+    }
+
     private async Task<CandidateAddResult> AddWithCandidateRetryAsync(
         IReadOnlyList<CandidateAddRequest> candidates,
         int tmdbId,
@@ -1074,17 +1182,23 @@ public sealed class Materialiser : IMaterialiser
             ct.ThrowIfCancellationRequested();
             try
             {
+                var validated = await EnsureCandidateValidatedForAddAsync(candidate, tmdbId, type, season, episode, imdb, cfg, ct).ConfigureAwait(false);
+                if (validated is null)
+                {
+                    continue;
+                }
+
                 GostreamAddResult result;
                 using (await _gostreamLimiter.AcquireAsync(ct).ConfigureAwait(false))
                 {
-                    result = await _gostream.AddAsync(candidate.Request, ct).ConfigureAwait(false);
+                    result = await _gostream.AddAsync(validated.Request, ct).ConfigureAwait(false);
                 }
                 var fusePath = type == "movie"
                     ? GostreamPathResolver.ResolveMoviePath(result.FusePath)
                     : GostreamPathResolver.ResolveEpisodePath(result.FusePath);
                 await WaitForFusePathAsync(fusePath, ct).ConfigureAwait(false);
-                await ReleaseUnconsumedCandidateLeasesAsync(candidates, candidate, CancellationToken.None).ConfigureAwait(false);
-                if (!candidate.FromCache)
+                await ReleaseUnconsumedCandidateLeasesAsync(candidates, validated, CancellationToken.None).ConfigureAwait(false);
+                if (!validated.FromCache)
                 {
                     try
                     {
@@ -1092,11 +1206,11 @@ public sealed class Materialiser : IMaterialiser
                             new MagnetCacheKey(tmdbId, imdb, type, season, episode, cfg.SourcePickerPreset),
                             new MagnetCacheEntry
                             {
-                                Magnet = candidate.Magnet.Magnet,
-                                InfoHash = candidate.Magnet.InfoHash,
-                                Size = candidate.Magnet.Size,
-                                Seeders = candidate.Magnet.Seeders,
-                                Indexer = candidate.Magnet.Indexer,
+                                Magnet = validated.Magnet.Magnet,
+                                InfoHash = validated.Magnet.InfoHash,
+                                Size = validated.Magnet.Size,
+                                Seeders = validated.Magnet.Seeders,
+                                Indexer = validated.Magnet.Indexer,
                                 CachedAt = DateTimeOffset.UtcNow,
                                 Ttl = TimeSpan.FromHours(cfg.MagnetCacheTtlHours),
                                 Source = "user",

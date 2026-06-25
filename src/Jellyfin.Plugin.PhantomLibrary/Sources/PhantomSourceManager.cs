@@ -697,8 +697,7 @@ public sealed class PhantomSourceManager
             return false;
         }
 
-        return string.Equals(row.ValidationStatus, "invalid", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(row.ValidationStatus, "transient", StringComparison.OrdinalIgnoreCase);
+        return string.Equals(row.ValidationStatus, "invalid", StringComparison.OrdinalIgnoreCase);
     }
 
     private static PhantomSourceOperationResult Result(PhantomSourceOperationStatus status, string code, string message)
