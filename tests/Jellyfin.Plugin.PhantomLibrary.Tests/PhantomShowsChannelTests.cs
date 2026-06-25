@@ -380,14 +380,24 @@ public class PhantomShowsChannelTests : IDisposable
     }
 
     [Fact]
-    public async Task GetChannelItems_SeasonFolder_MaterialisedEpisode_DoesNotProbeAudioStreamsDuringBrowse()
+    public async Task GetChannelItems_SeasonFolder_DoesNotProbeMaterialisedEpisodeFilesDuringBrowse()
     {
+        // Regression guard for 2026-06-25 root/list timeout: browse must
+        // not FFprobe every materialised episode while building channel
+        // lists. Audio stream probing belongs to playback/media-info for
+        // the selected item only.
         await SeedSeriesMetaAsync(1399, "Game of Thrones");
         _tmdb.Setup(t => t.GetSeasonAsync(1399, 1, null, It.IsAny<CancellationToken>()))
-            .ReturnsAsync(MakeSeasonDetails(1399, 1, 1));
-        var fusePath = Path.Combine(_splashHome, "browse_s01e01.mkv");
-        await File.WriteAllTextAsync(fusePath, "x", CancellationToken.None);
-        await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 1, "/stub/e1", fusePath, CancellationToken.None);
+            .ReturnsAsync(MakeSeasonDetails(1399, 1, 3));
+        var expectedPaths = new List<string>();
+        for (var episode = 1; episode <= 3; episode++)
+        {
+            var fusePath = Path.Combine(_splashHome, $"browse_s01e{episode:D2}.mkv");
+            await File.WriteAllTextAsync(fusePath, "x", CancellationToken.None);
+            expectedPaths.Add(fusePath);
+            await _db.InsertMaterialisedStateAsync(1399, "episode", 1, episode, $"/stub/e{episode}", fusePath, CancellationToken.None);
+        }
+
         var encoder = new Mock<IMediaEncoder>(MockBehavior.Strict);
         var channel = new PhantomShowsChannel(
             _db, _tmdb.Object, _splash, _state, _enumerator, encoder.Object,
@@ -395,8 +405,10 @@ public class PhantomShowsChannelTests : IDisposable
 
         var result = await channel.GetChannelItems(new InternalChannelItemQuery { FolderId = "season_1399_s01" }, CancellationToken.None);
 
-        var item = Assert.Single(result.Items);
-        Assert.Equal(fusePath, item.MediaSources[0].Path);
+        Assert.Equal(3, result.Items.Count);
+        Assert.Equal(
+            expectedPaths.OrderBy(p => p, StringComparer.Ordinal).ToArray(),
+            result.Items.Select(i => i.MediaSources[0].Path).OrderBy(p => p, StringComparer.Ordinal).ToArray());
         encoder.Verify(e => e.GetMediaInfo(It.IsAny<MediaInfoRequest>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 

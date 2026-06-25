@@ -150,12 +150,22 @@ public class PhantomMoviesChannelTests : IDisposable
     }
 
     [Fact]
-    public async Task GetChannelItems_MaterialisedOnly_DoesNotProbeAudioStreamsDuringBrowse()
+    public async Task GetChannelItems_RootBrowse_DoesNotProbeMaterialisedMovieFiles()
     {
-        await SeedMetaAsync(203, "Browse Movie");
-        var fusePath = Path.Combine(_moviesRoot, "browse-203.mkv");
-        File.WriteAllText(fusePath, string.Empty);
-        await _db.InsertMaterialisedStateAsync(203, "movie", -1, -1, "/stub/browse-203.mkv", fusePath, CancellationToken.None);
+        // Regression guard for 2026-06-25 root-list timeout: browse must
+        // not FFprobe every materialised file while building the channel
+        // root. Audio stream probing belongs to playback/media-info for the
+        // selected item only.
+        var expectedPaths = new List<string>();
+        for (var tmdb = 203; tmdb <= 205; tmdb++)
+        {
+            await SeedMetaAsync(tmdb, "Browse Movie " + tmdb);
+            var fusePath = Path.Combine(_moviesRoot, $"browse-{tmdb}.mkv");
+            File.WriteAllText(fusePath, string.Empty);
+            expectedPaths.Add(fusePath);
+            await _db.InsertMaterialisedStateAsync(tmdb, "movie", -1, -1, $"/stub/browse-{tmdb}.mkv", fusePath, CancellationToken.None);
+        }
+
         var encoder = new Mock<IMediaEncoder>(MockBehavior.Strict);
         var channel = new PhantomMoviesChannel(
             _db, _enumerator, _splash, _state, _tmdb.Object, encoder.Object,
@@ -163,8 +173,10 @@ public class PhantomMoviesChannelTests : IDisposable
 
         var result = await channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
 
-        var item = Assert.Single(result.Items);
-        Assert.Equal(fusePath, item.MediaSources[0].Path);
+        Assert.Equal(3, result.Items.Count);
+        Assert.Equal(
+            expectedPaths.OrderBy(p => p, StringComparer.Ordinal).ToArray(),
+            result.Items.Select(i => i.MediaSources[0].Path).OrderBy(p => p, StringComparer.Ordinal).ToArray());
         encoder.Verify(e => e.GetMediaInfo(It.IsAny<MediaInfoRequest>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
