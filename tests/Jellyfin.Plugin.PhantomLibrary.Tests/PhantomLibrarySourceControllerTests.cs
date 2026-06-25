@@ -344,6 +344,77 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
     }
 
     [Fact]
+    public async Task ResetCurrent_UnmaterialisedItem_ClearsRejectedCandidateValidation()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 42);
+        var candidate = Candidate("BAD", 100);
+        await db.UpsertSourceCandidatesAsync(
+            42,
+            "movie",
+            -1,
+            -1,
+            "test",
+            new[] { candidate },
+            "test",
+            TimeSpan.FromHours(1),
+            CancellationToken.None);
+        var validationTime = DateTimeOffset.FromUnixTimeSeconds(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        await db.UpdateSourceCandidateValidationAsync(new SourceCandidateValidationUpdate(
+            42,
+            "movie",
+            -1,
+            -1,
+            "test",
+            candidate.Magnet,
+            "invalid",
+            "target_episode_not_found",
+            validationTime,
+            validationTime.AddDays(7),
+            123,
+            "sv14-parser-audio-v1",
+            null,
+            null,
+            null), CancellationToken.None);
+        await db.MarkMagnetFailedAsync(
+            new MagnetFailureKey(42, "tt0000042", "movie", null, null, "test", candidate.Magnet),
+            new MagnetFailureEntry
+            {
+                InfoHash = candidate.InfoHash,
+                Reason = "target_episode_not_found",
+                FailedAt = validationTime,
+                RetryAfter = validationTime.AddDays(7),
+                ValidationPolicyVersion = "sv14-parser-audio-v1",
+            },
+            CancellationToken.None);
+        var ctrl = BuildController(db, new[] { candidate });
+
+        var before = Assert.IsType<OkObjectResult>(await ctrl.Sources("movie_42", CancellationToken.None));
+        var beforeSources = Assert.IsType<PhantomSourcesResponse>(before.Value);
+        Assert.True(beforeSources.CanResetCurrent);
+        Assert.True(Assert.Single(beforeSources.Candidates).IsRejected);
+
+        var result = await ctrl.ResetCurrent("movie_42", CancellationToken.None);
+
+        var ok = Assert.IsType<OkObjectResult>(result);
+        var payload = Assert.IsType<PhantomSourceOperationResult>(ok.Value);
+        Assert.Equal(PhantomSourceOperationStatus.Success, payload.Status);
+        Assert.Null(await db.GetMagnetFailureAsync(
+            new MagnetFailureKey(42, "tt0000042", "movie", null, null, "test", candidate.Magnet),
+            CancellationToken.None));
+        var resetCandidate = Assert.Single(await db.ListSourceCandidatesAsync(42, "movie", -1, -1, "test", includeExpired: true, CancellationToken.None));
+        Assert.Equal("unknown", resetCandidate.ValidationStatus);
+        Assert.Null(resetCandidate.ValidationReason);
+        Assert.Null(resetCandidate.ValidationExpiresAt);
+
+        var after = Assert.IsType<OkObjectResult>(await ctrl.Sources("movie_42", CancellationToken.None));
+        var afterSources = Assert.IsType<PhantomSourcesResponse>(after.Value);
+        Assert.False(afterSources.CanResetCurrent);
+        Assert.False(Assert.Single(afterSources.Candidates).IsRejected);
+        Assert.True(afterSources.CanMaterialiseSelected);
+    }
+
+    [Fact]
     public async Task ResetCurrent_InFlight_Returns409WithoutDeletingState()
     {
         using var db = await NewDbAsync();

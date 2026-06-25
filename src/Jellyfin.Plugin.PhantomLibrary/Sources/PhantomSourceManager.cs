@@ -49,6 +49,7 @@ public sealed record PhantomSourcesResponse
     public required string Status { get; init; }
     public PhantomCurrentSourceDto? CurrentSource { get; init; }
     public IReadOnlyList<PhantomSourceCandidateDto> Candidates { get; init; } = Array.Empty<PhantomSourceCandidateDto>();
+    public required bool CanResetCurrent { get; init; }
     public required bool CanRejectCurrent { get; init; }
     public required bool CanMaterialiseSelected { get; init; }
     public required string Message { get; init; }
@@ -194,6 +195,7 @@ public sealed class PhantomSourceManager
             key.TmdbId, key.Type, key.SeasonSentinel, key.EpisodeSentinel, ct).ConfigureAwait(false);
 
         var currentMagnet = current is null ? null : current.Value.Entry?.Magnet;
+        var cfg = _configProvider();
         var (candidates, errorKind, errorMessage) = await GetRankedCandidatesAsync(key, imdb, meta, includeRejected: true, currentMagnet: currentMagnet, ct)
             .ConfigureAwait(false);
 
@@ -204,8 +206,12 @@ public sealed class PhantomSourceManager
                 : errorKind is null && candidates.Count == 0
                     ? "unavailable"
                     : "unmaterialised";
+        var canReset = !inFlight
+            && (current is not null
+                || string.Equals(status, "unavailable", StringComparison.OrdinalIgnoreCase)
+                || candidates.Any(c => c.Failure is not null || IsValidationRejected(c.SourceRow, cfg)));
         var canReject = current is not null && current.Value.Entry is not null && !inFlight;
-        var canMaterialise = !inFlight && candidates.Any(c => c.Failure is null);
+        var canMaterialise = !inFlight && candidates.Any(c => c.Failure is null && !IsValidationRejected(c.SourceRow, cfg));
         var message = inFlight
             ? "Materialisation already in flight"
             : canReject || canMaterialise
@@ -222,6 +228,7 @@ public sealed class PhantomSourceManager
             Status = status,
             CurrentSource = current is null ? null : ToCurrentDto(current.Value.State, current.Value.Entry),
             Candidates = candidates.Select(ToCandidateDto).ToArray(),
+            CanResetCurrent = canReset,
             CanRejectCurrent = canReject,
             CanMaterialiseSelected = canMaterialise,
             Message = message,

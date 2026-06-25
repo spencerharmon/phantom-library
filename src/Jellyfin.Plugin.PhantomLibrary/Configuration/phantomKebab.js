@@ -510,6 +510,8 @@
 
     function canResetState(state) {
         if (!state) { return false; }
+        if (state.CanResetCurrent !== undefined) { return !!state.CanResetCurrent; }
+        if (state.canResetCurrent !== undefined) { return !!state.canResetCurrent; }
         var status = state.Status || state.status || '';
         return isMaterialisedState(state) || status === 'materialised' || status === 'unavailable';
     }

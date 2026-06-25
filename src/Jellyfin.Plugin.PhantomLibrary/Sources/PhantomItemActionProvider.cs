@@ -84,7 +84,7 @@ public sealed class PhantomItemActionProvider : IItemActionProvider
             }
         }
 
-        if (materialised || unavailable)
+        if (sources.CanResetCurrent || materialised || unavailable)
         {
             actions.Add(new ItemActionInfo
             {
