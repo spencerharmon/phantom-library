@@ -6,17 +6,17 @@ Subject: [PATCH] Add server-advertised item actions
 ---
 diff --git a/Jellyfin.Api/Controllers/ItemActionsController.cs b/Jellyfin.Api/Controllers/ItemActionsController.cs
 new file mode 100644
-index 0000000000..e372ac92d5
+index 0000000000..e9d4b6ef99
 --- /dev/null
 +++ b/Jellyfin.Api/Controllers/ItemActionsController.cs
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,207 @@
 +using System;
 +using System.Collections.Generic;
 +using System.ComponentModel.DataAnnotations;
 +using System.Linq;
 +using System.Threading;
 +using System.Threading.Tasks;
-+using Jellyfin.Api.Helpers;
++using Jellyfin.Api.Extensions;
 +using MediaBrowser.Controller.Entities;
 +using MediaBrowser.Controller.Library;
 +using MediaBrowser.Model.Dto;
@@ -76,7 +76,11 @@ index 0000000000..e372ac92d5
 +            return BadRequest("Invalid item id");
 +        }
 +
-+        var requestUserId = RequestHelpers.GetUserId(User, userId);
++        var requestUserId = ResolveUserId(userId);
++        if (requestUserId == Guid.Empty)
++        {
++            return BadRequest("userId query parameter is required when the authentication token is not user-scoped");
++        }
 +        var user = _userManager.GetUserById(requestUserId);
 +        if (user is null)
 +        {
@@ -131,7 +135,11 @@ index 0000000000..e372ac92d5
 +            return BadRequest("Invalid item id");
 +        }
 +
-+        var requestUserId = RequestHelpers.GetUserId(User, userId);
++        var requestUserId = ResolveUserId(userId);
++        if (requestUserId == Guid.Empty)
++        {
++            return BadRequest("userId query parameter is required when the authentication token is not user-scoped");
++        }
 +        var user = _userManager.GetUserById(requestUserId);
 +        if (user is null)
 +        {
@@ -187,6 +195,22 @@ index 0000000000..e372ac92d5
 +            Message = "Action not found",
 +            RefreshItem = false,
 +        });
++    }
++
++    private Guid ResolveUserId(Guid? requestedUserId)
++    {
++        var authenticatedUserId = User.GetUserId();
++        if (requestedUserId is null || requestedUserId == Guid.Empty)
++        {
++            return authenticatedUserId;
++        }
++
++        if (authenticatedUserId != Guid.Empty && authenticatedUserId != requestedUserId.Value)
++        {
++            throw new UnauthorizedAccessException("Requested user id does not match authenticated user");
++        }
++
++        return requestedUserId.Value;
 +    }
 +
 +    private static bool TryParseItemId(string itemId, out Guid parsedItemId)
