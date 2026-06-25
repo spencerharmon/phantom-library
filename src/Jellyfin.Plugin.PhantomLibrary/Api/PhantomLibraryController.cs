@@ -127,9 +127,9 @@ public sealed class PhantomLibraryController : ControllerBase
     [HttpGet("Items/{externalId}/Sources")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public async Task<IActionResult> Sources([FromRoute] string externalId, CancellationToken ct = default)
+    public async Task<IActionResult> Sources([FromRoute] string externalId, [FromQuery] bool refresh = false, CancellationToken ct = default)
     {
-        var response = await _sourceManager.GetSourcesAsync(externalId, ct).ConfigureAwait(false);
+        var response = await _sourceManager.GetSourcesAsync(externalId, refresh, ct).ConfigureAwait(false);
         return response is null ? NotFound(new { code = "not_found" }) : Ok(response);
     }
 

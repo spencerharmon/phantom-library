@@ -11,7 +11,7 @@ public class PhantomKebabScriptTests
 
         Assert.Contains("getPlayablePhantomItem", js);
         Assert.Contains("item.ExternalId", js);
-        Assert.Contains("fetchSources(ctx.externalId)", js);
+        Assert.Contains("fetchSources(ctx.externalId, refreshCandidates === true)", js);
         Assert.Contains("resolveExternalId(currentItemId())", js);
         Assert.Contains("Plugins/PhantomLibrary/Items/ResolveExternalId/", js);
         Assert.Contains("Plugins/PhantomLibrary/Items/", js);
@@ -71,6 +71,9 @@ public class PhantomKebabScriptTests
         Assert.Contains("fireRejectCurrent(ctx.externalId)", js);
         Assert.Contains("fireReset(ctx.externalId)", js);
         Assert.Contains("fireMaterialiseCandidate(ctx.externalId, selected)", js);
+        Assert.Contains("Refresh sources", js);
+        Assert.Contains("refreshSourceSection(true)", js);
+        Assert.Contains("?refresh=true", js);
     }
 
     [Fact]
@@ -84,7 +87,7 @@ public class PhantomKebabScriptTests
         Assert.Contains("startDetailPolling(ctx, 'reject')", js);
         Assert.Contains("startDetailPollingForCurrent('item-action')", js);
         Assert.Contains("setInterval(pollDetailState, 2000)", js);
-        Assert.Contains("fetchSources(externalId)", js);
+        Assert.Contains("fetchSources(externalId, false)", js);
         Assert.Contains("refreshVisibleItemContainers()", js);
         Assert.Contains("scanActionSheets()", js);
         Assert.Contains("window.location.reload()", js);

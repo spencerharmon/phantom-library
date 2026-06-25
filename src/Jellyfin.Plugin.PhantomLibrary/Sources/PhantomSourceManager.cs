@@ -176,6 +176,9 @@ public sealed class PhantomSourceManager
     }
 
     public async Task<PhantomSourcesResponse?> GetSourcesAsync(string externalId, CancellationToken ct)
+        => await GetSourcesAsync(externalId, refreshCandidates: false, ct).ConfigureAwait(false);
+
+    public async Task<PhantomSourcesResponse?> GetSourcesAsync(string externalId, bool refreshCandidates, CancellationToken ct)
     {
         if (!TryResolveKey(externalId, out var key))
         {
@@ -196,7 +199,7 @@ public sealed class PhantomSourceManager
 
         var currentMagnet = current is null ? null : current.Value.Entry?.Magnet;
         var cfg = _configProvider();
-        var (candidates, errorKind, errorMessage) = await GetRankedCandidatesAsync(key, imdb, meta, includeRejected: true, currentMagnet: currentMagnet, ct)
+        var (candidates, errorKind, errorMessage) = await GetRankedCandidatesAsync(key, imdb, meta, includeRejected: true, currentMagnet: currentMagnet, allowProbe: refreshCandidates, ct)
             .ConfigureAwait(false);
 
         var status = inFlight
@@ -331,7 +334,7 @@ public sealed class PhantomSourceManager
             return Result(PhantomSourceOperationStatus.NoAlternate, "no_alternate", "No metadata is cached for this item, so no alternate source can be selected");
         }
 
-        var (ranked, _, _) = await GetRankedCandidatesAsync(key, imdb, meta, includeRejected: false, currentMagnet: current.Value.Entry.Magnet, ct).ConfigureAwait(false);
+        var (ranked, _, _) = await GetRankedCandidatesAsync(key, imdb, meta, includeRejected: false, currentMagnet: current.Value.Entry.Magnet, allowProbe: true, ct).ConfigureAwait(false);
         var next = ranked.FirstOrDefault(c => !string.Equals(c.Candidate.Magnet, current.Value.Entry.Magnet, StringComparison.Ordinal));
 
         await DeleteCurrentStateAndMaybeRemoveAsync(key, current.Value.State, current.Value.Entry.InfoHash, ct).ConfigureAwait(false);
@@ -378,7 +381,7 @@ public sealed class PhantomSourceManager
             return Result(PhantomSourceOperationStatus.NotFound, "not_found", "Cached metadata for this item was not found");
         }
 
-        var (ranked, _, _) = await GetRankedCandidatesAsync(key, imdb, meta, includeRejected: request.OverrideRejected, currentMagnet: null, ct).ConfigureAwait(false);
+        var (ranked, _, _) = await GetRankedCandidatesAsync(key, imdb, meta, includeRejected: request.OverrideRejected, currentMagnet: null, allowProbe: true, ct).ConfigureAwait(false);
         var selected = ranked.FirstOrDefault(c => string.Equals(c.Candidate.Magnet, request.Magnet, StringComparison.Ordinal));
         if (selected is null)
         {
@@ -506,6 +509,7 @@ public sealed class PhantomSourceManager
         TmdbMetadataRow meta,
         bool includeRejected,
         string? currentMagnet,
+        bool allowProbe,
         CancellationToken ct)
     {
         var cfg = _configProvider();
@@ -542,23 +546,27 @@ public sealed class PhantomSourceManager
             }
         }
 
-        var probe = await _magnetSelector.ProbeAsync(
-            key.TmdbId, imdb, key.Type, key.Season, key.Episode,
-            meta.Title, meta.Year,
-            ct).ConfigureAwait(false);
-
-        if (probe.Outcome == MagnetProbeOutcome.Available)
+        MagnetProbeResult? probe = null;
+        if (allowProbe)
         {
-            await _db.UpsertSourceCandidatesAsync(
-                key.TmdbId,
-                key.Type,
-                key.SeasonSentinel,
-                key.EpisodeSentinel,
-                cfg.SourcePickerPreset,
-                probe.Candidates,
-                "details_probe",
-                TimeSpan.FromHours(Math.Max(1, cfg.MagnetCacheTtlHours)),
+            probe = await _magnetSelector.ProbeAsync(
+                key.TmdbId, imdb, key.Type, key.Season, key.Episode,
+                meta.Title, meta.Year,
                 ct).ConfigureAwait(false);
+
+            if (probe.Outcome == MagnetProbeOutcome.Available)
+            {
+                await _db.UpsertSourceCandidatesAsync(
+                    key.TmdbId,
+                    key.Type,
+                    key.SeasonSentinel,
+                    key.EpisodeSentinel,
+                    cfg.SourcePickerPreset,
+                    probe.Candidates,
+                    "details_probe",
+                    TimeSpan.FromHours(Math.Max(1, cfg.MagnetCacheTtlHours)),
+                    ct).ConfigureAwait(false);
+            }
         }
 
         var availability = await _db.GetAvailabilityItemAsync(key.TmdbId, key.Type, key.SeasonSentinel, key.EpisodeSentinel, ct)
@@ -594,7 +602,7 @@ public sealed class PhantomSourceManager
             }
         }
 
-        if (probe.Outcome == MagnetProbeOutcome.Available)
+        if (probe?.Outcome == MagnetProbeOutcome.Available)
         {
             foreach (var candidate in probe.Candidates)
             {
@@ -618,7 +626,7 @@ public sealed class PhantomSourceManager
 
         return result.Count > 0
             ? (result, null, null)
-            : (result, probe.ErrorKind, probe.ErrorMessage);
+            : (result, probe?.ErrorKind, probe?.ErrorMessage);
     }
 
     private static MagnetCandidate ToMagnetCandidate(SourceCandidateRow row)

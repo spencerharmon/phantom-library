@@ -287,8 +287,10 @@
         });
     }
 
-    function fetchSources(externalId) {
-        var url = apiUrl('Plugins/PhantomLibrary/Items/' + encodeURIComponent(externalId) + '/Sources');
+    function fetchSources(externalId, refresh) {
+        var path = 'Plugins/PhantomLibrary/Items/' + encodeURIComponent(externalId) + '/Sources';
+        if (refresh) { path += '?refresh=true'; }
+        var url = apiUrl(path);
         if (!url) { return Promise.resolve(null); }
         return ajaxJson({
             type: 'GET',
@@ -639,6 +641,20 @@
         });
         actions.appendChild(materialise);
 
+        var refresh = document.createElement('button');
+        refresh.type = 'button';
+        refresh.className = 'raised phantom-source-button';
+        refresh.textContent = 'Refresh sources';
+        refresh.addEventListener('click', function () {
+            refresh.disabled = true;
+            refreshSourceSection(true).then(function () {
+                refresh.disabled = false;
+            }, function () {
+                refresh.disabled = false;
+            });
+        });
+        actions.appendChild(refresh);
+
         var reset = document.createElement('button');
         reset.type = 'button';
         reset.className = 'raised phantom-source-button';
@@ -696,7 +712,7 @@
             || document.body;
     }
 
-    function refreshSourceSection() {
+    function refreshSourceSection(refreshCandidates) {
         var seenItemId = currentItemId();
         if (!seenItemId) {
             removeSourceSection();
@@ -709,7 +725,7 @@
                 stopDetailPolling();
                 return;
             }
-            return fetchSources(ctx.externalId).then(function (state) {
+            return fetchSources(ctx.externalId, refreshCandidates === true).then(function (state) {
                 if (currentItemId() !== seenItemId) { return; }
                 renderSourceSection(ctx, state);
                 observePhantomState(ctx, state, 'refresh');
@@ -778,7 +794,7 @@
         if (detailPoll.busy) { return; }
         detailPoll.busy = true;
         var externalId = detailPoll.externalId;
-        fetchSources(externalId).then(function (state) {
+        fetchSources(externalId, false).then(function (state) {
             if (!state || currentItemId() !== detailPoll.itemId || externalId !== detailPoll.externalId) { return; }
             var ctx = { externalId: externalId };
             renderSourceSection(ctx, state);

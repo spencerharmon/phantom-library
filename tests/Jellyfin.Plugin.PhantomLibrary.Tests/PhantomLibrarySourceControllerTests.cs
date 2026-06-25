@@ -209,7 +209,7 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
         using var db = await NewDbAsync();
         var ctrl = BuildController(db, Array.Empty<MagnetCandidate>());
 
-        var result = await ctrl.Sources("not-a-channel-id", CancellationToken.None);
+        var result = await ctrl.Sources("not-a-channel-id", refresh: false, CancellationToken.None);
 
         Assert.IsType<NotFoundObjectResult>(result);
     }
@@ -389,7 +389,7 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
             CancellationToken.None);
         var ctrl = BuildController(db, new[] { candidate });
 
-        var before = Assert.IsType<OkObjectResult>(await ctrl.Sources("movie_42", CancellationToken.None));
+        var before = Assert.IsType<OkObjectResult>(await ctrl.Sources("movie_42", refresh: false, CancellationToken.None));
         var beforeSources = Assert.IsType<PhantomSourcesResponse>(before.Value);
         Assert.True(beforeSources.CanResetCurrent);
         Assert.True(Assert.Single(beforeSources.Candidates).IsRejected);
@@ -407,7 +407,7 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
         Assert.Null(resetCandidate.ValidationReason);
         Assert.Null(resetCandidate.ValidationExpiresAt);
 
-        var after = Assert.IsType<OkObjectResult>(await ctrl.Sources("movie_42", CancellationToken.None));
+        var after = Assert.IsType<OkObjectResult>(await ctrl.Sources("movie_42", refresh: false, CancellationToken.None));
         var afterSources = Assert.IsType<PhantomSourcesResponse>(after.Value);
         Assert.False(afterSources.CanResetCurrent);
         Assert.False(Assert.Single(afterSources.Candidates).IsRejected);
