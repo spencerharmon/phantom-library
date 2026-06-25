@@ -184,6 +184,12 @@ if [ -f "$PHANTOM_DB_PATH" ] && command -v sqlite3 >/dev/null 2>&1; then
     "$EXPECTED_PHANTOM_SCHEMA")
       :
       ;;
+    13)
+      if [ "$EXPECTED_PHANTOM_SCHEMA" = "14" ]; then
+        die "phantom.db schema is v13 but Phantom Library $PLUGIN_VERSION requires v14. Stop Jellyfin and run: sudo bash scripts/migrate-source-validation-v14.sh, then re-run ./install.sh --build"
+      fi
+      die "phantom.db schema is v$PHANTOM_SCHEMA but Phantom Library $PLUGIN_VERSION requires v$EXPECTED_PHANTOM_SCHEMA. Stop Jellyfin and run: sudo bash scripts/phantom-wipe.sh --commit"
+      ;;
     *)
       die "phantom.db schema is v$PHANTOM_SCHEMA but Phantom Library $PLUGIN_VERSION requires v$EXPECTED_PHANTOM_SCHEMA. Stop Jellyfin and run: sudo bash scripts/phantom-wipe.sh --commit"
       ;;
