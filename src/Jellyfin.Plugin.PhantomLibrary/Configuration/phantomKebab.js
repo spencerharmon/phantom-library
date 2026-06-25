@@ -23,6 +23,7 @@
     var REJECT_DATA_ID = 'phantom-reject-current-source';
     var SECTION_ID = 'phantom-source-section';
     var ACTION_SECTION_ID = 'phantom-item-actions-section';
+    var ACTION_MENU_ID = 'phantom-item-actions-menu';
     var STYLE_ID = 'phantom-source-styles';
 
     function log() {
@@ -399,6 +400,9 @@
             '#phantom-item-actions-section{margin:1.25em 0;padding:1em;border:1px solid rgba(255,255,255,.18);border-radius:10px;}',
             '#phantom-item-actions-section h2{margin:.1em 0 .75em;font-size:1.2em;}',
             '.phantom-item-action-row{display:flex;gap:.6em;align-items:center;flex-wrap:wrap;margin:.6em 0;}',
+            '#phantom-item-actions-menu{position:fixed;z-index:99999;right:1em;top:5em;max-width:min(92vw,36em);background:rgba(32,32,32,.98);box-shadow:0 10px 35px rgba(0,0,0,.55);border-radius:10px;overflow:hidden;}',
+            '#phantom-item-actions-menu .actionSheetScroller{max-height:75vh;overflow:auto;}',
+            '.phantom-item-actions-backdrop{position:fixed;inset:0;z-index:99998;background:rgba(0,0,0,.18);}',
             '@media (max-width: 600px){.phantom-source-row,.phantom-item-action-row{display:block}.phantom-source-select,.phantom-source-button,.phantom-item-action-button{width:100%;margin:.35em 0}.phantom-source-button+ .phantom-source-button,.phantom-item-action-button+ .phantom-item-action-button{margin-left:0}}'
         ].join('\n');
         document.head.appendChild(style);
@@ -713,6 +717,15 @@
     }
 
     function closeSheet(sheet) {
+        if (sheet && sheet.dataset && sheet.dataset.phantomOwned === '1') {
+            var backdropId = sheet.dataset.backdropId;
+            if (backdropId) {
+                var backdrop = document.getElementById(backdropId);
+                if (backdrop) { backdrop.remove(); }
+            }
+            sheet.remove();
+            return;
+        }
         var close = sheet.querySelector('.btnCloseActionSheet') || sheet.querySelector('.actionSheetCloseButton');
         if (close) {
             close.click();
@@ -720,6 +733,76 @@
         }
         var bd = document.querySelector('.dialogBackdropOpened');
         if (bd) { bd.click(); }
+    }
+
+    function showPhantomActionMenu(itemId, actions, sourceButton) {
+        var enabled = actions.filter(function (action) {
+            return (action.Id || action.id) && action.IsEnabled !== false && action.isEnabled !== false;
+        });
+        if (!itemId || enabled.length === 0) { return; }
+        var existing = document.getElementById(ACTION_MENU_ID);
+        if (existing) { closeSheet(existing); }
+
+        ensureStyles();
+        var backdrop = document.createElement('div');
+        var backdropId = ACTION_MENU_ID + '-backdrop';
+        backdrop.id = backdropId;
+        backdrop.className = 'phantom-item-actions-backdrop';
+        document.body.appendChild(backdrop);
+
+        var sheet = document.createElement('div');
+        sheet.id = ACTION_MENU_ID;
+        sheet.className = 'actionSheet phantom-item-actions-menu';
+        sheet.dataset.phantomOwned = '1';
+        sheet.dataset.backdropId = backdropId;
+        sheet.setAttribute('role', 'menu');
+        sheet.innerHTML = '<div class="actionSheetContent"><div class="actionSheetScroller scrollY"></div></div>';
+        document.body.appendChild(sheet);
+
+        if (sourceButton && typeof sourceButton.getBoundingClientRect === 'function') {
+            var rect = sourceButton.getBoundingClientRect();
+            sheet.style.top = Math.max(8, Math.round(rect.bottom + 8)) + 'px';
+            sheet.style.right = Math.max(8, Math.round(window.innerWidth - rect.right)) + 'px';
+        }
+
+        var content = sheet.querySelector('.actionSheetScroller');
+        enabled.forEach(function (action) {
+            var actionId = action.Id || action.id;
+            var label = action.Name || action.name || actionId;
+            var icon = action.Icon || action.icon || 'extension';
+            var confirmText = action.ConfirmationText || action.confirmationText;
+            var requiresConfirmation = action.RequiresConfirmation === true || action.requiresConfirmation === true;
+            injectButton(sheet, content, label, 'phantom-action-' + actionId.replace(/[^a-zA-Z0-9_-]/g, '-'), icon, function () {
+                closeSheet(sheet);
+                if ((confirmText || requiresConfirmation) && !window.confirm(confirmText || ('Run ' + label + '?'))) { return; }
+                fireItemAction(itemId, actionId).then(refreshClientAfterAction, function () { /* alert already shown */ });
+            });
+        });
+        backdrop.addEventListener('click', function () { closeSheet(sheet); });
+    }
+
+    function interceptDetailMoreButtonClick(ev) {
+        var button = ev.target && ev.target.closest ? ev.target.closest('.btnMoreCommands') : null;
+        if (!button) { return; }
+        if (button.dataset.phantomBypass === '1') {
+            button.dataset.phantomBypass = '';
+            return;
+        }
+        var itemId = currentItemId();
+        if (!itemId) { return; }
+
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (typeof ev.stopImmediatePropagation === 'function') { ev.stopImmediatePropagation(); }
+
+        fetchItemActions(itemId).then(function (actions) {
+            if (actions.length > 0) {
+                showPhantomActionMenu(itemId, actions, button);
+                return;
+            }
+            button.dataset.phantomBypass = '1';
+            button.click();
+        });
     }
 
     /* Watch for the kebab action-sheet opening and inject source entries.
@@ -753,9 +836,10 @@
                 var enabled = action.IsEnabled !== false && action.isEnabled !== false;
                 var confirmText = action.ConfirmationText || action.confirmationText;
                 if (!actionId || !enabled) { return; }
+                var requiresConfirmation = action.RequiresConfirmation === true || action.requiresConfirmation === true;
                 injectButton(sheet, content, label, 'phantom-action-' + actionId.replace(/[^a-zA-Z0-9_-]/g, '-'), icon, function () {
                     closeSheet(sheet);
-                    if (confirmText && !window.confirm(confirmText)) { return; }
+                    if ((confirmText || requiresConfirmation) && !window.confirm(confirmText || ('Run ' + label + '?'))) { return; }
                     fireItemAction(itemId, actionId).then(refreshClientAfterAction, function () { /* alert already shown */ });
                 });
             });
@@ -815,6 +899,7 @@
         refreshSourceSection();
         refreshActionSection();
         prehydratePhantomSeasonChildren();
+        document.addEventListener('click', interceptDetailMoreButtonClick, true);
         window.addEventListener('hashchange', function () {
             window.setTimeout(refreshSourceSection, 50);
             window.setTimeout(refreshActionSection, 50);

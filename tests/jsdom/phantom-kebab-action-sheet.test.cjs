@@ -196,6 +196,43 @@ async function testDirectActionSectionWorksWithoutJellyfinKebab() {
   }
 }
 
+async function testItemPageKebabInterceptsPhantom404Path() {
+  const { dom, requests, alerts, cleanup } = createHarness('<button type="button" class="btnMoreCommands detailButton"><span class="material-icons">more_vert</span></button>');
+  try {
+    const document = dom.window.document;
+    let nativeClicked = false;
+    document.querySelector('.btnMoreCommands').addEventListener('click', () => {
+      nativeClicked = true;
+    });
+
+    await waitFor(
+      () => document.querySelector('#phantom-item-actions-section [data-action-id="phantom.materialise"]'),
+      'direct Phantom item action button before kebab click'
+    );
+
+    document.querySelector('.btnMoreCommands').dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true, cancelable: true }));
+    const menuButton = await waitFor(
+      () => document.querySelector('#phantom-item-actions-menu [data-id="phantom-action-phantom-reset"]'),
+      'intercepted Phantom action menu from item-page kebab'
+    );
+    assert.equal(nativeClicked, false, 'native Jellyfin item-page menu handler must be stopped for Phantom channel items');
+    assert.equal(requests.some((request) => request.url.includes(`/Items/${itemId}/Actions?userId=${encodeURIComponent(userId)}`)), true);
+
+    menuButton.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true, cancelable: true }));
+    await waitFor(
+      () => requests.some((request) => request.type === 'POST' && request.url.includes(`/Items/${itemId}/Actions/phantom.reset?userId=${encodeURIComponent(userId)}`)),
+      'intercepted menu POST /Items/{id}/Actions/phantom.reset'
+    );
+    await waitFor(
+      () => alerts.some((message) => message.includes('Phantom Library: phantom.reset — Reset')),
+      'intercepted menu action success alert'
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  } finally {
+    cleanup();
+  }
+}
+
 async function testDynamicallyAddedSheetInjectedByObserver() {
   const { dom, cleanup } = createHarness('');
   try {
@@ -213,6 +250,7 @@ async function testDynamicallyAddedSheetInjectedByObserver() {
 (async () => {
   await testExistingSheetInjectsIntoScrollerAndUsesItemActionApi();
   await testDirectActionSectionWorksWithoutJellyfinKebab();
+  await testItemPageKebabInterceptsPhantom404Path();
   await testDynamicallyAddedSheetInjectedByObserver();
   console.log('phantom kebab jsdom tests passed');
 })().catch((err) => {
