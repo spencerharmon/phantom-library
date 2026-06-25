@@ -10,18 +10,20 @@ const scriptPath = path.join(repoRoot, 'src/Jellyfin.Plugin.PhantomLibrary/Confi
 const script = fs.readFileSync(scriptPath, 'utf8');
 
 const itemId = 'df7a034eaf3de44e189609d6b04e52b3';
+const dashedItemId = 'df7a034e-af3d-e44e-1896-09d6b04e52b3';
 const userId = '8EB11AC1-9939-4621-896C-31D5CBA4951C';
+const channelId = '40ab6e9af516a84f46dcea7140855d88';
 
 function actionSheetHtml() {
   return `
     <div class="actionSheet">
       <div class="actionSheetContent">
         <div class="actionSheetScroller scrollY">
-          <button is="emby-button" type="button" class="listItem listItem-button actionSheetMenuItem" data-id="play">
-            <span class="actionsheetMenuItemIcon listItemIcon listItemIcon-transparent material-icons play_arrow" aria-hidden="true"></span>
+          <button is="emby-button" type="button" class="listItem listItem-button actionSheetMenuItem" data-id="metadata">
+            <span class="actionsheetMenuItemIcon listItemIcon listItemIcon-transparent material-icons edit" aria-hidden="true"></span>
             <div class="listItemBody actionsheetListItemBody">
-              <div class="listItemBodyText actionSheetItemText">Play</div>
-              <div class="listItemBodyText secondary">Existing secondary text</div>
+              <div class="listItemBodyText actionSheetItemText">Edit metadata</div>
+              <div class="listItemBodyText secondary">Default Jellyfin command</div>
             </div>
           </button>
         </div>
@@ -33,6 +35,14 @@ function createHarness(html) {
   const requests = [];
   const alerts = [];
   const confirms = [];
+  const channelItem = {
+    Id: dashedItemId,
+    Type: 'Episode',
+    Name: 'The Swamp',
+    ExternalId: 'episode_246_s2e4',
+    ChannelId: channelId,
+    ServerId: 'test-server'
+  };
   const dom = new JSDOM(`<!doctype html><html><head></head><body><main class="detailPageContent"></main>${html}</body></html>`, {
     url: `http://127.0.0.1:8096/web/index.html#/details?id=${itemId}`,
     runScripts: 'dangerously',
@@ -61,36 +71,47 @@ function createHarness(html) {
   dom.window.console = console;
   dom.window.ApiClient = {
     getCurrentUserId: () => userId,
-    getItem: async () => ({ Id: itemId, Type: 'Episode', ExternalId: 'episode_246_s2e4', ChannelId: '40ab6e9af516a84f46dcea7140855d88' }),
+    getItem: async () => {
+      throw new Error('native /Users/{userId}/Items/{channelItemId} lookup should be bypassed after channel cache');
+    },
     getUrl: (urlPath) => `http://127.0.0.1:8096/${urlPath}`,
     ajax: async (options) => {
       requests.push({ type: options.type || 'GET', url: options.url, data: options.data || null });
       const url = options.url;
+      if (url.includes(`/Channels/${channelId}/Items`)) {
+        return { Items: [channelItem], TotalRecordCount: 1 };
+      }
       if (url.includes(`/Items/${encodeURIComponent(itemId)}/Actions?userId=${encodeURIComponent(userId)}`)) {
         return [
           {
             Id: 'phantom.materialise',
-            Name: 'Materialise (Phantom Library)',
+            Name: 'Materialise Phantom',
             Icon: 'download',
-            IsEnabled: true,
-            ConfirmationText: 'Materialise selected Phantom item?'
+            IsEnabled: true
           },
           {
             Id: 'phantom.reset',
             Name: 'Reset Phantom',
             Icon: 'restart_alt',
-            IsEnabled: true
+            IsEnabled: true,
+            RequiresConfirmation: true,
+            ConfirmationText: 'Reset Phantom state?'
+          },
+          {
+            Id: 'phantom.rejectCurrent',
+            Name: 'Reject current Phantom source',
+            Icon: 'block',
+            IsEnabled: true,
+            RequiresConfirmation: true,
+            ConfirmationText: 'Reject current source?'
           }
         ];
-      }
-      if (url.includes(`/Items/${encodeURIComponent(itemId)}/Actions/phantom.materialise?userId=${encodeURIComponent(userId)}`)) {
-        return { Status: 'Queued', RefreshItem: false };
       }
       if (url.includes(`/Items/${encodeURIComponent(itemId)}/Actions/phantom.reset?userId=${encodeURIComponent(userId)}`)) {
         return { Status: 'Reset', RefreshItem: false };
       }
-      if (url.includes('/Plugins/PhantomLibrary/Items/episode_246_s2e4/Sources')) {
-        return { Status: 'available', Candidates: [] };
+      if (url.includes(`/Items/${encodeURIComponent(itemId)}/Actions/phantom.rejectCurrent?userId=${encodeURIComponent(userId)}`)) {
+        return { Status: 'Rejected', RefreshItem: false };
       }
       throw new Error(`Unexpected ajax URL: ${url}`);
     }
@@ -107,7 +128,7 @@ function createHarness(html) {
     dom.window.close();
   };
 
-  return { dom, requests, alerts, confirms, cleanup };
+  return { dom, requests, alerts, confirms, channelItem, cleanup };
 }
 
 async function waitFor(predicate, description) {
@@ -130,104 +151,36 @@ async function waitFor(predicate, description) {
   throw new Error(`Timed out waiting for ${description}`);
 }
 
-async function testExistingSheetInjectsIntoScrollerAndUsesItemActionApi() {
+async function testNativeActionSheetGetsOnlyResetAndRejectActions() {
   const { dom, requests, alerts, confirms, cleanup } = createHarness(actionSheetHtml());
   try {
     const document = dom.window.document;
-    const directButton = await waitFor(
-      () => document.querySelector('#phantom-item-actions-section [data-action-id="phantom.materialise"]'),
-      'direct Phantom item action button'
+    const reset = await waitFor(
+      () => document.querySelector('.actionSheetScroller [data-id="phantom-action-phantom-reset"]'),
+      'Phantom reset button inside native action sheet scroller'
     );
-    assert.equal(directButton.textContent.includes('Materialise (Phantom Library)'), true);
-
-    const button = await waitFor(
-      () => document.querySelector('.actionSheetScroller [data-id="phantom-action-phantom-materialise"]'),
-      'Phantom materialise button inside action sheet scroller'
+    const reject = await waitFor(
+      () => document.querySelector('.actionSheetScroller [data-id="phantom-action-phantom-rejectCurrent"]'),
+      'Phantom reject button inside native action sheet scroller'
     );
 
-    assert.equal(button.textContent.includes('Materialise (Phantom Library)'), true);
-    assert.equal(document.querySelector('.actionSheetContent > [data-id="phantom-action-phantom-materialise"]'), null, 'button must not be appended outside scroller');
-    assert.equal(document.querySelectorAll('[data-id="phantom-action-phantom-materialise"]').length, 1, 'button injected exactly once');
+    assert.equal(document.querySelector('[data-id="metadata"]') !== null, true, 'default Jellyfin command remains present');
+    assert.equal(document.querySelector('[data-id="phantom-action-phantom-materialise"]'), null, 'materialise action is not injected into item-page kebab');
+    assert.equal(reset.textContent.includes('Reset Phantom'), true);
+    assert.equal(reject.textContent.includes('Reject current Phantom source'), true);
     assert.equal(requests.some((request) => request.url.includes(`/Items/${itemId}/Actions?userId=${encodeURIComponent(userId)}`)), true, 'GET /Items/{id}/Actions uses current user id');
-    assert.equal(requests.some((request) => request.url.includes('/Plugins/PhantomLibrary/Items/') && request.url.includes('/Sources') && request.type === 'GET'), true, 'detail source panel can still refresh independently');
 
-    button.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true, cancelable: true }));
-    await waitFor(
-      () => requests.some((request) => request.type === 'POST' && request.url.includes(`/Items/${itemId}/Actions/phantom.materialise?userId=${encodeURIComponent(userId)}`)),
-      'POST /Items/{id}/Actions/{actionId}'
-    );
-    await waitFor(
-      () => alerts.some((message) => message.includes('Phantom Library: phantom.materialise — Queued')),
-      'action success alert'
-    );
-    await waitFor(
-      () => requests.filter((request) => request.url.includes('/Plugins/PhantomLibrary/Items/') && request.url.includes('/Sources')).length >= 2,
-      'source section refresh after action'
-    );
-    await new Promise((resolve) => setTimeout(resolve, 50));
-
-    assert.deepEqual(confirms, ['Materialise selected Phantom item?']);
-  } finally {
-    cleanup();
-  }
-}
-
-async function testDirectActionSectionWorksWithoutJellyfinKebab() {
-  const { dom, requests, cleanup } = createHarness('');
-  try {
-    const document = dom.window.document;
-    const button = await waitFor(
-      () => document.querySelector('#phantom-item-actions-section [data-action-id="phantom.reset"]'),
-      'direct Phantom reset action button without Jellyfin action sheet'
-    );
-    assert.equal(button.textContent.includes('Reset Phantom'), true);
-    button.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true, cancelable: true }));
+    reset.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true, cancelable: true }));
     await waitFor(
       () => requests.some((request) => request.type === 'POST' && request.url.includes(`/Items/${itemId}/Actions/phantom.reset?userId=${encodeURIComponent(userId)}`)),
-      'direct action POST /Items/{id}/Actions/phantom.reset'
-    );
-    await waitFor(
-      () => requests.filter((request) => request.url.includes(`/Items/${itemId}/Actions?userId=${encodeURIComponent(userId)}`)).length >= 2,
-      'direct action section refresh after reset'
-    );
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  } finally {
-    cleanup();
-  }
-}
-
-async function testItemPageKebabInterceptsPhantom404Path() {
-  const { dom, requests, alerts, cleanup } = createHarness('<button type="button" class="btnMoreCommands detailButton"><span class="material-icons">more_vert</span></button>');
-  try {
-    const document = dom.window.document;
-    let nativeClicked = false;
-    document.querySelector('.btnMoreCommands').addEventListener('click', () => {
-      nativeClicked = true;
-    });
-
-    await waitFor(
-      () => document.querySelector('#phantom-item-actions-section [data-action-id="phantom.materialise"]'),
-      'direct Phantom item action button before kebab click'
-    );
-
-    document.querySelector('.btnMoreCommands').dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true, cancelable: true }));
-    const menuButton = await waitFor(
-      () => document.querySelector('#phantom-item-actions-menu [data-id="phantom-action-phantom-reset"]'),
-      'intercepted Phantom action menu from item-page kebab'
-    );
-    assert.equal(nativeClicked, false, 'native Jellyfin item-page menu handler must be stopped for Phantom channel items');
-    assert.equal(requests.some((request) => request.url.includes(`/Items/${itemId}/Actions?userId=${encodeURIComponent(userId)}`)), true);
-
-    menuButton.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true, cancelable: true }));
-    await waitFor(
-      () => requests.some((request) => request.type === 'POST' && request.url.includes(`/Items/${itemId}/Actions/phantom.reset?userId=${encodeURIComponent(userId)}`)),
-      'intercepted menu POST /Items/{id}/Actions/phantom.reset'
+      'POST /Items/{id}/Actions/phantom.reset'
     );
     await waitFor(
       () => alerts.some((message) => message.includes('Phantom Library: phantom.reset — Reset')),
-      'intercepted menu action success alert'
+      'action success alert'
     );
-    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    assert.deepEqual(confirms, ['Reset Phantom state?']);
   } finally {
     cleanup();
   }
@@ -240,18 +193,29 @@ async function testDynamicallyAddedSheetInjectedByObserver() {
     document.body.insertAdjacentHTML('beforeend', actionSheetHtml());
     await waitFor(
       () => document.querySelector('.actionSheetScroller [data-id="phantom-action-phantom-reset"]'),
-      'Phantom reset button after dynamic action sheet insertion'
+      'Phantom reset button after dynamic native action sheet insertion'
     );
   } finally {
     cleanup();
   }
 }
 
+async function testChannelItemCacheLetsNativeKebabGetItemResolve() {
+  const { dom, channelItem, cleanup } = createHarness('');
+  try {
+    const api = dom.window.ApiClient;
+    await api.ajax({ type: 'GET', url: `http://127.0.0.1:8096/Channels/${channelId}/Items` });
+    const item = await api.getItem(userId, itemId);
+    assert.equal(item, channelItem);
+  } finally {
+    cleanup();
+  }
+}
+
 (async () => {
-  await testExistingSheetInjectsIntoScrollerAndUsesItemActionApi();
-  await testDirectActionSectionWorksWithoutJellyfinKebab();
-  await testItemPageKebabInterceptsPhantom404Path();
+  await testNativeActionSheetGetsOnlyResetAndRejectActions();
   await testDynamicallyAddedSheetInjectedByObserver();
+  await testChannelItemCacheLetsNativeKebabGetItemResolve();
   console.log('phantom kebab jsdom tests passed');
 })().catch((err) => {
   console.error(err);

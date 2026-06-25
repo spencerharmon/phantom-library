@@ -22,9 +22,8 @@
     var RESET_DATA_ID = 'phantom-reset';
     var REJECT_DATA_ID = 'phantom-reject-current-source';
     var SECTION_ID = 'phantom-source-section';
-    var ACTION_SECTION_ID = 'phantom-item-actions-section';
-    var ACTION_MENU_ID = 'phantom-item-actions-menu';
     var STYLE_ID = 'phantom-source-styles';
+    var cachedChannelItems = Object.create(null);
 
     function log() {
         // Quiet by default; uncomment for debugging.
@@ -53,6 +52,61 @@
             return window.connectionManager.currentApiClient();
         }
         return null;
+    }
+
+    function normaliseItemId(itemId) {
+        return typeof itemId === 'string' ? itemId.replace(/-/g, '').toLowerCase() : '';
+    }
+
+    function cacheChannelItem(item) {
+        if (!item || !item.Id || !item.ChannelId) { return; }
+        cachedChannelItems[normaliseItemId(item.Id)] = item;
+    }
+
+    function cacheChannelItemsFromResponse(response) {
+        if (!response) { return; }
+        if (Array.isArray(response)) {
+            response.forEach(cacheChannelItemsFromResponse);
+            return;
+        }
+        if (Array.isArray(response.Items)) {
+            response.Items.forEach(cacheChannelItemsFromResponse);
+        }
+        cacheChannelItem(response);
+    }
+
+    function cachedChannelItem(itemId) {
+        return cachedChannelItems[normaliseItemId(itemId)] || null;
+    }
+
+    function patchApiClientForChannelItems() {
+        var api = getApiClient();
+        if (!api || api.__phantomChannelItemPatch === '1') { return; }
+        api.__phantomChannelItemPatch = '1';
+
+        if (typeof api.ajax === 'function') {
+            var originalAjax = api.ajax;
+            api.ajax = function () {
+                return originalAjax.apply(this, arguments).then(function (result) {
+                    cacheChannelItemsFromResponse(result);
+                    return result;
+                });
+            };
+        }
+
+        if (typeof api.getItem === 'function') {
+            var originalGetItem = api.getItem;
+            api.getItem = function (userId, itemId) {
+                var cached = cachedChannelItem(itemId);
+                if (cached) {
+                    return Promise.resolve(cached);
+                }
+                return originalGetItem.apply(this, arguments).then(function (item) {
+                    cacheChannelItem(item);
+                    return item;
+                });
+            };
+        }
     }
 
     function getCurrentItem() {
@@ -376,7 +430,7 @@
     }
 
     function refreshClientAfterAction(result) {
-        return Promise.all([refreshSourceSection(), refreshActionSection()]).then(function () {
+        return refreshSourceSection().then(function () {
             if (!shouldRefreshItem(result)) { return; }
             window.setTimeout(function () {
                 window.location.reload();
@@ -395,15 +449,9 @@
             '.phantom-source-row{display:flex;gap:.6em;align-items:center;flex-wrap:wrap;margin:.6em 0;}',
             '.phantom-source-row label{font-weight:600;}',
             '.phantom-source-select{min-height:44px;min-width:16em;max-width:100%;}',
-            '.phantom-source-button,.phantom-item-action-button{min-height:44px;padding:.65em 1em;border-radius:8px;touch-action:manipulation;}',
-            '.phantom-source-button+ .phantom-source-button,.phantom-item-action-button+ .phantom-item-action-button{margin-left:.4em;}',
-            '#phantom-item-actions-section{margin:1.25em 0;padding:1em;border:1px solid rgba(255,255,255,.18);border-radius:10px;}',
-            '#phantom-item-actions-section h2{margin:.1em 0 .75em;font-size:1.2em;}',
-            '.phantom-item-action-row{display:flex;gap:.6em;align-items:center;flex-wrap:wrap;margin:.6em 0;}',
-            '#phantom-item-actions-menu{position:fixed;z-index:99999;right:1em;top:5em;max-width:min(92vw,36em);background:rgba(32,32,32,.98);box-shadow:0 10px 35px rgba(0,0,0,.55);border-radius:10px;overflow:hidden;}',
-            '#phantom-item-actions-menu .actionSheetScroller{max-height:75vh;overflow:auto;}',
-            '.phantom-item-actions-backdrop{position:fixed;inset:0;z-index:99998;background:rgba(0,0,0,.18);}',
-            '@media (max-width: 600px){.phantom-source-row,.phantom-item-action-row{display:block}.phantom-source-select,.phantom-source-button,.phantom-item-action-button{width:100%;margin:.35em 0}.phantom-source-button+ .phantom-source-button,.phantom-item-action-button+ .phantom-item-action-button{margin-left:0}}'
+            '.phantom-source-button{min-height:44px;padding:.65em 1em;border-radius:8px;touch-action:manipulation;}',
+            '.phantom-source-button+ .phantom-source-button{margin-left:.4em;}',
+            '@media (max-width: 600px){.phantom-source-row{display:block}.phantom-source-select,.phantom-source-button{width:100%;margin:.35em 0}.phantom-source-button+ .phantom-source-button{margin-left:0}}'
         ].join('\n');
         document.head.appendChild(style);
     }
@@ -640,92 +688,7 @@
         });
     }
 
-    function renderActionSection(itemId, actions) {
-        var enabled = actions.filter(function (action) {
-            return (action.Id || action.id) && action.IsEnabled !== false && action.isEnabled !== false;
-        });
-        if (!itemId || enabled.length === 0) {
-            removeActionSection();
-            return;
-        }
-
-        ensureStyles();
-        var existing = document.getElementById(ACTION_SECTION_ID);
-        if (existing && existing.dataset.itemId !== itemId) {
-            existing.remove();
-            existing = null;
-        }
-
-        var section = existing || document.createElement('section');
-        section.id = ACTION_SECTION_ID;
-        section.dataset.itemId = itemId;
-        section.setAttribute('aria-label', 'Phantom Actions');
-        section.innerHTML = '';
-
-        var heading = document.createElement('h2');
-        heading.textContent = 'Phantom Actions';
-        section.appendChild(heading);
-
-        var row = document.createElement('div');
-        row.className = 'phantom-item-action-row';
-        enabled.forEach(function (action) {
-            var actionId = action.Id || action.id;
-            var label = action.Name || action.name || actionId;
-            var confirmText = action.ConfirmationText || action.confirmationText;
-            var requiresConfirmation = action.RequiresConfirmation === true || action.requiresConfirmation === true;
-            var button = document.createElement('button');
-            button.type = 'button';
-            button.className = 'raised phantom-item-action-button';
-            button.textContent = label;
-            button.dataset.actionId = actionId;
-            button.addEventListener('click', function () {
-                if ((confirmText || requiresConfirmation) && !window.confirm(confirmText || ('Run ' + label + '?'))) { return; }
-                button.disabled = true;
-                fireItemAction(itemId, actionId).then(refreshClientAfterAction, function () {
-                    button.disabled = false;
-                });
-            });
-            row.appendChild(button);
-        });
-        section.appendChild(row);
-
-        if (!existing) {
-            var host = findDetailsHost();
-            if (host.firstChild) {
-                host.insertBefore(section, host.firstChild);
-            } else {
-                host.appendChild(section);
-            }
-        }
-    }
-
-    function removeActionSection() {
-        var existing = document.getElementById(ACTION_SECTION_ID);
-        if (existing) { existing.remove(); }
-    }
-
-    function refreshActionSection() {
-        var seenItemId = currentItemId();
-        if (!seenItemId) {
-            removeActionSection();
-            return Promise.resolve();
-        }
-        return fetchItemActions(seenItemId).then(function (actions) {
-            if (currentItemId() !== seenItemId) { return; }
-            renderActionSection(seenItemId, actions);
-        });
-    }
-
     function closeSheet(sheet) {
-        if (sheet && sheet.dataset && sheet.dataset.phantomOwned === '1') {
-            var backdropId = sheet.dataset.backdropId;
-            if (backdropId) {
-                var backdrop = document.getElementById(backdropId);
-                if (backdrop) { backdrop.remove(); }
-            }
-            sheet.remove();
-            return;
-        }
         var close = sheet.querySelector('.btnCloseActionSheet') || sheet.querySelector('.actionSheetCloseButton');
         if (close) {
             close.click();
@@ -735,74 +698,8 @@
         if (bd) { bd.click(); }
     }
 
-    function showPhantomActionMenu(itemId, actions, sourceButton) {
-        var enabled = actions.filter(function (action) {
-            return (action.Id || action.id) && action.IsEnabled !== false && action.isEnabled !== false;
-        });
-        if (!itemId || enabled.length === 0) { return; }
-        var existing = document.getElementById(ACTION_MENU_ID);
-        if (existing) { closeSheet(existing); }
-
-        ensureStyles();
-        var backdrop = document.createElement('div');
-        var backdropId = ACTION_MENU_ID + '-backdrop';
-        backdrop.id = backdropId;
-        backdrop.className = 'phantom-item-actions-backdrop';
-        document.body.appendChild(backdrop);
-
-        var sheet = document.createElement('div');
-        sheet.id = ACTION_MENU_ID;
-        sheet.className = 'actionSheet phantom-item-actions-menu';
-        sheet.dataset.phantomOwned = '1';
-        sheet.dataset.backdropId = backdropId;
-        sheet.setAttribute('role', 'menu');
-        sheet.innerHTML = '<div class="actionSheetContent"><div class="actionSheetScroller scrollY"></div></div>';
-        document.body.appendChild(sheet);
-
-        if (sourceButton && typeof sourceButton.getBoundingClientRect === 'function') {
-            var rect = sourceButton.getBoundingClientRect();
-            sheet.style.top = Math.max(8, Math.round(rect.bottom + 8)) + 'px';
-            sheet.style.right = Math.max(8, Math.round(window.innerWidth - rect.right)) + 'px';
-        }
-
-        var content = sheet.querySelector('.actionSheetScroller');
-        enabled.forEach(function (action) {
-            var actionId = action.Id || action.id;
-            var label = action.Name || action.name || actionId;
-            var icon = action.Icon || action.icon || 'extension';
-            var confirmText = action.ConfirmationText || action.confirmationText;
-            var requiresConfirmation = action.RequiresConfirmation === true || action.requiresConfirmation === true;
-            injectButton(sheet, content, label, 'phantom-action-' + actionId.replace(/[^a-zA-Z0-9_-]/g, '-'), icon, function () {
-                closeSheet(sheet);
-                if ((confirmText || requiresConfirmation) && !window.confirm(confirmText || ('Run ' + label + '?'))) { return; }
-                fireItemAction(itemId, actionId).then(refreshClientAfterAction, function () { /* alert already shown */ });
-            });
-        });
-        backdrop.addEventListener('click', function () { closeSheet(sheet); });
-    }
-
-    function interceptDetailMoreButtonClick(ev) {
-        var button = ev.target && ev.target.closest ? ev.target.closest('.btnMoreCommands') : null;
-        if (!button) { return; }
-        if (button.dataset.phantomBypass === '1') {
-            button.dataset.phantomBypass = '';
-            return;
-        }
-        var itemId = currentItemId();
-        if (!itemId) { return; }
-
-        ev.preventDefault();
-        ev.stopPropagation();
-        if (typeof ev.stopImmediatePropagation === 'function') { ev.stopImmediatePropagation(); }
-
-        fetchItemActions(itemId).then(function (actions) {
-            if (actions.length > 0) {
-                showPhantomActionMenu(itemId, actions, button);
-                return;
-            }
-            button.dataset.phantomBypass = '1';
-            button.click();
-        });
+    function isKebabAction(actionId) {
+        return actionId === 'phantom.reset' || actionId === 'phantom.rejectCurrent';
     }
 
     /* Watch for the kebab action-sheet opening and inject source entries.
@@ -835,7 +732,7 @@
                 var icon = action.Icon || action.icon || 'extension';
                 var enabled = action.IsEnabled !== false && action.isEnabled !== false;
                 var confirmText = action.ConfirmationText || action.confirmationText;
-                if (!actionId || !enabled) { return; }
+                if (!actionId || !enabled || !isKebabAction(actionId)) { return; }
                 var requiresConfirmation = action.RequiresConfirmation === true || action.requiresConfirmation === true;
                 injectButton(sheet, content, label, 'phantom-action-' + actionId.replace(/[^a-zA-Z0-9_-]/g, '-'), icon, function () {
                     closeSheet(sheet);
@@ -896,13 +793,12 @@
      * SPA swaps detail-page DOM fragments. */
     function start() {
         ensureStyles();
+        patchApiClientForChannelItems();
         refreshSourceSection();
-        refreshActionSection();
         prehydratePhantomSeasonChildren();
-        document.addEventListener('click', interceptDetailMoreButtonClick, true);
         window.addEventListener('hashchange', function () {
+            patchApiClientForChannelItems();
             window.setTimeout(refreshSourceSection, 50);
-            window.setTimeout(refreshActionSection, 50);
             window.setTimeout(prehydratePhantomSeasonChildren, 50);
             window.setTimeout(prehydratePhantomSeasonChildren, 500);
         });
@@ -911,16 +807,14 @@
             var sawExternalDom = false;
             for (var i = 0; i < mutations.length; i++) {
                 var target = mutations[i].target;
-                if (target && target.nodeType === 1 && target.closest
-                    && (target.closest('#' + SECTION_ID) || target.closest('#' + ACTION_SECTION_ID))) {
+                if (target && target.nodeType === 1 && target.closest && target.closest('#' + SECTION_ID)) {
                     continue;
                 }
                 var added = mutations[i].addedNodes;
                 for (var j = 0; j < added.length; j++) {
                     var node = added[j];
                     if (node.nodeType !== 1) { continue; }
-                    if (node.id === SECTION_ID || node.id === ACTION_SECTION_ID
-                        || (node.closest && (node.closest('#' + SECTION_ID) || node.closest('#' + ACTION_SECTION_ID)))) {
+                    if (node.id === SECTION_ID || (node.closest && node.closest('#' + SECTION_ID))) {
                         continue;
                     }
                     sawExternalDom = true;
@@ -940,7 +834,6 @@
                     scheduled = false;
                     scanActionSheets();
                     refreshSourceSection();
-                    refreshActionSection();
                     prehydratePhantomSeasonChildren();
                 }, 150);
             }
