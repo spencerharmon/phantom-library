@@ -155,33 +155,57 @@ public sealed partial class PhantomShowsChannel
     {
         ArgumentNullException.ThrowIfNull(query);
 
+        ChannelItemResult result;
         if (string.IsNullOrEmpty(query.FolderId))
         {
-            return await GetTopLevelSeriesAsync(cancellationToken).ConfigureAwait(false);
+            result = await GetTopLevelSeriesAsync(cancellationToken).ConfigureAwait(false);
+        }
+        else if (TryParseOrphanSeriesId(query.FolderId, out var orphanSeriesHash))
+        {
+            result = await GetOrphanSeasonsAsync(orphanSeriesHash, cancellationToken).ConfigureAwait(false);
+        }
+        else if (TryParseOrphanSeasonId(query.FolderId, out var orphanSeasonSeriesHash, out var orphanSeason))
+        {
+            result = await GetOrphanEpisodesAsync(orphanSeasonSeriesHash, orphanSeason, cancellationToken).ConfigureAwait(false);
+        }
+        else if (!ChannelItemId.TryParse(query.FolderId, out var parsed))
+        {
+            result = EmptyResult();
+        }
+        else
+        {
+            result = parsed.Kind switch
+            {
+                ChannelItemId.KindSeries =>
+                    await GetSeasonsForSeriesAsync(parsed.TmdbId!.Value, cancellationToken).ConfigureAwait(false),
+                ChannelItemId.KindSeason =>
+                    await GetEpisodesForSeasonAsync(parsed.TmdbId!.Value, parsed.Season!.Value, cancellationToken).ConfigureAwait(false),
+                _ => EmptyResult(),
+            };
         }
 
-        if (TryParseOrphanSeriesId(query.FolderId, out var orphanSeriesHash))
+        return PageResult(result, query.StartIndex, query.Limit);
+    }
+
+    private static ChannelItemResult PageResult(ChannelItemResult result, int? startIndex, int? limit)
+    {
+        var items = result.Items ?? Array.Empty<ChannelItemInfo>();
+        var total = result.TotalRecordCount ?? items.Count;
+        var start = Math.Max(0, startIndex ?? 0);
+        if (start >= items.Count)
         {
-            return await GetOrphanSeasonsAsync(orphanSeriesHash, cancellationToken).ConfigureAwait(false);
+            return new ChannelItemResult
+            {
+                Items = Array.Empty<ChannelItemInfo>(),
+                TotalRecordCount = total,
+            };
         }
 
-        if (TryParseOrphanSeasonId(query.FolderId, out var orphanSeasonSeriesHash, out var orphanSeason))
+        var count = limit.HasValue ? Math.Max(0, Math.Min(limit.Value, items.Count - start)) : items.Count - start;
+        return new ChannelItemResult
         {
-            return await GetOrphanEpisodesAsync(orphanSeasonSeriesHash, orphanSeason, cancellationToken).ConfigureAwait(false);
-        }
-
-        if (!ChannelItemId.TryParse(query.FolderId, out var parsed))
-        {
-            return EmptyResult();
-        }
-
-        return parsed.Kind switch
-        {
-            ChannelItemId.KindSeries =>
-                await GetSeasonsForSeriesAsync(parsed.TmdbId!.Value, cancellationToken).ConfigureAwait(false),
-            ChannelItemId.KindSeason =>
-                await GetEpisodesForSeasonAsync(parsed.TmdbId!.Value, parsed.Season!.Value, cancellationToken).ConfigureAwait(false),
-            _ => EmptyResult(),
+            Items = items.Skip(start).Take(count).ToArray(),
+            TotalRecordCount = total,
         };
     }
 

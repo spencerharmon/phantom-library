@@ -104,6 +104,17 @@ public class PhantomShowsChannelTests : IDisposable
         await cmd.ExecuteNonQueryAsync(CancellationToken.None);
     }
 
+    private async Task SetSeriesMetadataFetchedAtAsync(int tmdb, long fetchedAt)
+    {
+        await using var conn = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "UPDATE tmdb_metadata SET fetched_at=$fetched WHERE tmdb_id=$tmdb AND type='series';";
+        cmd.Parameters.AddWithValue("$tmdb", tmdb);
+        cmd.Parameters.AddWithValue("$fetched", fetchedAt);
+        await cmd.ExecuteNonQueryAsync(CancellationToken.None);
+    }
+
     private static TmdbSeriesDetails MakeSeriesDetails(int tmdb, int seasons)
     {
         return new TmdbSeriesDetails(
@@ -176,6 +187,38 @@ public class PhantomShowsChannelTests : IDisposable
         Assert.Equal(ChannelItemType.Folder, item.Type);
         Assert.Equal(ChannelFolderType.Series, item.FolderType);
         Assert.Equal("1399", item.ProviderIds["Tmdb"]);
+    }
+
+    [Fact]
+    public async Task GetChannelItems_WithPaging_ReturnsRequestedSliceAndFullTotal()
+    {
+        await SeedSeriesMetaAsync(301, "Paged Series 1");
+        await SeedSeriesMetaAsync(302, "Paged Series 2");
+        await SeedSeriesMetaAsync(303, "Paged Series 3");
+        await SetSeriesMetadataFetchedAtAsync(301, 1);
+        await SetSeriesMetadataFetchedAtAsync(302, 2);
+        await SetSeriesMetadataFetchedAtAsync(303, 3);
+        await SeedAvailableEpisodeAsync(301, 1, 1);
+        await SeedAvailableEpisodeAsync(302, 1, 1);
+        await SeedAvailableEpisodeAsync(303, 1, 1);
+
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery
+        {
+            StartIndex = 1,
+            Limit = 1,
+        }, CancellationToken.None);
+
+        var item = Assert.Single(result.Items);
+        Assert.Equal("series_302", item.Id);
+        Assert.Equal(3, result.TotalRecordCount);
+
+        var countOnly = await _channel.GetChannelItems(new InternalChannelItemQuery
+        {
+            Limit = 0,
+        }, CancellationToken.None);
+
+        Assert.Empty(countOnly.Items);
+        Assert.Equal(3, countOnly.TotalRecordCount);
     }
 
     [Fact]

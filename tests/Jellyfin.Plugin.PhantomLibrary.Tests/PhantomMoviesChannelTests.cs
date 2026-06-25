@@ -103,6 +103,17 @@ public class PhantomMoviesChannelTests : IDisposable
         await cmd.ExecuteNonQueryAsync(CancellationToken.None);
     }
 
+    private async Task SetMetadataFetchedAtAsync(int tmdb, long fetchedAt)
+    {
+        await using var conn = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "UPDATE tmdb_metadata SET fetched_at=$fetched WHERE tmdb_id=$tmdb AND type='movie';";
+        cmd.Parameters.AddWithValue("$tmdb", tmdb);
+        cmd.Parameters.AddWithValue("$fetched", fetchedAt);
+        await cmd.ExecuteNonQueryAsync(CancellationToken.None);
+    }
+
     [Fact]
     public async Task GetChannelItems_AllEmpty_ReturnsEmpty()
     {
@@ -127,6 +138,38 @@ public class PhantomMoviesChannelTests : IDisposable
         Assert.Contains("phantom", item.Tags);
         var src = Assert.Single(item.MediaSources);
         AssertOpeningSource(src, "movie_101");
+    }
+
+    [Fact]
+    public async Task GetChannelItems_WithPaging_ReturnsRequestedSliceAndFullTotal()
+    {
+        await SeedMetaAsync(301, "Paged Movie 1");
+        await SeedMetaAsync(302, "Paged Movie 2");
+        await SeedMetaAsync(303, "Paged Movie 3");
+        await SetMetadataFetchedAtAsync(301, 1);
+        await SetMetadataFetchedAtAsync(302, 2);
+        await SetMetadataFetchedAtAsync(303, 3);
+        await SeedAvailableMovieAsync(301);
+        await SeedAvailableMovieAsync(302);
+        await SeedAvailableMovieAsync(303);
+
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery
+        {
+            StartIndex = 1,
+            Limit = 1,
+        }, CancellationToken.None);
+
+        var item = Assert.Single(result.Items);
+        Assert.Equal("movie_302", item.Id);
+        Assert.Equal(3, result.TotalRecordCount);
+
+        var countOnly = await _channel.GetChannelItems(new InternalChannelItemQuery
+        {
+            Limit = 0,
+        }, CancellationToken.None);
+
+        Assert.Empty(countOnly.Items);
+        Assert.Equal(3, countOnly.TotalRecordCount);
     }
 
     [Fact]

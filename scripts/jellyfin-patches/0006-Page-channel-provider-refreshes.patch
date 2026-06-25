@@ -1,0 +1,190 @@
+diff --git a/src/Jellyfin.LiveTv/Channels/ChannelManager.cs b/src/Jellyfin.LiveTv/Channels/ChannelManager.cs
+index af6042b490..35db2c082f 100644
+--- a/src/Jellyfin.LiveTv/Channels/ChannelManager.cs
++++ b/src/Jellyfin.LiveTv/Channels/ChannelManager.cs
+@@ -1,6 +1,7 @@
+ #nullable disable
+ 
+ using System;
++using System.Collections;
+ using System.Collections.Generic;
+ using System.Globalization;
+ using System.IO;
+@@ -700,12 +701,16 @@ namespace Jellyfin.LiveTv.Channels
+                 ? channel
+                 : _libraryManager.GetItemById(query.ParentId);
+ 
++            var providerPagingRequested = (query.StartIndex.HasValue || query.Limit.HasValue)
++                && CanUseProviderPaging(query);
+             var itemsResult = await GetChannelItems(
+                 channelProvider,
+                 query.User,
+                 parentItem is Channel ? null : parentItem.ExternalId,
+                 null,
+                 false,
++                providerPagingRequested ? query.StartIndex : null,
++                providerPagingRequested ? query.Limit : null,
+                 cancellationToken)
+                 .ConfigureAwait(false);
+ 
+@@ -724,19 +729,32 @@ namespace Jellyfin.LiveTv.Channels
+             {
+                 var items = itemsResult.Items;
+                 var itemsLen = items.Count;
+-                var internalItems = new Guid[itemsLen];
++                var internalItems = new BaseItem[itemsLen];
+                 for (int i = 0; i < itemsLen; i++)
+                 {
+-                    internalItems[i] = (await GetChannelItemEntityAsync(
++                    internalItems[i] = await GetChannelItemEntityAsync(
+                         items[i],
+                         channelProvider,
+                         channel.Id,
+                         parentItem,
+-                        cancellationToken).ConfigureAwait(false)).Id;
++                        cancellationToken).ConfigureAwait(false);
++                }
++
++                var providerReturnedPage = providerPagingRequested
++                    && itemsResult.TotalRecordCount.HasValue
++                    && itemsResult.TotalRecordCount.Value > itemsLen;
++
++                if (providerReturnedPage)
++                {
++                    return new QueryResult<BaseItem>(
++                        query.StartIndex,
++                        itemsResult.TotalRecordCount,
++                        internalItems);
+                 }
+ 
++                var internalItemIds = internalItems.Select(i => i.Id).ToArray();
+                 var existingIds = _libraryManager.GetItemIds(query);
+-                var deadIds = existingIds.Except(internalItems)
++                var deadIds = existingIds.Except(internalItemIds)
+                     .ToArray();
+ 
+                 foreach (var deadId in deadIds)
+@@ -760,6 +778,72 @@ namespace Jellyfin.LiveTv.Channels
+             return _libraryManager.GetItemsResult(query);
+         }
+ 
++        private static bool CanUseProviderPaging(InternalItemsQuery query)
++        {
++            var baseline = new InternalItemsQuery();
++            foreach (var property in typeof(InternalItemsQuery).GetProperties())
++            {
++                if (!property.CanRead || property.GetIndexParameters().Length != 0 || IsProviderPagingContextProperty(property.Name))
++                {
++                    continue;
++                }
++
++                if (!QueryValuesEqual(property.GetValue(query), property.GetValue(baseline)))
++                {
++                    return false;
++                }
++            }
++
++            return true;
++        }
++
++        private static bool IsProviderPagingContextProperty(string name)
++            => name is nameof(InternalItemsQuery.StartIndex)
++                or nameof(InternalItemsQuery.Limit)
++                or nameof(InternalItemsQuery.User)
++                or nameof(InternalItemsQuery.DtoOptions)
++                or nameof(InternalItemsQuery.ChannelIds)
++                or nameof(InternalItemsQuery.ParentId)
++                or nameof(InternalItemsQuery.ParentType);
++
++        private static bool QueryValuesEqual(object left, object right)
++        {
++            if (ReferenceEquals(left, right))
++            {
++                return true;
++            }
++
++            if (left is null || right is null)
++            {
++                return false;
++            }
++
++            if (left is IDictionary leftDictionary && right is IDictionary rightDictionary)
++            {
++                if (leftDictionary.Count != rightDictionary.Count)
++                {
++                    return false;
++                }
++
++                foreach (DictionaryEntry entry in leftDictionary)
++                {
++                    if (!rightDictionary.Contains(entry.Key) || !Equals(entry.Value, rightDictionary[entry.Key]))
++                    {
++                        return false;
++                    }
++                }
++
++                return true;
++            }
++
++            if (left is IEnumerable leftEnumerable && right is IEnumerable rightEnumerable && left is not string && right is not string)
++            {
++                return leftEnumerable.Cast<object>().SequenceEqual(rightEnumerable.Cast<object>());
++            }
++
++            return Equals(left, right);
++        }
++
+         /// <inheritdoc />
+         public async Task<QueryResult<BaseItemDto>> GetChannelItems(InternalItemsQuery query, CancellationToken cancellationToken)
+         {
+@@ -781,16 +865,19 @@ namespace Jellyfin.LiveTv.Channels
+             string externalFolderId,
+             ChannelItemSortField? sortField,
+             bool sortDescending,
++            int? startIndex,
++            int? limit,
+             CancellationToken cancellationToken)
+         {
+             var userId = user?.Id.ToString("N", CultureInfo.InvariantCulture);
+ 
+             var cacheLength = CacheLength;
++            var bypassCache = startIndex.HasValue || limit.HasValue;
+             var cachePath = GetChannelDataCachePath(channel, userId, externalFolderId, sortField, sortDescending);
+ 
+             try
+             {
+-                if (_fileSystem.GetLastWriteTimeUtc(cachePath).Add(cacheLength) > DateTime.UtcNow)
++                if (!bypassCache && _fileSystem.GetLastWriteTimeUtc(cachePath).Add(cacheLength) > DateTime.UtcNow)
+                 {
+                     var jsonStream = AsyncFile.OpenRead(cachePath);
+                     await using (jsonStream.ConfigureAwait(false))
+@@ -816,7 +903,7 @@ namespace Jellyfin.LiveTv.Channels
+             {
+                 try
+                 {
+-                    if (_fileSystem.GetLastWriteTimeUtc(cachePath).Add(cacheLength) > DateTime.UtcNow)
++                    if (!bypassCache && _fileSystem.GetLastWriteTimeUtc(cachePath).Add(cacheLength) > DateTime.UtcNow)
+                     {
+                         var jsonStream = AsyncFile.OpenRead(cachePath);
+                         await using (jsonStream.ConfigureAwait(false))
+@@ -843,6 +930,8 @@ namespace Jellyfin.LiveTv.Channels
+                     UserId = user?.Id ?? Guid.Empty,
+                     SortBy = sortField,
+                     SortDescending = sortDescending,
++                    StartIndex = startIndex,
++                    Limit = limit,
+                     FolderId = externalFolderId
+                 };
+ 
+@@ -855,7 +944,10 @@ namespace Jellyfin.LiveTv.Channels
+                     throw new InvalidOperationException("Channel returned a null result from GetChannelItems");
+                 }
+ 
+-                await CacheResponse(result, cachePath).ConfigureAwait(false);
++                if (!bypassCache)
++                {
++                    await CacheResponse(result, cachePath).ConfigureAwait(false);
++                }
+ 
+                 return result;
+             }

@@ -322,7 +322,7 @@ for _ in $(seq 1 60); do
   [ "$schema" = "13" ] && break
   sleep 1
 done
-[ "${schema:-0}" = "13" ] || fail "phantom schema not v13, got ${schema:-0}"
+[ "${schema:-0}" = "14" ] || fail "phantom schema not v14, got ${schema:-0}"
 curl -sS --fail -X POST -H 'Content-Type: application/json' \
   -H 'X-Emby-Authorization: MediaBrowser Client="phantom-rig", Device="phantom-rig", DeviceId="phantom-rig-login", Version="1"' \
   -d '{"Username":"a","Pw":"a"}' "$API/Users/AuthenticateByName" -o /tmp/auth-user.json \
@@ -480,6 +480,10 @@ SET candidate_magnet='$alt_magnet',
     checked_at=$now,
     next_check_at=$((now + 604800))
 WHERE tmdb_id=$ALPHA AND type='movie' AND season=-1 AND episode=-1;
+INSERT OR REPLACE INTO source_candidates
+(tmdb_id,type,season,episode,preset,magnet,info_hash,indexer,title,seeders,size,rank,source,fetched_at,expires_at,validation_status,validation_policy_version)
+VALUES
+($ALPHA,'movie',-1,-1,'gostream-default','$alt_magnet','2222222222222222222222222222222222222222','rig-alt','Phantom Rig Alpha Alternate',55,20971520,2,'rig-alt',$now,$((now + 604800)),'unknown','unknown');
 SQL
 api "$API/Plugins/PhantomLibrary/Items/movie_$ALPHA/Sources" -o /tmp/sources-before-reject.json
 python3 - <<'PY'
