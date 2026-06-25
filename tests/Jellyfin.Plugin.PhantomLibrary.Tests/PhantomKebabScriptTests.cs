@@ -68,6 +68,7 @@ public class PhantomKebabScriptTests
         Assert.Contains("currentUserQuery", js);
         Assert.Contains("scanActionSheets", js);
         Assert.Contains("setInterval(scanActionSheets", js);
+        Assert.Contains("querySelector('.actionSheetScroller') || sheet.querySelector('.actionSheetContent')", js);
         var injectStart = js.IndexOf("function injectIntoSheet", StringComparison.Ordinal);
         var injectEnd = js.IndexOf("function scanActionSheets", StringComparison.Ordinal);
         Assert.True(injectStart >= 0 && injectEnd > injectStart, "injectIntoSheet block not found");

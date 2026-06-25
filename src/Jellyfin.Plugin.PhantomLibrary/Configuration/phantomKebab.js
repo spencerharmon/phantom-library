@@ -628,7 +628,7 @@
         if (!sheet || sheet.dataset.phantomInjected === '1') {
             return;
         }
-        var content = sheet.querySelector('.actionSheetContent') || sheet.querySelector('.actionSheetScroller') || sheet;
+        var content = sheet.querySelector('.actionSheetScroller') || sheet.querySelector('.actionSheetContent') || sheet;
         if (!content) {
             return;
         }
