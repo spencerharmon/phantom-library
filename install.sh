@@ -598,16 +598,42 @@ yellow "        different path, also chown that path to $JELLYFIN_USER:$JELLYFIN
 # ---------------------------------------------------------------- gostream image
 if [ "$DO_GOSTREAM" -eq 1 ]; then
   echo
-  bold "Loading gostream image into root podman storage..."
+  bold "Preparing gostream image..."
+  GOSTREAM_LOAD=1
   if ! command -v podman >/dev/null 2>&1; then
+    if [ "$DO_BUILD" -eq 1 ]; then
+      die "podman not in PATH; cannot build gostream image. Install podman or pass --no-gostream."
+    fi
     yellow "  podman not in PATH - skipping. Install podman or pass --no-gostream."
-  elif [ ! -f "$GOSTREAM_TARBALL" ]; then
-    yellow "  $GOSTREAM_TARBALL not found."
-    yellow "  The agent produces this with:"
-    yellow "    cd gostream && podman build -f docker/Dockerfile -t $GOSTREAM_IMAGE ."
-    yellow "    podman save -o $GOSTREAM_TARBALL $GOSTREAM_IMAGE"
-    yellow "  Skipping image load."
   else
+    if [ "$DO_BUILD" -eq 1 ]; then
+      if [ ! -d "$REPO_ROOT/gostream/.git" ]; then
+        die "gostream/ source checkout missing; cannot build $GOSTREAM_IMAGE. Pass --no-gostream to skip."
+      fi
+      if [ ! -f "$REPO_ROOT/gostream/docker/Dockerfile" ]; then
+        die "gostream/docker/Dockerfile missing; cannot build $GOSTREAM_IMAGE."
+      fi
+
+      bold "  Building gostream image from $REPO_ROOT/gostream..."
+      (
+        cd "$REPO_ROOT/gostream"
+        podman build -f docker/Dockerfile -t "$GOSTREAM_IMAGE" .
+        podman save -o "$GOSTREAM_TARBALL" "$GOSTREAM_IMAGE"
+      )
+      green "  built $GOSTREAM_IMAGE and wrote $GOSTREAM_TARBALL"
+      echo "  gostream commit:       $(git -C "$REPO_ROOT/gostream" rev-parse HEAD 2>/dev/null || echo unknown)"
+      echo "  gostream tar sha256:   $(file_sha256 "$GOSTREAM_TARBALL")"
+    elif [ ! -f "$GOSTREAM_TARBALL" ]; then
+      yellow "  $GOSTREAM_TARBALL not found."
+      yellow "  Re-run with --build to build gostream automatically, or create it with:"
+      yellow "    cd gostream && podman build -f docker/Dockerfile -t $GOSTREAM_IMAGE ."
+      yellow "    podman save -o $GOSTREAM_TARBALL $GOSTREAM_IMAGE"
+      yellow "  Skipping image load."
+      GOSTREAM_LOAD=0
+    fi
+
+    if [ "$GOSTREAM_LOAD" -eq 1 ]; then
+    bold "Loading gostream image into root podman storage..."
     # Capture the pre-load image id (if any) so we can detect whether
     # the load actually replaced anything new. Empty string if absent.
     OLD_IMG_ID="$($SUDO podman image inspect --format '{{.Id}}' "$GOSTREAM_IMAGE" 2>/dev/null || true)"
@@ -645,6 +671,7 @@ if [ "$DO_GOSTREAM" -eq 1 ]; then
       else
         yellow "  Image id unchanged; gostream.service not restarted."
       fi
+    fi
     fi
   fi
 else

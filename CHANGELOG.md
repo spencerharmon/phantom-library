@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `install.sh --build` now builds and saves the gostream `docker.io/mrrobotogit/gostream:testing` image from the in-repo `gostream/` checkout before loading it into root podman storage, preventing stale `/tmp/gostream-testing.tar` deployments.
 - Patched Jellyfin now exposes server-advertised item actions through `GET/POST /Items/{itemId}/Actions`, and Phantom registers Materialise, Reset Phantom, and Reject current source actions for Phantom movie/episode items.
 - BREAKING: patched Jellyfin deploy now requires replacing `MediaBrowser.Model.dll` and `Jellyfin.Api.dll` in addition to `MediaBrowser.Controller.dll` and `Jellyfin.LiveTv.dll`, because native item actions add model DTOs and an API controller.
 - BREAKING: requires wipe. Phantom DB schema is now v13 to persist TMDB movie runtime minutes; this lets Phantom movie channel items expose `RunTimeTicks` so Jellyfin can save playback progress and list movies in Continue Watching.
