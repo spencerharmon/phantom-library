@@ -62,6 +62,19 @@ public class PhantomKebabScriptTests
     }
 
     [Fact]
+    public void SourceControls_ExposeResetRejectAndCandidateMaterialiseControls()
+    {
+        var js = ReadScript();
+
+        Assert.Contains("canRejectState(state)", js);
+        Assert.Contains("canResetState(state)", js);
+        Assert.Contains("canMaterialiseState(state)", js);
+        Assert.Contains("fireRejectCurrent(ctx.externalId)", js);
+        Assert.Contains("fireReset(ctx.externalId)", js);
+        Assert.Contains("fireMaterialiseCandidate(ctx.externalId, selected)", js);
+    }
+
+    [Fact]
     public void ActionSheet_UsesServerAdvertisedItemActions()
     {
         var js = ReadScript();
