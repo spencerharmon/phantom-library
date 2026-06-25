@@ -13,6 +13,7 @@ const itemId = 'df7a034eaf3de44e189609d6b04e52b3';
 const dashedItemId = 'df7a034e-af3d-e44e-1896-09d6b04e52b3';
 const userId = '8EB11AC1-9939-4621-896C-31D5CBA4951C';
 const channelId = '40ab6e9af516a84f46dcea7140855d88';
+const mediaSourceId = '988fa383-1d88-426d-eaa4-8d2c2838110f';
 
 function actionSheetHtml() {
   return `
@@ -41,7 +42,8 @@ function createHarness(html) {
     Name: 'The Swamp',
     ExternalId: 'episode_246_s2e4',
     ChannelId: channelId,
-    ServerId: 'test-server'
+    ServerId: 'test-server',
+    MediaSources: [{ Id: mediaSourceId }]
   };
   const dom = new JSDOM(`<!doctype html><html><head></head><body><main class="detailPageContent"></main>${html}</body></html>`, {
     url: `http://127.0.0.1:8096/web/index.html#/details?id=${itemId}`,
@@ -200,12 +202,12 @@ async function testDynamicallyAddedSheetInjectedByObserver() {
   }
 }
 
-async function testChannelItemCacheLetsNativeKebabGetItemResolve() {
+async function testChannelItemCacheMapsMediaSourceIdForNativeKebab() {
   const { dom, channelItem, cleanup } = createHarness('');
   try {
     const api = dom.window.ApiClient;
     await api.ajax({ type: 'GET', url: `http://127.0.0.1:8096/Channels/${channelId}/Items` });
-    const item = await api.getItem(userId, itemId);
+    const item = await api.getItem(userId, mediaSourceId);
     assert.equal(item, channelItem);
   } finally {
     cleanup();
@@ -215,7 +217,7 @@ async function testChannelItemCacheLetsNativeKebabGetItemResolve() {
 (async () => {
   await testNativeActionSheetGetsOnlyResetAndRejectActions();
   await testDynamicallyAddedSheetInjectedByObserver();
-  await testChannelItemCacheLetsNativeKebabGetItemResolve();
+  await testChannelItemCacheMapsMediaSourceIdForNativeKebab();
   console.log('phantom kebab jsdom tests passed');
 })().catch((err) => {
   console.error(err);

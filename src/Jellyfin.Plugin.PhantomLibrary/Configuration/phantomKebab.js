@@ -61,6 +61,13 @@
     function cacheChannelItem(item) {
         if (!item || !item.Id || !item.ChannelId) { return; }
         cachedChannelItems[normaliseItemId(item.Id)] = item;
+        var mediaSources = item.MediaSources || item.mediaSources || [];
+        for (var i = 0; i < mediaSources.length; i++) {
+            var sourceId = mediaSources[i] && (mediaSources[i].Id || mediaSources[i].id);
+            if (sourceId) {
+                cachedChannelItems[normaliseItemId(sourceId)] = item;
+            }
+        }
     }
 
     function cacheChannelItemsFromResponse(response) {

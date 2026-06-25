@@ -56,7 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Phantom web now lets Jellyfin's native item-page kebab open for Phantom channel items by caching channel DTOs for Jellyfin's `/Users/{userId}/Items/{channelItemId}` refetch, then injects only Reset Phantom and Reject current Phantom source into the default command menu.
+- Phantom web now lets Jellyfin's native item-page kebab open for Phantom channel items by caching channel DTOs for Jellyfin's `/Users/{userId}/Items/{channelItemId}` refetch (including media-source ids selected by the detail page), then injects only Reset Phantom and Reject current Phantom source into the default command menu.
 - Fixed server-advertised item-action routes to accept Jellyfin web's dashless item ids, restoring Phantom kebab actions in the browser shim.
 - Phantom materialised/native-open movie and episode media sources now carry probed audio streams from the current gostream/FUSE file so Jellyfin can apply normal audio-language and remembered-track selection.
 - Phantom materialisation now validates source candidates through gostream before `/api/library/add`, persists valid/invalid/transient validation state, bounds gostream-heavy validation/add calls, and disables failed candidates in source controls and item actions.
