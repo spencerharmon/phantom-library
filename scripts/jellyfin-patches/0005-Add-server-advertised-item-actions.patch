@@ -6,10 +6,10 @@ Subject: [PATCH] Add server-advertised item actions
 ---
 diff --git a/Jellyfin.Api/Controllers/ItemActionsController.cs b/Jellyfin.Api/Controllers/ItemActionsController.cs
 new file mode 100644
-index 0000000000..e9d4b6ef99
+index 0000000000..b81725a5a8
 --- /dev/null
 +++ b/Jellyfin.Api/Controllers/ItemActionsController.cs
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,209 @@
 +using System;
 +using System.Collections.Generic;
 +using System.ComponentModel.DataAnnotations;
