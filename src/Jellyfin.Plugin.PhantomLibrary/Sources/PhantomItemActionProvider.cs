@@ -5,6 +5,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Database.Implementations.Entities;
+using Jellyfin.Plugin.PhantomLibrary.Channels;
 using Jellyfin.Plugin.PhantomLibrary.Materialisation;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
@@ -37,7 +38,7 @@ public sealed class PhantomItemActionProvider : IItemActionProvider
         ArgumentNullException.ThrowIfNull(item);
         _ = user;
 
-        if (item.SourceType != SourceType.Channel || string.IsNullOrWhiteSpace(item.ExternalId))
+        if (!IsPhantomChannelItem(item) || string.IsNullOrWhiteSpace(item.ExternalId))
         {
             return Array.Empty<ItemActionInfo>();
         }
@@ -122,7 +123,7 @@ public sealed class PhantomItemActionProvider : IItemActionProvider
         _ = user;
         _ = request;
 
-        if (item.SourceType != SourceType.Channel || string.IsNullOrWhiteSpace(item.ExternalId))
+        if (!IsPhantomChannelItem(item) || string.IsNullOrWhiteSpace(item.ExternalId))
         {
             return Failure("not_found", "Phantom channel external id not found");
         }
@@ -151,6 +152,9 @@ public sealed class PhantomItemActionProvider : IItemActionProvider
                 return Failure("action_not_found", "Action not found");
         }
     }
+
+    private static bool IsPhantomChannelItem(BaseItem item)
+        => item.SourceType == SourceType.Channel || ChannelIds.IsPhantom(item.ChannelId);
 
     private async Task<PhantomMaterialiseCandidateRequest?> ResolveCandidateRequestAsync(string externalId, string actionId, ItemActionRequest request, CancellationToken cancellationToken)
     {
