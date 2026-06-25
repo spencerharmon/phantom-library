@@ -1,0 +1,6 @@
+[submodule "jellyfin"]
+	path = jellyfin
+	url = https://github.com/spencerharmon/jellyfin
+[submodule "gostream"]
+	path = gostream
+	url = git@github.com:spencerharmon/gostream.git

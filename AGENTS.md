@@ -425,12 +425,25 @@ worry about. The plugin reads it on startup to decide whether to
 emit a "migration not yet run" warning, but does not perform the
 migration itself.
 
-## Jellyfin patch dependency
+## Jellyfin/gostream submodules and patch dependency
+
+`jellyfin/` and `gostream/` are git submodules. A fresh clone must be
+installable with:
+
+```bash
+git submodule update --init --recursive
+./install.sh --build
+```
+
+`install.sh --build` may initialise missing submodules, but correctness
+must never depend on untracked local checkout state. Keep the submodule
+SHA recorded in the phantom-library commit aligned with the patches and
+plugin code in that same commit.
 
 This plugin depends on patches applied to Jellyfin core, stored at
 `scripts/jellyfin-patches/`. `install.sh --build` applies them at
 build time (idempotently — second run reports `already applied`)
-against the `jellyfin/` source clone at exact tag v10.11.9 (base SHA
+against the `jellyfin/` submodule at exact tag v10.11.9 (base SHA
 `e83a7e62f2`). The patches add `IChannelItemRefresh` (an opt-in
 channel-side interface), `IChannelItemRefreshManager` (a new
 service sibling to `IChannelManager`), and a server-advertised
@@ -450,9 +463,29 @@ procedure.
 
 On Jellyfin upstream updates, the patches may need rebasing.
 `install.sh --build` aborts with an actionable error if a patch
-fails to apply. Rebase by applying via `git am`, resolving
+fails to apply. **Never ignore, skip, or special-case a patch that
+does not apply cleanly.** A broken patch means the repository is not in
+an installable state. Fix the patch stack or advance the `jellyfin/`
+submodule to the commit the patch stack targets, then verify from a
+fresh submodule checkout. Rebase by applying via `git am`, resolving
 conflicts, and re-exporting via `git format-patch`. See
 `scripts/jellyfin-patches/REBASE.md`.
+
+When changing Jellyfin-dependent behavior:
+
+1. Update `scripts/jellyfin-patches/`.
+2. Verify the patch series applies from the recorded `jellyfin/`
+   submodule commit with no pre-existing local modifications.
+3. Build patched Jellyfin from that submodule.
+4. Commit any required `jellyfin/` submodule SHA change together with
+   the plugin/patch changes.
+5. Leave `jellyfin/` clean enough that `git submodule update --init`
+   plus `./install.sh --build` reproduces the intended state.
+
+When changing gostream-dependent behavior, update and commit the
+`gostream/` submodule SHA in the same phantom-library commit as the
+plugin or install-script change that requires it. Do not rely on a
+locally built image or an untracked gostream checkout.
 
 Phase 8 (deferred): upstream PR. Per Jellyfin's LLM/AI
 contribution policy, this PR must be operator-authored with the
@@ -483,10 +516,8 @@ body, or responses to review comments.
 - Plugin DB: SQLite at
   `/var/lib/jellyfin/plugins/configurations/PhantomLibrary/phantom.db`
   on the operator's box, cloned into the rig per test.
-- Companion service: `gostream` (separate repo,
-  `phantom-library/api-add` and `phantom-library/vault-mode`
-  branches). Local instance on `:9080` (API) / `:8090`
-  (diagnostics).
+- Companion service: `gostream/` submodule. Local instance on `:9080`
+  (API) / `:8090` (diagnostics).
 
 ## Build
 

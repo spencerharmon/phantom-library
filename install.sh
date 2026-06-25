@@ -94,6 +94,24 @@ fi
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
 
+ensure_submodule_checkout() {
+  local path="$1"
+  if git -C "$REPO_ROOT/$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [ ! -f "$REPO_ROOT/.gitmodules" ]; then
+    die "$path/ source checkout missing and .gitmodules is absent; cannot initialise dependency."
+  fi
+
+  bold "Initialising submodule $path..."
+  git -C "$REPO_ROOT" submodule update --init --recursive "$path" \
+    || die "Failed to initialise submodule $path. Check network/credentials and retry."
+
+  git -C "$REPO_ROOT/$path" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die "$path/ submodule did not initialise to a git checkout."
+}
+
 # ---------------------------------------------------------------- detect
 # Read canonical plugin version + GUID from build.yaml so the install
 # layout matches what the manifest workflow publishes.
@@ -240,9 +258,7 @@ if [ "$DO_BUILD" -eq 1 ]; then
   # assembly-load failures (MediaBrowser.Common version mismatch).
   patches_dir="$REPO_ROOT/scripts/jellyfin-patches"
   if [ -d "$patches_dir" ] && ls "$patches_dir"/*.patch >/dev/null 2>&1; then
-    if [ ! -d "$REPO_ROOT/jellyfin/.git" ]; then
-      die "jellyfin/ source clone missing or not a git checkout; cannot apply patches"
-    fi
+    ensure_submodule_checkout jellyfin
 
     installed_version="$(installed_jellyfin_version || true)"
     if [ -z "$installed_version" ]; then
@@ -450,7 +466,7 @@ if [ -n "$VERIFY_JF_INSTALL_DIR" ]; then
 else
   echo "  Jellyfin install dir:    not detected"
 fi
-if [ -d "$REPO_ROOT/gostream/.git" ]; then
+if git -C "$REPO_ROOT/gostream" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "  gostream commit:         $(git -C "$REPO_ROOT/gostream" rev-parse HEAD 2>/dev/null || echo unknown)"
   echo "  gostream dirty files:"
   git -C "$REPO_ROOT/gostream" status --short 2>/dev/null | sed 's/^/    /' || true
@@ -613,9 +629,7 @@ if [ "$DO_GOSTREAM" -eq 1 ]; then
     yellow "  podman not in PATH - skipping. Install podman or pass --no-gostream."
   else
     if [ "$DO_BUILD" -eq 1 ]; then
-      if [ ! -d "$REPO_ROOT/gostream/.git" ]; then
-        die "gostream/ source checkout missing; cannot build $GOSTREAM_IMAGE. Pass --no-gostream to skip."
-      fi
+      ensure_submodule_checkout gostream
       if [ ! -f "$REPO_ROOT/gostream/docker/Dockerfile" ]; then
         die "gostream/docker/Dockerfile missing; cannot build $GOSTREAM_IMAGE."
       fi
