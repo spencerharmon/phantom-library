@@ -111,7 +111,7 @@ public class PluginConfiguration : BasePluginConfiguration
 
         SourceValidationParallelism = 2;
         SourceValidationWindowSize = 4;
-        SourceValidationTimeoutSeconds = 45;
+        SourceValidationTimeoutSeconds = 180;
         SourceValidationDetailsBudgetSeconds = 8;
         SourceValidationTtlHours = 168;
         SourceValidationTransientRetryMinutes = 30;

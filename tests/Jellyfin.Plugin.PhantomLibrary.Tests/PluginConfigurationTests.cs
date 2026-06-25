@@ -12,7 +12,7 @@ public sealed class PluginConfigurationTests
 
         Assert.Equal(2, cfg.SourceValidationParallelism);
         Assert.Equal(4, cfg.SourceValidationWindowSize);
-        Assert.Equal(45, cfg.SourceValidationTimeoutSeconds);
+        Assert.Equal(180, cfg.SourceValidationTimeoutSeconds);
         Assert.Equal(8, cfg.SourceValidationDetailsBudgetSeconds);
         Assert.Equal(168, cfg.SourceValidationTtlHours);
         Assert.Equal(30, cfg.SourceValidationTransientRetryMinutes);
