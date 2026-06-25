@@ -214,27 +214,10 @@ public sealed class PhantomMoviesChannel
             items.Add(await BuildOrphanMovieItemAsync(o, cancellationToken).ConfigureAwait(false));
         }
 
-        return PageResult(items, query.StartIndex, query.Limit);
-    }
-
-    private static ChannelItemResult PageResult(List<ChannelItemInfo> items, int? startIndex, int? limit)
-    {
-        var total = items.Count;
-        var start = Math.Max(0, startIndex ?? 0);
-        if (start >= total)
-        {
-            return new ChannelItemResult
-            {
-                Items = Array.Empty<ChannelItemInfo>(),
-                TotalRecordCount = total,
-            };
-        }
-
-        var count = limit.HasValue ? Math.Max(0, Math.Min(limit.Value, total - start)) : total - start;
         return new ChannelItemResult
         {
-            Items = items.Skip(start).Take(count).ToArray(),
-            TotalRecordCount = total,
+            Items = items,
+            TotalRecordCount = items.Count,
         };
     }
 

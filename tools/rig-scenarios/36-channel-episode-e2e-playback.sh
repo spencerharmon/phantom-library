@@ -294,7 +294,7 @@ for _ in $(seq 1 60); do
   [ "$schema" = "13" ] && break
   sleep 1
 done
-[ "${schema:-0}" = "14" ] || fail "phantom schema not v14, got ${schema:-0}"
+[ "${schema:-0}" = "13" ] || fail "phantom schema not v13, got ${schema:-0}"
 curl -sS --fail -X POST -H 'Content-Type: application/json' \
   -H 'X-Emby-Authorization: MediaBrowser Client="phantom-rig", Device="phantom-rig", DeviceId="phantom-rig-login", Version="1"' \
   -d '{"Username":"a","Pw":"a"}' "$API/Users/AuthenticateByName" -o /tmp/auth-user.json \

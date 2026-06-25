@@ -82,29 +82,6 @@ class Handler(BaseHTTPRequestHandler):
         return self.rfile.read(length) if length else b""
 
     def do_POST(self):
-        if self.path == "/api/library/validate":
-            body = json.loads(self._read_body() or b"{}")
-            lower = {str(k).lower(): v for k, v in body.items()}
-            magnet = str(lower.get("magnet") or "")
-            digest = hashlib.sha1(magnet.encode("utf-8")).hexdigest()[:8]
-            resp = {
-                "status": "valid",
-                "reason": None,
-                "hash": digest,
-                "selected_file": {"id": 0, "path": lower.get("title") or "selected.mkv", "size": 10485760},
-                "audio_tracks": [{"stream_index": 1, "language": "eng", "title": "English", "codec": "aac", "channels": 2}],
-                "selected_audio_index": 1,
-                "selected_audio_language": "eng",
-                "validation_session_id": lower.get("validationsessionid") or lower.get("validation_session_id"),
-            }
-            self._send_json(200, resp)
-            log(f"POST /api/library/validate body={body!r} -> 200")
-            return
-        if self.path == "/api/library/validate/release":
-            body = json.loads(self._read_body() or b"{}")
-            self._send_json(200, {"released": True})
-            log(f"POST /api/library/validate/release body={body!r} -> 200")
-            return
         if self.path != "/api/library/add":
             self._send_json(404, {"error": "not found"})
             log(f"POST {self.path} -> 404")
