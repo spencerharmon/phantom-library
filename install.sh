@@ -624,6 +624,10 @@ if [ "$DO_GOSTREAM" -eq 1 ]; then
       (
         cd "$REPO_ROOT/gostream"
         podman build -f docker/Dockerfile -t "$GOSTREAM_IMAGE" .
+        # podman saves docker-archive output, which cannot be modified in
+        # place. Remove any stale tarball first so repeated installs do not
+        # fail with: docker-archive doesn't support modifying existing images.
+        rm -f "$GOSTREAM_TARBALL"
         podman save -o "$GOSTREAM_TARBALL" "$GOSTREAM_IMAGE"
       )
       green "  built $GOSTREAM_IMAGE and wrote $GOSTREAM_TARBALL"
