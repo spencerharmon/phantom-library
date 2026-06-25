@@ -111,7 +111,7 @@ prepare_submodule_checkout() {
   if git -C "$REPO_ROOT/$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     git -C "$REPO_ROOT/$path" reset --hard >/dev/null \
       || die "Failed to reset submodule $path."
-    git -C "$REPO_ROOT/$path" clean -fdx >/dev/null \
+    git -C "$REPO_ROOT/$path" clean -fd -e obj/ -e bin/ >/dev/null \
       || die "Failed to clean submodule $path."
   fi
 
@@ -120,7 +120,7 @@ prepare_submodule_checkout() {
 
   git -C "$REPO_ROOT/$path" reset --hard >/dev/null \
     || die "Failed to reset submodule $path after checkout."
-  git -C "$REPO_ROOT/$path" clean -fdx >/dev/null \
+  git -C "$REPO_ROOT/$path" clean -fd -e obj/ -e bin/ >/dev/null \
     || die "Failed to clean submodule $path after checkout."
 
   git -C "$REPO_ROOT/$path" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
