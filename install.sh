@@ -324,6 +324,19 @@ if [ "$DO_BUILD" -eq 1 ]; then
   if [ ${#dotnet_build_args[@]} -gt 0 ]; then
     yellow "  extra dotnet build args: ${dotnet_build_args[*]}"
   fi
+  jf_server_csproj="$REPO_ROOT/jellyfin/Jellyfin.Server/Jellyfin.Server.csproj"
+  if [ ! -f "$jf_server_csproj" ]; then
+    die "jellyfin/Jellyfin.Server/Jellyfin.Server.csproj missing; expected a v10.11.9 clone at $REPO_ROOT/jellyfin (base commit $(cat "$REPO_ROOT/scripts/jellyfin-patches/REBASE.md" 2>/dev/null | grep -oE '[0-9a-f]{10,}' | head -1 || echo e83a7e62f2))"
+  fi
+
+  # Submodule reset/clean can remove stale generated files from earlier
+  # failed installs. Restore explicitly before any build so the install loop
+  # does not depend on preserved local obj/project.assets.json state, even if
+  # PHANTOM_DOTNET_BUILD_ARGS contains --no-restore for the build step.
+  bold "Restoring NuGet packages..."
+  dotnet restore
+  dotnet restore "$jf_server_csproj"
+
   dotnet build -c Release "${dotnet_build_args[@]}"
 
   # Also build the patched Jellyfin assemblies the plugin links against
@@ -331,10 +344,6 @@ if [ "$DO_BUILD" -eq 1 ]; then
   # MediaBrowser.Model, Jellyfin.Api, and Jellyfin.LiveTv transitively.
   # Output ends up in each project's bin/Release/net*/.
   bold "Building patched Jellyfin assemblies (Release)..."
-  jf_server_csproj="$REPO_ROOT/jellyfin/Jellyfin.Server/Jellyfin.Server.csproj"
-  if [ ! -f "$jf_server_csproj" ]; then
-    die "jellyfin/Jellyfin.Server/Jellyfin.Server.csproj missing; expected a v10.11.9 clone at $REPO_ROOT/jellyfin (base commit $(cat "$REPO_ROOT/scripts/jellyfin-patches/REBASE.md" 2>/dev/null | grep -oE '[0-9a-f]{10,}' | head -1 || echo e83a7e62f2))"
-  fi
   dotnet build -c Release "$jf_server_csproj" "${dotnet_build_args[@]}"
 
   jf_controller_dll="$REPO_ROOT/jellyfin/MediaBrowser.Controller/bin/Release/net9.0/MediaBrowser.Controller.dll"
