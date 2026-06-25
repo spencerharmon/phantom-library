@@ -181,7 +181,7 @@ public class MaterialiserTests : IDisposable
         {
             return Task.FromResult<System.Collections.Generic.IReadOnlyList<IndexerCandidate>>(_magnets.Select(m => new IndexerCandidate
             {
-                Title = "Test Movie 1080p",
+                Title = m.Title ?? "Test Movie 1080p",
                 Magnet = m.Magnet,
                 InfoHash = m.InfoHash,
                 Size = m.Size,
@@ -462,6 +462,74 @@ public class MaterialiserTests : IDisposable
         Assert.NotNull(cached);
         Assert.Equal(good.Magnet, cached!.Magnet);
         gostream.Verify(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()), Times.Exactly(2));
+    }
+
+    [Fact]
+    public async Task EpisodeMaterialise_SkipsCandidatesWithWrongSeriesYear()
+    {
+        using var db = await NewDbAsync();
+        await SeedSeriesMetadataAsync(db, 200, "The Twilight Zone", 1959);
+        var wrong = new MagnetCandidate(
+            "magnet:?xt=urn:btih:BAD2019000000000000000000000000000000000",
+            "BAD2019000000000000000000000000000000000",
+            5L * 1024 * 1024 * 1024,
+            100,
+            "test")
+        {
+            Title = "The Twilight Zone 2019 S01E01 The Comedian 1080p WEB-DL",
+        };
+        var correct = new MagnetCandidate(
+            "magnet:?xt=urn:btih:ABC1959000000000000000000000000000000000",
+            "ABC1959000000000000000000000000000000000",
+            2L * 1024 * 1024 * 1024,
+            5,
+            "test")
+        {
+            Title = "The Twilight Zone S01E01 Where Is Everybody 720p WEB-DL",
+        };
+
+        GostreamAddRequest? added = null;
+        var (sut, gostream, _, _, _, cfg) = BuildSut(
+            db,
+            imdb: "tt0052520",
+            magnets: new[] { wrong, correct },
+            gostreamSetup: g =>
+            {
+                g.Setup(x => x.ValidateAsync(It.IsAny<GostreamValidateRequest>(), It.IsAny<CancellationToken>()))
+                    .ReturnsAsync((GostreamValidateRequest req, CancellationToken _) => new GostreamValidateResult
+                    {
+                        Status = "valid",
+                        Hash = req.Magnet.Contains("ABC1959", StringComparison.Ordinal) ? correct.InfoHash : wrong.InfoHash,
+                        SelectedFile = new GostreamSelectedFile { Id = 7, Path = "The Twilight Zone S01E01.mkv", Size = correct.Size },
+                        ValidationSessionId = req.ValidationSessionId,
+                    });
+                g.Setup(x => x.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()))
+                    .Returns<GostreamAddRequest, CancellationToken>((req, _) =>
+                    {
+                        added = req;
+                        var fuse = Path.Combine(_fuseMount, "twilight-zone-good.mkv");
+                        File.WriteAllText(fuse, "x");
+                        return Task.FromResult(new GostreamAddResult
+                        {
+                            StubPath = "/var/gostream/stubs/good.mkv",
+                            FusePath = fuse,
+                            Hash = correct.InfoHash,
+                            Size = correct.Size,
+                        });
+                    });
+            });
+
+        var outcome = await sut.MaterialiseAsync(200, "episode", 1, 1, MaterialiseTrigger.Manual, CancellationToken.None);
+
+        Assert.Equal(MaterialisationStatus.Success, outcome.Status);
+        Assert.NotNull(added);
+        Assert.Equal(correct.Magnet, added!.Magnet);
+        gostream.Verify(g => g.ValidateAsync(It.Is<GostreamValidateRequest>(r => r.Magnet == wrong.Magnet), It.IsAny<CancellationToken>()), Times.Never);
+        var failure = await db.GetMagnetFailureAsync(
+            new MagnetFailureKey(200, "tt0052520", "episode", 1, 1, cfg.SourcePickerPreset, wrong.Magnet),
+            CancellationToken.None);
+        Assert.NotNull(failure);
+        Assert.Equal("series_year_mismatch", failure!.Reason);
     }
 
     [Fact]

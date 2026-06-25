@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
@@ -700,10 +701,36 @@ public sealed class Materialiser : IMaterialiser
             var windowSize = Math.Clamp(cfg.SourceValidationWindowSize, 1, 12);
             for (var offset = 0; offset < ordered.Length; offset += windowSize)
             {
-                validationCt.ThrowIfCancellationRequested();
+                try
+                {
+                    validationCt.ThrowIfCancellationRequested();
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    await _db.MarkUnavailableAsync(
+                        unavailableKey,
+                        retryAfter: TimeSpan.FromMinutes(Math.Clamp(cfg.SourceValidationTransientRetryMinutes, 1, 1440)),
+                        ct).ConfigureAwait(false);
+                    throw new InvalidOperationException(
+                        $"Source validation timed out for {type}/{tmdbId} s{season}e{episode}; attempted {attempted} candidates");
+                }
+
                 var window = ordered.Skip(offset).Take(windowSize).ToArray();
                 attempted += window.Length;
-                var validations = await ValidateWindowAsync(window, tmdbId, type, season, episode, imdb, cfg, validationCt).ConfigureAwait(false);
+                IReadOnlyList<CandidateValidation> validations;
+                try
+                {
+                    validations = await ValidateWindowAsync(window, tmdbId, type, season, episode, imdb, cfg, validationCt).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    await _db.MarkUnavailableAsync(
+                        unavailableKey,
+                        retryAfter: TimeSpan.FromMinutes(Math.Clamp(cfg.SourceValidationTransientRetryMinutes, 1, 1440)),
+                        ct).ConfigureAwait(false);
+                    throw new InvalidOperationException(
+                        $"Source validation timed out for {type}/{tmdbId} s{season}e{episode}; attempted {attempted} candidates");
+                }
                 var winner = validations
                     .Where(v => string.Equals(v.Result.Status, "valid", StringComparison.OrdinalIgnoreCase))
                     .OrderBy(v => v.Candidate.Rank == 0 ? int.MinValue : v.Candidate.Rank)
@@ -715,8 +742,11 @@ public sealed class Materialiser : IMaterialiser
                         .Where(v => string.Equals(v.Result.Status, "valid", StringComparison.OrdinalIgnoreCase))
                         .ToDictionary(v => v.Candidate.Magnet.Magnet, StringComparer.Ordinal);
                     return ordered
-                        .Select(c => validByMagnet.TryGetValue(c.Magnet.Magnet, out var v)
-                            ? c with
+                        .Where(c => validByMagnet.ContainsKey(c.Magnet.Magnet))
+                        .Select(c =>
+                        {
+                            var v = validByMagnet[c.Magnet.Magnet];
+                            return c with
                             {
                                 Request = c.Request with
                                 {
@@ -724,8 +754,8 @@ public sealed class Materialiser : IMaterialiser
                                     SelectedFilePath = v.Result.SelectedFile?.Path,
                                     ValidationSessionId = string.IsNullOrWhiteSpace(v.SessionId) ? null : v.SessionId,
                                 },
-                            }
-                            : c)
+                            };
+                        })
                         .ToArray();
                 }
             }
@@ -777,6 +807,19 @@ public sealed class Materialiser : IMaterialiser
         PluginConfiguration cfg,
         CancellationToken ct)
     {
+        if (CandidateHasMismatchedYear(candidate))
+        {
+            var mismatchedYearResult = new GostreamValidateResult
+            {
+                Status = "invalid",
+                Reason = "series_year_mismatch",
+                Hash = candidate.Magnet.InfoHash,
+                ValidationSessionId = string.Empty,
+            };
+            await PersistValidationResultAsync(candidate, tmdbId, imdb, type, season, episode, cfg, mismatchedYearResult, TimeSpan.Zero, ct).ConfigureAwait(false);
+            return new CandidateValidation(candidate, mismatchedYearResult, string.Empty);
+        }
+
         if (IsSourceCandidateCachedValid(candidate.SourceRow, cfg))
         {
             var cached = candidate.SourceRow!;
@@ -952,8 +995,49 @@ public sealed class Materialiser : IMaterialiser
         return 3;
     }
 
+    private static bool CandidateHasMismatchedYear(CandidateAddRequest candidate)
+    {
+        if (candidate.Request.Type != "episode" || !candidate.Request.Year.HasValue)
+        {
+            return false;
+        }
+
+        var title = candidate.Magnet.Title;
+        if (string.IsNullOrWhiteSpace(title))
+        {
+            return false;
+        }
+
+        var expected = candidate.Request.Year.Value;
+        for (var i = 0; i <= title.Length - 4; i++)
+        {
+            if (!char.IsDigit(title[i])
+                || !char.IsDigit(title[i + 1])
+                || !char.IsDigit(title[i + 2])
+                || !char.IsDigit(title[i + 3]))
+            {
+                continue;
+            }
+
+            var beforeOk = i == 0 || !char.IsLetterOrDigit(title[i - 1]);
+            var afterOk = i + 4 >= title.Length || !char.IsLetterOrDigit(title[i + 4]);
+            if (!beforeOk || !afterOk)
+            {
+                continue;
+            }
+
+            var year = int.Parse(title.AsSpan(i, 4), CultureInfo.InvariantCulture);
+            if (year >= 1900 && year <= 2100 && year != expected)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private static bool IsHardValidationReason(string reason)
-        => reason is "target_episode_not_found" or "no_valid_files" or "no_english_audio" or "no_main_english_audio" or "audio_probe_unsupported_format";
+        => reason is "target_episode_not_found" or "no_valid_files" or "no_english_audio" or "no_main_english_audio" or "audio_probe_unsupported_format" or "series_year_mismatch";
 
     private static string NormalizeValidationStatus(string? status)
     {
