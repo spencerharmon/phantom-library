@@ -1,15 +1,18 @@
 #!/bin/bash
 # Scenario 08: M12 heal against prod-clone (5021 broken rows).
 #
-# Import the operator's actual prod DB (with its 5021 broken phantom
-# rows) into the rig. Run Suggestions. Assert: rows that get
-# re-discovered by Catalogue get healed in place; no duplicates.
+# Use an existing rig DB clone containing the historical broken phantom
+# rows. Do not import production DBs during scenario execution. Run
+# Suggestions. Assert: rows that get re-discovered by Catalogue get healed
+# in place; no duplicates.
 set -u
 exec > /tmp/jf-rig/logs/scenario-08-m12-prod-clone.log 2>&1
 BASE=http://localhost:18096
 TOK=testtoken00000000000000000000000
 JFDB=/tmp/jf-test/data/data/jellyfin.db
 PHDB=/tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db
+REPO=${PHANTOM_REPO_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}
+source "$REPO/tools/rig-scenarios/rig-db.sh"
 
 echo "=== Scenario 08: M12 heal against prod clone ==="
 date
@@ -18,12 +21,11 @@ date
 systemctl --user stop rig-jellyfin
 sleep 2
 
-# Reimport prod state.
-cp /var/lib/jellyfin/data/jellyfin.db $JFDB
-cp /var/lib/jellyfin/data/jellyfin.db-wal "$JFDB-wal" 2>/dev/null
-cp /var/lib/jellyfin/plugins/configurations/PhantomLibrary/phantom.db $PHDB
+# Reuse existing cloned state.
+ensure_existing_rig_jellyfin_db "$JFDB"
+migrate_existing_rig_phantom_db "$PHDB" "$REPO"
 sqlite3 $JFDB "
-DELETE FROM ApiKeys WHERE Name='test-rig';
+DELETE FROM ApiKeys WHERE Name='test-rig' OR AccessToken='testtoken00000000000000000000000';
 INSERT INTO ApiKeys (DateCreated, DateLastActivity, Name, AccessToken)
 VALUES ('2026-06-04','2026-06-04','test-rig','testtoken00000000000000000000000');"
 

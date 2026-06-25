@@ -17,22 +17,24 @@ for a real environmental reason (e.g. .NET runtime version
 missing) — say so explicitly and ask. Otherwise, do it
 yourself.
 
-The single exception: copying the production DB requires the
-operator to have granted you read permission on it. The operator
-has already done so via `chmod o+x` on the relevant parent dirs
-plus world-read on the DB files themselves:
+Current rule: test scenarios use an existing sandbox DB clone, normally
+under `/tmp/jf-test`. Do not copy production DBs during routine test
+runs. If an existing clone is stale, run supported offline migration
+scripts against the clone. If no suitable clone exists, ask the operator
+to provide/refresh the sandbox seed outside the scenario; do not clone
+live production state as part of the test.
+
+Production DBs remain read-only reference material only:
 
 ```
-/var/lib/jellyfin/data/jellyfin.db        # main Jellyfin EF Core DB
-/var/lib/jellyfin/data/jellyfin.db-wal    # WAL — MUST be copied with the .db
-/var/lib/jellyfin/data/jellyfin.db-shm    # shared-memory index — MUST be copied
+/var/lib/jellyfin/data/jellyfin.db
 /var/lib/jellyfin/plugins/configurations/PhantomLibrary/phantom.db
 ```
 
-If you find them unreadable on a future engagement, ask the
-operator to re-apply traversal permissions to their parent
-dirs — that is the only legitimate ask. Do **not** propose
-running anything via `sudo` on your side; you don't have it.
+If you find them unreadable on a future engagement, ask the operator to
+re-apply traversal permissions to their parent dirs only if investigation
+requires read-only inspection. Do not propose running anything via `sudo`
+on your side; you don't have it.
 
 ## Jellyfin source is in-tree
 
@@ -235,130 +237,80 @@ The Jellyfin server binary itself lives at
 `/usr/lib/jellyfin-ffmpeg/ffmpeg`. `dotnet` (net9.0) is on PATH.
 You do not need to install anything.
 
-## Bring-up procedure (full clean clone)
+## Bring-up procedure (existing clone only)
+
+Routine tests must use the existing rig DB clone under `/tmp/jf-test` (or
+scenario-specific clone path such as `/var/tmp/jf-channel-ttfb`). Do **not**
+copy production DBs as part of a test run. If the clone is stale, migrate it
+with the repo migration scripts. If the clone is missing, stop and ask the
+operator to provide/refresh the seed clone outside the scenario; do not silently
+clone live production state.
+
+Why: production `phantom.db` is now large enough that cloning during scenarios
+can hang or leave partial zero-version DBs. Existing clones are stable, fast,
+and safe to mutate.
+
+Required existing files for normal rig use:
+
+```text
+/tmp/jf-test/data/data/jellyfin.db
+/tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db
+/tmp/jf-test/data/root/default/
+```
+
+Before starting Jellyfin, scripts must:
 
 ```bash
-# 0. kill any prior test instance. NEVER use a bare
-#    `pkill -f jellyfin.dll` — that regex matches the
-#    systemd-launched production instance owned by the jellyfin
-#    user. You'll get permission denied AND race with the real
-#    service. Always scope by user and by the jf-test path.
-pkill -u "$USER" -9 -f "dotnet.*jellyfin.dll.*jf-test"
-sleep 2
+# 0. stop prior rig processes. Scope by user + jf-test path; never kill prod.
+systemctl --user stop rig-jellyfin.service rig-tmdb-mock.service rig-gostream-mock.service 2>/dev/null || true
+systemctl --user reset-failed rig-jellyfin.service rig-tmdb-mock.service rig-gostream-mock.service 2>/dev/null || true
+ps -u "$USER" -o pid=,comm=,args= \
+  | awk '$2 == "dotnet" && $0 ~ /jellyfin\.dll/ && $0 ~ /jf-test/ { print $1 }' \
+  | xargs -r kill -9
 
-# 1. clone the production DBs (with WAL+SHM so the snapshot is consistent).
-# ALSO clone /root/default — without it, AddMediaPath returns 404
-# ("Could not find a part of the path .../<libname>/<safename>.mblink")
-# because Jellyfin's library config dir on disk is missing.
-rm -rf /tmp/jf-test
-mkdir -p /tmp/jf-test/{data/data,data/plugins/configurations/PhantomLibrary,data/plugins/Jellyfin.Plugin.PhantomLibrary_0.2.0.0,data/root/default,config,cache,log,media/tv,media/movies}
-cp /var/lib/jellyfin/data/jellyfin.db       /tmp/jf-test/data/data/jellyfin.db
-cp /var/lib/jellyfin/data/jellyfin.db-wal   /tmp/jf-test/data/data/jellyfin.db-wal
-cp /var/lib/jellyfin/data/jellyfin.db-shm   /tmp/jf-test/data/data/jellyfin.db-shm
-cp -r /var/lib/jellyfin/root/default/*      /tmp/jf-test/data/root/default/
-cp /var/lib/jellyfin/plugins/configurations/PhantomLibrary/phantom.db \
-   /tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db
-
-# 2. drop the freshly-built plugin DLL
+# 1. verify existing clone, migrate phantom.db if needed.
 cd /home/spencer/git-repos/spencerharmon/phantom-library
-dotnet build -c Release
+source tools/rig-scenarios/rig-db.sh
+ensure_existing_rig_jellyfin_db /tmp/jf-test/data/data/jellyfin.db
+migrate_existing_rig_phantom_db_if_present \
+  /tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db \
+  /home/spencer/git-repos/spencerharmon/phantom-library
+
+# 2. build/drop plugin DLL into existing clone.
+MSBUILDDISABLENODEREUSE=1 dotnet build -c Release -p:UseSharedCompilation=false --no-restore
+mkdir -p /tmp/jf-test/data/plugins/Jellyfin.Plugin.PhantomLibrary_0.3.0.0
 cp src/Jellyfin.Plugin.PhantomLibrary/bin/Release/net9.0/Jellyfin.Plugin.PhantomLibrary.dll \
-   /tmp/jf-test/data/plugins/Jellyfin.Plugin.PhantomLibrary_0.2.0.0/
+   /tmp/jf-test/data/plugins/Jellyfin.Plugin.PhantomLibrary_0.3.0.0/
 md5sum src/Jellyfin.Plugin.PhantomLibrary/bin/Release/net9.0/Jellyfin.Plugin.PhantomLibrary.dll \
-       /tmp/jf-test/data/plugins/Jellyfin.Plugin.PhantomLibrary_0.2.0.0/Jellyfin.Plugin.PhantomLibrary.dll
-# ALWAYS md5 both sides. The plugin csproj has incremental-build
-# quirks and the dest dir is easy to forget; mismatched md5 = your
-# edits did not take and you will waste an hour wondering why the
-# fix does nothing.
+       /tmp/jf-test/data/plugins/Jellyfin.Plugin.PhantomLibrary_0.3.0.0/Jellyfin.Plugin.PhantomLibrary.dll
 
-# 3. pre-seed the plugin config XML so the TMDB key is loaded at startup.
-#    Operator's prod key lives at /etc/gostream/config.json under
-#    "tmdb_api_key" (world-readable).
-TMDB_KEY=$(awk -F '"' '/tmdb_api_key/ {print $4}' /etc/gostream/config.json)
-cat > /tmp/jf-test/data/plugins/configurations/Jellyfin.Plugin.PhantomLibrary.xml <<EOF
-<?xml version="1.0" encoding="utf-8"?>
-<PluginConfiguration>
-  <TmdbApiKey>$TMDB_KEY</TmdbApiKey>
-  <GostreamBaseUrl>http://127.0.0.1:9080</GostreamBaseUrl>
-  <GostreamDiagnosticsBaseUrl>http://127.0.0.1:8090</GostreamDiagnosticsBaseUrl>
-  <ProwlarrBaseUrl></ProwlarrBaseUrl>
-  <ProwlarrApiKey></ProwlarrApiKey>
-  <TorrentioBaseUrl>https://torrentio.strem.fun</TorrentioBaseUrl>
-  <QualityPreset>GostreamDefault</QualityPreset>
-  <MinSeeders>5</MinSeeders>
-  <MinSizeGb1080p>4</MinSizeGb1080p>
-  <MinSizeGb4K>20</MinSizeGb4K>
-  <EvictionEnabled>true</EvictionEnabled>
-  <EvictionIdleDays>7</EvictionIdleDays>
-  <EvictionScheduleCron>0 4 * * *</EvictionScheduleCron>
-  <MaterialisationConcurrencyGlobal>4</MaterialisationConcurrencyGlobal>
-  <MaterialisationConcurrencyPerIndexer>2</MaterialisationConcurrencyPerIndexer>
-  <EagerResolveEnabled>true</EagerResolveEnabled>
-  <EagerResolveMaxConcurrent>2</EagerResolveMaxConcurrent>
-  <PhantomRetentionDays>7</PhantomRetentionDays>
-  <SeriesAutopilotEnabled>true</SeriesAutopilotEnabled>
-  <SeriesAutopilotPrefetchEpisodes>1</SeriesAutopilotPrefetchEpisodes>
-  <PhantomBadgeVisibility>AlwaysShow</PhantomBadgeVisibility>
-  <SplashLoopAssetPath></SplashLoopAssetPath>
-  <PhantomTargetLibraryId></PhantomTargetLibraryId>
-</PluginConfiguration>
-EOF
-
-# 4. seed network.xml so the test instance listens on 18096. NOT 8096
-#    — production jellyfin owns 8096; binding it will EADDRINUSE and
-#    crash. Disable AutoDiscovery so the rig doesn't fight production
-#    for the UDP :7359 discovery port.
-cat > /tmp/jf-test/config/network.xml <<'EOF'
-<?xml version="1.0" encoding="utf-8"?>
-<NetworkConfiguration>
-  <PublicHttpPort>18096</PublicHttpPort>
-  <InternalHttpPort>18096</InternalHttpPort>
-  <AutoDiscovery>false</AutoDiscovery>
-</NetworkConfiguration>
-EOF
-
-# 5. insert an API key directly into the cloned DB so REST calls
-#    skip the startup wizard and login flow entirely. Trying to
-#    drive /Startup/User over REST does NOT work in 10.11 — the
-#    wizard endpoint is gated by FirstTimeSetupOrElevated and the
-#    cloned DB has IsStartupWizardCompleted=true already, so the
-#    endpoint returns 404. Just put a key in the DB. Cloned admin
-#    user persists from prod.
+# 3. seed API key idempotently. Delete by Name OR token to avoid UNIQUE errors.
 sqlite3 /tmp/jf-test/data/data/jellyfin.db \
-  "DELETE FROM ApiKeys WHERE Name='test-rig';
+  "DELETE FROM ApiKeys WHERE Name='test-rig' OR AccessToken='testtoken00000000000000000000000';
    INSERT INTO ApiKeys (DateCreated, DateLastActivity, Name, AccessToken)
    VALUES ('2026-06-04','2026-06-04','test-rig','testtoken00000000000000000000000');"
-
-# 6. (optional, but recommended) wipe Phantom-created rows from
-#    the prod clone so you exercise the create path from a clean
-#    slate. Order matters: BaseItemProviders has UNIQUE
-#    (ItemId, ProviderId), so orphan rows left from a prior failed
-#    Run will silently dedupe new attempts.
-sqlite3 /tmp/jf-test/data/data/jellyfin.db \
-  "DELETE FROM BaseItemProviders WHERE ItemId IN (
-      SELECT Id FROM BaseItems
-      WHERE Type IN ('MediaBrowser.Controller.Entities.Movies.Movie',
-                     'MediaBrowser.Controller.Entities.TV.Series')
-        AND (Path IS NULL OR Path=''));
-   DELETE FROM BaseItems
-   WHERE Type IN ('MediaBrowser.Controller.Entities.Movies.Movie',
-                  'MediaBrowser.Controller.Entities.TV.Series')
-     AND (Path IS NULL OR Path='');
-   DELETE FROM BaseItemProviders WHERE ItemId NOT IN (SELECT Id FROM BaseItems);"
-sqlite3 /tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db \
-  "DELETE FROM phantom_items WHERE state='Virtual';
-   DELETE FROM tmdb_cache;"
-
-# 7. write the start script (idempotent — overwrite each rig rebuild)
-cat > /tmp/jf-test/start.sh <<'EOF'
-#!/bin/bash
-exec dotnet /usr/lib/jellyfin/jellyfin.dll \
-  --datadir /tmp/jf-test/data --configdir /tmp/jf-test/config \
-  --cachedir /tmp/jf-test/cache --logdir /tmp/jf-test/log \
-  --webdir /usr/share/jellyfin/web --ffmpeg /usr/lib/jellyfin-ffmpeg/ffmpeg
-EOF
-chmod +x /tmp/jf-test/start.sh
 ```
+
+Preferred command for normal movie/TV rig tests:
+
+```bash
+tools/rig-scenarios/rig-up.sh --reset
+```
+
+`rig-up.sh --reset` still wipes Phantom-created rows from the **existing cloned**
+Jellyfin DB and removes cloned `phantom.db` so the plugin can recreate clean
+state. It does not copy production DBs. Non-reset runs keep and migrate the
+existing cloned `phantom.db`.
+
+For production-shaped channel-root TTFB testing, `PHANTOM_TTFB_RIG` is required. Point the scenario at an
+existing DB clone and let it migrate in place:
+
+```bash
+PHANTOM_TTFB_RIG=/path/to/existing/jf-clone tools/rig-scenarios/38-channel-root-ttfb.sh
+```
+
+The scenario fails if the clone is missing or has unsupported `phantom.db`
+`user_version`. It never clones from `/var/lib/jellyfin` during the run.
 
 ## Process lifecycle — the single most important constraint
 

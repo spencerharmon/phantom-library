@@ -67,8 +67,10 @@
 
 set -euo pipefail
 
-PHANTOM_DB=${PHANTOM_DB:-/var/lib/jellyfin/plugins/configurations/PhantomLibrary/phantom.db}
-JELLYFIN_DB=${JELLYFIN_DB:-/var/lib/jellyfin/data/jellyfin.db}
+PHANTOM_DB=${PHANTOM_DB:-/tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db}
+JELLYFIN_DB=${JELLYFIN_DB:-/tmp/jf-test/data/data/jellyfin.db}
+# Default DB paths point at the existing rig clone. Override only with another
+# sandbox clone; never point scenario tests at production DBs.
 TMDB_ID=${TMDB_ID:-872585}   # default: a recent movie expected in trending
 API=${API:-http://127.0.0.1:18096}
 TOKEN=${TOKEN:-}   # operator-supplied API key

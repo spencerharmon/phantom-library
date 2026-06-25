@@ -319,7 +319,7 @@ bash tools/rig-scenarios/rig-up.sh --reset
 
 for _ in $(seq 1 60); do
   [ -f "$PHDB" ] && schema=$(sqlite3 "$PHDB" 'PRAGMA user_version;' 2>/dev/null || echo 0) || schema=0
-  [ "$schema" = "13" ] && break
+  [ "$schema" = "14" ] && break
   sleep 1
 done
 [ "${schema:-0}" = "14" ] || fail "phantom schema not v14, got ${schema:-0}"

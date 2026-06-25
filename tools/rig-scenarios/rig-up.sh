@@ -14,6 +14,7 @@ PLUGIN_VERSION=0.3.0.0
 PLUGIN_DIR=$JF_DATA/plugins/Jellyfin.Plugin.PhantomLibrary_$PLUGIN_VERSION
 PHANTOM_ROOT=$JF_DATA/phantom-library
 GOSTREAM_ROOT=$ROOT/gostream
+source "$REPO/tools/rig-scenarios/rig-db.sh"
 
 # ---------------------------------------------------------------- helpers
 log() { printf '\033[1m[rig-up]\033[0m %s\n' "$*"; }
@@ -27,10 +28,13 @@ stop_units() {
       systemctl --user stop "$u.service" || true
     fi
   done
-  # belt + braces against pgroup-orphans
-  pkill -u "$USER" -9 -f "dotnet.*jellyfin.dll.*jf-test" 2>/dev/null || true
-  pkill -u "$USER" -9 -f "tmdb-mock.py" 2>/dev/null || true
-  pkill -u "$USER" -9 -f "gostream-mock.py" 2>/dev/null || true
+  # belt + braces against pgroup-orphans; match process names, not shell command text.
+  ps -u "$USER" -o pid=,comm=,args= \
+    | awk '$2 == "dotnet" && $0 ~ /jellyfin\.dll/ && $0 ~ /jf-test/ { print $1 }' \
+    | xargs -r kill -9 >/dev/null 2>&1 || true
+  ps -u "$USER" -o pid=,comm=,args= \
+    | awk '$0 ~ /python/ && ($0 ~ /tmdb-mock\.py/ || $0 ~ /gostream-mock\.py/) { print $1 }' \
+    | xargs -r kill -9 >/dev/null 2>&1 || true
   sleep 1
 }
 
@@ -50,32 +54,24 @@ mkdir -p $ROOT/{bin,scenarios,logs,fixtures/tmdb,state,gostream/movies,gostream/
 cp $REPO/tools/rig-scenarios/*.{py,sh} $ROOT/bin/ 2>/dev/null || true
 chmod +x $ROOT/bin/*.py $ROOT/bin/*.sh 2>/dev/null || true
 
-# ---------------------------------------------------------------- jellyfin rig (rebuild from prod only when missing/explicit)
-if [ ! -f "$JF_DATA/data/jellyfin.db" ] || [ "${RIG_RECOPY_PROD:-0}" = "1" ]; then
-  log "reseed jellyfin rig from prod"
-  rm -rf /tmp/jf-test
-  mkdir -p $JF_DATA/{data,plugins/configurations/PhantomLibrary,root/default} \
-           $PLUGIN_DIR \
-           $JF_CFG $JF_CACHE $JF_LOG
-  # Routine rig resets reuse the last production clone. If the production
-  # schema/data shape must be refreshed, run with RIG_RECOPY_PROD=1 while
-  # production Jellyfin is stopped; copying db/wal/shm while live can race
-  # WAL writes and corrupt the rig clone.
-  cp /var/lib/jellyfin/data/jellyfin.db       $JF_DATA/data/jellyfin.db
-  cp /var/lib/jellyfin/data/jellyfin.db-wal   $JF_DATA/data/jellyfin.db-wal 2>/dev/null || true
-  cp /var/lib/jellyfin/data/jellyfin.db-shm   $JF_DATA/data/jellyfin.db-shm 2>/dev/null || true
-  cp -r /var/lib/jellyfin/root/default/*      $JF_DATA/root/default/ 2>/dev/null || true
-fi
+# ---------------------------------------------------------------- jellyfin rig (existing DB clone only)
+log "verify existing rig DB clone"
+mkdir -p $JF_DATA/{data,plugins/configurations/PhantomLibrary,root/default} \
+         $PLUGIN_DIR \
+         $JF_CFG $JF_CACHE $JF_LOG
+ensure_existing_rig_jellyfin_db "$JF_DATA/data/jellyfin.db"
+migrate_existing_rig_phantom_db_if_present "$JF_DATA/plugins/configurations/PhantomLibrary/phantom.db" "$REPO"
+[ -d "$JF_DATA/root/default" ] || rig_fail "existing Jellyfin root/default clone missing: $JF_DATA/root/default"
 
-if [ $RESET -eq 1 ] || [ "${RIG_RECOPY_PROD:-0}" = "1" ]; then
-  log "reset phantom state in rig clone"
+if [ $RESET -eq 1 ]; then
+  log "reset phantom state in existing rig clone"
   mkdir -p $JF_DATA/{data,plugins/configurations/PhantomLibrary,root/default} \
            $PLUGIN_DIR \
            $JF_CFG $JF_CACHE $JF_LOG
   rm -f $JF_DATA/plugins/configurations/PhantomLibrary/phantom.db
 
   # Wipe all Phantom channel rows from the CLONED rig DB; we want deterministic
-  # from-scratch channel behaviour, not prod-cloned channel cache rows.
+  # from-scratch channel behaviour, not cached channel rows from prior rig runs.
   sqlite3 $JF_DATA/data/jellyfin.db <<'SQL' || true
 CREATE TEMP TABLE phantom_delete_ids AS
 SELECT Id FROM BaseItems

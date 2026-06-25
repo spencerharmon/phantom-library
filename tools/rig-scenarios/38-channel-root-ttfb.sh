@@ -5,8 +5,8 @@
 set -euo pipefail
 
 ROOT=${PHANTOM_REPO_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}
-RIG=${PHANTOM_TTFB_RIG:-/var/tmp/jf-channel-ttfb}
-USE_EXISTING_RIG=${PHANTOM_TTFB_USE_EXISTING_RIG:-0}
+source "$ROOT/tools/rig-scenarios/rig-db.sh"
+RIG=${PHANTOM_TTFB_RIG:?set PHANTOM_TTFB_RIG to an existing Jellyfin rig DB clone; this scenario never copies production DBs}
 JF_DATA=$RIG/data
 JF_CFG=$RIG/config
 JF_CACHE=$RIG/cache
@@ -17,9 +17,7 @@ PLUGIN_VERSION=0.3.0.0
 PLUGIN_DIR=$JF_DATA/plugins/Jellyfin.Plugin.PhantomLibrary_$PLUGIN_VERSION
 DLL=$ROOT/src/Jellyfin.Plugin.PhantomLibrary/bin/Release/net9.0/Jellyfin.Plugin.PhantomLibrary.dll
 JF_DLL=$ROOT/jellyfin/Jellyfin.Server/bin/Release/net9.0/jellyfin.dll
-PROD_JDB=${PROD_JELLYFIN_DB:-/var/lib/jellyfin/data/jellyfin.db}
-PROD_PHDB=${PROD_PHANTOM_DB:-/var/lib/jellyfin/plugins/configurations/PhantomLibrary/phantom.db}
-PROD_CFG=${PROD_PHANTOM_CONFIG:-/var/lib/jellyfin/plugins/configurations/Jellyfin.Plugin.PhantomLibrary.xml}
+PLUGIN_CFG=${PHANTOM_PLUGIN_CONFIG:-/var/lib/jellyfin/plugins/configurations/Jellyfin.Plugin.PhantomLibrary.xml}
 MOVIES_MAX_SECONDS=${PHANTOM_TTFB_MOVIES_MAX_SECONDS:-30}
 SHOWS_MAX_SECONDS=${PHANTOM_TTFB_SHOWS_MAX_SECONDS:-15}
 LOG_FILE=/tmp/phantom-channel-root-ttfb.log
@@ -45,10 +43,6 @@ cleanup() {
     | xargs -r kill >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
-
-require_readable() {
-  [ -r "$1" ] || fail "required readable file missing: $1"
-}
 
 find_channel_id() {
   local name=$1
@@ -107,33 +101,18 @@ PY
 }
 
 echo '[0] preflight'
-require_readable "$PROD_JDB"
-require_readable "$PROD_PHDB"
-require_readable "$PROD_CFG"
 [ -f "$JF_DLL" ] || fail "patched Jellyfin not built: $JF_DLL"
+[ -r "$PLUGIN_CFG" ] || fail "plugin config missing/read-protected: $PLUGIN_CFG"
 
 MSBUILDDISABLENODEREUSE=1 dotnet build -c Release -p:UseSharedCompilation=false --no-restore >/tmp/phantom-channel-root-ttfb-build.log
 [ -f "$DLL" ] || fail "plugin DLL not built: $DLL"
 
-echo '[1] prepare isolated rig DBs'
+echo '[1] prepare existing isolated rig DBs'
 stop_rig
-if [ "$USE_EXISTING_RIG" = "1" ]; then
-  mkdir -p "$JF_DATA/data" "$JF_DATA/plugins/configurations/PhantomLibrary" "$JF_DATA/root/default" "$PLUGIN_DIR" "$JF_CFG" "$JF_CACHE" "$JF_LOG" "$RIG/tmp"
-  [ -s "$JF_DATA/data/jellyfin.db" ] || fail "existing jellyfin DB missing/empty: $JF_DATA/data/jellyfin.db"
-  [ -s "$JF_DATA/plugins/configurations/PhantomLibrary/phantom.db" ] || fail "existing phantom DB missing/empty: $JF_DATA/plugins/configurations/PhantomLibrary/phantom.db"
-else
-  rm -rf "$RIG"
-  mkdir -p "$JF_DATA/data" "$JF_DATA/plugins/configurations/PhantomLibrary" "$JF_DATA/root/default" "$PLUGIN_DIR" "$JF_CFG" "$JF_CACHE" "$JF_LOG" "$RIG/tmp"
-  sqlite3 "$PROD_JDB" ".backup '$JF_DATA/data/jellyfin.db'"
-  sqlite3 "$PROD_PHDB" ".backup '$JF_DATA/plugins/configurations/PhantomLibrary/phantom.db'"
-  [ -s "$JF_DATA/data/jellyfin.db" ] || fail "jellyfin DB clone is empty: $JF_DATA/data/jellyfin.db"
-  [ -s "$JF_DATA/plugins/configurations/PhantomLibrary/phantom.db" ] || fail "phantom DB clone is empty: $JF_DATA/plugins/configurations/PhantomLibrary/phantom.db"
-  cp -r /var/lib/jellyfin/root/default/* "$JF_DATA/root/default/" 2>/dev/null || true
-fi
-chmod u+rw "$JF_DATA/data/jellyfin.db" "$JF_DATA/plugins/configurations/PhantomLibrary/phantom.db"
-cp "$PROD_CFG" "$JF_DATA/plugins/configurations/Jellyfin.Plugin.PhantomLibrary.xml"
-scripts/migrate-source-candidates-v12.sh "$JF_DATA/plugins/configurations/PhantomLibrary/phantom.db" >/tmp/phantom-channel-root-ttfb-v12.log 2>&1 || true
-scripts/migrate-source-validation-v14.sh "$JF_DATA/plugins/configurations/PhantomLibrary/phantom.db" >/tmp/phantom-channel-root-ttfb-v14.log
+mkdir -p "$JF_DATA/data" "$JF_DATA/plugins/configurations/PhantomLibrary" "$JF_DATA/root/default" "$PLUGIN_DIR" "$JF_CFG" "$JF_CACHE" "$JF_LOG" "$RIG/tmp"
+ensure_existing_rig_jellyfin_db "$JF_DATA/data/jellyfin.db"
+migrate_existing_rig_phantom_db "$JF_DATA/plugins/configurations/PhantomLibrary/phantom.db" "$ROOT"
+cp "$PLUGIN_CFG" "$JF_DATA/plugins/configurations/Jellyfin.Plugin.PhantomLibrary.xml"
 sqlite3 "$JF_DATA/data/jellyfin.db" \
   "DELETE FROM ApiKeys WHERE Name='channel-ttfb-rig' OR AccessToken='$TOK';
    INSERT INTO ApiKeys (DateCreated, DateLastActivity, Name, AccessToken)

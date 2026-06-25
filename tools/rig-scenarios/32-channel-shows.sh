@@ -87,8 +87,10 @@
 
 set -euo pipefail
 
-PHANTOM_DB=${PHANTOM_DB:-/var/lib/jellyfin/plugins/configurations/PhantomLibrary/phantom.db}
-JELLYFIN_DB=${JELLYFIN_DB:-/var/lib/jellyfin/data/jellyfin.db}
+PHANTOM_DB=${PHANTOM_DB:-/tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db}
+JELLYFIN_DB=${JELLYFIN_DB:-/tmp/jf-test/data/data/jellyfin.db}
+# Default DB paths point at the existing rig clone. Override only with another
+# sandbox clone; never point scenario tests at production DBs.
 # Default to TMDB id 1399 (Game of Thrones) — long-running series with
 # multiple seasons makes the cross-season autopilot path easy to drive.
 SERIES_TMDB=${SERIES_TMDB:-1399}

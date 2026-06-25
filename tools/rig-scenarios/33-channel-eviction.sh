@@ -63,8 +63,10 @@
 
 set -euo pipefail
 
-PHANTOM_DB=${PHANTOM_DB:-/var/lib/jellyfin/plugins/configurations/PhantomLibrary/phantom.db}
-JELLYFIN_DB=${JELLYFIN_DB:-/var/lib/jellyfin/data/jellyfin.db}
+PHANTOM_DB=${PHANTOM_DB:-/tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db}
+JELLYFIN_DB=${JELLYFIN_DB:-/tmp/jf-test/data/data/jellyfin.db}
+# Default DB paths point at the existing rig clone. Override only with another
+# sandbox clone; never point scenario tests at production DBs.
 PLUGIN_CFG=${PLUGIN_CFG:-/var/lib/jellyfin/plugins/configurations/Jellyfin.Plugin.PhantomLibrary.xml}
 # Default to TMDB id 603 (The Matrix) for the idle-eviction movie target.
 MOVIE_TMDB=${MOVIE_TMDB:-603}
