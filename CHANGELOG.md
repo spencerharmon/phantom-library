@@ -56,6 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fixed gostream episode validation treating `EpisodeMinBytes` as 1 GiB instead of 1 byte, which incorrectly rejected short animated episodes with `target_episode_not_found` before matching the requested episode file.
 - Fixed Phantom Movies/Shows root browse regression introduced by audio stream selection: channel browse now emits unprobed file media sources and reserves FFprobe/audio-stream extraction for playback/media-info paths.
 - Patched Jellyfin audio stream selection now honors the user's preferred audio language ahead of the container default track, matching Phantom's selector and preventing non-preferred default tracks from winning at play time.
 - Phantom web now lets Jellyfin's native item-page kebab open for Phantom channel items by caching channel DTOs for Jellyfin's `/Users/{userId}/Items/{channelItemId}` refetch (including media-source ids selected by the detail page), then injects only Reset Phantom and Reject current Phantom source into the default command menu.
