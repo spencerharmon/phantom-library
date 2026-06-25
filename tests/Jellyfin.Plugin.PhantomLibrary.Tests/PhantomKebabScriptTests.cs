@@ -25,7 +25,9 @@ public class PhantomKebabScriptTests
         var js = ReadScript();
 
         Assert.Contains("Phantom Source", js);
+        Assert.Contains("Phantom Actions", js);
         Assert.Contains("phantom-source-section", js);
+        Assert.Contains("phantom-item-actions-section", js);
         Assert.Contains("phantom-source-candidates", js);
         Assert.Contains("Materialise selected source", js);
         Assert.Contains("Reject current source", js);
@@ -79,6 +81,7 @@ public class PhantomKebabScriptTests
         Assert.Contains("/Actions", js);
         Assert.Contains("fireItemAction(itemId, actionId)", js);
         Assert.Contains("refreshClientAfterAction", js);
+        Assert.Contains("refreshActionSection", js);
         Assert.Contains("window.location.reload()", js);
         Assert.Contains("ConfirmationText", js);
         Assert.Contains("phantom-action-", js);

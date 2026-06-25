@@ -86,6 +86,9 @@ function createHarness(html) {
       if (url.includes(`/Items/${encodeURIComponent(itemId)}/Actions/phantom.materialise?userId=${encodeURIComponent(userId)}`)) {
         return { Status: 'Queued', RefreshItem: false };
       }
+      if (url.includes(`/Items/${encodeURIComponent(itemId)}/Actions/phantom.reset?userId=${encodeURIComponent(userId)}`)) {
+        return { Status: 'Reset', RefreshItem: false };
+      }
       if (url.includes('/Plugins/PhantomLibrary/Items/episode_246_s2e4/Sources')) {
         return { Status: 'available', Candidates: [] };
       }
@@ -131,6 +134,12 @@ async function testExistingSheetInjectsIntoScrollerAndUsesItemActionApi() {
   const { dom, requests, alerts, confirms, cleanup } = createHarness(actionSheetHtml());
   try {
     const document = dom.window.document;
+    const directButton = await waitFor(
+      () => document.querySelector('#phantom-item-actions-section [data-action-id="phantom.materialise"]'),
+      'direct Phantom item action button'
+    );
+    assert.equal(directButton.textContent.includes('Materialise (Phantom Library)'), true);
+
     const button = await waitFor(
       () => document.querySelector('.actionSheetScroller [data-id="phantom-action-phantom-materialise"]'),
       'Phantom materialise button inside action sheet scroller'
@@ -163,6 +172,30 @@ async function testExistingSheetInjectsIntoScrollerAndUsesItemActionApi() {
   }
 }
 
+async function testDirectActionSectionWorksWithoutJellyfinKebab() {
+  const { dom, requests, cleanup } = createHarness('');
+  try {
+    const document = dom.window.document;
+    const button = await waitFor(
+      () => document.querySelector('#phantom-item-actions-section [data-action-id="phantom.reset"]'),
+      'direct Phantom reset action button without Jellyfin action sheet'
+    );
+    assert.equal(button.textContent.includes('Reset Phantom'), true);
+    button.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true, cancelable: true }));
+    await waitFor(
+      () => requests.some((request) => request.type === 'POST' && request.url.includes(`/Items/${itemId}/Actions/phantom.reset?userId=${encodeURIComponent(userId)}`)),
+      'direct action POST /Items/{id}/Actions/phantom.reset'
+    );
+    await waitFor(
+      () => requests.filter((request) => request.url.includes(`/Items/${itemId}/Actions?userId=${encodeURIComponent(userId)}`)).length >= 2,
+      'direct action section refresh after reset'
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  } finally {
+    cleanup();
+  }
+}
+
 async function testDynamicallyAddedSheetInjectedByObserver() {
   const { dom, cleanup } = createHarness('');
   try {
@@ -179,6 +212,7 @@ async function testDynamicallyAddedSheetInjectedByObserver() {
 
 (async () => {
   await testExistingSheetInjectsIntoScrollerAndUsesItemActionApi();
+  await testDirectActionSectionWorksWithoutJellyfinKebab();
   await testDynamicallyAddedSheetInjectedByObserver();
   console.log('phantom kebab jsdom tests passed');
 })().catch((err) => {
