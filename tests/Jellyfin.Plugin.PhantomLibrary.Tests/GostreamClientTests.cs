@@ -62,6 +62,98 @@ public class GostreamClientTests
     }
 
     [Fact]
+    public async Task Validate_Returns_Parsed_Result_And_Sends_Token()
+    {
+        var body = """
+            {
+              "status":"valid",
+              "hash":"abc",
+              "selected_file":{"id":12,"path":"Avatar S02E01.mkv","size":456},
+              "audio_tracks":[{"stream_index":1,"language":"pol"},{"stream_index":2,"language":"eng","title":"English"}],
+              "selected_audio_index":2,
+              "selected_audio_language":"eng",
+              "validation_session_id":"session-1",
+              "validation_lease_expires_at":"2026-06-24T01:23:45Z"
+            }
+            """;
+        var h = new QueuedHandler().Enqueue(HttpStatusCode.OK, body);
+        var c = MakeClient(h, "secret-token");
+
+        var result = await c.ValidateAsync(new GostreamValidateRequest
+        {
+            Type = "episode",
+            Title = "Avatar",
+            Season = 2,
+            Episode = 1,
+            Magnet = "magnet:?xt=urn:btih:abc",
+            PreferredAudioLanguage = "eng",
+            RequiredAudioLanguages = new[] { "eng" },
+            ValidationSessionId = "session-1",
+        }, CancellationToken.None);
+
+        Assert.Equal("valid", result.Status);
+        Assert.Equal("abc", result.Hash);
+        Assert.Equal(12, result.SelectedFile?.Id);
+        Assert.Equal("Avatar S02E01.mkv", result.SelectedFile?.Path);
+        Assert.Equal(456, result.SelectedFile?.Size);
+        Assert.Equal(2, result.SelectedAudioIndex);
+        Assert.Equal("eng", result.SelectedAudioLanguage);
+        Assert.Equal(2, result.AudioTracks.Count);
+        Assert.Equal("secret-token", h.Requests[0].Headers.GetValues("X-Gostream-Token").Single());
+        Assert.EndsWith("/api/library/validate", h.Requests[0].RequestUri!.AbsolutePath, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Validate_5xx_Returns_Transient_Result()
+    {
+        var h = new QueuedHandler().Enqueue(HttpStatusCode.BadGateway, "{\"error\":\"upstream\"}");
+        var c = MakeClient(h);
+
+        var result = await c.ValidateAsync(new GostreamValidateRequest
+        {
+            Type = "movie",
+            Title = "X",
+            Magnet = "magnet:?xt=urn:btih:abc",
+            ValidationSessionId = "session-1",
+        }, CancellationToken.None);
+
+        Assert.Equal("transient", result.Status);
+        Assert.Equal("gostream_server_error", result.Reason);
+        Assert.Equal("session-1", result.ValidationSessionId);
+    }
+
+    [Fact]
+    public async Task ReleaseValidation_Sends_Configured_Gostream_Token()
+    {
+        var h = new QueuedHandler().Enqueue(HttpStatusCode.OK, "{\"status\":\"released\"}");
+        var c = MakeClient(h, "secret-token");
+
+        await c.ReleaseValidationAsync(new GostreamValidationReleaseRequest
+        {
+            ValidationSessionId = "session-1",
+            Hash = "abc",
+        }, CancellationToken.None);
+
+        Assert.Equal("secret-token", h.Requests[0].Headers.GetValues("X-Gostream-Token").Single());
+        Assert.EndsWith("/api/library/validate/release", h.Requests[0].RequestUri!.AbsolutePath, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ReleaseValidation_Skips_When_Hash_Missing()
+    {
+        var h = new QueuedHandler();
+        var c = MakeClient(h, "secret-token");
+
+        await c.ReleaseValidationAsync(new GostreamValidationReleaseRequest
+        {
+            ValidationSessionId = "session-1",
+            Hash = null,
+        }, CancellationToken.None);
+
+        Assert.Empty(h.Requests);
+    }
+
+    [Fact]
     public async Task Add_504_Throws_Timeout()
     {
         var h = new QueuedHandler().Enqueue(HttpStatusCode.GatewayTimeout, "{\"error\":\"metadata_timeout\"}");
