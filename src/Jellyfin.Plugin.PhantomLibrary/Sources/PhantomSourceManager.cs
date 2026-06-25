@@ -542,11 +542,6 @@ public sealed class PhantomSourceManager
             }
         }
 
-        if (result.Count > 0)
-        {
-            return (result, null, null);
-        }
-
         var probe = await _magnetSelector.ProbeAsync(
             key.TmdbId, imdb, key.Type, key.Season, key.Episode,
             meta.Title, meta.Year,

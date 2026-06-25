@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -607,6 +608,91 @@ public class MaterialiserTests : IDisposable
             CancellationToken.None);
         Assert.True(marker.HasValue);
         Assert.False(await db.IsMaterialiseInFlightAsync(90, "movie", -1, -1, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Materialise_ProbesFreshSourcesEvenWhenCachedCandidatesExist()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieMetadataAsync(db, 42);
+        var old = new MagnetCandidate("magnet:?xt=urn:btih:OLD", "OLD", 5L * 1024 * 1024 * 1024, 10, "old") { Title = "Old 1080p" };
+        var fresh = new MagnetCandidate("magnet:?xt=urn:btih:NEW", "NEW", 8L * 1024 * 1024 * 1024, 50, "fresh") { Title = "Fresh 1080p" };
+        await db.UpsertSourceCandidatesAsync(42, "movie", -1, -1, "test", new[] { old }, "details_probe", TimeSpan.FromHours(1), CancellationToken.None);
+        var validatedMagnets = new List<string>();
+        string? addedMagnet = null;
+        var (sut, _, _, indexer, _, cfg) = BuildSut(
+            db,
+            magnets: new[] { fresh },
+            gostreamSetup: g =>
+            {
+                g.Setup(x => x.ValidateAsync(It.IsAny<GostreamValidateRequest>(), It.IsAny<CancellationToken>()))
+                    .ReturnsAsync((GostreamValidateRequest req, CancellationToken _) =>
+                    {
+                        validatedMagnets.Add(req.Magnet);
+                        return new GostreamValidateResult
+                        {
+                            Status = "valid",
+                            Hash = req.Magnet.Contains("NEW", StringComparison.Ordinal) ? "NEW" : "OLD",
+                            SelectedFile = new GostreamSelectedFile { Id = 0, Path = "movie.mkv", Size = 100 },
+                            ValidationSessionId = req.ValidationSessionId,
+                        };
+                    });
+                g.Setup(x => x.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()))
+                    .ReturnsAsync((GostreamAddRequest req, CancellationToken _) =>
+                    {
+                        addedMagnet = req.Magnet;
+                        return new GostreamAddResult
+                        {
+                            StubPath = "/var/gostream/stubs/movie.mkv",
+                            FusePath = Path.Combine(_fuseMount, "movie.mkv"),
+                            Hash = req.Magnet.Contains("NEW", StringComparison.Ordinal) ? "NEW" : "OLD",
+                            Size = 100,
+                        };
+                    });
+            });
+        cfg.SourceValidationParallelism = 1;
+        cfg.SourceValidationWindowSize = 1;
+        File.WriteAllText(Path.Combine(_fuseMount, "movie.mkv"), "x");
+
+        var outcome = await sut.MaterialiseAsync(42, "movie", null, null, MaterialiseTrigger.Manual, CancellationToken.None);
+
+        Assert.Equal(MaterialisationStatus.Success, outcome.Status);
+        Assert.Contains(fresh.Magnet, validatedMagnets);
+        Assert.Equal(fresh.Magnet, addedMagnet);
+        var rows = await db.ListSourceCandidatesAsync(42, "movie", -1, -1, "test", includeExpired: false, CancellationToken.None);
+        Assert.Contains(rows, r => r.Magnet == old.Magnet);
+        Assert.Contains(rows, r => r.Magnet == fresh.Magnet);
+        Assert.IsType<FakeIndexer>(indexer);
+    }
+
+    [Fact]
+    public async Task TransientValidationFailure_UsesShortRetryMarker_NotUnavailableRetryWindow()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieMetadataAsync(db, 90);
+        var (sut, gostream, _, _, _, cfg) = BuildSut(db, gostreamSetup: g =>
+        {
+            g.Setup(x => x.ValidateAsync(It.IsAny<GostreamValidateRequest>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync((GostreamValidateRequest req, CancellationToken _) => new GostreamValidateResult
+                {
+                    Status = "transient",
+                    Reason = "validation_cancelled",
+                    ValidationSessionId = req.ValidationSessionId,
+                });
+        });
+        cfg.SourceValidationTransientRetryMinutes = 7;
+
+        var before = DateTimeOffset.UtcNow;
+        var outcome = await sut.MaterialiseAsync(90, "movie", null, null, MaterialiseTrigger.Manual, CancellationToken.None);
+
+        Assert.Equal(MaterialisationStatus.Error, outcome.Status);
+        Assert.Contains("transient validation failure", outcome.Error, StringComparison.OrdinalIgnoreCase);
+        var marker = await db.IsMarkedUnavailableAsync(
+            new UnavailableKey(TmdbId: 90, ImdbId: "tt0000042", Type: "movie", Season: null, Episode: null),
+            CancellationToken.None);
+        Assert.True(marker.HasValue);
+        Assert.InRange(marker.Value, before.AddMinutes(6), before.AddMinutes(9));
+        gostream.Verify(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
     // ---- type rejects ----

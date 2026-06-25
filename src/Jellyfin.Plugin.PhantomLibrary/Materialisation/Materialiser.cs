@@ -60,6 +60,7 @@ public sealed class Materialiser : IMaterialiser
     private readonly ILogger<Materialiser> _logger;
 
     private sealed record CandidateAddRequest(GostreamAddRequest Request, MagnetCandidate Magnet, bool FromCache, int Rank = 0, SourceCandidateRow? SourceRow = null);
+    private sealed record CandidatePlan(IReadOnlyList<CandidateAddRequest> InitialCandidates, Task<IReadOnlyList<CandidateAddRequest>>? FreshCandidatesTask);
     private sealed record CandidateValidation(CandidateAddRequest Candidate, GostreamValidateResult Result, string SessionId);
     private sealed record CandidateAddResult(GostreamAddResult AddResult, string FusePath);
 
@@ -318,10 +319,12 @@ public sealed class Materialiser : IMaterialiser
                     externalId);
             }
 
-            var candidates = await BuildGostreamRequestsAsync(
+            var candidatePlan = await BuildGostreamRequestsAsync(
                 tmdbId, type, season, episode, imdb, unavailKey, selectedCandidate, ct).ConfigureAwait(false);
             var validatedCandidates = await ValidateCandidatesAsync(
-                candidates, tmdbId, type, season, episode, imdb, unavailKey, ct).ConfigureAwait(false);
+                candidatePlan.InitialCandidates,
+                candidatePlan.FreshCandidatesTask,
+                tmdbId, type, season, episode, imdb, unavailKey, ct).ConfigureAwait(false);
             var addResult = await AddWithCandidateRetryAsync(
                 validatedCandidates, tmdbId, type, season, episode, imdb, unavailKey, ct).ConfigureAwait(false);
 
@@ -433,7 +436,7 @@ public sealed class Materialiser : IMaterialiser
     /// an item-level <c>unavailable_marker</c> only when no candidate is
     /// available.
     /// </summary>
-    private async Task<IReadOnlyList<CandidateAddRequest>> BuildGostreamRequestsAsync(
+    private async Task<CandidatePlan> BuildGostreamRequestsAsync(
         int tmdbId,
         string type,
         int? season,
@@ -487,8 +490,22 @@ public sealed class Materialiser : IMaterialiser
                 TimeSpan.FromHours(Math.Max(1, cfg.MagnetCacheTtlHours)),
                 ct).ConfigureAwait(false);
             candidates.Add(BuildCandidateRequest(meta, type, tmdbId, imdb, season, episode, selectedCandidate, cfg, fromCache: false, rank: 1));
-            return candidates;
+            return new CandidatePlan(candidates, null);
         }
+
+        var freshCandidatesTask = BuildFreshMaterialiseCandidatesAsync(
+            tmdbId,
+            type,
+            season,
+            episode,
+            imdb,
+            metadataType,
+            meta,
+            cfg,
+            magnetKey,
+            sSentinel,
+            eSentinel,
+            ct);
 
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var cached = await _db.GetCachedMagnetAsync(magnetKey, ct).ConfigureAwait(false);
@@ -507,7 +524,7 @@ public sealed class Materialiser : IMaterialiser
                     "magnet_cache",
                     TimeSpan.FromHours(Math.Max(1, cfg.MagnetCacheTtlHours)),
                     ct).ConfigureAwait(false);
-                candidates.Add(BuildCandidateRequest(meta, type, tmdbId, imdb, season, episode, cachedCandidate, cfg, fromCache: true, rank: 0));
+                candidates.Add(BuildCandidateRequest(meta, type, tmdbId, imdb, season, episode, cachedCandidate, cfg, fromCache: true, rank: int.MaxValue));
                 seen.Add(cachedCandidate.Magnet);
             }
         }
@@ -549,57 +566,67 @@ public sealed class Materialiser : IMaterialiser
             candidates.Add(BuildCandidateRequest(meta, type, tmdbId, imdb, season, episode, magnet, cfg, fromCache: false, rank: sourceCandidate.Rank, sourceRow: sourceCandidate));
         }
 
-        if (candidates.Count > 0)
-        {
-            return candidates;
-        }
+        return new CandidatePlan(candidates, freshCandidatesTask);
+    }
 
+    private async Task<IReadOnlyList<CandidateAddRequest>> BuildFreshMaterialiseCandidatesAsync(
+        int tmdbId,
+        string type,
+        int? season,
+        int? episode,
+        string? imdb,
+        string metadataType,
+        TmdbMetadataRow meta,
+        PluginConfiguration cfg,
+        MagnetCacheKey magnetKey,
+        int sSentinel,
+        int eSentinel,
+        CancellationToken ct)
+    {
         var probe = await _magnetSelector.ProbeAsync(
             tmdbId, imdb, type, season, episode,
             meta.Title, meta.Year,
             ct).ConfigureAwait(false);
-        if (probe.Outcome == MagnetProbeOutcome.Available)
+        if (probe.Outcome == MagnetProbeOutcome.IndeterminateTransient)
         {
-            await _db.UpsertSourceCandidatesAsync(
-                tmdbId,
-                type,
-                sSentinel,
-                eSentinel,
-                cfg.SourcePickerPreset,
-                probe.Candidates,
-                "materialise_probe",
-                TimeSpan.FromHours(Math.Max(1, cfg.MagnetCacheTtlHours)),
-                ct).ConfigureAwait(false);
-            foreach (var magnet in probe.Candidates)
-            {
-                if (string.IsNullOrWhiteSpace(magnet.Magnet) || !seen.Add(magnet.Magnet))
-                {
-                    continue;
-                }
-
-                if (!await IsCandidateAllowedAsync(magnetKey, magnet, ct).ConfigureAwait(false))
-                {
-                    continue;
-                }
-
-                candidates.Add(BuildCandidateRequest(meta, type, tmdbId, imdb, season, episode, magnet, cfg, fromCache: false, rank: candidates.Count + 1));
-            }
+            throw new InvalidOperationException(
+                $"Source availability transient for {metadataType}/{tmdbId} (season={season} episode={episode}): {probe.ErrorKind} {probe.ErrorMessage}");
         }
 
-        if (candidates.Count == 0)
+        if (probe.Outcome != MagnetProbeOutcome.Available)
         {
-            if (probe.Outcome == MagnetProbeOutcome.IndeterminateTransient)
+            return Array.Empty<CandidateAddRequest>();
+        }
+
+        await _db.UpsertSourceCandidatesAsync(
+            tmdbId,
+            type,
+            sSentinel,
+            eSentinel,
+            cfg.SourcePickerPreset,
+            probe.Candidates,
+            "materialise_probe",
+            TimeSpan.FromHours(Math.Max(1, cfg.MagnetCacheTtlHours)),
+            ct).ConfigureAwait(false);
+
+        var candidates = new List<CandidateAddRequest>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var rank = 0;
+        foreach (var magnet in probe.Candidates)
+        {
+            ct.ThrowIfCancellationRequested();
+            rank++;
+            if (string.IsNullOrWhiteSpace(magnet.Magnet) || !seen.Add(magnet.Magnet))
             {
-                throw new InvalidOperationException(
-                    $"Source availability transient for {metadataType}/{tmdbId} (season={season} episode={episode}): {probe.ErrorKind} {probe.ErrorMessage}");
+                continue;
             }
 
-            await _db.MarkUnavailableAsync(
-                unavailableKey,
-                retryAfter: TimeSpan.FromHours(cfg.UnavailableRetryAfterHours),
-                ct).ConfigureAwait(false);
-            throw new InvalidOperationException(
-                $"No unfailed magnet candidates for {metadataType}/{tmdbId} (season={season} episode={episode}); marked unavailable for {cfg.UnavailableRetryAfterHours}h");
+            if (!await IsCandidateAllowedAsync(magnetKey, magnet, ct).ConfigureAwait(false))
+            {
+                continue;
+            }
+
+            candidates.Add(BuildCandidateRequest(meta, type, tmdbId, imdb, season, episode, magnet, cfg, fromCache: false, rank: rank));
         }
 
         return candidates;
@@ -670,6 +697,7 @@ public sealed class Materialiser : IMaterialiser
 
     private async Task<IReadOnlyList<CandidateAddRequest>> ValidateCandidatesAsync(
         IReadOnlyList<CandidateAddRequest> candidates,
+        Task<IReadOnlyList<CandidateAddRequest>>? freshCandidatesTask,
         int tmdbId,
         string type,
         int? season,
@@ -678,23 +706,148 @@ public sealed class Materialiser : IMaterialiser
         UnavailableKey unavailableKey,
         CancellationToken ct)
     {
-        if (candidates.Count == 0)
-        {
-            return candidates;
-        }
-
         var cfg = _configProvider();
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeout.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(cfg.SourceValidationTimeoutSeconds, 5, 300)));
         var validationCt = timeout.Token;
+        var attempted = 0;
+        var sawTransient = false;
+
+        var initial = await ValidateCandidateSetAsync(
+            candidates,
+            tmdbId,
+            type,
+            season,
+            episode,
+            imdb,
+            unavailableKey,
+            cfg,
+            validationCt,
+            ct).ConfigureAwait(false);
+        attempted += initial.Attempted;
+        sawTransient |= initial.SawTransient;
+
+        IReadOnlyList<CandidateAddRequest> freshCandidates = Array.Empty<CandidateAddRequest>();
+        Exception? freshFailure = null;
+        if (freshCandidatesTask is not null)
+        {
+            try
+            {
+                freshCandidates = await freshCandidatesTask.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                freshFailure = ex;
+                sawTransient = true;
+                _logger.LogWarning(
+                    ex,
+                    "Fresh materialisation source probe failed for {Type}/{Tmdb} s{Season}e{Episode}",
+                    type,
+                    tmdbId,
+                    season,
+                    episode);
+            }
+        }
+
+        var freshOnly = DistinctFreshCandidates(candidates, freshCandidates);
+        ValidatedCandidateSet fresh = ValidatedCandidateSet.Empty;
+        if (freshOnly.Length > 0)
+        {
+            fresh = await ValidateCandidateSetAsync(
+                freshOnly,
+                tmdbId,
+                type,
+                season,
+                episode,
+                imdb,
+                unavailableKey,
+                cfg,
+                validationCt,
+                ct).ConfigureAwait(false);
+            attempted += fresh.Attempted;
+            sawTransient |= fresh.SawTransient;
+        }
+
+        var winnerSet = PickPreferredValidatedSet(initial, fresh);
+        if (winnerSet.Result.Count > 0)
+        {
+            if (!ReferenceEquals(winnerSet, initial))
+            {
+                await ReleaseCandidateLeasesAsync(initial.Result, CancellationToken.None).ConfigureAwait(false);
+            }
+
+            if (!ReferenceEquals(winnerSet, fresh))
+            {
+                await ReleaseCandidateLeasesAsync(fresh.Result, CancellationToken.None).ConfigureAwait(false);
+            }
+
+            return winnerSet.Result;
+        }
+
+        if (freshFailure is not null && candidates.Count == 0)
+        {
+            throw new InvalidOperationException(
+                $"Source availability transient for {type}/{tmdbId} s{season}e{episode}: {freshFailure.Message}",
+                freshFailure);
+        }
+
+        if (sawTransient)
+        {
+            await _db.MarkUnavailableAsync(
+                unavailableKey,
+                retryAfter: TimeSpan.FromMinutes(Math.Clamp(cfg.SourceValidationTransientRetryMinutes, 1, 1440)),
+                ct).ConfigureAwait(false);
+            throw new InvalidOperationException(
+                $"No source candidate validated for {type}/{tmdbId} s{season}e{episode}; attempted {attempted} candidates; transient validation failure, retry scheduled in {Math.Clamp(cfg.SourceValidationTransientRetryMinutes, 1, 1440)} minutes");
+        }
+
+        await _db.MarkUnavailableAsync(
+            unavailableKey,
+            retryAfter: TimeSpan.FromHours(cfg.UnavailableRetryAfterHours),
+            ct).ConfigureAwait(false);
+        throw new InvalidOperationException(
+            $"No source candidate validated for {type}/{tmdbId} s{season}e{episode}; attempted {attempted} candidates");
+    }
+
+    private sealed record ValidatedCandidateSet(
+        IReadOnlyList<CandidateAddRequest> Result,
+        int BestRank,
+        int Attempted,
+        bool SawTransient)
+    {
+        public static ValidatedCandidateSet Empty { get; } = new(Array.Empty<CandidateAddRequest>(), int.MaxValue, 0, false);
+    }
+
+    private async Task<ValidatedCandidateSet> ValidateCandidateSetAsync(
+        IReadOnlyList<CandidateAddRequest> candidates,
+        int tmdbId,
+        string type,
+        int? season,
+        int? episode,
+        string? imdb,
+        UnavailableKey unavailableKey,
+        PluginConfiguration cfg,
+        CancellationToken validationCt,
+        CancellationToken outerCt)
+    {
+        if (candidates.Count == 0)
+        {
+            return ValidatedCandidateSet.Empty;
+        }
+
         var groups = candidates
             .OrderBy(c => ValidationGroup(c, type, season, episode))
-            .ThenBy(c => c.Rank == 0 ? int.MinValue : c.Rank)
+            .ThenBy(c => c.Rank)
             .ThenByDescending(c => c.Magnet.Seeders)
             .GroupBy(c => ValidationGroup(c, type, season, episode))
             .OrderBy(g => g.Key);
 
         var attempted = 0;
+        var sawTransient = false;
         foreach (var group in groups)
         {
             var ordered = group.ToArray();
@@ -705,12 +858,12 @@ public sealed class Materialiser : IMaterialiser
                 {
                     validationCt.ThrowIfCancellationRequested();
                 }
-                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                catch (OperationCanceledException) when (!outerCt.IsCancellationRequested)
                 {
                     await _db.MarkUnavailableAsync(
                         unavailableKey,
                         retryAfter: TimeSpan.FromMinutes(Math.Clamp(cfg.SourceValidationTransientRetryMinutes, 1, 1440)),
-                        ct).ConfigureAwait(false);
+                        outerCt).ConfigureAwait(false);
                     throw new InvalidOperationException(
                         $"Source validation timed out for {type}/{tmdbId} s{season}e{episode}; attempted {attempted} candidates");
                 }
@@ -722,18 +875,20 @@ public sealed class Materialiser : IMaterialiser
                 {
                     validations = await ValidateWindowAsync(window, tmdbId, type, season, episode, imdb, cfg, validationCt).ConfigureAwait(false);
                 }
-                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                catch (OperationCanceledException) when (!outerCt.IsCancellationRequested)
                 {
                     await _db.MarkUnavailableAsync(
                         unavailableKey,
                         retryAfter: TimeSpan.FromMinutes(Math.Clamp(cfg.SourceValidationTransientRetryMinutes, 1, 1440)),
-                        ct).ConfigureAwait(false);
+                        outerCt).ConfigureAwait(false);
                     throw new InvalidOperationException(
                         $"Source validation timed out for {type}/{tmdbId} s{season}e{episode}; attempted {attempted} candidates");
                 }
+
+                sawTransient |= validations.Any(v => string.Equals(v.Result.Status, "transient", StringComparison.OrdinalIgnoreCase));
                 var winner = validations
                     .Where(v => string.Equals(v.Result.Status, "valid", StringComparison.OrdinalIgnoreCase))
-                    .OrderBy(v => v.Candidate.Rank == 0 ? int.MinValue : v.Candidate.Rank)
+                    .OrderBy(v => v.Candidate.Rank)
                     .FirstOrDefault();
                 if (winner is not null)
                 {
@@ -741,7 +896,7 @@ public sealed class Materialiser : IMaterialiser
                     var validByMagnet = validations
                         .Where(v => string.Equals(v.Result.Status, "valid", StringComparison.OrdinalIgnoreCase))
                         .ToDictionary(v => v.Candidate.Magnet.Magnet, StringComparer.Ordinal);
-                    return ordered
+                    var result = ordered
                         .Select(c =>
                         {
                             if (!validByMagnet.TryGetValue(c.Magnet.Magnet, out var v))
@@ -760,16 +915,40 @@ public sealed class Materialiser : IMaterialiser
                             };
                         })
                         .ToArray();
+                    return new ValidatedCandidateSet(result, winner.Candidate.Rank, attempted, sawTransient);
                 }
             }
         }
 
-        await _db.MarkUnavailableAsync(
-            unavailableKey,
-            retryAfter: TimeSpan.FromHours(cfg.UnavailableRetryAfterHours),
-            ct).ConfigureAwait(false);
-        throw new InvalidOperationException(
-            $"No source candidate validated for {type}/{tmdbId} s{season}e{episode}; attempted {attempted} candidates");
+        return new ValidatedCandidateSet(Array.Empty<CandidateAddRequest>(), int.MaxValue, attempted, sawTransient);
+    }
+
+    private static CandidateAddRequest[] DistinctFreshCandidates(
+        IReadOnlyList<CandidateAddRequest> existing,
+        IReadOnlyList<CandidateAddRequest> fresh)
+    {
+        if (fresh.Count == 0)
+        {
+            return Array.Empty<CandidateAddRequest>();
+        }
+
+        var seen = new HashSet<string>(existing.Select(c => c.Magnet.Magnet), StringComparer.Ordinal);
+        return fresh.Where(c => seen.Add(c.Magnet.Magnet)).ToArray();
+    }
+
+    private static ValidatedCandidateSet PickPreferredValidatedSet(ValidatedCandidateSet initial, ValidatedCandidateSet fresh)
+    {
+        if (initial.Result.Count == 0)
+        {
+            return fresh;
+        }
+
+        if (fresh.Result.Count == 0)
+        {
+            return initial;
+        }
+
+        return fresh.BestRank <= initial.BestRank ? fresh : initial;
     }
 
     private async Task<IReadOnlyList<CandidateValidation>> ValidateWindowAsync(
@@ -1270,6 +1449,36 @@ public sealed class Materialiser : IMaterialiser
         throw new InvalidOperationException(
             $"All {candidates.Count} magnet candidates failed for {type}/{tmdbId} s{season}e{episode}; marked unavailable for {cfg.UnavailableRetryAfterHours}h",
             last);
+    }
+
+    private async Task ReleaseCandidateLeasesAsync(IReadOnlyList<CandidateAddRequest> candidates, CancellationToken ct)
+    {
+        foreach (var candidate in candidates)
+        {
+            if (string.IsNullOrWhiteSpace(candidate.Request.ValidationSessionId))
+            {
+                continue;
+            }
+
+            try
+            {
+                await _gostream.ReleaseValidationAsync(
+                    new GostreamValidationReleaseRequest
+                    {
+                        ValidationSessionId = candidate.Request.ValidationSessionId!,
+                        Hash = candidate.Magnet.InfoHash,
+                    },
+                    ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Failed to release validation session {SessionId}", candidate.Request.ValidationSessionId);
+            }
+        }
     }
 
     private async Task ReleaseUnconsumedCandidateLeasesAsync(

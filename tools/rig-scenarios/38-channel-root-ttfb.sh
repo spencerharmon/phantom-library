@@ -6,6 +6,7 @@ set -euo pipefail
 
 ROOT=${PHANTOM_REPO_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}
 RIG=${PHANTOM_TTFB_RIG:-/var/tmp/jf-channel-ttfb}
+USE_EXISTING_RIG=${PHANTOM_TTFB_USE_EXISTING_RIG:-0}
 JF_DATA=$RIG/data
 JF_CFG=$RIG/config
 JF_CACHE=$RIG/cache
@@ -31,15 +32,17 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 stop_rig() {
   systemctl --user stop rig-channel-ttfb.service >/dev/null 2>&1 || true
   systemctl --user reset-failed rig-channel-ttfb.service >/dev/null 2>&1 || true
-  pkill -u "$USER" -f 'dotnet.*jellyfin.dll.*jf-channel-ttfb' 2>/dev/null || true
+  ps -u "$USER" -o pid=,comm=,args= \
+    | awk '$2 == "dotnet" && $0 ~ /jellyfin\.dll/ && $0 ~ /jf-channel-ttfb/ { print $1 }' \
+    | xargs -r kill >/dev/null 2>&1 || true
 }
 
 cleanup() {
   stop_rig
-  dotnet build-server shutdown >/dev/null 2>&1 || true
-  pkill -u "$USER" -f 'MSBuild.dll /noautoresponse' 2>/dev/null || true
-  pkill -u "$USER" -f VBCSCompiler 2>/dev/null || true
-  pkill -u "$USER" -f testhost 2>/dev/null || true
+  timeout 10s dotnet build-server shutdown >/dev/null 2>&1 || true
+  ps -u "$USER" -o pid=,comm=,args= \
+    | awk '$2 == "VBCSCompiler" || $2 == "testhost" || ($2 == "dotnet" && $0 ~ /MSBuild\.dll \/noautoresponse/) { print $1 }' \
+    | xargs -r kill >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
@@ -112,16 +115,27 @@ require_readable "$PROD_CFG"
 MSBUILDDISABLENODEREUSE=1 dotnet build -c Release -p:UseSharedCompilation=false --no-restore >/tmp/phantom-channel-root-ttfb-build.log
 [ -f "$DLL" ] || fail "plugin DLL not built: $DLL"
 
-echo '[1] clone production-shaped DBs into isolated rig'
+echo '[1] prepare isolated rig DBs'
 stop_rig
-rm -rf "$RIG"
-mkdir -p "$JF_DATA/data" "$JF_DATA/plugins/configurations/PhantomLibrary" "$JF_DATA/root/default" "$PLUGIN_DIR" "$JF_CFG" "$JF_CACHE" "$JF_LOG" "$RIG/tmp"
-sqlite3 "$PROD_JDB" ".backup '$JF_DATA/data/jellyfin.db'"
-sqlite3 "$PROD_PHDB" ".backup '$JF_DATA/plugins/configurations/PhantomLibrary/phantom.db'"
+if [ "$USE_EXISTING_RIG" = "1" ]; then
+  mkdir -p "$JF_DATA/data" "$JF_DATA/plugins/configurations/PhantomLibrary" "$JF_DATA/root/default" "$PLUGIN_DIR" "$JF_CFG" "$JF_CACHE" "$JF_LOG" "$RIG/tmp"
+  [ -s "$JF_DATA/data/jellyfin.db" ] || fail "existing jellyfin DB missing/empty: $JF_DATA/data/jellyfin.db"
+  [ -s "$JF_DATA/plugins/configurations/PhantomLibrary/phantom.db" ] || fail "existing phantom DB missing/empty: $JF_DATA/plugins/configurations/PhantomLibrary/phantom.db"
+else
+  rm -rf "$RIG"
+  mkdir -p "$JF_DATA/data" "$JF_DATA/plugins/configurations/PhantomLibrary" "$JF_DATA/root/default" "$PLUGIN_DIR" "$JF_CFG" "$JF_CACHE" "$JF_LOG" "$RIG/tmp"
+  sqlite3 "$PROD_JDB" ".backup '$JF_DATA/data/jellyfin.db'"
+  sqlite3 "$PROD_PHDB" ".backup '$JF_DATA/plugins/configurations/PhantomLibrary/phantom.db'"
+  [ -s "$JF_DATA/data/jellyfin.db" ] || fail "jellyfin DB clone is empty: $JF_DATA/data/jellyfin.db"
+  [ -s "$JF_DATA/plugins/configurations/PhantomLibrary/phantom.db" ] || fail "phantom DB clone is empty: $JF_DATA/plugins/configurations/PhantomLibrary/phantom.db"
+  cp -r /var/lib/jellyfin/root/default/* "$JF_DATA/root/default/" 2>/dev/null || true
+fi
+chmod u+rw "$JF_DATA/data/jellyfin.db" "$JF_DATA/plugins/configurations/PhantomLibrary/phantom.db"
 cp "$PROD_CFG" "$JF_DATA/plugins/configurations/Jellyfin.Plugin.PhantomLibrary.xml"
-cp -r /var/lib/jellyfin/root/default/* "$JF_DATA/root/default/" 2>/dev/null || true
+scripts/migrate-source-candidates-v12.sh "$JF_DATA/plugins/configurations/PhantomLibrary/phantom.db" >/tmp/phantom-channel-root-ttfb-v12.log 2>&1 || true
+scripts/migrate-source-validation-v14.sh "$JF_DATA/plugins/configurations/PhantomLibrary/phantom.db" >/tmp/phantom-channel-root-ttfb-v14.log
 sqlite3 "$JF_DATA/data/jellyfin.db" \
-  "DELETE FROM ApiKeys WHERE Name='channel-ttfb-rig';
+  "DELETE FROM ApiKeys WHERE Name='channel-ttfb-rig' OR AccessToken='$TOK';
    INSERT INTO ApiKeys (DateCreated, DateLastActivity, Name, AccessToken)
    VALUES (datetime('now'), datetime('now'), 'channel-ttfb-rig', '$TOK');"
 cp "$DLL" "$PLUGIN_DIR/Jellyfin.Plugin.PhantomLibrary.dll"

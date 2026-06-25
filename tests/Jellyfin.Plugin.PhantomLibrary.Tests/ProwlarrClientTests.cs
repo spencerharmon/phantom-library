@@ -50,6 +50,35 @@ public class ProwlarrClientTests
     }
 
     [Fact]
+    public async Task Movie_Search_Uses_Imdb_And_Title_Year_Union()
+    {
+        var imdbBody = "[{\"title\":\"YTS\",\"size\":2147483648,\"seeders\":100,\"magnetUrl\":\"magnet:?xt=urn:btih:AAAA&dn=YTS\",\"indexer\":\"yts\"}]";
+        var titleBody = "["
+            + "{\"title\":\"Spirited Away 2001 QxR\",\"size\":8580000000,\"seeders\":292,\"magnetUrl\":\"magnet:?xt=urn:btih:BBBB&dn=QxR\",\"indexer\":\"lime\"},"
+            + "{\"title\":\"YTS duplicate\",\"size\":2147483648,\"seeders\":100,\"magnetUrl\":\"magnet:?xt=urn:btih:AAAA&dn=YTS\",\"indexer\":\"yts\"}"
+            + "]";
+        var handler = new QueuedHandler()
+            .Enqueue(HttpStatusCode.OK, imdbBody)
+            .Enqueue(HttpStatusCode.OK, titleBody);
+        var c = Make(handler);
+
+        var res = await c.SearchAsync(new IndexerQuery
+        {
+            Type = "movie",
+            Imdb = "tt0245429",
+            Title = "Spirited Away",
+            Year = 2001,
+        }, CancellationToken.None);
+
+        Assert.Equal(2, res.Count);
+        Assert.Contains(res, c => c.InfoHash == "AAAA");
+        Assert.Contains(res, c => c.InfoHash == "BBBB");
+        Assert.Contains("tt0245429", handler.Requests[0].RequestUri!.ToString());
+        Assert.Contains("Spirited", handler.Requests[1].RequestUri!.ToString());
+        Assert.Contains("2001", handler.Requests[1].RequestUri!.ToString());
+    }
+
+    [Fact]
     public async Task Episode_Search_Uses_Text_Query_Not_Imdb_Tvsearch()
     {
         var body = "[]";

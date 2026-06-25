@@ -59,19 +59,59 @@ public sealed class ProwlarrClient : IIndexerClient
 
         var isEpisode = string.Equals(query.Type, "episode", StringComparison.OrdinalIgnoreCase);
         var cat = isEpisode ? "5000" : "2000";
-        var seriesImdb = query.SeriesImdb ?? (isEpisode ? query.Imdb : null);
-
-        var queryStr = isEpisode
-            ? BuildTextQuery(query)
-            : !string.IsNullOrWhiteSpace(query.Imdb)
-                ? query.Imdb!
-                : BuildTextQuery(query);
-
-        if (string.IsNullOrWhiteSpace(queryStr))
+        var queries = BuildSearchQueries(query, isEpisode);
+        if (queries.Count == 0)
         {
             return Array.Empty<IndexerCandidate>();
         }
 
+        var results = new List<IndexerCandidate>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        IndexerTransientException? transient = null;
+        var successfulResponses = 0;
+
+        foreach (var queryStr in queries)
+        {
+            IReadOnlyList<IndexerCandidate> hits;
+            try
+            {
+                hits = await SearchSingleAsync(baseUrl, apiKey, queryStr, cat, ct).ConfigureAwait(false);
+                successfulResponses++;
+            }
+            catch (IndexerAuthException)
+            {
+                throw;
+            }
+            catch (IndexerTransientException ex)
+            {
+                transient ??= ex;
+                continue;
+            }
+
+            foreach (var hit in hits)
+            {
+                if (string.IsNullOrWhiteSpace(hit.InfoHash) || seen.Add(hit.InfoHash))
+                {
+                    results.Add(hit);
+                }
+            }
+        }
+
+        if (successfulResponses == 0 && transient is not null)
+        {
+            throw transient;
+        }
+
+        return results;
+    }
+
+    private async Task<IReadOnlyList<IndexerCandidate>> SearchSingleAsync(
+        string baseUrl,
+        string apiKey,
+        string queryStr,
+        string cat,
+        CancellationToken ct)
+    {
         var url = string.Format(
             CultureInfo.InvariantCulture,
             "{0}/api/v1/search?query={1}&type=search&categories={2}",
@@ -145,6 +185,33 @@ public sealed class ProwlarrClient : IIndexerClient
         {
             resp.Dispose();
         }
+    }
+
+    private static List<string> BuildSearchQueries(IndexerQuery query, bool isEpisode)
+    {
+        var queries = new List<string>();
+        void Add(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return;
+            }
+
+            if (!queries.Contains(value, StringComparer.OrdinalIgnoreCase))
+            {
+                queries.Add(value);
+            }
+        }
+
+        if (isEpisode)
+        {
+            Add(BuildTextQuery(query));
+            return queries;
+        }
+
+        Add(query.Imdb);
+        Add(BuildTextQuery(query));
+        return queries;
     }
 
     private async Task<IndexerCandidate?> MapItemAsync(ProwlarrItemDto it, CancellationToken ct)

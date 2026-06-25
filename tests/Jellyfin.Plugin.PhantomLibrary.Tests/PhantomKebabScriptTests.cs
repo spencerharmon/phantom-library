@@ -74,6 +74,23 @@ public class PhantomKebabScriptTests
     }
 
     [Fact]
+    public void SourceControls_PollDetailStateAfterMaterialiseResetAndReject()
+    {
+        var js = ReadScript();
+
+        Assert.Contains("detailPoll", js);
+        Assert.Contains("startDetailPolling(ctx, 'materialise-candidate')", js);
+        Assert.Contains("startDetailPolling(ctx, 'reset')", js);
+        Assert.Contains("startDetailPolling(ctx, 'reject')", js);
+        Assert.Contains("startDetailPollingForCurrent('item-action')", js);
+        Assert.Contains("setInterval(pollDetailState, 2000)", js);
+        Assert.Contains("fetchSources(externalId)", js);
+        Assert.Contains("refreshVisibleItemContainers()", js);
+        Assert.Contains("scanActionSheets()", js);
+        Assert.Contains("window.location.reload()", js);
+    }
+
+    [Fact]
     public void ActionSheet_UsesServerAdvertisedItemActions()
     {
         var js = ReadScript();

@@ -167,7 +167,7 @@ EOF
 
 # API key for REST
 sqlite3 $JF_DATA/data/jellyfin.db \
-  "DELETE FROM ApiKeys WHERE Name='test-rig';
+  "DELETE FROM ApiKeys WHERE Name='test-rig' OR AccessToken='testtoken00000000000000000000000';
    INSERT INTO ApiKeys (DateCreated, DateLastActivity, Name, AccessToken)
    VALUES ('2026-06-04','2026-06-04','test-rig','testtoken00000000000000000000000');"
 

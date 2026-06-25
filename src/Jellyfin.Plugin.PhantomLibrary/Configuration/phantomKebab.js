@@ -24,6 +24,15 @@
     var SECTION_ID = 'phantom-source-section';
     var STYLE_ID = 'phantom-source-styles';
     var cachedChannelItems = Object.create(null);
+    var detailPoll = {
+        timer: null,
+        itemId: null,
+        externalId: null,
+        deadline: 0,
+        busy: false,
+        lastStatus: null,
+        reloadTriggered: false
+    };
 
     function log() {
         // Quiet by default; uncomment for debugging.
@@ -438,10 +447,9 @@
 
     function refreshClientAfterAction(result) {
         return refreshSourceSection().then(function () {
-            if (!shouldRefreshItem(result)) { return; }
-            window.setTimeout(function () {
-                window.location.reload();
-            }, 150);
+            if (shouldRefreshItem(result)) {
+                startDetailPollingForCurrent('item-action');
+            }
         });
     }
 
@@ -622,7 +630,10 @@
                 return;
             }
             materialise.disabled = true;
-            fireMaterialiseCandidate(ctx.externalId, selected).then(refreshSourceSection, function () {
+            fireMaterialiseCandidate(ctx.externalId, selected).then(function () {
+                startDetailPolling(ctx, 'materialise-candidate');
+                return refreshSourceSection();
+            }, function () {
                 materialise.disabled = false;
             });
         });
@@ -636,7 +647,10 @@
         reset.addEventListener('click', function () {
             if (!window.confirm('Reset Phantom state for this item? This does not reject the current source.')) { return; }
             reset.disabled = true;
-            fireReset(ctx.externalId).then(refreshSourceSection, function () {
+            fireReset(ctx.externalId).then(function () {
+                startDetailPolling(ctx, 'reset');
+                return refreshSourceSection();
+            }, function () {
                 reset.disabled = false;
             });
         });
@@ -649,7 +663,10 @@
         reject.disabled = !canRejectState(state);
         reject.addEventListener('click', function () {
             reject.disabled = true;
-            fireRejectCurrent(ctx.externalId).then(refreshSourceSection, function () {
+            fireRejectCurrent(ctx.externalId).then(function () {
+                startDetailPolling(ctx, 'reject');
+                return refreshSourceSection();
+            }, function () {
                 reject.disabled = false;
             });
         });
@@ -683,17 +700,108 @@
         var seenItemId = currentItemId();
         if (!seenItemId) {
             removeSourceSection();
+            stopDetailPolling();
             return Promise.resolve();
         }
         return getPlayablePhantomItem().then(function (ctx) {
             if (!ctx || currentItemId() !== seenItemId) {
                 removeSourceSection();
+                stopDetailPolling();
                 return;
             }
             return fetchSources(ctx.externalId).then(function (state) {
                 if (currentItemId() !== seenItemId) { return; }
                 renderSourceSection(ctx, state);
+                observePhantomState(ctx, state, 'refresh');
             });
+        });
+    }
+
+    function sourceStatus(state) {
+        return (state && (state.Status || state.status)) || '';
+    }
+
+    function stopDetailPolling() {
+        if (detailPoll.timer) {
+            window.clearInterval(detailPoll.timer);
+        }
+        detailPoll.timer = null;
+        detailPoll.itemId = null;
+        detailPoll.externalId = null;
+        detailPoll.deadline = 0;
+        detailPoll.busy = false;
+        detailPoll.lastStatus = null;
+        detailPoll.reloadTriggered = false;
+    }
+
+    function startDetailPolling(ctx, reason) {
+        if (!ctx || !ctx.externalId) { return; }
+        var itemId = currentItemId();
+        if (!itemId) { return; }
+        if (detailPoll.itemId !== itemId || detailPoll.externalId !== ctx.externalId) {
+            stopDetailPolling();
+            detailPoll.itemId = itemId;
+            detailPoll.externalId = ctx.externalId;
+        }
+        detailPoll.deadline = Date.now() + 90000;
+        if (detailPoll.timer) { return; }
+        detailPoll.timer = window.setInterval(pollDetailState, 2000);
+        window.setTimeout(pollDetailState, reason === 'materialising' ? 500 : 1000);
+    }
+
+    function startDetailPollingForCurrent(reason) {
+        return getPlayablePhantomItem().then(function (ctx) {
+            if (ctx) { startDetailPolling(ctx, reason); }
+        });
+    }
+
+    function observePhantomState(ctx, state, reason) {
+        var status = sourceStatus(state);
+        if (!status) { return; }
+        if (status === 'materialising' || reason !== 'refresh') {
+            startDetailPolling(ctx, status || reason);
+        }
+        if (detailPoll.externalId === ctx.externalId) {
+            detailPoll.lastStatus = status;
+        }
+    }
+
+    function pollDetailState() {
+        if (!detailPoll.externalId || !detailPoll.itemId || currentItemId() !== detailPoll.itemId) {
+            stopDetailPolling();
+            return;
+        }
+        if (Date.now() > detailPoll.deadline) {
+            stopDetailPolling();
+            return;
+        }
+        if (detailPoll.busy) { return; }
+        detailPoll.busy = true;
+        var externalId = detailPoll.externalId;
+        fetchSources(externalId).then(function (state) {
+            if (!state || currentItemId() !== detailPoll.itemId || externalId !== detailPoll.externalId) { return; }
+            var ctx = { externalId: externalId };
+            renderSourceSection(ctx, state);
+            scanActionSheets();
+            refreshVisibleItemContainers();
+            var status = sourceStatus(state);
+            var prior = detailPoll.lastStatus;
+            detailPoll.lastStatus = status;
+            if (status === 'materialised' && prior && prior !== 'materialised' && !detailPoll.reloadTriggered) {
+                detailPoll.reloadTriggered = true;
+                window.setTimeout(function () {
+                    if (currentItemId() === detailPoll.itemId) {
+                        window.location.reload();
+                    }
+                }, 600);
+            }
+            if (status && status !== 'materialising' && status !== 'unmaterialised' && detailPoll.reloadTriggered) {
+                stopDetailPolling();
+            }
+        }, function (err) {
+            warn('detail poll failed', err);
+        }).then(function () {
+            detailPoll.busy = false;
         });
     }
 
@@ -806,6 +914,7 @@
         refreshSourceSection();
         prehydratePhantomSeasonChildren();
         window.addEventListener('hashchange', function () {
+            stopDetailPolling();
             patchApiClientForChannelItems();
             window.setTimeout(refreshSourceSection, 50);
             window.setTimeout(prehydratePhantomSeasonChildren, 50);
