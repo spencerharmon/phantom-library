@@ -241,6 +241,10 @@ public class MaterialiserTests : IDisposable
             It.IsAny<Guid>(), It.IsAny<string>(),
             It.Is<ChannelItemRefreshOptions>(o => o.ForceUpdate && o.ForceProbe && o.InvalidateMediaInfoCache),
             It.IsAny<CancellationToken>()), Times.Once);
+        refresh.Verify(r => r.RefreshChannelItemAsync(
+            It.IsAny<Guid>(), It.IsAny<string>(),
+            It.Is<ChannelItemRefreshOptions>(o => !o.ForceUpdate && !o.ForceProbe && o.InvalidateMediaInfoCache),
+            It.IsAny<CancellationToken>()), Times.Once);
         gostream.Verify(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
@@ -590,7 +594,7 @@ public class MaterialiserTests : IDisposable
         refresh.Verify(r => r.RefreshChannelItemAsync(
             It.IsAny<Guid>(), It.IsAny<string>(),
             It.Is<ChannelItemRefreshOptions>(o => !o.ForceUpdate && !o.ForceProbe && o.InvalidateMediaInfoCache),
-            It.IsAny<CancellationToken>()), Times.Once);
+            It.IsAny<CancellationToken>()), Times.Exactly(2));
     }
 
     [Fact]

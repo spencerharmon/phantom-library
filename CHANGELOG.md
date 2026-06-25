@@ -56,6 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fixed episode materialisation post-refresh ordering so Jellyfin invalidates stale dynamic media-source cache before probing the new FUSE file, preventing a newly materialised episode from inheriting runtime/size/media-info from a different episode in the same pack.
 - Fixed manual materialisation source discovery so materialise always launches a fresh indexer probe while cached candidates validate, adds newly discovered candidates to the queue, and treats transient validation cancellations as short-retry failures instead of poisoning the item for 24 hours.
 - Fixed Prowlarr movie discovery to query both IMDb ID and title/year, deduplicating by info hash so title-only tracker results are not missed.
 - Added light Phantom detail-page polling after materialise/reset/reject actions to refresh source controls, kebab actions, visible item containers, and trigger one reload when native Jellyfin detail state must be rebuilt.

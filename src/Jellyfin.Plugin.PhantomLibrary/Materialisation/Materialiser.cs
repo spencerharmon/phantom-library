@@ -334,10 +334,12 @@ public sealed class Materialiser : IMaterialiser
                 fusePath: addResult.FusePath,
                 ct).ConfigureAwait(false);
 
-            // Post-flight refresh: channel now emits real MediaSource;
-            // probe runs against the FUSE path. If this throws we still
-            // wrote materialised_state — next browse picks up the new
-            // path even without an immediate refresh.
+            // Post-flight refresh: channel now emits real MediaSource.
+            // Invalidate dynamic media-source cache before queueing the
+            // ForceProbe refresh; Jellyfin's channel refresh queues the
+            // metadata probe asynchronously, so invalidating after queueing
+            // can let the probe reuse an older pack file's cached source.
+            await TryInvalidateMediaInfoCacheAsync(channelId, externalId).ConfigureAwait(false);
             try
             {
                 await _refreshManager.RefreshChannelItemAsync(
