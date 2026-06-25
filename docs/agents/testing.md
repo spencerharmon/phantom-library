@@ -18,7 +18,7 @@ missing) — say so explicitly and ask. Otherwise, do it
 yourself.
 
 Current rule: test scenarios use an existing sandbox DB clone, normally
-under `/tmp/jf-test`. Do not copy production DBs during routine test
+under `/var/tmp/jf-test`. Do not copy production DBs during routine test
 runs. If an existing clone is stale, run supported offline migration
 scripts against the clone. If no suitable clone exists, ask the operator
 to provide/refresh the sandbox seed outside the scenario; do not clone
@@ -61,7 +61,7 @@ know what the host will do.
 
 There are now **two rigs** depending on what you're doing:
 
-- **`/tmp/jf-test/` — the legacy one-shot rig.** Bring-up + drive +
+- **`/var/tmp/jf-test/` — the legacy one-shot rig.** Bring-up + drive +
   tear-down in a single bash invocation. Each scenario script
   rebuilds rig state. Use when you need a deterministic, throwaway
   full-cycle test. Documented in the rest of this file.
@@ -93,9 +93,10 @@ chmod +x /tmp/jf-rig/bin/*.sh /tmp/jf-rig/bin/*.py /tmp/jf-rig/scenarios/*.sh
 # Build the plugin DLL (the rig copies it into place).
 dotnet build -c Release
 
-# Start: clones prod DB into /tmp/jf-test, drops fresh DLL, writes
-# plugin config pointing at the TMDB mock (port 18099), launches
-# jellyfin + mock under `systemd-run --user` as transient services.
+# Start: verifies existing /var/tmp/jf-test clone, migrates cloned phantom.db
+# if present, drops fresh DLL, writes plugin config pointing at the TMDB mock
+# (port 18099), launches jellyfin + mock under `systemd-run --user` as
+# transient services.
 bash /tmp/jf-rig/bin/rig-up.sh --reset
 
 # Status check (units survive across tool calls).
@@ -111,8 +112,8 @@ cat /tmp/jf-rig/logs/scenario-suggestions.log
 # under systemd-run --user).
 systemd-run --user --unit=rig-observer --setenv=JF_RIG_ROOT=/tmp/jf-rig \
   -- /usr/bin/python3 /tmp/jf-rig/bin/db-observer.py \
-     "/tmp/jf-test/data/data/jellyfin.db:BaseItems:Path LIKE '%[tmdbid-99000001]%'" \
-     "/tmp/jf-test/data/data/jellyfin.db:BaseItemProviders:ItemId IN (SELECT Id FROM BaseItems WHERE Path LIKE '%[tmdbid-99000001]%')"
+     "/var/tmp/jf-test/data/data/jellyfin.db:BaseItems:Path LIKE '%[tmdbid-99000001]%'" \
+     "/var/tmp/jf-test/data/data/jellyfin.db:BaseItemProviders:ItemId IN (SELECT Id FROM BaseItems WHERE Path LIKE '%[tmdbid-99000001]%')"
 # ... run test ...
 systemctl --user stop rig-observer
 ls /tmp/jf-rig/logs/observer-*.log   # mutation timeline
@@ -193,17 +194,17 @@ Key facts about the persistent rig:
   user session systemd to be available (`systemctl --user status`
   must work). Lingering not required for our session-attached use.
 - **Plugin source pulls the splash mp4 into
-  `/tmp/jf-test/cache/PhantomLibrary/splash.mp4` lazily on first
+  `/var/tmp/jf-test/cache/PhantomLibrary/splash.mp4` lazily on first
   PhantomStubManager bootstrap.** The rig's phantom symlinks all
   resolve to this single file.
 
 ## Rig layout
 
-The test rig lives under `/tmp/jf-test/`. Once seeded it looks
+The test rig lives under `/var/tmp/jf-test/`. Once seeded it looks
 like this:
 
 ```
-/tmp/jf-test/
+/var/tmp/jf-test/
 ├── start.sh                    # launches dotnet jellyfin.dll
 ├── run-test.sh                 # full driver: start + wait + REST + inspect + kill
 ├── data/                       # --datadir
@@ -239,7 +240,7 @@ You do not need to install anything.
 
 ## Bring-up procedure (existing clone only)
 
-Routine tests must use the existing rig DB clone under `/tmp/jf-test` (or
+Routine tests must use the existing rig DB clone under `/var/tmp/jf-test` (or
 scenario-specific clone path such as `/var/tmp/jf-channel-ttfb`). Do **not**
 copy production DBs as part of a test run. If the clone is stale, migrate it
 with the repo migration scripts. If the clone is missing, stop and ask the
@@ -253,9 +254,9 @@ and safe to mutate.
 Required existing files for normal rig use:
 
 ```text
-/tmp/jf-test/data/data/jellyfin.db
-/tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db
-/tmp/jf-test/data/root/default/
+/var/tmp/jf-test/data/data/jellyfin.db
+/var/tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db
+/var/tmp/jf-test/data/root/default/
 ```
 
 Before starting Jellyfin, scripts must:
@@ -271,21 +272,21 @@ ps -u "$USER" -o pid=,comm=,args= \
 # 1. verify existing clone, migrate phantom.db if needed.
 cd /home/spencer/git-repos/spencerharmon/phantom-library
 source tools/rig-scenarios/rig-db.sh
-ensure_existing_rig_jellyfin_db /tmp/jf-test/data/data/jellyfin.db
+ensure_existing_rig_jellyfin_db /var/tmp/jf-test/data/data/jellyfin.db
 migrate_existing_rig_phantom_db_if_present \
-  /tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db \
+  /var/tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db \
   /home/spencer/git-repos/spencerharmon/phantom-library
 
 # 2. build/drop plugin DLL into existing clone.
 MSBUILDDISABLENODEREUSE=1 dotnet build -c Release -p:UseSharedCompilation=false --no-restore
-mkdir -p /tmp/jf-test/data/plugins/Jellyfin.Plugin.PhantomLibrary_0.3.0.0
+mkdir -p /var/tmp/jf-test/data/plugins/Jellyfin.Plugin.PhantomLibrary_0.3.0.0
 cp src/Jellyfin.Plugin.PhantomLibrary/bin/Release/net9.0/Jellyfin.Plugin.PhantomLibrary.dll \
-   /tmp/jf-test/data/plugins/Jellyfin.Plugin.PhantomLibrary_0.3.0.0/
+   /var/tmp/jf-test/data/plugins/Jellyfin.Plugin.PhantomLibrary_0.3.0.0/
 md5sum src/Jellyfin.Plugin.PhantomLibrary/bin/Release/net9.0/Jellyfin.Plugin.PhantomLibrary.dll \
-       /tmp/jf-test/data/plugins/Jellyfin.Plugin.PhantomLibrary_0.3.0.0/Jellyfin.Plugin.PhantomLibrary.dll
+       /var/tmp/jf-test/data/plugins/Jellyfin.Plugin.PhantomLibrary_0.3.0.0/Jellyfin.Plugin.PhantomLibrary.dll
 
 # 3. seed API key idempotently. Delete by Name OR token to avoid UNIQUE errors.
-sqlite3 /tmp/jf-test/data/data/jellyfin.db \
+sqlite3 /var/tmp/jf-test/data/data/jellyfin.db \
   "DELETE FROM ApiKeys WHERE Name='test-rig' OR AccessToken='testtoken00000000000000000000000';
    INSERT INTO ApiKeys (DateCreated, DateLastActivity, Name, AccessToken)
    VALUES ('2026-06-04','2026-06-04','test-rig','testtoken00000000000000000000000');"
@@ -342,17 +343,17 @@ working copy:
 ```bash
 #!/bin/bash
 set -u
-LOG=/tmp/jf-test/run.log
+LOG=/var/tmp/jf-test/run.log
 BASE=http://localhost:18096
 TOK=testtoken00000000000000000000000
 # admin user GUID — read once from the cloned DB:
-#   sqlite3 /tmp/jf-test/data/data/jellyfin.db \
+#   sqlite3 /var/tmp/jf-test/data/data/jellyfin.db \
 #     "SELECT lower(substr(hex(Id),1,8)||'-'||substr(hex(Id),9,4)||'-'||
 #            substr(hex(Id),13,4)||'-'||substr(hex(Id),17,4)||'-'||
 #            substr(hex(Id),21,12)), Username FROM Users;"
 ADMIN=8EB11AC1-9939-4621-896C-31D5CBA4951C
 
-/tmp/jf-test/start.sh > $LOG 2>&1 &
+/var/tmp/jf-test/start.sh > $LOG 2>&1 &
 JF=$!
 echo "jf pid=$JF"
 trap "kill -9 $JF 2>/dev/null; sleep 1" EXIT
@@ -381,10 +382,10 @@ sleep 3
 # FROM BaseItems WHERE Type='MediaBrowser.Controller.Entities.CollectionFolder';"
 PARENT_MOVIES=DB8B6E7B-707B-B546-9E4D-9B125CAEBB3C
 curl -s "$BASE/Users/$ADMIN/Items?ParentId=$PARENT_MOVIES&Limit=200" \
-     -H "X-Emby-Token: $TOK" > /tmp/jf-test/items.json
+     -H "X-Emby-Token: $TOK" > /var/tmp/jf-test/items.json
 python3 -c "
 import json
-d = json.load(open('/tmp/jf-test/items.json'))
+d = json.load(open('/var/tmp/jf-test/items.json'))
 items = d.get('Items', [])
 print('TotalRecordCount=', d.get('TotalRecordCount'))
 splash = [i for i in items if i.get('Path','').endswith('splash.mp4')]
@@ -394,7 +395,7 @@ for i in splash[:10]:
 "
 
 echo "=== DB state ==="
-sqlite3 -separator '|' /tmp/jf-test/data/data/jellyfin.db \
+sqlite3 -separator '|' /var/tmp/jf-test/data/data/jellyfin.db \
   "SELECT b.Name, b.IsVirtualItem, COALESCE(p.Name,'<ORPHAN>'),
           substr(b.Path, length(b.Path)-15, 16)
    FROM BaseItems b LEFT JOIN BaseItems p ON b.ParentId=p.Id
@@ -409,7 +410,7 @@ echo "=== DONE ==="
 Run with:
 
 ```bash
-bash /tmp/jf-test/run-test.sh 2>&1 | tee /tmp/jf-test/out.log
+bash /var/tmp/jf-test/run-test.sh 2>&1 | tee /var/tmp/jf-test/out.log
 ```
 
 ## SQLite consistency — WAL/SHM
@@ -425,7 +426,7 @@ Always copy all three together in the order shown in step 1.
 Quick sanity check after a clone:
 
 ```bash
-sqlite3 /tmp/jf-test/data/data/jellyfin.db "SELECT COUNT(*) FROM BaseItems;"
+sqlite3 /var/tmp/jf-test/data/data/jellyfin.db "SELECT COUNT(*) FROM BaseItems;"
 ```
 
 Expect thousands (operator's real library), not an error.
@@ -433,12 +434,12 @@ Expect thousands (operator's real library), not an error.
 For the rig's own DB after the test runs, the same caveat
 applies if Jellyfin is still up. The `trap` in `run-test.sh`
 kills jellyfin before the script returns, so by the time you
-inspect `/tmp/jf-test/data/data/jellyfin.db` from a follow-up
+inspect `/var/tmp/jf-test/data/data/jellyfin.db` from a follow-up
 command, WAL has been flushed. If you inspect mid-test (from
 inside the script), include WAL:
 
 ```bash
-sqlite3 /tmp/jf-test/data/data/jellyfin.db "PRAGMA wal_checkpoint(FULL); SELECT ...;"
+sqlite3 /var/tmp/jf-test/data/data/jellyfin.db "PRAGMA wal_checkpoint(FULL); SELECT ...;"
 ```
 
 ## REST surface cheatsheet
@@ -465,7 +466,7 @@ Look them up rather than hardcoding — they are stable per
 operator but not per project:
 
 ```bash
-sqlite3 /tmp/jf-test/data/data/jellyfin.db \
+sqlite3 /var/tmp/jf-test/data/data/jellyfin.db \
   "SELECT lower(substr(hex(Id),1,8)||'-'||substr(hex(Id),9,4)||'-'||
                 substr(hex(Id),13,4)||'-'||substr(hex(Id),17,4)||'-'||
                 substr(hex(Id),21,12)), Name
@@ -504,7 +505,7 @@ SELECT state, COUNT(*) FROM phantom_items GROUP BY state;
 
 -- find phantom rows whose Jellyfin BaseItem went missing
 -- (run this attached to BOTH DBs)
-ATTACH '/tmp/jf-test/data/data/jellyfin.db' AS jf;
+ATTACH '/var/tmp/jf-test/data/data/jellyfin.db' AS jf;
 SELECT p.title, p.state, p.jellyfin_item_id
 FROM phantom_items p
 LEFT JOIN jf.BaseItems b ON lower(hex(b.Id)) = lower(p.jellyfin_item_id)
@@ -524,7 +525,7 @@ WHERE b.Id IS NULL;
 | `UNIQUE constraint failed: BaseItemProviders` | orphan provider rows from prior run | redo step 6 |
 | Phantom items "missing" from browse but in DB | item has `IsVirtualItem=1` and user filter hides virtuals; or `ParentId` points to wrong CollectionFolder | inspect with the DB-state SQL in `run-test.sh` and the lookup in "CollectionFolder IDs" |
 | Browse returns 0 items but DB has rows | wrong `ParentId` GUID in URL | re-derive from `VirtualFolders` endpoint or the SQL above |
-| `AddMediaPath` returns 404 `Could not find a part of the path .../<libname>/<safename>.mblink` | `/root/default/<libname>/` missing on disk (we cloned the DB but not the library config dirs) | `cp -r /var/lib/jellyfin/root/default/* /tmp/jf-test/data/root/default/` |
+| `AddMediaPath` returns 404 `Could not find a part of the path .../<libname>/<safename>.mblink` | `/root/default/<libname>/` missing on disk in the existing clone | refresh the sandbox seed clone outside the scenario so `/var/tmp/jf-test/data/root/default/` exists |
 | Multi-path library: items from 2nd path don't show in browse even after scan + restart | `CollectionFolder.PhysicalLocationsList` and `PhysicalFolderIds` did not refresh; `AddMediaPath` + `ValidateMediaLibrary` does not propagate to those fields reliably on 10.11 | see "CollectionFolder GUID resolution" below — patch `BaseItems.Data` directly OR call `libraryManager.UpdateItemAsync(cf, parent, ItemUpdateType.MetadataEdit, ct)` after setting both arrays in-process |
 | Phantom item gets weird Name like `Backrooms.Enderman` after scan | scanner renamed from filename + TMDB fuzzy-matched | set `IsLocked = true` on the BaseItem at creation; scanner skips locked items |
 | Browse `ParentId=<CollectionFolderId>` returns items recursively but `children of <CollectionFolderId>` SQL is empty | normal — CollectionFolder browse goes via `GetTopParentIdsForQuery` which returns `PhysicalFolderIds`, not via the `BaseItems.ParentId` tree | use `TopParentId` to find what a CollectionFolder claims, not `ParentId` |
@@ -572,7 +573,7 @@ does not fix this. Direct patch is required.
 **To verify the binding state**:
 
 ```bash
-sqlite3 /tmp/jf-test/data/data/jellyfin.db \
+sqlite3 /var/tmp/jf-test/data/data/jellyfin.db \
   "SELECT Data FROM BaseItems WHERE Id='<CollectionFolderId>';" \
   | python3 -c "import json,sys; d=json.load(sys.stdin); print('paths:',d.get('PhysicalLocationsList')); print('ids:',d.get('PhysicalFolderIds'))"
 ```
@@ -581,7 +582,7 @@ sqlite3 /tmp/jf-test/data/data/jellyfin.db \
 
 ```bash
 NEW_DATA='{"PhysicalLocationsList":["<container>","<path1>","<path2>"],"PhysicalFolderIds":["<id1>","<id2>"],"CollectionType":"movies",...}'
-sqlite3 /tmp/jf-test/data/data/jellyfin.db \
+sqlite3 /var/tmp/jf-test/data/data/jellyfin.db \
   "UPDATE BaseItems SET Data='$NEW_DATA' WHERE Id='<CollectionFolderId>';"
 ```
 
@@ -620,7 +621,7 @@ calls (within milliseconds) reflect the new path. No
 `/Items/{id}/Refresh`. UserData (favourites, watch progress)
 stays attached because the BaseItem.Id is unchanged.
 
-Verified end-to-end in `/tmp/jf-test/m2.sh`: SQL-update +
+Verified end-to-end in `/var/tmp/jf-test/m2.sh`: SQL-update +
 immediate browse showed the cached old value (because we
 bypassed `UpdateItemAsync` and went straight to SQL); a
 single `/Items/{id}/Refresh` forced in-memory invalidation
@@ -636,10 +637,10 @@ scan-free.
 
 ### Rig logs (the rig you control)
 
-#### One-shot rig (`/tmp/jf-test/`)
+#### One-shot rig (`/var/tmp/jf-test/`)
 
-- `/tmp/jf-test/run.log` — jellyfin's stdout/stderr
-- `/tmp/jf-test/log/*.log` — jellyfin's structured logs
+- `/var/tmp/jf-test/run.log` — jellyfin's stdout/stderr
+- `/var/tmp/jf-test/log/*.log` — jellyfin's structured logs
   (per `--logdir`)
 - Plugin log lines are prefixed `[PhantomLibrary]` and
   `[Phantom.*]` (per-subsystem categories like
@@ -648,8 +649,8 @@ scan-free.
 Grep examples:
 
 ```bash
-grep -i 'PhantomLibrary\|Phantom\.' /tmp/jf-test/log/*.log
-grep -i 'error\|exception\|fail' /tmp/jf-test/run.log | head -50
+grep -i 'PhantomLibrary\|Phantom\.' /var/tmp/jf-test/log/*.log
+grep -i 'error\|exception\|fail' /var/tmp/jf-test/run.log | head -50
 ```
 
 #### Persistent rig (`/tmp/jf-rig/`)
@@ -661,7 +662,7 @@ journalctl --user -u rig-jellyfin --no-pager --since '5 min ago'
 journalctl --user -u rig-jellyfin -f                # live tail
 ```
 
-The `--logdir` is still `/tmp/jf-test/log` (the two rigs share
+The `--logdir` is still `/var/tmp/jf-test/log` (the two rigs share
 that dir), so structured logs are at the same place. Use
 `journalctl --user` for stdout/stderr from the .NET host (faults,
 crashes, startup output).
@@ -747,23 +748,23 @@ is 30 seconds in the admin dashboard.
   with `curl http://127.0.0.1:8090/health` before assuming
   they're up.
 - **Destructive prod tests.** The rig writes only to
-  `/tmp/jf-test`. It never writes back to
+  `/var/tmp/jf-test`. It never writes back to
   `/var/lib/jellyfin/...`. Keep it that way.
 
 ## Tear-down
 
-**One-shot rig (`/tmp/jf-test/`):**
+**One-shot rig (`/var/tmp/jf-test/`):**
 
 ```bash
 pkill -u "$USER" -9 -f "dotnet.*jellyfin.dll.*jf-test"
-rm -rf /tmp/jf-test
+rm -rf /var/tmp/jf-test
 ```
 
 **Persistent rig (`/tmp/jf-rig/` + user systemd units):**
 
 ```bash
 bash /tmp/jf-rig/bin/rig-down.sh   # stops rig-jellyfin / rig-tmdb-mock / rig-observer cleanly
-# Optional: rm -rf /tmp/jf-rig /tmp/jf-test
+# Optional: rm -rf /tmp/jf-rig /var/tmp/jf-test
 ```
 
 Both rigs are disposable. Rebuild from prod whenever you suspect

@@ -3,10 +3,10 @@
 # Idempotent. Re-running stops + re-starts the units.
 set -euo pipefail
 ROOT=/tmp/jf-rig
-JF_DATA=/tmp/jf-test/data
-JF_CFG=/tmp/jf-test/config
-JF_CACHE=/tmp/jf-test/cache
-JF_LOG=/tmp/jf-test/log
+JF_DATA=/var/tmp/jf-test/data
+JF_CFG=/var/tmp/jf-test/config
+JF_CACHE=/var/tmp/jf-test/cache
+JF_LOG=/var/tmp/jf-test/log
 REPO=${PHANTOM_REPO_ROOT:-/home/spencer/git-repos/spencerharmon/phantom-library}
 DLL=$REPO/src/Jellyfin.Plugin.PhantomLibrary/bin/Release/net9.0/Jellyfin.Plugin.PhantomLibrary.dll
 JF_DLL=$REPO/jellyfin/Jellyfin.Server/bin/Release/net9.0/jellyfin.dll
@@ -203,11 +203,11 @@ done
 
 # ---------------------------------------------------------------- launch jellyfin under user systemd
 log "start rig-jellyfin.service"
-mkdir -p /tmp/jf-test/tmp
+mkdir -p /var/tmp/jf-test/tmp
 systemd-run --user --unit=rig-jellyfin \
   --description='Phantom rig Jellyfin' \
   --working-directory=$JF_DATA \
-  --setenv=TMPDIR=/tmp/jf-test/tmp \
+  --setenv=TMPDIR=/var/tmp/jf-test/tmp \
   -- /usr/bin/dotnet $JF_DLL \
        --datadir $JF_DATA --configdir $JF_CFG \
        --cachedir $JF_CACHE --logdir $JF_LOG \

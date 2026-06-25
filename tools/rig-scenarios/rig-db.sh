@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Shared DB helpers for Phantom rig scenarios.
-# Tests must use an existing cloned DB under /tmp/jf-test (or caller-provided
+# Tests must use an existing cloned DB under /var/tmp/jf-test (or caller-provided
 # rig path). Do not clone production DBs during routine test runs.
 set -euo pipefail
 
@@ -8,14 +8,14 @@ rig_fail() { echo "FAIL: $*" >&2; exit 1; }
 
 ensure_existing_rig_jellyfin_db() {
   local db=$1
-  [ -s "$db" ] || rig_fail "existing Jellyfin DB clone missing/empty: $db. Seed /tmp/jf-test once outside test run; do not copy prod during scenario execution."
+  [ -s "$db" ] || rig_fail "existing Jellyfin DB clone missing/empty: $db. Seed /var/tmp/jf-test once outside test run; do not copy prod during scenario execution."
   chmod u+rw "$db" 2>/dev/null || true
 }
 
 migrate_existing_rig_phantom_db() {
   local db=$1
   local repo=${2:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
-  [ -s "$db" ] || rig_fail "existing Phantom DB clone missing/empty: $db. Seed /tmp/jf-test once or run a reset scenario that intentionally starts with no phantom.db."
+  [ -s "$db" ] || rig_fail "existing Phantom DB clone missing/empty: $db. Seed /var/tmp/jf-test once or run a reset scenario that intentionally starts with no phantom.db."
   chmod u+rw "$db" 2>/dev/null || true
 
   local version
