@@ -84,6 +84,15 @@ internal static class PhantomAudioStreamSelector
             .OrderByDescending(i => GetStreamScore(i, preferredLanguages))
             .ToList();
 
+        if (preferredLanguages.Count > 0)
+        {
+            var preferredStream = sortedStreams.FirstOrDefault(i => MatchesPreferredLanguage(i.Language, preferredLanguages));
+            if (preferredStream is not null)
+            {
+                return preferredStream.Index;
+            }
+        }
+
         if (preferDefaultTrack)
         {
             var defaultStream = sortedStreams.FirstOrDefault(i => i.IsDefault);
@@ -107,6 +116,9 @@ internal static class PhantomAudioStreamSelector
         score = (score * 10) + (stream.IsExternal ? 2 : 1);
         return score;
     }
+
+    private static bool MatchesPreferredLanguage(string language, IReadOnlyList<string> languagePreferences)
+        => FindLanguageIndex(languagePreferences, language) != -1;
 
     private static int FindLanguageIndex(IReadOnlyList<string> languagePreferences, string language)
     {

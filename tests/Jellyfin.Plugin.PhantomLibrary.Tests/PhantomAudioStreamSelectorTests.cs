@@ -35,7 +35,7 @@ public class PhantomAudioStreamSelectorTests
     }
 
     [Fact]
-    public void PlayDefaultAudioTrack_MirrorsJellyfinDefaultFlagSemantics()
+    public void PreferredLanguage_WinsOverContainerDefault_WhenPlayDefaultAudioTrackEnabled()
     {
         var source = SourceWithPolishDefaultAndEnglish();
 
@@ -48,7 +48,7 @@ public class PhantomAudioStreamSelectorTests
                 RememberedAudioStreamIndex: null,
                 AllowRememberingSelection: true));
 
-        Assert.Equal(1, source.DefaultAudioStreamIndex);
+        Assert.Equal(2, source.DefaultAudioStreamIndex);
         Assert.True(source.DefaultAudioIndexSource.HasFlag(AudioIndexSource.Default));
         Assert.True(source.DefaultAudioIndexSource.HasFlag(AudioIndexSource.Language));
     }
