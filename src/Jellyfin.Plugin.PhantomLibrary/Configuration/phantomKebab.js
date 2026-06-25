@@ -660,6 +660,13 @@
         });
     }
 
+    function scanActionSheets() {
+        var sheets = document.querySelectorAll('.actionSheet');
+        for (var i = 0; i < sheets.length; i++) {
+            injectIntoSheet(sheets[i]);
+        }
+    }
+
     function injectButton(sheet, content, label, dataId, iconText, onClick) {
         if (content.querySelector('[data-id="' + dataId + '"]')) { return; }
 
@@ -739,12 +746,14 @@
                 scheduled = true;
                 window.setTimeout(function () {
                     scheduled = false;
+                    scanActionSheets();
                     refreshSourceSection();
                     prehydratePhantomSeasonChildren();
                 }, 150);
             }
         });
         observer.observe(document.body, { childList: true, subtree: true });
+        window.setInterval(scanActionSheets, 500);
         log('observer started');
     }
 
