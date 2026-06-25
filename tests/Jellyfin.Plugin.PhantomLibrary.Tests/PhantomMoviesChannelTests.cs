@@ -150,6 +150,25 @@ public class PhantomMoviesChannelTests : IDisposable
     }
 
     [Fact]
+    public async Task GetChannelItems_MaterialisedOnly_DoesNotProbeAudioStreamsDuringBrowse()
+    {
+        await SeedMetaAsync(203, "Browse Movie");
+        var fusePath = Path.Combine(_moviesRoot, "browse-203.mkv");
+        File.WriteAllText(fusePath, string.Empty);
+        await _db.InsertMaterialisedStateAsync(203, "movie", -1, -1, "/stub/browse-203.mkv", fusePath, CancellationToken.None);
+        var encoder = new Mock<IMediaEncoder>(MockBehavior.Strict);
+        var channel = new PhantomMoviesChannel(
+            _db, _enumerator, _splash, _state, _tmdb.Object, encoder.Object,
+            NullLogger<PhantomMoviesChannel>.Instance);
+
+        var result = await channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+
+        var item = Assert.Single(result.Items);
+        Assert.Equal(fusePath, item.MediaSources[0].Path);
+        encoder.Verify(e => e.GetMediaInfo(It.IsAny<MediaInfoRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
     public async Task GetChannelItems_MaterialisedOnlyWithMissingFile_EmitsOpeningSource()
     {
         await SeedMetaAsync(202, "Materialised Movie");

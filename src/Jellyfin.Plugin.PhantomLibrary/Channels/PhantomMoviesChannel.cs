@@ -241,7 +241,7 @@ public sealed class PhantomMoviesChannel
                         var path = GostreamPathResolver.ResolveMoviePath(state.FusePath);
                         if (File.Exists(path))
                         {
-                            return new[] { await FuseMediaSourceAsync(path, cancellationToken).ConfigureAwait(false) };
+                            return new[] { await FuseMediaSourceAsync(path, cancellationToken, probe: true).ConfigureAwait(false) };
                         }
                     }
 
@@ -257,7 +257,7 @@ public sealed class PhantomMoviesChannel
                         return Array.Empty<MediaSourceInfo>();
                     }
 
-                    return new[] { await FuseMediaSourceAsync(orphan.Path, cancellationToken).ConfigureAwait(false) };
+                    return new[] { await FuseMediaSourceAsync(orphan.Path, cancellationToken, probe: true).ConfigureAwait(false) };
                 }
 
             default:
@@ -552,6 +552,8 @@ public sealed class PhantomMoviesChannel
         };
     }
 
-    private Task<MediaSourceInfo> FuseMediaSourceAsync(string path, CancellationToken ct)
-        => PhantomMediaSourceBuilder.CreateFileMediaSourceAsync(path, _mediaEncoder, _logger, ct);
+    private Task<MediaSourceInfo> FuseMediaSourceAsync(string path, CancellationToken ct, bool probe = false)
+        => probe
+            ? PhantomMediaSourceBuilder.CreateFileMediaSourceAsync(path, _mediaEncoder, _logger, ct)
+            : Task.FromResult(PhantomMediaSourceBuilder.CreateFileMediaSource(path));
 }

@@ -380,6 +380,27 @@ public class PhantomShowsChannelTests : IDisposable
     }
 
     [Fact]
+    public async Task GetChannelItems_SeasonFolder_MaterialisedEpisode_DoesNotProbeAudioStreamsDuringBrowse()
+    {
+        await SeedSeriesMetaAsync(1399, "Game of Thrones");
+        _tmdb.Setup(t => t.GetSeasonAsync(1399, 1, null, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MakeSeasonDetails(1399, 1, 1));
+        var fusePath = Path.Combine(_splashHome, "browse_s01e01.mkv");
+        await File.WriteAllTextAsync(fusePath, "x", CancellationToken.None);
+        await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 1, "/stub/e1", fusePath, CancellationToken.None);
+        var encoder = new Mock<IMediaEncoder>(MockBehavior.Strict);
+        var channel = new PhantomShowsChannel(
+            _db, _tmdb.Object, _splash, _state, _enumerator, encoder.Object,
+            NullLogger<PhantomShowsChannel>.Instance);
+
+        var result = await channel.GetChannelItems(new InternalChannelItemQuery { FolderId = "season_1399_s01" }, CancellationToken.None);
+
+        var item = Assert.Single(result.Items);
+        Assert.Equal(fusePath, item.MediaSources[0].Path);
+        encoder.Verify(e => e.GetMediaInfo(It.IsAny<MediaInfoRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
     public async Task GetChannelItems_SeasonFolder_MaterialisedEpisodeWithMissingFile_EmitsOpeningSource()
     {
         await SeedSeriesMetaAsync(1399, "Game of Thrones");

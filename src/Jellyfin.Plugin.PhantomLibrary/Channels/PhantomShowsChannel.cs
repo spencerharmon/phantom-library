@@ -192,7 +192,7 @@ public sealed partial class PhantomShowsChannel
         if (TryParseOrphanEpisodeId(id, out var orphanEpisodeHash))
         {
             var orphan = await _enumerator.LookupOrphanEpisodeByHashAsync(orphanEpisodeHash, cancellationToken).ConfigureAwait(false);
-            return orphan is null ? Array.Empty<MediaSourceInfo>() : new[] { await FuseMediaSourceAsync(orphan.Path, cancellationToken).ConfigureAwait(false) };
+            return orphan is null ? Array.Empty<MediaSourceInfo>() : new[] { await FuseMediaSourceAsync(orphan.Path, cancellationToken, probe: true).ConfigureAwait(false) };
         }
 
         if (!ChannelItemId.TryParse(id, out var parsed))
@@ -218,7 +218,7 @@ public sealed partial class PhantomShowsChannel
 
         var path = GostreamPathResolver.ResolveEpisodePath(state.FusePath);
         return File.Exists(path)
-            ? new[] { await FuseMediaSourceAsync(path, cancellationToken).ConfigureAwait(false) }
+            ? new[] { await FuseMediaSourceAsync(path, cancellationToken, probe: true).ConfigureAwait(false) }
             : Array.Empty<MediaSourceInfo>();
     }
 
@@ -1282,6 +1282,8 @@ public sealed partial class PhantomShowsChannel
         return "https://image.tmdb.org/t/p/w500" + prefixed;
     }
 
-    private Task<MediaSourceInfo> FuseMediaSourceAsync(string path, CancellationToken ct)
-        => PhantomMediaSourceBuilder.CreateFileMediaSourceAsync(path, _mediaEncoder, _logger, ct);
+    private Task<MediaSourceInfo> FuseMediaSourceAsync(string path, CancellationToken ct, bool probe = false)
+        => probe
+            ? PhantomMediaSourceBuilder.CreateFileMediaSourceAsync(path, _mediaEncoder, _logger, ct)
+            : Task.FromResult(PhantomMediaSourceBuilder.CreateFileMediaSource(path));
 }
