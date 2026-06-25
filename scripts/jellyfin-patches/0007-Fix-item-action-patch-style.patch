@@ -1,0 +1,45 @@
+diff --git a/Jellyfin.Api/Controllers/ItemActionsController.cs b/Jellyfin.Api/Controllers/ItemActionsController.cs
+index e9d4b6ef99..b81725a5a8 100644
+--- a/Jellyfin.Api/Controllers/ItemActionsController.cs
++++ b/Jellyfin.Api/Controllers/ItemActionsController.cs
+@@ -65,10 +65,11 @@ public class ItemActionsController : BaseJellyfinApiController
+         }
+ 
+         var requestUserId = ResolveUserId(userId);
+-        if (requestUserId == Guid.Empty)
++        if (requestUserId.Equals(Guid.Empty))
+         {
+             return BadRequest("userId query parameter is required when the authentication token is not user-scoped");
+         }
++
+         var user = _userManager.GetUserById(requestUserId);
+         if (user is null)
+         {
+@@ -124,10 +125,11 @@ public class ItemActionsController : BaseJellyfinApiController
+         }
+ 
+         var requestUserId = ResolveUserId(userId);
+-        if (requestUserId == Guid.Empty)
++        if (requestUserId.Equals(Guid.Empty))
+         {
+             return BadRequest("userId query parameter is required when the authentication token is not user-scoped");
+         }
++
+         var user = _userManager.GetUserById(requestUserId);
+         if (user is null)
+         {
+@@ -188,12 +190,12 @@ public class ItemActionsController : BaseJellyfinApiController
+     private Guid ResolveUserId(Guid? requestedUserId)
+     {
+         var authenticatedUserId = User.GetUserId();
+-        if (requestedUserId is null || requestedUserId == Guid.Empty)
++        if (requestedUserId is null || requestedUserId.Value.Equals(Guid.Empty))
+         {
+             return authenticatedUserId;
+         }
+ 
+-        if (authenticatedUserId != Guid.Empty && authenticatedUserId != requestedUserId.Value)
++        if (!authenticatedUserId.Equals(Guid.Empty) && !authenticatedUserId.Equals(requestedUserId.Value))
+         {
+             throw new UnauthorizedAccessException("Requested user id does not match authenticated user");
+         }
