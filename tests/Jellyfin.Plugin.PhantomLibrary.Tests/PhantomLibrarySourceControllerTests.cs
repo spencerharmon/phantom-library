@@ -140,6 +140,14 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
         var gostream = gostreamMock ?? new Mock<IGostreamClient>(MockBehavior.Loose);
         gostream.Setup(g => g.RemoveAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
+        gostream.Setup(g => g.ValidateAsync(It.IsAny<GostreamValidateRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((GostreamValidateRequest req, CancellationToken _) => new GostreamValidateResult
+            {
+                Status = "valid",
+                Hash = "abc",
+                SelectedFile = new GostreamSelectedFile { Id = 0, Path = "selected.mkv", Size = 100 },
+                ValidationSessionId = req.ValidationSessionId,
+            });
         gostreamSetup?.Invoke(gostream);
 
         var scorer = new QualityScorer(NullLogger<QualityScorer>.Instance);

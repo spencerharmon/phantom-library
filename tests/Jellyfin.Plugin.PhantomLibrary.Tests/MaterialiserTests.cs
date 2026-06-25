@@ -65,6 +65,14 @@ public class MaterialiserTests : IDisposable
         File.WriteAllText(fusePath, "x"); // pre-create so WaitForFusePathAsync returns immediately
 
         var gostream = new Mock<IGostreamClient>(MockBehavior.Loose);
+        gostream.Setup(g => g.ValidateAsync(It.IsAny<GostreamValidateRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((GostreamValidateRequest req, CancellationToken _) => new GostreamValidateResult
+            {
+                Status = "valid",
+                Hash = "abc",
+                SelectedFile = new GostreamSelectedFile { Id = 0, Path = "movie.mkv", Size = 100 },
+                ValidationSessionId = req.ValidationSessionId,
+            });
         if (gostreamSetup is null)
         {
             gostream.Setup(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()))
@@ -604,6 +612,14 @@ public class MaterialiserTests : IDisposable
         var gostream = new Mock<IGostreamClient>(MockBehavior.Loose);
         var fusePath = Path.Combine(_fuseMount, "legacy.mkv");
         File.WriteAllText(fusePath, "x");
+        gostream.Setup(g => g.ValidateAsync(It.IsAny<GostreamValidateRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((GostreamValidateRequest req, CancellationToken _) => new GostreamValidateResult
+            {
+                Status = "valid",
+                Hash = "h",
+                SelectedFile = new GostreamSelectedFile { Id = 0, Path = "legacy.mkv", Size = 1 },
+                ValidationSessionId = req.ValidationSessionId,
+            });
         gostream.Setup(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new GostreamAddResult { StubPath = "/stub", FusePath = fusePath, Hash = "h", Size = 1 });
         var refresh = new Mock<IChannelItemRefreshManager>(MockBehavior.Loose);

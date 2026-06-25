@@ -139,7 +139,7 @@ public sealed class PhantomSourceManager
         int EpisodeSentinel,
         string MetadataType);
 
-    private sealed record CandidateWithFailure(MagnetCandidate Candidate, MagnetFailureEntry? Failure, int Rank, bool IsCurrent);
+    private sealed record CandidateWithFailure(MagnetCandidate Candidate, MagnetFailureEntry? Failure, SourceCandidateRow? SourceRow, int Rank, bool IsCurrent);
 
     public PhantomSourceManager(
         PhantomDb db,
@@ -386,10 +386,10 @@ public sealed class PhantomSourceManager
                 new MagnetFailureKey(key.TmdbId, imdb, key.Type, key.Season, key.Episode, cfg.SourcePickerPreset, requested.Magnet),
                 cfg.SourceValidationPolicyVersion,
                 ct).ConfigureAwait(false);
-            selected = new CandidateWithFailure(requested, failure, 1, false);
+            selected = new CandidateWithFailure(requested, failure, null, 1, false);
         }
 
-        if (selected.Failure is not null && !request.OverrideRejected)
+        if ((selected.Failure is not null || IsValidationRejected(selected.SourceRow, _configProvider())) && !request.OverrideRejected)
         {
             return Result(PhantomSourceOperationStatus.CandidateNotFound, "candidate_not_found", "Selected candidate is currently rejected");
         }
@@ -523,11 +523,13 @@ public sealed class PhantomSourceManager
                 new MagnetFailureKey(cacheKey.TmdbId, cacheKey.ImdbId, cacheKey.Type, cacheKey.Season, cacheKey.Episode, cacheKey.Preset, candidate.Magnet),
                 cfg.SourceValidationPolicyVersion,
                 ct).ConfigureAwait(false);
-            if ((failure is null || includeRejected) && seen.Add(candidate.Magnet))
+            var validationRejected = IsValidationRejected(cached, cfg);
+            if ((failure is null && !validationRejected || includeRejected) && seen.Add(candidate.Magnet))
             {
                 result.Add(new CandidateWithFailure(
                     candidate,
                     failure,
+                    cached,
                     rank,
                     string.Equals(candidate.Magnet, currentMagnet, StringComparison.Ordinal)));
             }
@@ -584,6 +586,7 @@ public sealed class PhantomSourceManager
                 result.Add(new CandidateWithFailure(
                     candidate,
                     failure,
+                    null,
                     rank,
                     string.Equals(candidate.Magnet, currentMagnet, StringComparison.Ordinal)));
             }
@@ -604,6 +607,7 @@ public sealed class PhantomSourceManager
                     result.Add(new CandidateWithFailure(
                         candidate,
                         failure,
+                        null,
                         rank,
                         string.Equals(candidate.Magnet, currentMagnet, StringComparison.Ordinal)));
                 }
@@ -663,7 +667,9 @@ public sealed class PhantomSourceManager
         };
 
     private static PhantomSourceCandidateDto ToCandidateDto(CandidateWithFailure candidate)
-        => new()
+    {
+        var validationRejected = IsValidationRejected(candidate.SourceRow, null);
+        return new()
         {
             Magnet = candidate.Candidate.Magnet,
             InfoHash = candidate.Candidate.InfoHash,
@@ -673,10 +679,27 @@ public sealed class PhantomSourceManager
             Title = candidate.Candidate.Title,
             Rank = candidate.Rank,
             IsCurrent = candidate.IsCurrent,
-            IsRejected = candidate.Failure is not null,
-            FailureReason = candidate.Failure?.Reason,
-            RetryAfter = candidate.Failure?.RetryAfter,
+            IsRejected = candidate.Failure is not null || validationRejected,
+            FailureReason = candidate.Failure?.Reason ?? (validationRejected ? candidate.SourceRow?.ValidationReason ?? candidate.SourceRow?.ValidationStatus : null),
+            RetryAfter = candidate.Failure?.RetryAfter ?? (validationRejected ? candidate.SourceRow?.ValidationExpiresAt : null),
         };
+    }
+
+    private static bool IsValidationRejected(SourceCandidateRow? row, PluginConfiguration? cfg)
+    {
+        if (row?.ValidationExpiresAt is null || row.ValidationExpiresAt.Value < DateTimeOffset.UtcNow)
+        {
+            return false;
+        }
+
+        if (cfg is not null && !string.Equals(row.ValidationPolicyVersion, cfg.SourceValidationPolicyVersion, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return string.Equals(row.ValidationStatus, "invalid", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(row.ValidationStatus, "transient", StringComparison.OrdinalIgnoreCase);
+    }
 
     private static PhantomSourceOperationResult Result(PhantomSourceOperationStatus status, string code, string message)
         => new()

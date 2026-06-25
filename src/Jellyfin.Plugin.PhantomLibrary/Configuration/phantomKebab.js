@@ -465,6 +465,18 @@
         return Array.isArray(list) ? list : [];
     }
 
+    function candidateRejected(candidate) {
+        return !!(candidate && (candidate.IsRejected || candidate.isRejected));
+    }
+
+    function selectableCandidates(candidates) {
+        return candidates.filter(function (candidate) { return !candidateRejected(candidate); });
+    }
+
+    function candidateFailureText(candidate) {
+        return (candidate && (candidate.FailureReason || candidate.failureReason || candidate.ValidationReason || candidate.validationReason)) || '';
+    }
+
     function renderSourceSection(ctx, state) {
         if (!ctx || !state) {
             removeSourceSection();
@@ -493,6 +505,7 @@
         section.appendChild(summary);
 
         var candidates = candidateList(state);
+        var selectable = selectableCandidates(candidates);
         var row = document.createElement('div');
         row.className = 'phantom-source-row';
 
@@ -504,17 +517,23 @@
         var select = document.createElement('select');
         select.id = 'phantom-source-candidates';
         select.className = 'phantom-source-select';
-        select.disabled = candidates.length === 0;
+        select.disabled = selectable.length === 0;
         if (candidates.length === 0) {
             var empty = document.createElement('option');
             empty.value = '';
             empty.textContent = 'No alternate candidates available';
             select.appendChild(empty);
         } else {
+            var firstSelectableSeen = false;
             candidates.forEach(function (candidate) {
                 var option = document.createElement('option');
                 option.value = candidateId(candidate);
-                option.textContent = candidateSummary(candidate);
+                option.textContent = candidateSummary(candidate) + (candidateRejected(candidate) ? ' — unavailable: ' + (candidateFailureText(candidate) || 'validation failed') : '');
+                option.disabled = candidateRejected(candidate);
+                if (!option.disabled && !firstSelectableSeen) {
+                    option.selected = true;
+                    firstSelectableSeen = true;
+                }
                 select.appendChild(option);
             });
         }
@@ -528,11 +547,15 @@
         materialise.type = 'button';
         materialise.className = 'raised button-submit phantom-source-button';
         materialise.textContent = 'Materialise selected source';
-        materialise.disabled = candidates.length === 0;
+        materialise.disabled = selectable.length === 0;
         materialise.addEventListener('click', function () {
             if (!select.value) { return; }
             var selected = candidates.filter(function (candidate) { return candidateId(candidate) === select.value; })[0];
             if (!selected) { return; }
+            if (candidateRejected(selected)) {
+                alert('Phantom Library: selected source is unavailable\n' + (candidateFailureText(selected) || 'validation failed'));
+                return;
+            }
             materialise.disabled = true;
             fireMaterialiseCandidate(ctx.externalId, selected).then(refreshSourceSection, function () {
                 materialise.disabled = false;
