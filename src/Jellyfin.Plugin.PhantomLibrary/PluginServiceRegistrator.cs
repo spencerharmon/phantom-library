@@ -50,6 +50,7 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         });
 
         // Gostream
+        serviceCollection.AddSingleton<GostreamHeavyLimiter>();
         serviceCollection.AddHttpClient<IGostreamClient, GostreamClient>(c =>
         {
             c.Timeout = TimeSpan.FromSeconds(60);
