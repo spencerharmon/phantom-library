@@ -56,6 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Renamed the Phantom kebab rejection item to "Reject current source" and start detail-page polling immediately when reject/materialise actions are submitted so the UI can transition into materialising while the action is still running.
 - Fixed Phantom Source and kebab action loading latency by making source/action lookups use cached DB state by default; fresh indexer discovery now runs on materialise or explicit "Refresh sources" instead of blocking every detail-page/poll/action lookup.
 - Fixed episode materialisation post-refresh ordering so Jellyfin invalidates stale dynamic media-source cache before probing the new FUSE file, preventing a newly materialised episode from inheriting runtime/size/media-info from a different episode in the same pack.
 - Fixed manual materialisation source discovery so materialise always launches a fresh indexer probe while cached candidates validate, adds newly discovered candidates to the queue, and treats transient validation cancellations as short-retry failures instead of poisoning the item for 24 hours.

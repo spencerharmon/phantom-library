@@ -679,8 +679,8 @@
         reject.disabled = !canRejectState(state);
         reject.addEventListener('click', function () {
             reject.disabled = true;
+            startDetailPolling(ctx, 'reject');
             fireRejectCurrent(ctx.externalId).then(function () {
-                startDetailPolling(ctx, 'reject');
                 return refreshSourceSection();
             }, function () {
                 reject.disabled = false;
@@ -870,6 +870,9 @@
                 injectButton(sheet, content, label, 'phantom-action-' + actionId.replace(/[^a-zA-Z0-9_-]/g, '-'), icon, function () {
                     closeSheet(sheet);
                     if ((confirmText || requiresConfirmation) && !window.confirm(confirmText || ('Run ' + label + '?'))) { return; }
+                    if (actionId === 'phantom.rejectCurrent' || actionId === 'phantom.materialise') {
+                        startDetailPollingForCurrent(actionId);
+                    }
                     fireItemAction(itemId, actionId).then(refreshClientAfterAction, function () { /* alert already shown */ });
                 });
             });

@@ -104,7 +104,7 @@ public sealed class PhantomItemActionProvider : IItemActionProvider
             actions.Add(new ItemActionInfo
             {
                 Id = RejectCurrentActionId,
-                Name = "Reject current Phantom source",
+                Name = "Reject current source",
                 Description = "Reject the current source and try an alternate candidate if one exists.",
                 Icon = "block",
                 IsEnabled = !materialising,

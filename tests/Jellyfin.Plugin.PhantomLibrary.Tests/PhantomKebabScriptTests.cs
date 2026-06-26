@@ -85,6 +85,8 @@ public class PhantomKebabScriptTests
         Assert.Contains("startDetailPolling(ctx, 'materialise-candidate')", js);
         Assert.Contains("startDetailPolling(ctx, 'reset')", js);
         Assert.Contains("startDetailPolling(ctx, 'reject')", js);
+        Assert.Contains("startDetailPollingForCurrent(actionId)", js);
+        Assert.Contains("actionId === 'phantom.rejectCurrent'", js);
         Assert.Contains("startDetailPollingForCurrent('item-action')", js);
         Assert.Contains("setInterval(pollDetailState, 2000)", js);
         Assert.Contains("fetchSources(externalId, false)", js);

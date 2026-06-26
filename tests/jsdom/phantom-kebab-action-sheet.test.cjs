@@ -101,7 +101,7 @@ function createHarness(html) {
           },
           {
             Id: 'phantom.rejectCurrent',
-            Name: 'Reject current Phantom source',
+            Name: 'Reject current source',
             Icon: 'block',
             IsEnabled: true,
             RequiresConfirmation: true,
@@ -169,7 +169,7 @@ async function testNativeActionSheetGetsOnlyResetAndRejectActions() {
     assert.equal(document.querySelector('[data-id="metadata"]') !== null, true, 'default Jellyfin command remains present');
     assert.equal(document.querySelector('[data-id="phantom-action-phantom-materialise"]'), null, 'materialise action is not injected into item-page kebab');
     assert.equal(reset.textContent.includes('Reset Phantom'), true);
-    assert.equal(reject.textContent.includes('Reject current Phantom source'), true);
+    assert.equal(reject.textContent.includes('Reject current source'), true);
     assert.equal(requests.some((request) => request.url.includes(`/Items/${itemId}/Actions?userId=${encodeURIComponent(userId)}`)), true, 'GET /Items/{id}/Actions uses current user id');
 
     reset.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true, cancelable: true }));
