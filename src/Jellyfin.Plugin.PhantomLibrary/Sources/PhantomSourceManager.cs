@@ -335,22 +335,27 @@ public sealed class PhantomSourceManager
         }
 
         var (ranked, _, _) = await GetRankedCandidatesAsync(key, imdb, meta, includeRejected: false, currentMagnet: current.Value.Entry.Magnet, allowProbe: true, ct).ConfigureAwait(false);
-        var next = ranked.FirstOrDefault(c => !string.Equals(c.Candidate.Magnet, current.Value.Entry.Magnet, StringComparison.Ordinal));
+        var hasAlternate = ranked.Any(c => !string.Equals(c.Candidate.Magnet, current.Value.Entry.Magnet, StringComparison.Ordinal));
 
         await DeleteCurrentStateAndMaybeRemoveAsync(key, current.Value.State, current.Value.Entry.InfoHash, ct).ConfigureAwait(false);
+        await _db.DeleteUnavailableAsync(
+            new UnavailableKey(key.TmdbId, imdb, key.Type, key.Season, key.Episode),
+            ct).ConfigureAwait(false);
 
-        if (next is null)
+        if (!hasAlternate)
         {
             await RefreshItemAsync(key, forceProbe: false, ct).ConfigureAwait(false);
             return Result(PhantomSourceOperationStatus.NoAlternate, "no_alternate", "Current source rejected; no non-rejected alternate candidate is available");
         }
 
         var outcome = await _materialiser.MaterialiseAsync(
-            key.TmdbId, key.Type, key.Season, key.Episode,
-            next.Candidate,
+            key.TmdbId,
+            key.Type,
+            key.Season,
+            key.Episode,
             MaterialiseTrigger.Manual,
             ct).ConfigureAwait(false);
-        return PhantomSourceOperationResult.FromOutcome(outcome, ToCandidateDto(next));
+        return FromRejectMaterialisationOutcome(outcome);
     }
 
     public async Task<PhantomSourceOperationResult> MaterialiseCandidateAsync(
@@ -709,6 +714,26 @@ public sealed class PhantomSourceManager
 
         return string.Equals(row.ValidationStatus, "invalid", StringComparison.OrdinalIgnoreCase);
     }
+
+    private static PhantomSourceOperationResult FromRejectMaterialisationOutcome(MaterialisationOutcome outcome)
+        => outcome.Status switch
+        {
+            MaterialisationStatus.Success or MaterialisationStatus.Duplicate => Result(
+                PhantomSourceOperationStatus.Success,
+                "materialised",
+                "Current source rejected; alternate source materialised"),
+            MaterialisationStatus.AlreadyInProgress => Result(
+                PhantomSourceOperationStatus.InFlight,
+                "in_flight",
+                "Current source rejected; materialisation already in flight"),
+            _ => Result(
+                PhantomSourceOperationStatus.Error,
+                "materialise_failed",
+                outcome.Error ?? "Current source rejected; alternate materialisation failed"),
+        } with
+        {
+            Outcome = outcome,
+        };
 
     private static PhantomSourceOperationResult Result(PhantomSourceOperationStatus status, string code, string message)
         => new()
