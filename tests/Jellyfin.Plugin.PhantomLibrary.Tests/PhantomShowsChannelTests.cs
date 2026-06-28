@@ -674,31 +674,21 @@ public class PhantomShowsChannelTests : IDisposable
     }
 
     // ----------------------------------------------------------------
-    // GetLatestMedia
+    // Latest media suppression (Option 3, operator decision 2026-06-28)
     // ----------------------------------------------------------------
 
     [Fact]
-    public async Task GetLatestMedia_ReturnsMaterialisedEpisodesNewestFirst()
+    public void Channel_DoesNotImplementISupportsLatestMedia()
     {
-        await SeedSeriesMetaAsync(1399, "Game of Thrones");
-        await _db.UpsertTmdbEpisodeAsync(
-            new TmdbEpisodeRow(1399, 1, 1, "Pilot", null, null, null, null, DateTimeOffset.UtcNow),
-            CancellationToken.None);
-        var f1 = Path.Combine(_splashHome, "latest-1.mkv");
-        await File.WriteAllTextAsync(f1, "x", CancellationToken.None);
-        await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 1, "/s1", f1, CancellationToken.None);
-        await Task.Delay(1100);
-        await _db.UpsertTmdbEpisodeAsync(
-            new TmdbEpisodeRow(1399, 1, 2, "Second", null, null, null, null, DateTimeOffset.UtcNow),
-            CancellationToken.None);
-        var f2 = Path.Combine(_splashHome, "latest-2.mkv");
-        await File.WriteAllTextAsync(f2, "x", CancellationToken.None);
-        await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 2, "/s2", f2, CancellationToken.None);
-
-        var got = (await _channel.GetLatestMedia(new ChannelLatestMediaSearch(), CancellationToken.None)).ToList();
-        Assert.Equal(2, got.Count);
-        Assert.Equal("episode_1399_s01e02", got[0].Id);
-        Assert.Equal("episode_1399_s01e01", got[1].Id);
+        // Implementing ISupportsLatestMedia makes Jellyfin core's
+        // RefreshLatestChannelItems deep-enumerate the whole channel
+        // (series -> season -> build) on every Home load to populate the
+        // "Latest in Phantom Shows" row, hanging the Home screen on every
+        // client. The interface must stay off until the O(latest) Option 2
+        // fast-path exists.
+        Assert.DoesNotContain(
+            typeof(MediaBrowser.Controller.Channels.ISupportsLatestMedia),
+            _channel.GetType().GetInterfaces());
     }
 
     [Fact]

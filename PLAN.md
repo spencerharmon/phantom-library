@@ -176,6 +176,25 @@ by tests, not re-defer it.
 
 ### Documented partials
 
+- **Home "Latest in Phantom Movies/Shows" rows are suppressed**
+  (operator decision 2026-06-28, Option 3). Phantom channels no
+  longer implement `ISupportsLatestMedia`, because Jellyfin core's
+  `RefreshLatestChannelItems` ignores `GetLatestMedia` and instead
+  deep-enumerates the entire channel (`GetChannelItems`: series →
+  season → build) on every Home load. On production-shaped data that
+  enumeration ran for seconds-to-minutes, hanging the Home screen
+  loading indicator on **every** client (web and native/Xbox).
+  Dropping the interface makes `GetLatestChannelItemsInternal`
+  short-circuit to empty instantly. **Deferred fix (Option 2,
+  operator-approved):** restore the Latest rows cheaply by giving the
+  latest-refresh-root channel query an O(latest) fast-path backed by
+  `materialised_state` (instead of O(catalogue)), then re-add
+  `ISupportsLatestMedia`. Guarded by
+  `tools/rig-scenarios/40-channel-latest-suppressed.sh` (asserts the
+  Latest call stays fast + empty until Option 2 lands). See the
+  `TODO(operator-approved):` markers in `PhantomMoviesChannel.cs` /
+  `PhantomShowsChannel.cs`.
+
 - **Custom `QualityPreset` falls back to `GostreamDefault`** with a
   warning log (M4 decision). Revisit when a real custom-scoring use
   case appears.

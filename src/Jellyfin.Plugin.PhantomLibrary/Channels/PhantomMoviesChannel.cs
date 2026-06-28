@@ -32,7 +32,7 @@ namespace Jellyfin.Plugin.PhantomLibrary.Channels;
 /// (favourites, watched, playback position) is preserved.
 /// </summary>
 public sealed class PhantomMoviesChannel
-    : IChannel, ISupportsLatestMedia, IChannelItemRefresh, ISupportsMediaProbe
+    : IChannel, IChannelItemRefresh, ISupportsMediaProbe
 {
     private readonly PhantomDb _db;
     private readonly GostreamFilesystemEnumerator _enumerator;
@@ -266,27 +266,22 @@ public sealed class PhantomMoviesChannel
     }
 
     /// <inheritdoc />
-    public async Task<IEnumerable<ChannelItemInfo>> GetLatestMedia(ChannelLatestMediaSearch request, CancellationToken cancellationToken)
-    {
-        ArgumentNullException.ThrowIfNull(request);
-        // ChannelLatestMediaSearch (Jellyfin 10.11) carries UserId only;
-        // no Limit field. Default to 20 as the conventional "Latest" row size.
-        const int defaultLimit = 20;
-
-        var materialised = await _db.ListMaterialisedStateAsync("movie", cancellationToken).ConfigureAwait(false);
-        var items = new List<ChannelItemInfo>(Math.Min(materialised.Count, defaultLimit));
-        foreach (var row in materialised.OrderByDescending(r => r.MaterialisedAt).Take(defaultLimit))
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var built = await BuildMovieItemAsync(row.TmdbId, row, variants: null, cancellationToken).ConfigureAwait(false);
-            if (built is not null)
-            {
-                items.Add(built);
-            }
-        }
-
-        return items;
-    }
+    // ISupportsLatestMedia / GetLatestMedia deliberately removed (operator
+    // decision, 2026-06-28). Jellyfin core's RefreshLatestChannelItems ignores
+    // GetLatestMedia and instead deep-enumerates the whole channel via
+    // GetChannelItems (series -> season -> build) to populate the Home "Latest
+    // in Phantom Movies" row. On production-shaped data that enumeration runs
+    // for seconds-to-minutes on every Home load, on every client (the spinner
+    // never clears). Dropping ISupportsLatestMedia makes
+    // GetLatestChannelItemsInternal short-circuit to an empty result instantly
+    // (ChannelManager.cs: GetAllChannels().Where(i => i is ISupportsLatestMedia)).
+    //
+    // Tradeoff: the "Latest in Phantom Movies" Home row is gone for now.
+    // TODO(operator-approved): restore the Latest row cheaply (Option 2) by
+    // making the latest-refresh root enumeration O(latest) instead of
+    // O(catalogue) -- e.g. a cheap GetChannelItems fast-path for the
+    // refresh-root query backed by materialised_state -- then re-add
+    // ISupportsLatestMedia. Tracked in PLAN.md "Deferred".
 
     /// <inheritdoc />
     public Task<DynamicImageResponse> GetChannelImage(ImageType type, CancellationToken cancellationToken)

@@ -42,7 +42,7 @@ namespace Jellyfin.Plugin.PhantomLibrary.Channels;
 /// Stage 5.1 implementation per <c>docs/plans/channel-handoff.md</c>.
 /// </summary>
 public sealed partial class PhantomShowsChannel
-    : IChannel, ISupportsLatestMedia, IChannelItemRefresh, ISupportsMediaProbe
+    : IChannel, IChannelItemRefresh, ISupportsMediaProbe
 {
     private const string OrphanSeriesPrefix = "orphanseries_";
     private const string OrphanSeasonPrefix = "orphanseason_";
@@ -223,25 +223,17 @@ public sealed partial class PhantomShowsChannel
     }
 
     /// <inheritdoc />
-    public async Task<IEnumerable<ChannelItemInfo>> GetLatestMedia(ChannelLatestMediaSearch request, CancellationToken cancellationToken)
-    {
-        ArgumentNullException.ThrowIfNull(request);
-        const int defaultLimit = 20;
-
-        var materialised = await _db.ListMaterialisedStateAsync("episode", cancellationToken).ConfigureAwait(false);
-        var items = new List<ChannelItemInfo>(Math.Min(materialised.Count, defaultLimit));
-        foreach (var row in materialised.OrderByDescending(r => r.MaterialisedAt).Take(defaultLimit))
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var built = await BuildEpisodeItemAsync(row.TmdbId, row.Season, row.Episode, row, cancellationToken).ConfigureAwait(false);
-            if (built is not null)
-            {
-                items.Add(built);
-            }
-        }
-
-        return items;
-    }
+    // ISupportsLatestMedia / GetLatestMedia deliberately removed (operator
+    // decision, 2026-06-28). See the matching note in PhantomMoviesChannel:
+    // core's RefreshLatestChannelItems deep-enumerates the channel
+    // (series -> season -> build) to populate the Home "Latest in Phantom
+    // Shows" row, which on production-shaped data hangs the Home screen on
+    // every client. Dropping the interface short-circuits the Latest query.
+    //
+    // Tradeoff: the "Latest in Phantom Shows" Home row is gone for now.
+    // TODO(operator-approved): restore cheaply (Option 2) via an O(latest)
+    // latest-refresh-root fast-path, then re-add ISupportsLatestMedia.
+    // Tracked in PLAN.md "Deferred".
 
     /// <inheritdoc />
     public Task<DynamicImageResponse> GetChannelImage(ImageType type, CancellationToken cancellationToken)

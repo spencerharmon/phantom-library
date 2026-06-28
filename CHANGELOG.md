@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Home screen no longer hangs with a perpetual loading indicator on
+  native clients (Xbox, mobile) and is faster on web. Phantom channels
+  no longer implement `ISupportsLatestMedia`, so Jellyfin core's
+  `RefreshLatestChannelItems` no longer deep-enumerates the whole
+  channel (series → season → build) to populate the "Latest in Phantom
+  Movies/Shows" Home rows on every load — an enumeration that ran for
+  seconds-to-minutes on production-shaped data and affected every
+  client. Tradeoff: the "Latest in Phantom Movies/Shows" Home rows are
+  removed for now; a cheap O(latest) replacement is deferred (see
+  PLAN.md "Documented partials"). Guarded by
+  `tools/rig-scenarios/40-channel-latest-suppressed.sh`.
 - Home-screen badge state lookups (`POST /Plugins/PhantomLibrary/States`) no
   longer enumerate and MD5-hash the entire visible phantom catalogue
   (~540k movie+episode rows on the operator's data) on every request. Real

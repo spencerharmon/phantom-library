@@ -480,23 +480,16 @@ public class PhantomMoviesChannelTests : IDisposable
     }
 
     [Fact]
-    public async Task GetLatestMedia_ReturnsMaterialisedSortedByMaterialisedAtDesc()
+    public void Channel_DoesNotImplementISupportsLatestMedia()
     {
-        await SeedMetaAsync(1, "First");
-        var f1 = Path.Combine(_moviesRoot, "latest-1.mkv");
-        File.WriteAllText(f1, string.Empty);
-        await _db.InsertMaterialisedStateAsync(1, "movie", -1, -1, "/s1", f1, CancellationToken.None);
-        await Task.Delay(1100); // unix-seconds resolution
-        await SeedMetaAsync(2, "Second");
-        var f2 = Path.Combine(_moviesRoot, "latest-2.mkv");
-        File.WriteAllText(f2, string.Empty);
-        await _db.InsertMaterialisedStateAsync(2, "movie", -1, -1, "/s2", f2, CancellationToken.None);
-
-        var got = (await _channel.GetLatestMedia(new ChannelLatestMediaSearch(), CancellationToken.None)).ToList();
-
-        Assert.Equal(2, got.Count);
-        Assert.Equal("movie_2", got[0].Id); // most-recent first
-        Assert.Equal("movie_1", got[1].Id);
+        // Implementing ISupportsLatestMedia makes Jellyfin core's
+        // RefreshLatestChannelItems deep-enumerate the whole channel to
+        // populate the "Latest in Phantom Movies" Home row, hanging the Home
+        // screen on every client on production-shaped data. Keep it off until
+        // the O(latest) Option 2 fast-path exists.
+        Assert.DoesNotContain(
+            typeof(MediaBrowser.Controller.Channels.ISupportsLatestMedia),
+            _channel.GetType().GetInterfaces());
     }
 
     private static IApplicationPaths MockPaths(string root)
