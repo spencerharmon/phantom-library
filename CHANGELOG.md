@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Home-screen badge state lookups (`POST /Plugins/PhantomLibrary/States`) no
+  longer enumerate and MD5-hash the entire visible phantom catalogue
+  (~540k movie+episode rows on the operator's data) on every request. Real
+  (non-channel) library cards — Continue Watching items, library view tiles —
+  now short-circuit before the catalogue scan, and the residual virtual-card
+  fallback map is cached across requests (60s TTL, single-flight). This
+  removes the sustained per-poll latency that kept the web loading indicator
+  lit and slowed the Continue Watching section. Covered by
+  `tools/rig-scenarios/39-channel-badge-states-perf.sh`.
+
 ### Documentation
 
 - Added durable design/testing/deploy protocols for native phantom

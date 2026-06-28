@@ -24,6 +24,7 @@ areas, read the linked source doc before editing code.
 | Testing / rig usage | `docs/agents/testing.md`, `tools/rig-scenarios/` | Required live Jellyfin rig workflow; unit tests are not enough |
 | Movie channel playback/materialise regression coverage | `tools/rig-scenarios/35-channel-e2e-playback.sh` | Movie browse → playback → native-open materialise → stream assertions |
 | TV episode playback/materialise regression coverage | `tools/rig-scenarios/36-channel-episode-e2e-playback.sh` | Series → season → episode browse, badge scope, native-open playback |
+| Badge state endpoint performance (Home screen) | `tools/rig-scenarios/39-channel-badge-states-perf.sh` | `POST /Plugins/PhantomLibrary/States` must stay sub-second under phantomBadges.js polling on production-shaped data |
 | Operator deployment | `docs/operator-deploy.md`, `install.sh` | Patched Jellyfin DLL deployment models, package-manager clobber checks |
 | Jellyfin patch maintenance | `scripts/jellyfin-patches/REBASE.md`, `scripts/jellyfin-patches/` | Patch stack, exact upstream tag, rebase workflow |
 | Wipe / rebuild validation | `docs/operator-wipe-validation.md`, `scripts/phantom-wipe.sh` | Pre-v1.0 schema-change path, wipe verification |

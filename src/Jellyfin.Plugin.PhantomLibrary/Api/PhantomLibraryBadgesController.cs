@@ -112,6 +112,16 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
         var resolved = new Dictionary<Guid, (BaseItem? Item, ChannelItemId Parsed)>();
         var unresolved = new HashSet<Guid>(requests.Select(r => r.Guid));
 
+        // Guids that resolve to a concrete, non-channel library BaseItem.
+        // These are genuine library content (regular movies/episodes in
+        // Continue Watching, Next Up, etc.) and are definitively NOT virtual
+        // phantom cards, so they must never enter the computed-channel-id
+        // fallback below. Without this, every Home-screen badge poll — which
+        // batches real library card ids — forced a full phantom-catalog scan
+        // (hundreds of thousands of MD5 id computations), keeping the web
+        // loading indicator lit and Continue Watching slow.
+        var realLibraryGuids = new HashSet<Guid>();
+
         foreach (var guid in unresolved.ToArray())
         {
             ct.ThrowIfCancellationRequested();
@@ -120,6 +130,10 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
             {
                 resolved[guid] = (item, parsed);
                 unresolved.Remove(guid);
+            }
+            else if (item is not null && item.SourceType != SourceType.Channel)
+            {
+                realLibraryGuids.Add(guid);
             }
         }
 
@@ -159,7 +173,13 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
             }
             else
             {
-                computedIds ??= await BuildComputedChannelIdMapAsync(ct).ConfigureAwait(false);
+                if (realLibraryGuids.Contains(guid))
+                {
+                    // Concrete non-channel library item; not a phantom card.
+                    continue;
+                }
+
+                computedIds ??= await GetComputedChannelIdMapAsync(ct).ConfigureAwait(false);
                 if (!computedIds.TryGetValue(guid, out var computed))
                 {
                     continue;
@@ -303,6 +323,58 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
 
         parsed = null!;
         return false;
+    }
+
+    // The computed-channel-id map enumerates the entire visible phantom
+    // catalogue (every visible movie + every display episode of every visible
+    // series) and MD5-hashes each into its deterministic BaseItem guid. On the
+    // operator's data this is ~540k rows / hashes. It only changes when the
+    // catalogue's membership changes (refresh tasks, materialise), not on
+    // per-item state transitions (which are computed live from the DB on every
+    // request), so it is safe to cache across requests for a short TTL. The
+    // semaphore collapses concurrent badge polls onto a single rebuild instead
+    // of letting each request kick off its own full-catalogue scan.
+    private static readonly TimeSpan ComputedMapTtl = TimeSpan.FromSeconds(60);
+    private static readonly SemaphoreSlim ComputedMapGate = new(1, 1);
+    private static Dictionary<Guid, ChannelItemId>? _computedMapCache;
+    private static DateTimeOffset _computedMapBuiltAt = DateTimeOffset.MinValue;
+
+    /// <summary>
+    /// Test hook: drops the cached computed-channel-id map so a unit test can
+    /// force a cold rebuild deterministically. Not used in production.
+    /// </summary>
+    internal static void ResetComputedChannelIdMapCacheForTests()
+    {
+        _computedMapCache = null;
+        _computedMapBuiltAt = DateTimeOffset.MinValue;
+    }
+
+    private async Task<Dictionary<Guid, ChannelItemId>> GetComputedChannelIdMapAsync(CancellationToken ct)
+    {
+        var cached = _computedMapCache;
+        if (cached is not null && DateTimeOffset.UtcNow - _computedMapBuiltAt < ComputedMapTtl)
+        {
+            return cached;
+        }
+
+        await ComputedMapGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            cached = _computedMapCache;
+            if (cached is not null && DateTimeOffset.UtcNow - _computedMapBuiltAt < ComputedMapTtl)
+            {
+                return cached;
+            }
+
+            var fresh = await BuildComputedChannelIdMapAsync(ct).ConfigureAwait(false);
+            _computedMapCache = fresh;
+            _computedMapBuiltAt = DateTimeOffset.UtcNow;
+            return fresh;
+        }
+        finally
+        {
+            ComputedMapGate.Release();
+        }
     }
 
     private async Task<Dictionary<Guid, ChannelItemId>> BuildComputedChannelIdMapAsync(CancellationToken ct)
