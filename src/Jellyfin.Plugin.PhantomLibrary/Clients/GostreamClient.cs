@@ -441,6 +441,7 @@ public sealed class GostreamClient : IGostreamClient
                     Id = body.SelectedFile.Id,
                     Path = body.SelectedFile.Path,
                     Size = body.SelectedFile.Size,
+                    Container = body.SelectedFile.Container,
                 },
             AudioTracks = body.AudioTracks ?? Array.Empty<GostreamAudioTrack>(),
             SelectedAudioIndex = body.SelectedAudioIndex,
@@ -504,5 +505,6 @@ public sealed class GostreamClient : IGostreamClient
         [JsonPropertyName("id")] public int? Id { get; init; }
         [JsonPropertyName("path")] public string? Path { get; init; }
         [JsonPropertyName("size")] public long? Size { get; init; }
+        [JsonPropertyName("container")] public string? Container { get; init; }
     }
 }

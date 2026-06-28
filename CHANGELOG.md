@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Added an allowed video-container materialisation setting; Phantom defaults gostream selection/validation to MKV files for client compatibility while allowing operators to opt into other containers.
 - `install.sh --build` now builds and saves the gostream `docker.io/mrrobotogit/gostream:testing` image from the in-repo `gostream/` checkout before loading it into root podman storage, preventing stale `/tmp/gostream-testing.tar` deployments.
 - BREAKING: requires offline migration. Phantom DB schema is now v14 to persist source-candidate validation state, magnet-failure validation policy versions, and durable bulk materialise queue tables; run `scripts/migrate-source-validation-v14.sh` with Jellyfin stopped before starting this build.
 - Added an optional gostream library-control shared token setting; Phantom now sends `X-Gostream-Token` on protected gostream add/remove calls when configured.

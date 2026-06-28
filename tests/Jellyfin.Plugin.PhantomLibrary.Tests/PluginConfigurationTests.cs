@@ -20,9 +20,10 @@ public sealed class PluginConfigurationTests
         Assert.Equal(30, cfg.BulkMaterialiseRunningStaleMinutes);
         Assert.Equal(2, cfg.BulkMaterialiseWorkerCount);
         Assert.Equal(5, cfg.BulkMaterialiseMaxAttempts);
-        Assert.Equal("sv14-parser-audio-v1", cfg.SourceValidationPolicyVersion);
         Assert.Equal(2, cfg.GostreamHeavyConcurrency);
         Assert.Equal(string.Empty, cfg.GostreamToken);
+        Assert.Equal("MKV", cfg.AllowedVideoContainers);
+        Assert.Equal("sv14-parser-audio-v1|containers:MKV", cfg.SourceValidationPolicyVersion);
     }
 
     [Fact]
@@ -42,6 +43,7 @@ public sealed class PluginConfigurationTests
             BulkMaterialiseMaxAttempts = 0,
             SourceValidationPolicyVersion = "",
             GostreamHeavyConcurrency = 0,
+            AllowedVideoContainers = " .MKV, mp4, mkv ",
         };
 
         Assert.Equal(1, cfg.SourceValidationParallelism);
@@ -54,8 +56,9 @@ public sealed class PluginConfigurationTests
         Assert.Equal(1, cfg.BulkMaterialiseRunningStaleMinutes);
         Assert.Equal(1, cfg.BulkMaterialiseWorkerCount);
         Assert.Equal(1, cfg.BulkMaterialiseMaxAttempts);
-        Assert.Equal("sv14-parser-audio-v1", cfg.SourceValidationPolicyVersion);
+        Assert.Equal("sv14-parser-audio-v1|containers:MKV,MP4", cfg.SourceValidationPolicyVersion);
         Assert.Equal(1, cfg.GostreamHeavyConcurrency);
+        Assert.Equal("MKV,MP4", cfg.AllowedVideoContainers);
 
         cfg.SourceValidationParallelism = 99;
         cfg.SourceValidationWindowSize = 99;

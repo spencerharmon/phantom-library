@@ -57,6 +57,7 @@ public sealed record GostreamAddRequest
     public string? SeriesImdb { get; init; }
     public required string Magnet { get; init; }
     public string? MinQuality { get; init; }
+    public string[]? AllowedVideoContainers { get; init; }
     public int? SelectedFileId { get; init; }
     public string? SelectedFilePath { get; init; }
     public string[]? RequiredAudioLanguages { get; init; }
@@ -86,6 +87,7 @@ public sealed record GostreamValidateRequest
     public required string Magnet { get; init; }
     public string[] RequiredAudioLanguages { get; init; } = System.Array.Empty<string>();
     public string? PreferredAudioLanguage { get; init; }
+    public string[]? AllowedVideoContainers { get; init; }
     public required string ValidationSessionId { get; init; }
 }
 
@@ -94,6 +96,7 @@ public sealed record GostreamSelectedFile
     public int? Id { get; init; }
     public string? Path { get; init; }
     public long? Size { get; init; }
+    public string? Container { get; init; }
 }
 
 public sealed record GostreamAudioTrack

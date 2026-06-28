@@ -245,7 +245,12 @@ public class MaterialiserTests : IDisposable
             It.IsAny<Guid>(), It.IsAny<string>(),
             It.Is<ChannelItemRefreshOptions>(o => !o.ForceUpdate && !o.ForceProbe && o.InvalidateMediaInfoCache),
             It.IsAny<CancellationToken>()), Times.Once);
-        gostream.Verify(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()), Times.Once);
+        gostream.Verify(g => g.ValidateAsync(
+            It.Is<GostreamValidateRequest>(r => r.AllowedVideoContainers != null && r.AllowedVideoContainers.SequenceEqual(new[] { "MKV" })),
+            It.IsAny<CancellationToken>()), Times.Once);
+        gostream.Verify(g => g.AddAsync(
+            It.Is<GostreamAddRequest>(r => r.AllowedVideoContainers != null && r.AllowedVideoContainers.SequenceEqual(new[] { "MKV" })),
+            It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]

@@ -68,7 +68,7 @@ public class GostreamClientTests
             {
               "status":"valid",
               "hash":"abc",
-              "selected_file":{"id":12,"path":"Avatar S02E01.mkv","size":456},
+              "selected_file":{"id":12,"path":"Avatar S02E01.mkv","size":456,"container":"mkv"},
               "audio_tracks":[{"stream_index":1,"language":"pol"},{"stream_index":2,"language":"eng","title":"English"}],
               "selected_audio_index":2,
               "selected_audio_language":"eng",
@@ -88,6 +88,7 @@ public class GostreamClientTests
             Magnet = "magnet:?xt=urn:btih:abc",
             PreferredAudioLanguage = "eng",
             RequiredAudioLanguages = new[] { "eng" },
+            AllowedVideoContainers = new[] { "mkv" },
             ValidationSessionId = "session-1",
         }, CancellationToken.None);
 
@@ -96,11 +97,43 @@ public class GostreamClientTests
         Assert.Equal(12, result.SelectedFile?.Id);
         Assert.Equal("Avatar S02E01.mkv", result.SelectedFile?.Path);
         Assert.Equal(456, result.SelectedFile?.Size);
+        Assert.Equal("mkv", result.SelectedFile?.Container);
         Assert.Equal(2, result.SelectedAudioIndex);
         Assert.Equal("eng", result.SelectedAudioLanguage);
         Assert.Equal(2, result.AudioTracks.Count);
         Assert.Equal("secret-token", h.Requests[0].Headers.GetValues("X-Gostream-Token").Single());
         Assert.EndsWith("/api/library/validate", h.Requests[0].RequestUri!.AbsolutePath, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Add_And_Validate_Serialize_AllowedVideoContainers()
+    {
+        var bodies = new List<string>();
+        var captor = new BodyCaptureHandler(req =>
+        {
+            bodies.Add(req.Content!.ReadAsStringAsync(CancellationToken.None).GetAwaiter().GetResult());
+            return (HttpStatusCode.OK, req.RequestUri!.AbsolutePath.EndsWith("/validate", System.StringComparison.Ordinal) ? "{\"status\":\"valid\"}" : OkBody);
+        });
+        var http = new HttpClient(captor) { BaseAddress = null };
+        var c = new GostreamClient(http, NullLogger<GostreamClient>.Instance, () => "http://gs.test:9080");
+
+        await c.AddAsync(new GostreamAddRequest
+        {
+            Type = "movie",
+            Title = "X",
+            Magnet = "magnet:?xt=urn:btih:abc",
+            AllowedVideoContainers = new[] { "mkv" },
+        }, CancellationToken.None);
+        await c.ValidateAsync(new GostreamValidateRequest
+        {
+            Type = "movie",
+            Title = "X",
+            Magnet = "magnet:?xt=urn:btih:abc",
+            AllowedVideoContainers = new[] { "mkv" },
+            ValidationSessionId = "session-1",
+        }, CancellationToken.None);
+
+        Assert.All(bodies, body => Assert.Contains("\"allowed_video_containers\":[\"mkv\"]", body, System.StringComparison.Ordinal));
     }
 
     [Fact]
@@ -315,7 +348,7 @@ public class GostreamClientTests
             Requests.Add(request);
             var (status, body) = _resp(request);
             var msg = new System.Net.Http.HttpResponseMessage(status);
-            if (body is not null) msg.Content = new System.Net.Http.StringContent(body);
+            if (body is not null) msg.Content = new System.Net.Http.StringContent(body, System.Text.Encoding.UTF8, "application/json");
             return System.Threading.Tasks.Task.FromResult(msg);
         }
     }

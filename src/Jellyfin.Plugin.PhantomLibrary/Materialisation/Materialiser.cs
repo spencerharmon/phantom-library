@@ -659,6 +659,7 @@ public sealed class Materialiser : IMaterialiser
                 Episode = episode,
                 Magnet = magnet.Magnet,
                 MinQuality = string.IsNullOrWhiteSpace(cfg.GostreamMinQuality) ? null : cfg.GostreamMinQuality,
+                AllowedVideoContainers = ToAllowedVideoContainers(cfg),
                 RequiredAudioLanguages = RequiredAudioLanguages,
                 PreferredAudioLanguage = "eng",
             },
@@ -666,6 +667,14 @@ public sealed class Materialiser : IMaterialiser
             fromCache,
             rank,
             sourceRow);
+
+    private static string[]? ToAllowedVideoContainers(PluginConfiguration cfg)
+    {
+        var normalized = PluginConfiguration.NormalizeAllowedVideoContainers(cfg.AllowedVideoContainers);
+        return string.IsNullOrWhiteSpace(normalized)
+            ? null
+            : normalized.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    }
 
     private async Task<bool> IsCandidateAllowedAsync(MagnetCacheKey key, MagnetCandidate magnet, CancellationToken ct)
         => await _db.GetMagnetFailureAsync(ToFailureKey(key, magnet), _configProvider().SourceValidationPolicyVersion, ct).ConfigureAwait(false) is null;
@@ -1109,6 +1118,7 @@ public sealed class Materialiser : IMaterialiser
             Magnet = candidate.Request.Magnet,
             RequiredAudioLanguages = RequiredAudioLanguages,
             PreferredAudioLanguage = "eng",
+            AllowedVideoContainers = ToAllowedVideoContainers(cfg),
             ValidationSessionId = sessionId,
         };
 
@@ -1292,7 +1302,7 @@ public sealed class Materialiser : IMaterialiser
     }
 
     private static bool IsHardValidationReason(string reason)
-        => reason is "target_episode_not_found" or "no_valid_files" or "no_english_audio" or "no_main_english_audio" or "audio_probe_unsupported_format" or "series_year_mismatch";
+        => reason is "target_episode_not_found" or "no_valid_files" or "container_not_allowed" or "no_english_audio" or "no_main_english_audio" or "audio_probe_unsupported_format" or "series_year_mismatch";
 
     private static string NormalizeValidationStatus(string? status)
     {

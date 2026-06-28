@@ -313,7 +313,7 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
             validationTime,
             validationTime.AddHours(1),
             123,
-            "sv14-parser-audio-v1",
+            "sv14-parser-audio-v1|containers:MKV",
             1,
             "Movie.mkv",
             current.Size), CancellationToken.None);
@@ -372,7 +372,7 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
             validationTime,
             validationTime.AddDays(7),
             123,
-            "sv14-parser-audio-v1",
+            "sv14-parser-audio-v1|containers:MKV",
             null,
             null,
             null), CancellationToken.None);
@@ -384,7 +384,7 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
                 Reason = "target_episode_not_found",
                 FailedAt = validationTime,
                 RetryAfter = validationTime.AddDays(7),
-                ValidationPolicyVersion = "sv14-parser-audio-v1",
+                ValidationPolicyVersion = "sv14-parser-audio-v1|containers:MKV",
             },
             CancellationToken.None);
         var ctrl = BuildController(db, new[] { candidate });

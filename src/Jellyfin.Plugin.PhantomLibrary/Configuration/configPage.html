@@ -102,6 +102,11 @@
                             <label class="inputLabel inputLabelUnfocused" for="MinSizeGb4K">Minimum 4K size (GB)</label>
                             <input id="MinSizeGb4K" name="MinSizeGb4K" type="number" min="0" is="emby-input" />
                         </div>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="AllowedVideoContainers">Allowed video containers</label>
+                            <input id="AllowedVideoContainers" name="AllowedVideoContainers" type="text" is="emby-input" />
+                            <div class="fieldDescription">Comma-separated extensions used during gostream file selection. Default: mkv. Empty allows all recognized video containers.</div>
+                        </div>
                     </fieldset>
 
                     <fieldset class="verticalSection">
@@ -282,6 +287,7 @@
                             document.querySelector('#MinSeeders').value = cfg.MinSeeders;
                             document.querySelector('#MinSizeGb1080p').value = cfg.MinSizeGb1080p;
                             document.querySelector('#MinSizeGb4K').value = cfg.MinSizeGb4K;
+                            document.querySelector('#AllowedVideoContainers').value = cfg.AllowedVideoContainers ?? 'mkv';
                             document.querySelector('#EvictionEnabled').checked = !!cfg.EvictionEnabled;
                             document.querySelector('#EvictionIdleDays').value = cfg.EvictionIdleDays;
                             document.querySelector('#EvictionScheduleCron').value = cfg.EvictionScheduleCron || '';
@@ -331,6 +337,7 @@
                             cfg.MinSeeders = parseInt(document.querySelector('#MinSeeders').value, 10);
                             cfg.MinSizeGb1080p = parseInt(document.querySelector('#MinSizeGb1080p').value, 10);
                             cfg.MinSizeGb4K = parseInt(document.querySelector('#MinSizeGb4K').value, 10);
+                            cfg.AllowedVideoContainers = document.querySelector('#AllowedVideoContainers').value;
                             cfg.EvictionEnabled = document.querySelector('#EvictionEnabled').checked;
                             cfg.EvictionIdleDays = parseInt(document.querySelector('#EvictionIdleDays').value, 10);
                             cfg.EvictionScheduleCron = document.querySelector('#EvictionScheduleCron').value;
