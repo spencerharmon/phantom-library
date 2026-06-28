@@ -855,18 +855,61 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(currentValidationPolicyVersion);
         var failure = await GetMagnetFailureAsync(key, ct).ConfigureAwait(false);
-        if (failure is null)
+        return IsCurrentFailure(failure, currentValidationPolicyVersion) ? failure : null;
+    }
+
+    public async Task<MagnetFailureEntry?> GetMagnetFailureByInfoHashAsync(
+        MagnetCacheKey key,
+        string infoHash,
+        string currentValidationPolicyVersion,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+        ArgumentException.ThrowIfNullOrWhiteSpace(infoHash);
+        ArgumentException.ThrowIfNullOrWhiteSpace(currentValidationPolicyVersion);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT info_hash, reason, failed_at, retry_after, validation_policy_version
+            FROM magnet_failure_cache
+            WHERE tmdb_id=$tmdb
+              AND imdb_id=$imdb
+              AND type=$type
+              AND season=$season
+              AND episode=$episode
+              AND preset=$preset
+              AND lower(info_hash)=lower($hash)
+            ORDER BY retry_after DESC
+            LIMIT 1;";
+        BindKey(cmd, key);
+        cmd.Parameters.AddWithValue("$preset", key.Preset);
+        cmd.Parameters.AddWithValue("$hash", infoHash);
+
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (!await r.ReadAsync(ct).ConfigureAwait(false))
         {
             return null;
         }
 
-        if (IsPolicySensitiveFailureReason(failure.Reason)
-            && !string.Equals(failure.ValidationPolicyVersion, currentValidationPolicyVersion, StringComparison.Ordinal))
+        var failure = new MagnetFailureEntry
         {
-            return null;
+            InfoHash = r.GetString(0),
+            Reason = r.GetString(1),
+            FailedAt = DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(2)),
+            RetryAfter = DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(3)),
+            ValidationPolicyVersion = r.GetString(4),
+        };
+        return IsCurrentFailure(failure, currentValidationPolicyVersion) ? failure : null;
+    }
+
+    private static bool IsCurrentFailure(MagnetFailureEntry? failure, string currentValidationPolicyVersion)
+    {
+        if (failure is null || DateTimeOffset.UtcNow >= failure.RetryAfter)
+        {
+            return false;
         }
 
-        return failure;
+        return !IsPolicySensitiveFailureReason(failure.Reason)
+            || string.Equals(failure.ValidationPolicyVersion, currentValidationPolicyVersion, StringComparison.Ordinal);
     }
 
     public async Task MarkMagnetFailedAsync(MagnetFailureKey key, MagnetFailureEntry entry, CancellationToken ct)

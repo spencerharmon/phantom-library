@@ -275,6 +275,12 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
         using var db = await NewDbAsync();
         await SeedMovieAsync(db, 42);
         var current = Candidate("CURRENT", 100);
+        var sameHashAlternateMagnet = new MagnetCandidate(
+            "magnet:?xt=urn:btih:CURRENT-DIFFERENT-MAGNET",
+            current.InfoHash,
+            current.Size,
+            95,
+            current.Indexer);
         var invalid = Candidate("INVALID", 90);
         var valid = Candidate("VALID", 50);
         await CacheCurrentAsync(db, 42, current, "/stub/current.mkv", "/fuse/current.mkv");
@@ -296,7 +302,7 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
         };
         var ctrl = BuildController(
             db,
-            new[] { current, invalid, valid },
+            new[] { current, sameHashAlternateMagnet, invalid, valid },
             gostreamSetup: g =>
             {
                 g.Setup(x => x.ValidateAsync(It.IsAny<GostreamValidateRequest>(), It.IsAny<CancellationToken>()))
@@ -329,6 +335,13 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
         var payload = Assert.IsType<PhantomSourceOperationResult>(ok.Value);
         Assert.Equal(PhantomSourceOperationStatus.Success, payload.Status);
         Assert.Equal(valid.Magnet, Assert.Single(added));
+        var sameHashFailure = await db.GetMagnetFailureByInfoHashAsync(
+            new MagnetCacheKey(42, "tt0000042", "movie", null, null, "test"),
+            sameHashAlternateMagnet.InfoHash,
+            cfg.SourceValidationPolicyVersion,
+            CancellationToken.None);
+        Assert.NotNull(sameHashFailure);
+        Assert.Equal("operator_rejected", sameHashFailure!.Reason);
         var state = await db.GetMaterialisedStateAsync(42, "movie", -1, -1, CancellationToken.None);
         Assert.NotNull(state);
         Assert.Equal(fusePath, state!.FusePath);

@@ -677,7 +677,15 @@ public sealed class Materialiser : IMaterialiser
     }
 
     private async Task<bool> IsCandidateAllowedAsync(MagnetCacheKey key, MagnetCandidate magnet, CancellationToken ct)
-        => await _db.GetMagnetFailureAsync(ToFailureKey(key, magnet), _configProvider().SourceValidationPolicyVersion, ct).ConfigureAwait(false) is null;
+    {
+        var policy = _configProvider().SourceValidationPolicyVersion;
+        if (await _db.GetMagnetFailureAsync(ToFailureKey(key, magnet), policy, ct).ConfigureAwait(false) is not null)
+        {
+            return false;
+        }
+
+        return await _db.GetMagnetFailureByInfoHashAsync(key, magnet.InfoHash, policy, ct).ConfigureAwait(false) is null;
+    }
 
     private static bool IsSourceCandidateValidationBlocked(SourceCandidateRow row, PluginConfiguration cfg)
     {
