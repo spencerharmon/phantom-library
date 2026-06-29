@@ -219,7 +219,7 @@ public sealed record TmdbEpisodeRow(
 
 /// <summary>
 /// SQLite-backed persistence for the plugin's private state under the
-/// channel architecture (schema v14). Single writer, serialised via a
+/// channel architecture (schema v15). Single writer, serialised via a
 /// process-wide <see cref="SemaphoreSlim"/>; concurrent readers
 /// permitted via separate short-lived connections.
 ///
@@ -230,14 +230,14 @@ public sealed record TmdbEpisodeRow(
 /// <c>magnet_failure_cache</c> so rejected pack candidates do not
 /// block viable alternatives; v11 adds append-only catalogue and
 /// availability scheduler state; v12 adds ranked source candidates;
-/// v13 persists movie runtime minutes for resume eligibility; v14 adds source validation state, failure policy versions, and a durable bulk materialise queue). Per
+/// v13 persists movie runtime minutes for resume eligibility; v14 adds source validation state, failure policy versions, and a durable bulk materialise queue; v15 adds the persistent gostream path→tmdb resolution cache). Per
 /// AGENTS.md "No database migrations until v1.0", existing databases
-/// at any pre-v14 user_version are HARD-REFUSED and the operator must
-/// run <c>scripts/migrate-source-validation-v14.sh</c> before restart.
+/// at any pre-v15 user_version are HARD-REFUSED and the operator must
+/// wipe (<c>scripts/phantom-wipe.sh --commit</c>) before restart.
 /// </summary>
 public sealed class PhantomDb : IDisposable
 {
-    public const int CurrentSchemaVersion = 14;
+    public const int CurrentSchemaVersion = 15;
 
     private readonly string _connectionString;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
@@ -314,24 +314,12 @@ public sealed class PhantomDb : IDisposable
             return;
         }
 
-        if (version == 13)
-        {
-            // HARD-REFUSE: SV14 has an operator-approved offline migration;
-            // do not mutate the v13 DB from plugin startup.
-            throw new InvalidOperationException(
-                $"Phantom Library schema is at version {version}; this build requires" + Environment.NewLine
-                + $"version {CurrentSchemaVersion}. This build requires the SV14 offline migration." + Environment.NewLine
-                + "Stop Jellyfin, run" + Environment.NewLine
-                + "`sudo bash scripts/migrate-source-validation-v14.sh`, then restart.");
-        }
-
         if (version > 0 && version < CurrentSchemaVersion)
         {
-            // HARD-REFUSE: older pre-v14 schemas are not accepted by the
-            // SV14 offline migration script. Preserve the pre-v1.0 wipe path.
+            // HARD-REFUSE: pre-v1.0 = wipe-and-rebuild, no migrations.
             throw new InvalidOperationException(
                 $"Phantom Library schema is at version {version}; this build requires" + Environment.NewLine
-                + $"version {CurrentSchemaVersion}. The SV14 offline migration accepts only v13." + Environment.NewLine
+                + $"version {CurrentSchemaVersion}. Pre-v1.0 has no migrations." + Environment.NewLine
                 + "Stop Jellyfin, run" + Environment.NewLine
                 + "`sudo bash scripts/phantom-wipe.sh --commit`, then restart.");
         }
@@ -703,6 +691,16 @@ CREATE TABLE IF NOT EXISTS tmdb_episode_cache (
 );
 CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
     ON tmdb_episode_cache(fetched_at);
+
+-- v15 persistent gostream FUSE-path -> tmdb_id resolution cache. Without
+-- this, channel cold-browse re-runs TMDB search per orphan file every
+-- restart (movies ~40s, shows ~5.3s). 'kind' is 'movie' or 'series'.
+CREATE TABLE IF NOT EXISTS gostream_path_tmdb (
+    path        TEXT PRIMARY KEY,
+    kind        TEXT NOT NULL,
+    tmdb_id     INTEGER NOT NULL,
+    resolved_at INTEGER NOT NULL
+);
 ";
 
     // ---- magnet_cache ----
@@ -3237,6 +3235,47 @@ CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
         }
 
         return ReadTmdbMetadata(r);
+    }
+
+    public async Task<int?> GetGostreamPathTmdbAsync(string path, string kind, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        ArgumentException.ThrowIfNullOrWhiteSpace(kind);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT tmdb_id FROM gostream_path_tmdb WHERE path=$path AND kind=$kind LIMIT 1;";
+        cmd.Parameters.AddWithValue("$path", path);
+        cmd.Parameters.AddWithValue("$kind", kind);
+        var v = await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
+        if (v is null || v is DBNull)
+        {
+            return null;
+        }
+
+        return Convert.ToInt32(v, System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    public async Task UpsertGostreamPathTmdbAsync(string path, string kind, int tmdbId, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        ArgumentException.ThrowIfNullOrWhiteSpace(kind);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"INSERT OR REPLACE INTO gostream_path_tmdb (path, kind, tmdb_id, resolved_at)
+                VALUES ($path,$kind,$tmdb,$at);";
+            cmd.Parameters.AddWithValue("$path", path);
+            cmd.Parameters.AddWithValue("$kind", kind);
+            cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+            cmd.Parameters.AddWithValue("$at", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     private static TmdbMetadataRow ReadTmdbMetadata(SqliteDataReader r)

@@ -667,6 +667,19 @@ public sealed partial class PhantomShowsChannel
             _gostreamSeriesTmdbByPath.TryGetValue(series.DirectoryPath, out tmdbId);
         }
 
+        if (tmdbId == 0)
+        {
+            var persisted = await _db.GetGostreamPathTmdbAsync(series.DirectoryPath, "series", ct).ConfigureAwait(false);
+            if (persisted is { } cached && cached != 0)
+            {
+                tmdbId = cached;
+                lock (_gostreamSeriesTmdbByPath)
+                {
+                    _gostreamSeriesTmdbByPath[series.DirectoryPath] = tmdbId;
+                }
+            }
+        }
+
         TmdbMetadataRow? metadata = null;
         if (tmdbId != 0)
         {
@@ -681,6 +694,7 @@ public sealed partial class PhantomShowsChannel
             }
 
             tmdbId = metadata.TmdbId;
+            await _db.UpsertGostreamPathTmdbAsync(series.DirectoryPath, "series", tmdbId, ct).ConfigureAwait(false);
             lock (_gostreamSeriesTmdbByPath)
             {
                 _gostreamSeriesTmdbByPath[series.DirectoryPath] = tmdbId;

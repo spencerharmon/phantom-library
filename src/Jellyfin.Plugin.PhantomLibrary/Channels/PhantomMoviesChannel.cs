@@ -385,6 +385,19 @@ public sealed class PhantomMoviesChannel
 
         if (tmdbId == 0)
         {
+            var persisted = await _db.GetGostreamPathTmdbAsync(path, "movie", ct).ConfigureAwait(false);
+            if (persisted is { } cached && cached != 0)
+            {
+                tmdbId = cached;
+                lock (_gostreamMovieTmdbByPath)
+                {
+                    _gostreamMovieTmdbByPath[path] = tmdbId;
+                }
+            }
+        }
+
+        if (tmdbId == 0)
+        {
             IReadOnlyList<TmdbSearchHit> hits;
             try
             {
@@ -402,6 +415,7 @@ public sealed class PhantomMoviesChannel
             }
 
             tmdbId = hits[0].Id;
+            await _db.UpsertGostreamPathTmdbAsync(path, "movie", tmdbId, ct).ConfigureAwait(false);
             lock (_gostreamMovieTmdbByPath)
             {
                 _gostreamMovieTmdbByPath[path] = tmdbId;

@@ -55,6 +55,7 @@ public class PhantomShowsChannelTests : IDisposable
 
     public void Dispose()
     {
+        GostreamFilesystemEnumerator.ResetForTests();
         _db.Dispose();
         SqliteConnection.ClearAllPools();
         try { if (File.Exists(_dbPath)) File.Delete(_dbPath); } catch { }
@@ -746,6 +747,35 @@ public class PhantomShowsChannelTests : IDisposable
         Assert.Equal("https://image.tmdb.org/t/p/w500/poster.jpg", series.ImageUrl);
         Assert.Equal("99056001", series.ProviderIds["Tmdb"]);
         Assert.Contains("external", series.Tags);
+    }
+
+    [Fact]
+    public async Task GostreamOnlyTvFiles_PathTmdbPersisted_SecondColdChannel_UsesCacheNotTitleSearch()
+    {
+        var seasonDir = Path.Combine(_enumerator.ShowsRootOverride!, "56_Days (2026)", "Season.01");
+        Directory.CreateDirectory(seasonDir);
+        await File.WriteAllTextAsync(Path.Combine(seasonDir, "56_Days_S01E01_72a275d4.mkv"), "x", CancellationToken.None);
+        await _db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(99056001, "series", "56 Days From TMDB", 2026, "ov",
+                "https://img/p.jpg", "https://img/b.jpg", new[] { "Drama" }, null, 8.1, "56 Days", DateTimeOffset.UtcNow),
+            CancellationToken.None);
+
+        var first = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        Assert.Single(first.Items, i => i.Id == "series_99056001");
+        Assert.Equal(99056001, await _db.GetGostreamPathTmdbAsync(Path.Combine(_enumerator.ShowsRootOverride!, "56_Days (2026)"), "series", CancellationToken.None));
+
+        // Rename metadata so a title/year search would no longer match. Only the
+        // persisted path->tmdb cache + GetTmdbMetadataAsync(id) can still resolve.
+        await _db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(99056001, "series", "Renamed", null, "ov",
+                null, null, null, null, null, "Renamed", DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        GostreamFilesystemEnumerator.ResetForTests();
+        var cold = new PhantomShowsChannel(_db, _tmdb.Object, _splash, _state, _enumerator,
+            NullLogger<PhantomShowsChannel>.Instance, () => null);
+        var second = await cold.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var series = Assert.Single(second.Items, i => i.Id == "series_99056001");
+        Assert.Equal("Renamed", series.Name);
     }
 
     [Fact]

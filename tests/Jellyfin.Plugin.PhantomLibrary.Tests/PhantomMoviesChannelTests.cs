@@ -61,6 +61,7 @@ public class PhantomMoviesChannelTests : IDisposable
 
     public void Dispose()
     {
+        GostreamFilesystemEnumerator.ResetForTests();
         _db.Dispose();
         SqliteConnection.ClearAllPools();
         try { if (File.Exists(_dbPath)) File.Delete(_dbPath); } catch { }
@@ -356,6 +357,32 @@ public class PhantomMoviesChannelTests : IDisposable
         Assert.Contains("external", item.Tags);
         Assert.Equal(orphanPath, item.MediaSources[0].Path);
         Assert.True(Guid.TryParse(item.MediaSources[0].Id, out _));
+    }
+
+    [Fact]
+    public async Task GetChannelItems_GostreamPathTmdbPersisted_SecondColdChannel_DoesNotResearchTmdb()
+    {
+        var path = Path.Combine(_moviesRoot, "Apex_2026_2160p_DV_Atmos_7cf0a865.mkv");
+        File.WriteAllText(path, string.Empty);
+        _tmdb.Setup(t => t.SearchMoviesAsync("Apex", 2026, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { new TmdbSearchHit(1318447, "Apex", "Apex", "hit", null, null, "2026-01-01", 8.1, 10) });
+        _tmdb.Setup(t => t.GetMovieAsync(1318447, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new TmdbMovieDetails(1318447, "Apex", "Apex", "overview", "/poster.jpg", null,
+                "2026-01-01", 8.1, 10, 100, new[] { "Action" }, "Released", null, "tt1318447", null, null));
+
+        var first = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        Assert.Equal("movie_1318447", Assert.Single(first.Items).Id);
+        _tmdb.Verify(t => t.SearchMoviesAsync("Apex", 2026, It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Once);
+
+        // Cold restart: new channel + new in-memory dict; bust the enumerator's
+        // static walk cache. Resolution must come from the persisted path->tmdb
+        // cache, not a fresh TMDB search.
+        GostreamFilesystemEnumerator.ResetForTests();
+        var cold = new PhantomMoviesChannel(_db, _enumerator, _splash, _state, _tmdb.Object,
+            NullLogger<PhantomMoviesChannel>.Instance);
+        var second = await cold.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        Assert.Equal("movie_1318447", Assert.Single(second.Items).Id);
+        _tmdb.Verify(t => t.SearchMoviesAsync("Apex", 2026, It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]

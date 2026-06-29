@@ -176,6 +176,16 @@ by tests, not re-defer it.
 
 ### Documented partials
 
+- **Gostream path→tmdb resolution cache is now persistent (implemented).**
+  Cold channel browse previously re-ran TMDB `SearchMovies`+`GetMovie`
+  per orphan movie (~40s) and `FindTmdbMetadataByTitleYear` full-scans
+  per orphan series (~5.3s) on every restart, because the path→tmdb map
+  was in-memory only. Persisted to `phantom.db` table `gostream_path_tmdb`
+  (schema v15); both channels resolve in-mem dict → DB → search and
+  write-through on resolve. `GostreamFilesystemEnumerator` adds a 30s
+  single-flight FUSE-walk cache keyed on `MoviesVersion()`/`ShowsVersion()`.
+  BREAKING: schema bump v14→v15 requires wipe (no migration).
+
 - **Home "Latest in Phantom Movies/Shows" rows are suppressed**
   (operator decision 2026-06-28, Option 3). Phantom channels no
   longer implement `ISupportsLatestMedia`, because Jellyfin core's

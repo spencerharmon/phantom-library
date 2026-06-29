@@ -32,6 +32,7 @@ public class GostreamFilesystemEnumeratorTests : IDisposable
 
     public void Dispose()
     {
+        GostreamFilesystemEnumerator.ResetForTests();
         _db.Dispose();
         SqliteConnection.ClearAllPools();
         try { if (File.Exists(_dbPath)) File.Delete(_dbPath); } catch { }

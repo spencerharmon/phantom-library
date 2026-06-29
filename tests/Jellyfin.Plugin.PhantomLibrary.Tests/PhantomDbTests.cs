@@ -48,7 +48,7 @@ public class PhantomDbTests : IDisposable
     // ----------------------------------------------------------------
 
     [Fact]
-    public async Task FreshDb_CreatesSchemaV14_WithAllExpectedTables()
+    public async Task FreshDb_CreatesSchemaV15_WithAllExpectedTables()
     {
         using var db = await NewDbAsync();
 
@@ -67,7 +67,7 @@ public class PhantomDbTests : IDisposable
             version = Convert.ToInt32(await v.ExecuteScalarAsync());
         }
 
-        Assert.Equal(14, version);
+        Assert.Equal(15, version);
 
         var expectedTables = new[]
         {
@@ -89,6 +89,7 @@ public class PhantomDbTests : IDisposable
             "bulk_materialise_items",
             "unavailable_marker",
             "plugin_meta",
+            "gostream_path_tmdb",
         };
 
         foreach (var tbl in expectedTables)
@@ -133,7 +134,9 @@ public class PhantomDbTests : IDisposable
     [InlineData(8)]
     [InlineData(9)]
     [InlineData(12)]
-    public async Task HardRefuse_PreV13SchemaVersion_ThrowsWithWipePointer(int oldVersion)
+    [InlineData(13)]
+    [InlineData(14)]
+    public async Task HardRefuse_PreCurrentSchemaVersion_ThrowsWithWipePointer(int oldVersion)
     {
         await CreateDbWithUserVersionAsync(oldVersion);
 
@@ -141,21 +144,26 @@ public class PhantomDbTests : IDisposable
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => db.SetMetaAsync("test", "1", CancellationToken.None));
 
-        Assert.Contains("version 14", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("version 15", ex.Message, StringComparison.Ordinal);
         Assert.Contains("phantom-wipe.sh", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task HardRefuse_V13SchemaVersion_ThrowsWithMigrationPointer()
+    public async Task GostreamPathTmdb_UpsertGetOverwrite_Roundtrips()
     {
-        await CreateDbWithUserVersionAsync(13);
+        using var db = await NewDbAsync();
+        Assert.Null(await db.GetGostreamPathTmdbAsync("/m/a.mkv", "movie", CancellationToken.None));
 
-        using var db = new PhantomDb(_dbPath);
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => db.SetMetaAsync("test", "1", CancellationToken.None));
+        await db.UpsertGostreamPathTmdbAsync("/m/a.mkv", "movie", 111, CancellationToken.None);
+        Assert.Equal(111, await db.GetGostreamPathTmdbAsync("/m/a.mkv", "movie", CancellationToken.None));
+        // kind is part of the lookup; same path other kind is distinct.
+        Assert.Null(await db.GetGostreamPathTmdbAsync("/m/a.mkv", "series", CancellationToken.None));
 
-        Assert.Contains("version 14", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("migrate-source-validation-v14.sh", ex.Message, StringComparison.Ordinal);
+        await db.UpsertGostreamPathTmdbAsync("/m/a.mkv", "movie", 222, CancellationToken.None);
+        Assert.Equal(222, await db.GetGostreamPathTmdbAsync("/m/a.mkv", "movie", CancellationToken.None));
+
+        await db.UpsertGostreamPathTmdbAsync("/tv/s", "series", 333, CancellationToken.None);
+        Assert.Equal(333, await db.GetGostreamPathTmdbAsync("/tv/s", "series", CancellationToken.None));
     }
 
     [Fact]

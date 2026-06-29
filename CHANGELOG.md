@@ -6,7 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: requires wipe.** Phantom DB schema bumped v14→v15: adds
+  `gostream_path_tmdb` (path→tmdb resolution cache). Pre-v1.0 has no
+  migrations — stop Jellyfin, run `sudo bash scripts/phantom-wipe.sh
+  --commit`, then restart. The cache repopulates on next browse.
+
 ### Fixed
+
+- Phantom channel cold-cache browse is fast again. The gostream FUSE
+  path→tmdb resolution map is now persisted to `phantom.db` instead of
+  living only in memory, so a Jellyfin restart no longer forces a fresh
+  TMDB search per orphan movie (~40s) and a TMDB title/year full-scan
+  per orphan series (~5.3s). FUSE tree walks are also deduped via a 30s
+  single-flight cache keyed on the gostream movies/shows version.
 
 - Home screen no longer hangs with a perpetual loading indicator on
   native clients (Xbox, mobile) and is faster on web. Phantom channels
