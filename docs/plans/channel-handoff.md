@@ -1,5 +1,21 @@
 # Phantom Library — IChannel migration handoff (Path A: local patch)
 
+> **⚠ Historical planning document — SUPERSEDED. The M14 IChannel
+> migration this plan describes has SHIPPED.** This is the
+> pre-implementation execution plan (DRAFT v3); it is retained for design
+> history only and is NOT the current state of the code. For the
+> authoritative record of what M14 actually implemented, read
+> `docs/plans/m14-ledger-evaluation.md` (the ledger). Where this plan
+> describes phantom playback via a **splash MediaSource as the normal
+> path**, that design was superseded during v0.3 hardening by the native
+> `RequiresOpening` / `OpenMediaSource` materialise-on-play contract:
+> unmaterialised items expose no splash/file path and auto-open returns
+> the real gostream file. Per the ledger (REQ-M14-SPLASH) the splash
+> asset/code is **legacy/support only, not the active playback handoff.**
+> Canonical stub naming is `[tmdbid-<id>]`; treat any `__phantom_tmdb<id>`
+> reference as deprecated (see AGENTS.md § "Canonical phantom stub naming
+> scheme"). Do not implement from this document.
+
 Date: 2026-06-09 (v3 after critic round 3)
 Status: **DRAFT v3 — addresses critic round 3 findings; awaiting final critic pass**
 Path: A (local Jellyfin patch shipped via `install.sh`; upstream PR

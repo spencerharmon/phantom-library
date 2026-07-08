@@ -1,5 +1,21 @@
 # Phantom Library as IChannel + targeted ChannelManager patch (architectural plan v2)
 
+> **⚠ Historical planning document — SUPERSEDED. The M14 IChannel
+> architecture has SHIPPED.** This is a design-context draft (v2); it is
+> retained for history and is NOT the current state of the code. The
+> authoritative record of what M14 implemented is
+> `docs/plans/m14-ledger-evaluation.md` (the ledger). Two cautions when
+> reading below: (1) the plugin-design snippets that emit a **splash
+> MediaSource for phantoms as the normal playback path** are superseded —
+> the shipped design uses native `RequiresOpening` / `OpenMediaSource`
+> materialise-on-play, and splash is **legacy/support only** per the
+> ledger (REQ-M14-SPLASH). The accurate, as-shipped contract is the
+> "Native playback contract" under § "Post-implementation contracts (v0.3
+> hardening)" in this same file. (2) Canonical stub naming is
+> `[tmdbid-<id>]`; treat any `__phantom_tmdb<id>` reference as deprecated
+> (AGENTS.md § "Canonical phantom stub naming scheme"). Do not implement
+> from this document.
+
 Date: 2026-06-09 (v2 after critic review of v1)
 Status: **DRAFT v2 — awaiting critic review**
 Author: agent

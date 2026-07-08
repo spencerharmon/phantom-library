@@ -1,5 +1,19 @@
 # Eliminating the scanner-race GUID divergence (plan v2)
 
+> **⚠ Historical planning document — SUPERSEDED and NOT pursued.** This
+> is the pre-M14 **file-on-disk + `ItemAdded`-reactor** alternative
+> (including the `PhantomCollectionFolderBinder` "binder window" race). It
+> was rejected in favour of the M14 **IChannel** architecture, which
+> removed the two-writers scanner race entirely by having ChannelManager
+> own the BaseItem lifecycle — no plugin `CreateItem`, no on-disk stub
+> files, no collection-folder binder. It is retained for design history
+> only. For the authoritative record of the architecture that shipped,
+> read `docs/plans/m14-ledger-evaluation.md` (the ledger). Canonical stub
+> naming is `[tmdbid-<id>]`; the lone `__phantom_tmdb<id>` reference below
+> names the **deprecated** legacy sentinel this plan proposed to retire
+> (see AGENTS.md § "Canonical phantom stub naming scheme"). Do not
+> implement from this document.
+
 Date: 2026-06-09 (v2 after critic review)
 Status: **DRAFT v2 — addresses critic findings; awaiting second-pass review**
 Author: agent

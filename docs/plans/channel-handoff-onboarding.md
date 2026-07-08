@@ -1,5 +1,18 @@
 # Channel architecture handoff — agent onboarding
 
+> **⚠ Historical onboarding document — SUPERSEDED. The M14 IChannel
+> migration described here has SHIPPED; it is NOT unstarted work.** This
+> doc was written to onboard an agent BEFORE the migration was built, so
+> its "state at handoff" / "start at Phase 0" framing no longer reflects
+> reality — treat every present-tense claim below as historical. It is
+> retained for design history only. For the authoritative record of what
+> M14 implemented, read `docs/plans/m14-ledger-evaluation.md` (the
+> ledger). The splash-as-playback design referenced here was superseded
+> by native `RequiresOpening` playback (splash is legacy/support only per
+> the ledger, REQ-M14-SPLASH). Canonical stub naming is `[tmdbid-<id>]`;
+> `__phantom_tmdb<id>` is deprecated (AGENTS.md § "Canonical phantom stub
+> naming scheme"). Do not treat this as a live work assignment.
+
 **You are picking up the IChannel migration work for the phantom-library
 plugin.** The architectural plan is `docs/plans/channel-handoff.md`
 (2334 lines, committed at `9357c5c`). Before doing anything, read this
@@ -10,11 +23,14 @@ code, dispatching any subagent, or contacting the operator.
 
 ---
 
-## Current state
+## State at handoff (historical — superseded; see banner)
 
-- **No code in the plan has been implemented yet.** You start at
-  Phase 0 (pre-flight). The plan is execution-ready per the most
-  recent critic verdict; nothing has been built against it.
+- **[Historical] At the time this doc was written, no code in the plan
+  had been implemented yet** and the reader was to start at Phase 0
+  (pre-flight). The plan was execution-ready per the most recent critic
+  verdict. This is no longer true: the M14 IChannel migration has since
+  been built and SHIPPED — see `docs/plans/m14-ledger-evaluation.md` for
+  the as-shipped disposition of each requirement.
 - The plan went through **4 design iterations + 3 critic passes**.
   The critic verdict on v4 was "fix-and-ship"; the round-4 findings
   were patched and committed. No architectural blockers remain.
