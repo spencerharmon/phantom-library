@@ -1,0 +1,42 @@
+---
+# Phantom Library — Zuul job definitions.
+#
+# phantom-library is an UNTRUSTED project on the swarm's self-hosted Zuul
+# (deployed by the flux submodule). It may only DEFINE jobs and ATTACH them
+# to pipelines flux already provides (check / gate); it must NEVER define a
+# `pipeline:` of its own. See zuul.d/project.yaml for the attachment.
+#
+# This file lands the NON-RIG half of the CI migration: a pure
+# build-and-unit-test gate. The live-Jellyfin rig job is a separate,
+# later task (see docs/ci-zuul.md).
+
+- job:
+    name: phantom-library-nonrig-build-test
+    description: |
+      Non-rig gate for the Phantom Library Jellyfin plugin.
+
+      Restores the pinned, patched Jellyfin source tree the plugin compiles
+      against (a v10.11.9 clone under jellyfin/ with scripts/jellyfin-patches/*
+      applied — the plugin ProjectReferences ../../jellyfin/*), then runs
+      `dotnet build -c Release` followed by `dotnet test`, with MSBuild node
+      reuse and shared compilation DISABLED and a cleanup trap that shuts down
+      the dotnet build servers and verifies no stray dotnet/testhost/VBCSCompiler
+      processes survive the job.
+
+      No live Jellyfin rig is exercised here (that is the separate rig job).
+
+      No `nodeset:` is declared: the tenant has no Nodepool provider yet, so
+      there is no node label to request. The playbook therefore FAILS HONESTLY
+      (red) when it is handed an empty inventory rather than reporting success
+      on zero hosts — nothing is faked green. Once flux stands up a Nodepool
+      build-node provider, a nodeset is added here (tracked in docs/ci-zuul.md).
+    run: playbooks/phantom-library-nonrig-build-test.yaml
+    post-run: playbooks/phantom-library-nonrig-cleanup.yaml
+    timeout: 3600
+    vars:
+      # Where the build node clones the patched-Jellyfin base from and the
+      # pinned tag. The tag mirrors scripts/jellyfin-patches/REBASE.md; the
+      # build script re-derives it from REBASE.md as the source of truth and
+      # only falls back to this value.
+      phantom_jellyfin_repo: https://github.com/jellyfin/jellyfin.git
+      phantom_jellyfin_tag: v10.11.9
