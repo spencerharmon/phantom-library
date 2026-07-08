@@ -15,6 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `DiscoveryRefreshTask` now closes REQ-M14-RECOMMENDATIONS: it walks every
+  user's favourited phantom-channel movies/series (and season/episode, via the
+  parent series) and pulls TMDB `/similar` + `/recommendations` for each,
+  folding hits into the existing catalogue/availability/series-expansion
+  pipeline alongside trending/Discover (source-tagged separately so its
+  contribution is distinguishable). Configurable via
+  `FavouriteRecommendationsEnabled` (default on) and
+  `FavouriteRecommendationsMaxFavouritesPerRun` (default 100, bounds per-tick
+  TMDB calls; the existing 24h TMDB response cache means repeat ticks still
+  converge on full favourite coverage). A per-user or per-favourite query
+  failure is logged and skipped rather than aborting the run.
 - Added `scripts/prestage-materialised.sh`, an operator dry-run/commit helper that reads `materialised_state` and asks gostream Vault Mode to prestage existing materialised movies and episodes.
 - Added Phantom source-management APIs and web controls for listing candidates, rejecting the current source, and materialising a selected candidate from stable channel external IDs.
 - Favourite saves on Phantom movie/episode channel items now trigger materialisation/prewarm using the existing materialiser pipeline.

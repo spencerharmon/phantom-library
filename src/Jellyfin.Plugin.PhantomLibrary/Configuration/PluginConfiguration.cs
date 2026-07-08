@@ -73,6 +73,9 @@ public class PluginConfiguration : BasePluginConfiguration
         DiscoverPageDelayMilliseconds = 100;
         DiscoveryLanguage = string.Empty;
 
+        FavouriteRecommendationsEnabled = true;
+        FavouriteRecommendationsMaxFavouritesPerRun = 100;
+
         AvailabilityProbeEnabled = true;
         AvailabilityProbeMinIntervalSeconds = 4;
         AvailabilityProbeMaxIntervalSeconds = 28;
@@ -279,6 +282,23 @@ public class PluginConfiguration : BasePluginConfiguration
 
     /// <summary>Delay between Discover page fetch/write batches.</summary>
     public int DiscoverPageDelayMilliseconds { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether <c>DiscoveryRefreshTask</c>
+    /// pulls TMDB /similar + /recommendations for every user's favourited
+    /// phantom-channel movies/series and folds the hits into the catalogue
+    /// (source-tagged distinctly from trending/Discover). Defaults to true.
+    /// </summary>
+    public bool FavouriteRecommendationsEnabled { get; set; }
+
+    /// <summary>
+    /// Gets or sets the maximum number of distinct favourited tmdb ids (per
+    /// kind: movies, series) processed per <c>DiscoveryRefreshTask</c> tick.
+    /// Bounds TMDB call volume for operators with many favourites; the
+    /// per-id 24h TMDB response cache means repeat ticks still converge on
+    /// full favourite coverage. 0 = no cap. Default 100.
+    /// </summary>
+    public int FavouriteRecommendationsMaxFavouritesPerRun { get; set; }
 
     /// <summary>Enables bounded background source availability probing.</summary>
     public bool AvailabilityProbeEnabled { get; set; }

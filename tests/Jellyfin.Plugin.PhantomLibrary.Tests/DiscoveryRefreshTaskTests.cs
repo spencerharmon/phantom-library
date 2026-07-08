@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Plugin.PhantomLibrary.Channels;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
 using Jellyfin.Plugin.PhantomLibrary.Clients.Models;
@@ -11,8 +12,13 @@ using Jellyfin.Plugin.PhantomLibrary.Configuration;
 using Jellyfin.Plugin.PhantomLibrary.Library;
 using Jellyfin.Plugin.PhantomLibrary.Scheduled;
 using Jellyfin.Plugin.PhantomLibrary.State;
+using MediaBrowser.Controller.Entities;
+using MediaBrowser.Controller.Entities.Movies;
+using MediaBrowser.Controller.Entities.TV;
+using MediaBrowser.Controller.Library;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
+using Moq;
 using Xunit;
 
 namespace Jellyfin.Plugin.PhantomLibrary.Tests;
@@ -47,16 +53,76 @@ public class DiscoveryRefreshTaskTests : IDisposable
         }
     }
 
-    private DiscoveryRefreshTask NewTask(StubTmdbClient tmdb, PluginConfiguration? config = null)
+    private DiscoveryRefreshTask NewTask(
+        StubTmdbClient tmdb,
+        PluginConfiguration? config = null,
+        IReadOnlyList<User>? users = null,
+        Dictionary<Guid, IReadOnlyList<BaseItem>>? favouritesByUser = null)
     {
         var cached = new CachedTmdbReader(tmdb, _db, NullLogger<CachedTmdbReader>.Instance);
+
+        var userManager = new Mock<IUserManager>(MockBehavior.Loose);
+        userManager.Setup(u => u.GetUsers()).Returns(users ?? Array.Empty<User>());
+
+        var libraryManager = new Mock<ILibraryManager>(MockBehavior.Loose);
+        libraryManager
+            .Setup(l => l.GetItemList(It.IsAny<InternalItemsQuery>()))
+            .Returns((InternalItemsQuery q) =>
+                q.User is not null && favouritesByUser is not null && favouritesByUser.TryGetValue(q.User.Id, out var items)
+                    ? items
+                    : Array.Empty<BaseItem>());
+
         return new DiscoveryRefreshTask(
             cached,
             tmdb,
             _db,
+            libraryManager.Object,
+            userManager.Object,
             _state,
             NullLogger<DiscoveryRefreshTask>.Instance,
             () => config);
+    }
+
+    private static User MakeUser(string name = "alice")
+    {
+        // Two-arg ctor variant isn't public; the three-arg one is.
+        return new User(name, "InternalProvider", "InternalReset")
+        {
+            Id = Guid.NewGuid(),
+        };
+    }
+
+    private static Movie MakeChannelMovie(int tmdb)
+    {
+        return new Movie
+        {
+            Id = Guid.NewGuid(),
+            ExternalId = ChannelItemId.ForMovie(tmdb).Encode(),
+            ChannelId = ChannelIds.Movies,
+            Name = "Favourited Movie " + tmdb,
+        };
+    }
+
+    private static Series MakeChannelSeries(int tmdb)
+    {
+        return new Series
+        {
+            Id = Guid.NewGuid(),
+            ExternalId = ChannelItemId.ForSeries(tmdb).Encode(),
+            ChannelId = ChannelIds.Shows,
+            Name = "Favourited Series " + tmdb,
+        };
+    }
+
+    private static Episode MakeChannelEpisode(int tmdb, int season, int episode)
+    {
+        return new Episode
+        {
+            Id = Guid.NewGuid(),
+            ExternalId = ChannelItemId.ForEpisode(tmdb, season, episode).Encode(),
+            ChannelId = ChannelIds.Shows,
+            Name = "Favourited Episode " + tmdb,
+        };
     }
 
     private async Task<IReadOnlyList<int>> ListCatalogueAsync(string type)
@@ -74,6 +140,18 @@ public class DiscoveryRefreshTaskTests : IDisposable
         }
 
         return list;
+    }
+
+    private async Task<int> GetSourceMaskAsync(string type, int tmdbId)
+    {
+        await using var conn = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT source_mask FROM catalogue_items WHERE type=$type AND tmdb_id=$tmdb;";
+        cmd.Parameters.AddWithValue("$type", type);
+        cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+        var v = await cmd.ExecuteScalarAsync(CancellationToken.None);
+        return Convert.ToInt32(v, System.Globalization.CultureInfo.InvariantCulture);
     }
 
     [Fact]
@@ -317,6 +395,283 @@ public class DiscoveryRefreshTaskTests : IDisposable
         Assert.Equal("OK", meta!.Title);
     }
 
+    // ---- REQ-M14-RECOMMENDATIONS: favourite -> similar/recommendations ----
+
+    [Fact]
+    public async Task Execute_FavouriteMovie_IngestsSimilarAndRecommendedMovies()
+    {
+        var alice = MakeUser("alice");
+        var favouriteMovie = MakeChannelMovie(42);
+
+        var tmdb = new StubTmdbClient();
+        tmdb.SimilarMoviesByTmdb[42] = new[] { Hit(501, "Similar 501") };
+        tmdb.MovieRecommendationsByTmdb[42] = new[] { Hit(502, "Recommended 502") };
+
+        var task = NewTask(
+            tmdb,
+            users: new[] { alice },
+            favouritesByUser: new Dictionary<Guid, IReadOnlyList<BaseItem>>
+            {
+                [alice.Id] = new BaseItem[] { favouriteMovie },
+            });
+
+        await task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
+
+        var movies = await ListCatalogueAsync("movie");
+        Assert.Contains(501, movies);
+        Assert.Contains(502, movies);
+        Assert.Equal(new[] { 42 }, tmdb.SimilarMoviesCalls);
+        Assert.Equal(new[] { 42 }, tmdb.MovieRecommendationsCalls);
+
+        var meta501 = await _db.GetTmdbMetadataAsync(501, "movie", CancellationToken.None);
+        Assert.NotNull(meta501);
+        Assert.Equal("Similar 501", meta501!.Title);
+
+        var mask = await GetSourceMaskAsync("movie", 501);
+        Assert.Equal(4, mask); // SourceFavouriteSimilar
+    }
+
+    [Fact]
+    public async Task Execute_FavouriteSeries_IngestsSimilarAndRecommendedSeries()
+    {
+        var alice = MakeUser("alice");
+        var favouriteSeries = MakeChannelSeries(1399);
+
+        var tmdb = new StubTmdbClient();
+        tmdb.SimilarSeriesByTmdb[1399] = new[] { Hit(601, "Similar Series 601") };
+        tmdb.SeriesRecommendationsByTmdb[1399] = new[] { Hit(602, "Recommended Series 602") };
+
+        var task = NewTask(
+            tmdb,
+            users: new[] { alice },
+            favouritesByUser: new Dictionary<Guid, IReadOnlyList<BaseItem>>
+            {
+                [alice.Id] = new BaseItem[] { favouriteSeries },
+            });
+
+        await task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
+
+        var series = await ListCatalogueAsync("series");
+        Assert.Contains(601, series);
+        Assert.Contains(602, series);
+        Assert.Equal(new[] { 1399 }, tmdb.SimilarSeriesCalls);
+        Assert.Equal(new[] { 1399 }, tmdb.SeriesRecommendationsCalls);
+    }
+
+    [Fact]
+    public async Task Execute_FavouriteEpisode_ResolvesToParentSeriesTmdbIdForRecommendations()
+    {
+        // An episode-level favourite (ChannelItemId.KindEpisode) carries the
+        // PARENT SERIES tmdb id, not an episode-specific one; the favourite
+        // walk must key /similar + /recommendations off that series id.
+        var alice = MakeUser("alice");
+        var favouriteEpisode = MakeChannelEpisode(1399, season: 1, episode: 2);
+
+        var tmdb = new StubTmdbClient();
+        tmdb.SimilarSeriesByTmdb[1399] = new[] { Hit(701, "Similar Series 701") };
+
+        var task = NewTask(
+            tmdb,
+            users: new[] { alice },
+            favouritesByUser: new Dictionary<Guid, IReadOnlyList<BaseItem>>
+            {
+                [alice.Id] = new BaseItem[] { favouriteEpisode },
+            });
+
+        await task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
+
+        var series = await ListCatalogueAsync("series");
+        Assert.Contains(701, series);
+        Assert.Equal(new[] { 1399 }, tmdb.SimilarSeriesCalls);
+    }
+
+    [Fact]
+    public async Task Execute_FavouritesAcrossMultipleUsers_AreDeduplicatedBeforeTmdbCalls()
+    {
+        var alice = MakeUser("alice");
+        var bob = MakeUser("bob");
+        // Both users favourited the same movie; the tmdb id must be
+        // processed once, not once per favouriting user.
+        var tmdb = new StubTmdbClient();
+        tmdb.SimilarMoviesByTmdb[42] = new[] { Hit(501, "Similar 501") };
+
+        var task = NewTask(
+            tmdb,
+            users: new[] { alice, bob },
+            favouritesByUser: new Dictionary<Guid, IReadOnlyList<BaseItem>>
+            {
+                [alice.Id] = new BaseItem[] { MakeChannelMovie(42) },
+                [bob.Id] = new BaseItem[] { MakeChannelMovie(42) },
+            });
+
+        await task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
+
+        Assert.Equal(new[] { 42 }, tmdb.SimilarMoviesCalls);
+    }
+
+    [Fact]
+    public async Task Execute_NoFavourites_DoesNotCallSimilarOrRecommendations()
+    {
+        var alice = MakeUser("alice");
+        var tmdb = new StubTmdbClient();
+
+        var task = NewTask(tmdb, users: new[] { alice });
+
+        await task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
+
+        Assert.Empty(tmdb.SimilarMoviesCalls);
+        Assert.Empty(tmdb.MovieRecommendationsCalls);
+        Assert.Empty(tmdb.SimilarSeriesCalls);
+        Assert.Empty(tmdb.SeriesRecommendationsCalls);
+    }
+
+    [Fact]
+    public async Task Execute_UnparseableOrOrphanFavourite_IsSkippedWithoutThrowing()
+    {
+        var alice = MakeUser("alice");
+        var orphan = new Movie
+        {
+            Id = Guid.NewGuid(),
+            ExternalId = "not-a-channel-item-id",
+            ChannelId = ChannelIds.Movies,
+            Name = "Orphan",
+        };
+        var noExternalId = new Movie
+        {
+            Id = Guid.NewGuid(),
+            ChannelId = ChannelIds.Movies,
+            Name = "NoExternalId",
+        };
+
+        var tmdb = new StubTmdbClient();
+        var task = NewTask(
+            tmdb,
+            users: new[] { alice },
+            favouritesByUser: new Dictionary<Guid, IReadOnlyList<BaseItem>>
+            {
+                [alice.Id] = new BaseItem[] { orphan, noExternalId },
+            });
+
+        await task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
+
+        Assert.Empty(tmdb.SimilarMoviesCalls);
+        Assert.Empty(tmdb.SimilarSeriesCalls);
+    }
+
+    [Fact]
+    public async Task Execute_FavouriteRecommendationsDisabled_SkipsEnrichmentEntirely()
+    {
+        var alice = MakeUser("alice");
+        var tmdb = new StubTmdbClient();
+        tmdb.SimilarMoviesByTmdb[42] = new[] { Hit(501, "Similar 501") };
+
+        var task = NewTask(
+            tmdb,
+            new PluginConfiguration { FavouriteRecommendationsEnabled = false },
+            users: new[] { alice },
+            favouritesByUser: new Dictionary<Guid, IReadOnlyList<BaseItem>>
+            {
+                [alice.Id] = new BaseItem[] { MakeChannelMovie(42) },
+            });
+
+        await task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
+
+        Assert.Empty(tmdb.SimilarMoviesCalls);
+        var movies = await ListCatalogueAsync("movie");
+        Assert.DoesNotContain(501, movies);
+    }
+
+    [Fact]
+    public async Task Execute_FavouriteCountExceedsCap_ProcessesOnlyUpToConfiguredMax()
+    {
+        var alice = MakeUser("alice");
+        var favourites = new List<BaseItem>();
+        var tmdb = new StubTmdbClient();
+        for (var i = 0; i < 5; i++)
+        {
+            var id = 100 + i;
+            favourites.Add(MakeChannelMovie(id));
+            tmdb.SimilarMoviesByTmdb[id] = Array.Empty<TmdbSearchHit>();
+        }
+
+        var task = NewTask(
+            tmdb,
+            new PluginConfiguration { FavouriteRecommendationsMaxFavouritesPerRun = 2 },
+            users: new[] { alice },
+            favouritesByUser: new Dictionary<Guid, IReadOnlyList<BaseItem>> { [alice.Id] = favourites });
+
+        await task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
+
+        Assert.Equal(2, tmdb.SimilarMoviesCalls.Count);
+        // Deterministic (ascending tmdb id) so the cap is stable across runs.
+        Assert.Equal(new[] { 100, 101 }, tmdb.SimilarMoviesCalls.OrderBy(x => x));
+    }
+
+    [Fact]
+    public async Task Execute_FavouriteSimilarFetchThrows_DoesNotAbortRecommendationsOrRestOfRun()
+    {
+        var alice = MakeUser("alice");
+        var tmdb = new StubTmdbClient
+        {
+            TrendingMovies = new[] { Hit(1, "Trending 1") },
+        };
+        tmdb.SimilarMoviesThrowFor.Add(42);
+        tmdb.MovieRecommendationsByTmdb[42] = new[] { Hit(502, "Recommended 502") };
+
+        var task = NewTask(
+            tmdb,
+            users: new[] { alice },
+            favouritesByUser: new Dictionary<Guid, IReadOnlyList<BaseItem>>
+            {
+                [alice.Id] = new BaseItem[] { MakeChannelMovie(42) },
+            });
+
+        await task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
+
+        var movies = await ListCatalogueAsync("movie");
+        // Trending phase (independent) still landed...
+        Assert.Contains(1, movies);
+        // ...and the recommendations call for the SAME tmdb id still ran
+        // even though the similar call for it threw.
+        Assert.Contains(502, movies);
+    }
+
+    [Fact]
+    public async Task Execute_LibraryManagerThrowsForOneUser_OtherUsersStillProcessed()
+    {
+        var alice = MakeUser("alice");
+        var bob = MakeUser("bob");
+        var tmdb = new StubTmdbClient();
+        tmdb.SimilarMoviesByTmdb[99] = new[] { Hit(901, "Similar 901") };
+
+        var cached = new CachedTmdbReader(tmdb, _db, NullLogger<CachedTmdbReader>.Instance);
+        var userManager = new Mock<IUserManager>(MockBehavior.Loose);
+        userManager.Setup(u => u.GetUsers()).Returns(new[] { alice, bob });
+
+        var libraryManager = new Mock<ILibraryManager>(MockBehavior.Loose);
+        libraryManager
+            .Setup(l => l.GetItemList(It.Is<InternalItemsQuery>(q => q.User == alice)))
+            .Throws(new InvalidOperationException("simulated GetItemList failure"));
+        libraryManager
+            .Setup(l => l.GetItemList(It.Is<InternalItemsQuery>(q => q.User == bob)))
+            .Returns(new BaseItem[] { MakeChannelMovie(99) });
+
+        var task = new DiscoveryRefreshTask(
+            cached,
+            tmdb,
+            _db,
+            libraryManager.Object,
+            userManager.Object,
+            _state,
+            NullLogger<DiscoveryRefreshTask>.Instance,
+            () => null);
+
+        await task.ExecuteAsync(new Progress<double>(_ => { }), CancellationToken.None);
+
+        var movies = await ListCatalogueAsync("movie");
+        Assert.Contains(901, movies);
+    }
+
     private static TmdbSearchHit Hit(int id, string title)
     {
         return new TmdbSearchHit(
@@ -345,6 +700,18 @@ internal sealed class StubTmdbClient : ITmdbClient
     public List<int> MovieDetailCalls { get; } = new();
     public List<int> SeriesDetailCalls { get; } = new();
     public HashSet<int> DetailsThrowFor { get; set; } = new();
+    public Dictionary<int, IReadOnlyList<TmdbSearchHit>> SimilarMoviesByTmdb { get; } = new();
+    public Dictionary<int, IReadOnlyList<TmdbSearchHit>> SimilarSeriesByTmdb { get; } = new();
+    public Dictionary<int, IReadOnlyList<TmdbSearchHit>> MovieRecommendationsByTmdb { get; } = new();
+    public Dictionary<int, IReadOnlyList<TmdbSearchHit>> SeriesRecommendationsByTmdb { get; } = new();
+    public List<int> SimilarMoviesCalls { get; } = new();
+    public List<int> SimilarSeriesCalls { get; } = new();
+    public List<int> MovieRecommendationsCalls { get; } = new();
+    public List<int> SeriesRecommendationsCalls { get; } = new();
+    public HashSet<int> SimilarMoviesThrowFor { get; } = new();
+    public HashSet<int> SimilarSeriesThrowFor { get; } = new();
+    public HashSet<int> MovieRecommendationsThrowFor { get; } = new();
+    public HashSet<int> SeriesRecommendationsThrowFor { get; } = new();
 
     public Task<IReadOnlyList<TmdbSearchHit>> GetTrendingMoviesAsync(string window, string? languageCode, CancellationToken ct)
         => Task.FromResult(TrendingMovies);
@@ -495,16 +862,48 @@ internal sealed class StubTmdbClient : ITmdbClient
     }
 
     public Task<IReadOnlyList<TmdbSearchHit>> GetSimilarMoviesAsync(int tmdbId, string? languageCode, CancellationToken ct)
-        => Task.FromResult<IReadOnlyList<TmdbSearchHit>>(Array.Empty<TmdbSearchHit>());
+    {
+        SimilarMoviesCalls.Add(tmdbId);
+        if (SimilarMoviesThrowFor.Contains(tmdbId))
+        {
+            throw new InvalidOperationException("simulated similar-movies failure for tmdb=" + tmdbId);
+        }
+
+        return Task.FromResult(SimilarMoviesByTmdb.GetValueOrDefault(tmdbId, Array.Empty<TmdbSearchHit>()));
+    }
 
     public Task<IReadOnlyList<TmdbSearchHit>> GetSimilarSeriesAsync(int tmdbId, string? languageCode, CancellationToken ct)
-        => Task.FromResult<IReadOnlyList<TmdbSearchHit>>(Array.Empty<TmdbSearchHit>());
+    {
+        SimilarSeriesCalls.Add(tmdbId);
+        if (SimilarSeriesThrowFor.Contains(tmdbId))
+        {
+            throw new InvalidOperationException("simulated similar-series failure for tmdb=" + tmdbId);
+        }
+
+        return Task.FromResult(SimilarSeriesByTmdb.GetValueOrDefault(tmdbId, Array.Empty<TmdbSearchHit>()));
+    }
 
     public Task<IReadOnlyList<TmdbSearchHit>> GetMovieRecommendationsAsync(int tmdbId, string? languageCode, CancellationToken ct)
-        => Task.FromResult<IReadOnlyList<TmdbSearchHit>>(Array.Empty<TmdbSearchHit>());
+    {
+        MovieRecommendationsCalls.Add(tmdbId);
+        if (MovieRecommendationsThrowFor.Contains(tmdbId))
+        {
+            throw new InvalidOperationException("simulated movie-recommendations failure for tmdb=" + tmdbId);
+        }
+
+        return Task.FromResult(MovieRecommendationsByTmdb.GetValueOrDefault(tmdbId, Array.Empty<TmdbSearchHit>()));
+    }
 
     public Task<IReadOnlyList<TmdbSearchHit>> GetSeriesRecommendationsAsync(int tmdbId, string? languageCode, CancellationToken ct)
-        => Task.FromResult<IReadOnlyList<TmdbSearchHit>>(Array.Empty<TmdbSearchHit>());
+    {
+        SeriesRecommendationsCalls.Add(tmdbId);
+        if (SeriesRecommendationsThrowFor.Contains(tmdbId))
+        {
+            throw new InvalidOperationException("simulated series-recommendations failure for tmdb=" + tmdbId);
+        }
+
+        return Task.FromResult(SeriesRecommendationsByTmdb.GetValueOrDefault(tmdbId, Array.Empty<TmdbSearchHit>()));
+    }
 
     public Task<TmdbSeasonDetails?> GetSeasonAsync(int seriesTmdbId, int seasonNumber, string? languageCode, CancellationToken ct)
         => Task.FromResult<TmdbSeasonDetails?>(null);

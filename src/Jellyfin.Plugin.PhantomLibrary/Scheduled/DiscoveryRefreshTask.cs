@@ -4,6 +4,7 @@ using System.Globalization;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Plugin.PhantomLibrary.Channels;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
 using Jellyfin.Plugin.PhantomLibrary.Clients.Models;
@@ -11,6 +12,8 @@ using Jellyfin.Plugin.PhantomLibrary.Configuration;
 using Jellyfin.Plugin.PhantomLibrary.Diagnostics;
 using Jellyfin.Plugin.PhantomLibrary.Library;
 using Jellyfin.Plugin.PhantomLibrary.State;
+using MediaBrowser.Controller.Entities;
+using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Tasks;
 using Microsoft.Extensions.Logging;
 
@@ -18,7 +21,7 @@ namespace Jellyfin.Plugin.PhantomLibrary.Scheduled;
 
 /// <summary>
 /// Periodic scheduled task that feeds the append-only Phantom catalogue
-/// from TMDB trending and Discover.
+/// from TMDB trending, Discover, and per-user favourite similar/recommendations.
 ///
 /// On each tick:
 ///   1. Pull /trending/movie/week and /trending/tv/week via
@@ -32,6 +35,13 @@ namespace Jellyfin.Plugin.PhantomLibrary.Scheduled;
 ///   4. Enqueue new movies for availability probing and new series for
 ///      bounded series expansion. Channel visibility changes only after
 ///      availability/materialised state changes.
+///   5. Walk every user's favourited channel items (movies + series/season/
+///      episode) and pull TMDB /similar + /recommendations for each
+///      favourited tmdb id, upserting the results into the same catalogue
+///      pipeline as trending/Discover (source-tagged
+///      <see cref="SourceFavouriteSimilar"/>). Bounded by
+///      <see cref="PluginConfiguration.FavouriteRecommendationsMaxFavouritesPerRun"/>
+///      and gated by <see cref="PluginConfiguration.FavouriteRecommendationsEnabled"/>.
 /// </summary>
 public sealed class DiscoveryRefreshTask : IScheduledTask
 {
@@ -40,13 +50,17 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
 
     private const int DefaultDiscoveryRefreshIntervalHours = 6;
     private const int DefaultCatalogueMaxItems = 5000;
+    private const int DefaultFavouriteRecommendationsMaxPerRun = 100;
     private const int TmdbMaxDiscoverPage = 500;
     private const int SourceTrending = 1;
     private const int SourceDiscover = 2;
+    private const int SourceFavouriteSimilar = 4;
 
     private readonly CachedTmdbReader _tmdb;
     private readonly ITmdbClient _tmdbClient;
     private readonly PhantomDb _db;
+    private readonly ILibraryManager _libraryManager;
+    private readonly IUserManager _userManager;
     private readonly ILogger<DiscoveryRefreshTask> _logger;
     private readonly Func<PluginConfiguration?> _configurationProvider;
 
@@ -54,9 +68,11 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
         CachedTmdbReader tmdb,
         ITmdbClient tmdbClient,
         PhantomDb db,
+        ILibraryManager libraryManager,
+        IUserManager userManager,
         ChannelStateProvider state,
         ILogger<DiscoveryRefreshTask> logger)
-        : this(tmdb, tmdbClient, db, state, logger, () => Plugin.Instance?.Configuration)
+        : this(tmdb, tmdbClient, db, libraryManager, userManager, state, logger, () => Plugin.Instance?.Configuration)
     {
     }
 
@@ -64,6 +80,8 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
         CachedTmdbReader tmdb,
         ITmdbClient tmdbClient,
         PhantomDb db,
+        ILibraryManager libraryManager,
+        IUserManager userManager,
         ChannelStateProvider state,
         ILogger<DiscoveryRefreshTask> logger,
         Func<PluginConfiguration?> configurationProvider)
@@ -71,6 +89,8 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
         _tmdb = tmdb;
         _tmdbClient = tmdbClient;
         _db = db;
+        _libraryManager = libraryManager ?? throw new ArgumentNullException(nameof(libraryManager));
+        _userManager = userManager ?? throw new ArgumentNullException(nameof(userManager));
         _ = state;
         _logger = logger;
         ArgumentNullException.ThrowIfNull(configurationProvider);
@@ -85,7 +105,7 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
 
     /// <inheritdoc />
     public string Description =>
-        "Refreshes the phantom-channel discovery cache from TMDB trending and Discover.";
+        "Refreshes the phantom-channel discovery cache from TMDB trending, Discover, and favourite similar/recommendations.";
 
     /// <inheritdoc />
     public string Category => "Phantom Library";
@@ -210,18 +230,51 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
             cancellationToken: cancellationToken).ConfigureAwait(false);
         progress.Report(45);
 
-        // --- Phase 3: favourite-similar enrichment --------------------------
-        // TODO(stage-future): wire favourite-similar enrichment per plan §3.1.
-        // Needs IUserManager + ILibraryManager.GetItemList(IsFavorite=true,
-        // user=...) joined against ProviderIds["Tmdb"], then
-        // SimilarMoviesAsync / SimilarSeriesAsync per favourited id, with
-        // the results upserted into discovery_cache. Deferred for v0.3.0:
-        // TMDB Discover now supplies the bulk catalogue surface, and wiring
-        // the ILibraryManager / favourite query without producing BaseItem-load
-        // churn deserves its own design pass. To re-enable, inject IUserManager
-        // + ILibraryManager here and walk users → favourites →
-        // SimilarMoviesAsync/SimilarSeriesAsync
-        // → UpsertDiscoveryCacheAsync.
+        // --- Phase 3: favourite-similar/recommendations enrichment ---------
+        if (config?.FavouriteRecommendationsEnabled ?? true)
+        {
+            try
+            {
+                var favouriteWrite = await RunFavouriteEnrichmentAsync(language, config, cancellationToken).ConfigureAwait(false);
+                PhantomMetrics.DiscoveryRows(
+                    "movie",
+                    favouriteWrite.MovieResult.Seen,
+                    favouriteWrite.MovieResult.Inserted,
+                    favouriteWrite.MovieResult.AvailabilityInserted,
+                    favouriteWrite.MovieResult.SeriesExpansionInserted);
+                PhantomMetrics.DiscoveryRows(
+                    "series",
+                    favouriteWrite.SeriesResult.Seen,
+                    favouriteWrite.SeriesResult.Inserted,
+                    favouriteWrite.SeriesResult.AvailabilityInserted,
+                    favouriteWrite.SeriesResult.SeriesExpansionInserted);
+
+                totalSeen += favouriteWrite.MovieResult.Seen + favouriteWrite.SeriesResult.Seen;
+                totalInserted += favouriteWrite.MovieResult.Inserted + favouriteWrite.SeriesResult.Inserted;
+                totalAvailabilityInserted += favouriteWrite.MovieResult.AvailabilityInserted + favouriteWrite.SeriesResult.AvailabilityInserted;
+                totalSeriesExpansionInserted += favouriteWrite.MovieResult.SeriesExpansionInserted + favouriteWrite.SeriesResult.SeriesExpansionInserted;
+
+                _logger.LogInformation(
+                    "Favourite enrichment: users={Users} favMovies={FavMovies} favSeries={FavSeries} newMovieRows={NewMovieRows} newSeriesRows={NewSeriesRows}",
+                    favouriteWrite.UsersScanned,
+                    favouriteWrite.FavouriteMovieCount,
+                    favouriteWrite.FavouriteSeriesCount,
+                    favouriteWrite.MovieResult.Inserted,
+                    favouriteWrite.SeriesResult.Inserted);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Favourite-similar enrichment failed; continuing");
+            }
+        }
+        else
+        {
+            _logger.LogDebug("Favourite-similar enrichment disabled by configuration");
+        }
 
         progress.Report(50);
 
@@ -232,6 +285,220 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
             totalAvailabilityInserted,
             totalSeriesExpansionInserted);
         progress.Report(100);
+    }
+
+    /// <summary>
+    /// Aggregated result of a single favourite-enrichment pass, surfaced for
+    /// logging and test assertions.
+    /// </summary>
+    internal sealed record FavouriteEnrichmentResult(
+        int UsersScanned,
+        int FavouriteMovieCount,
+        int FavouriteSeriesCount,
+        CatalogueHitWriteResult MovieResult,
+        CatalogueHitWriteResult SeriesResult);
+
+    /// <summary>
+    /// Walks every user's favourited phantom-channel items (movies, series,
+    /// seasons, episodes), collects the distinct favourited TMDB ids, and
+    /// pulls TMDB /similar + /recommendations for each — upserting hits into
+    /// the same catalogue/availability pipeline as trending/Discover, tagged
+    /// <see cref="SourceFavouriteSimilar"/>. A per-kind cap
+    /// (<see cref="PluginConfiguration.FavouriteRecommendationsMaxFavouritesPerRun"/>)
+    /// bounds TMDB calls per tick; <see cref="CachedTmdbReader"/>'s 24h TTL
+    /// cache means repeat ticks re-hit the network only for ids not already
+    /// warmed, so a modest per-tick cap still converges to full favourite
+    /// coverage across a handful of runs even for an operator with many
+    /// favourites.
+    /// </summary>
+    private async Task<FavouriteEnrichmentResult> RunFavouriteEnrichmentAsync(
+        string? language,
+        PluginConfiguration? config,
+        CancellationToken ct)
+    {
+        var (favouriteMovies, favouriteSeries, usersScanned) = CollectFavouriteTmdbIds();
+
+        var maxPerRun = config?.FavouriteRecommendationsMaxFavouritesPerRun ?? DefaultFavouriteRecommendationsMaxPerRun;
+        if (maxPerRun < 0)
+        {
+            maxPerRun = DefaultFavouriteRecommendationsMaxPerRun;
+        }
+
+        var moviesToProcess = LimitFavourites(favouriteMovies, maxPerRun);
+        var seriesToProcess = LimitFavourites(favouriteSeries, maxPerRun);
+
+        var movieHits = new Dictionary<int, TmdbSearchHit>();
+        foreach (var tmdbId in moviesToProcess)
+        {
+            ct.ThrowIfCancellationRequested();
+            await CollectSimilarAndRecommendedAsync(
+                movieHits,
+                innerCt => _tmdb.SimilarMoviesAsync(tmdbId, language, innerCt),
+                innerCt => _tmdb.MovieRecommendationsAsync(tmdbId, language, innerCt),
+                "movie",
+                tmdbId,
+                ct).ConfigureAwait(false);
+        }
+
+        var seriesHits = new Dictionary<int, TmdbSearchHit>();
+        foreach (var tmdbId in seriesToProcess)
+        {
+            ct.ThrowIfCancellationRequested();
+            await CollectSimilarAndRecommendedAsync(
+                seriesHits,
+                innerCt => _tmdb.SimilarSeriesAsync(tmdbId, language, innerCt),
+                innerCt => _tmdb.SeriesRecommendationsAsync(tmdbId, language, innerCt),
+                "series",
+                tmdbId,
+                ct).ConfigureAwait(false);
+        }
+
+        var movieWrite = await UpsertHitsAsync(movieHits.Values.ToList(), "movie", SourceFavouriteSimilar, ct).ConfigureAwait(false);
+        var seriesWrite = await UpsertHitsAsync(seriesHits.Values.ToList(), "series", SourceFavouriteSimilar, ct).ConfigureAwait(false);
+
+        return new FavouriteEnrichmentResult(
+            usersScanned,
+            favouriteMovies.Count,
+            favouriteSeries.Count,
+            movieWrite,
+            seriesWrite);
+    }
+
+    private static List<int> LimitFavourites(HashSet<int> favourites, int maxPerRun)
+    {
+        if (maxPerRun == 0 || favourites.Count <= maxPerRun)
+        {
+            return favourites.OrderBy(id => id).ToList();
+        }
+
+        return favourites.OrderBy(id => id).Take(maxPerRun).ToList();
+    }
+
+    /// <summary>
+    /// Walks every Jellyfin user, queries their favourited phantom-channel
+    /// items (movies + series/season/episode), and resolves each to the
+    /// TMDB id that a /similar or /recommendations call should key off:
+    /// the movie's own tmdb id for a favourited movie, or the parent
+    /// series' tmdb id for a favourited series/season/episode (all three
+    /// carry the series tmdb id in their <see cref="ChannelItemId"/>).
+    /// Defensive: a per-user query failure is logged and skipped rather
+    /// than aborting the whole pass.
+    /// </summary>
+    private (HashSet<int> Movies, HashSet<int> Series, int UsersScanned) CollectFavouriteTmdbIds()
+    {
+        var movies = new HashSet<int>();
+        var series = new HashSet<int>();
+
+        List<User> users;
+        try
+        {
+            users = _userManager.GetUsers().ToList();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Favourite enrichment: could not enumerate users; skipping");
+            return (movies, series, 0);
+        }
+
+        foreach (var user in users)
+        {
+            IReadOnlyList<BaseItem> favourites;
+            try
+            {
+                favourites = _libraryManager.GetItemList(new InternalItemsQuery
+                {
+                    User = user,
+                    IsFavorite = true,
+                    ChannelIds = new[] { ChannelIds.Movies, ChannelIds.Shows },
+                    SourceTypes = new[] { SourceType.Channel },
+                }) ?? Array.Empty<BaseItem>();
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Favourite enrichment: GetItemList failed for user={User}; skipping user", user?.Id);
+                continue;
+            }
+
+            foreach (var item in favourites)
+            {
+                if (item is null
+                    || !ChannelItemId.TryParse(item.ExternalId, out var parsed)
+                    || !parsed.TmdbId.HasValue)
+                {
+                    continue;
+                }
+
+                switch (parsed.Kind)
+                {
+                    case ChannelItemId.KindMovie:
+                        movies.Add(parsed.TmdbId.Value);
+                        break;
+                    case ChannelItemId.KindSeries:
+                    case ChannelItemId.KindSeason:
+                    case ChannelItemId.KindEpisode:
+                        series.Add(parsed.TmdbId.Value);
+                        break;
+                }
+            }
+        }
+
+        return (movies, series, users.Count);
+    }
+
+    /// <summary>
+    /// Fetches /similar and /recommendations for a single favourited tmdb id
+    /// and merges the hits into <paramref name="accumulator"/> (keyed by
+    /// tmdb id so a hit returned by both endpoints is upserted once). Each
+    /// call is independently defensive: a failure on one endpoint does not
+    /// skip the other, and neither aborts the enclosing favourite walk.
+    /// </summary>
+    private async Task CollectSimilarAndRecommendedAsync(
+        Dictionary<int, TmdbSearchHit> accumulator,
+        Func<CancellationToken, Task<(IReadOnlyList<TmdbSearchHit> Hits, bool FromCache)>> fetchSimilar,
+        Func<CancellationToken, Task<(IReadOnlyList<TmdbSearchHit> Hits, bool FromCache)>> fetchRecommendations,
+        string kind,
+        int sourceTmdbId,
+        CancellationToken ct)
+    {
+        try
+        {
+            var (similar, _) = await fetchSimilar(ct).ConfigureAwait(false);
+            MergeHits(accumulator, similar);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Favourite {Kind} similar fetch failed for tmdb={Tmdb}; continuing", kind, sourceTmdbId);
+        }
+
+        try
+        {
+            var (recommended, _) = await fetchRecommendations(ct).ConfigureAwait(false);
+            MergeHits(accumulator, recommended);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Favourite {Kind} recommendations fetch failed for tmdb={Tmdb}; continuing", kind, sourceTmdbId);
+        }
+    }
+
+    private static void MergeHits(Dictionary<int, TmdbSearchHit> accumulator, IReadOnlyList<TmdbSearchHit> hits)
+    {
+        foreach (var hit in hits)
+        {
+            accumulator[hit.Id] = hit;
+        }
     }
 
     private async Task WalkDiscoverAsync(
