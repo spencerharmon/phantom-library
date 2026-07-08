@@ -1,0 +1,20 @@
+---
+# yamllint config for the in-repo Zuul CI config (zuul.d/, playbooks/).
+# Run:  yamllint -c .yamllint zuul.d playbooks
+# Zuul/Ansible YAML idioms need a few relaxations vs yamllint defaults.
+extends: default
+
+rules:
+  document-start:
+    present: true
+  line-length:
+    max: 120
+    allow-non-breakable-words: true
+  # Ansible/Zuul commonly use `on:`/`yes`/`no` style truthy values and long
+  # comment blocks; keep those from being noise.
+  truthy:
+    allowed-values: ['true', 'false']
+    check-keys: false
+  comments:
+    min-spaces-from-content: 1
+  comments-indentation: disable

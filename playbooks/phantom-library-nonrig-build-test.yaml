@@ -1,0 +1,48 @@
+---
+# Non-rig gate playbook: dotnet build -c Release, then dotnet test.
+#
+# Two plays on purpose:
+#   1. A localhost guard that ALWAYS runs (implicit local host) and fails the
+#      job when the inventory has no build node. Without this, a `hosts: all`
+#      play against an empty inventory would run zero tasks and report a SILENT
+#      GREEN — exactly the false pass we refuse. The tenant has no Nodepool yet,
+#      so today this guard is what keeps the gate honestly red.
+#   2. The real build+test, run ON the build node, inside the Zuul checkout.
+#
+# The mandatory MSBuild process-cleanup contract
+# (MSBUILDDISABLENODEREUSE=1, -p:UseSharedCompilation=false, cleanup trap,
+# no leftover dotnet/testhost) lives in tools/ci/nonrig-build-test.sh, which
+# both this job and a developer run identically.
+
+- name: Guard — refuse to pass on an empty inventory (no build node)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Fail honestly when there is no build node (no Nodepool yet)
+      ansible.builtin.fail:
+        msg: >-
+          No build node in the inventory (groups['all'] is empty). The
+          phantom-library non-rig gate needs a real executor node providing
+          git and the .NET 9 SDK, but the Zuul tenant has no Nodepool provider
+          yet, so no node was assigned. Refusing to report success on zero
+          hosts. This job goes green only once flux stands up a Nodepool
+          build-node provider and a nodeset is added to zuul.d/jobs.yaml.
+      when: groups['all'] | length == 0
+
+- name: Non-rig build + unit test
+  hosts: all
+  tasks:
+    - name: dotnet build -c Release && dotnet test (no reusable build servers)
+      ansible.builtin.shell:
+        cmd: exec ./tools/ci/nonrig-build-test.sh
+        chdir: "{{ ansible_user_dir }}/{{ zuul.project.src_dir }}"
+        executable: /bin/bash
+      environment:
+        # Authoritative values are set inside the script; mirrored here so the
+        # contract is visible in the job's environment as well.
+        MSBUILDDISABLENODEREUSE: "1"
+        DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+        DOTNET_NOLOGO: "1"
+        PHANTOM_JELLYFIN_REPO: "{{ phantom_jellyfin_repo | default('') }}"
+        PHANTOM_JELLYFIN_TAG: "{{ phantom_jellyfin_tag | default('') }}"
