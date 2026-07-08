@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added `scripts/prestage-materialised.sh`, an operator dry-run/commit helper that reads `materialised_state` and asks gostream Vault Mode to prestage existing materialised movies and episodes.
 - Added Phantom source-management APIs and web controls for listing candidates, rejecting the current source, and materialising a selected candidate from stable channel external IDs.
+- Made the Phantom source-management controls usable in a mobile browser: the same detail-page section and kebab (…) action-sheet entries run the identical custom-JS shim, now with >=44px touch targets, `touch-action:manipulation`, a full-width stacked layout under a `max-width:600px` media query, a dropped desktop min-width so the candidate `<select>` never overflows a narrow phone, and a 16px `<select>` font so iOS Safari does not focus-zoom. Backed by executable mobile-viewport DOM/API evidence in `tools/rig-scenarios/phantom-kebab-mobile-dom.mjs` (movie + TV episode).
 - Favourite saves on Phantom movie/episode channel items now trigger materialisation/prewarm using the existing materialiser pipeline.
 - Phantom DB retention remains deferred/no-op and is now labelled that way in the admin UI instead of presenting an active retention policy.
 - Legacy per-user preferences admin page/link is hidden until a real per-user preferences API is reintroduced.

@@ -151,6 +151,22 @@ tools/rig-scenarios/36-channel-episode-e2e-playback.sh
 # native-open episode materialise, real TV stream, DB sanity.
 ```
 
+Not every scenario needs a live Jellyfin. The source-management UX is
+custom JS injected into jellyfin-web, and a mobile *browser* loads the
+same SPA + shim as desktop, so its mobile behaviour is proven without a
+server:
+
+```bash
+tools/rig-scenarios/38-mobile-source-dom.sh
+# Runs the real phantomKebab.js shim against a faithful minimal DOM at a
+# 390px phone viewport (node, no npm deps, no server). Asserts the injected
+# detail-page source section and kebab (…) action-sheet entries, >=44px
+# touch targets, the max-width:600px stacked/full-width layout, and the
+# materialise/reject tap → API flow, for movie AND TV episode. Exits non-zero
+# on regression; also invoked from the PhantomKebabScriptTests xUnit suite
+# when node is present.
+```
+
 For native phantom playback, scenarios must assert the two-step Jellyfin
 contract:
 

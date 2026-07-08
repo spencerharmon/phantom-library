@@ -289,7 +289,11 @@
             '.phantom-source-select{min-height:44px;min-width:16em;max-width:100%;}',
             '.phantom-source-button{min-height:44px;padding:.65em 1em;border-radius:8px;touch-action:manipulation;}',
             '.phantom-source-button+ .phantom-source-button{margin-left:.4em;}',
-            '@media (max-width: 600px){.phantom-source-row{display:block}.phantom-source-select,.phantom-source-button{width:100%;margin:.35em 0}.phantom-source-button+ .phantom-source-button{margin-left:0}}'
+            // Mobile browser viewport: stack the row, let controls fill the width,
+            // drop the desktop min-width so the <select> never overflows a narrow
+            // phone, and pin the <select> font to 16px so iOS Safari does not
+            // auto-zoom the whole page when the picker gains focus.
+            '@media (max-width: 600px){.phantom-source-row{display:block}.phantom-source-select{width:100%;min-width:0;font-size:16px;margin:.35em 0}.phantom-source-button{width:100%;margin:.35em 0}.phantom-source-button+ .phantom-source-button{margin-left:0}}'
         ].join('\n');
         document.head.appendChild(style);
     }
