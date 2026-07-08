@@ -2,6 +2,7 @@ using System;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
+using Jellyfin.Plugin.PhantomLibrary.Library;
 using Jellyfin.Plugin.PhantomLibrary.Materialisation;
 using Jellyfin.Plugin.PhantomLibrary.Sources;
 using Jellyfin.Plugin.PhantomLibrary.State;
@@ -36,6 +37,7 @@ public sealed class PhantomLibraryController : ControllerBase
     private readonly IUserManager _userManager;
     private readonly PhantomDb _db;
     private readonly PhantomSourceManager _sourceManager;
+    private readonly IFavouriteRecommendationIngestor _recommendationIngestor;
 
     public PhantomLibraryController(
         IMaterialiser materialiser,
@@ -44,7 +46,8 @@ public sealed class PhantomLibraryController : ControllerBase
         IApplicationPaths paths,
         IUserManager userManager,
         PhantomDb db,
-        PhantomSourceManager sourceManager)
+        PhantomSourceManager sourceManager,
+        IFavouriteRecommendationIngestor recommendationIngestor)
     {
         _materialiser = materialiser;
         _queue = queue;
@@ -53,6 +56,7 @@ public sealed class PhantomLibraryController : ControllerBase
         _userManager = userManager;
         _db = db;
         _sourceManager = sourceManager;
+        _recommendationIngestor = recommendationIngestor;
     }
 
     /// <summary>
@@ -140,6 +144,36 @@ public sealed class PhantomLibraryController : ControllerBase
     {
         var result = await _sourceManager.MaterialiseCandidateAsync(externalId, request, ct).ConfigureAwait(false);
         return ToActionResult(result);
+    }
+
+    /// <summary>
+    /// Manually trigger favourite-style TMDB similar/recommendations
+    /// ingestion for a seed title. Mirrors the automatic
+    /// UserDataSavedListener path (a user favouriting the title) and is the
+    /// admin/rig hook for REQ-M14-RECOMMENDATIONS. New movie rows enqueue
+    /// availability probing; new series rows enqueue expansion.
+    /// </summary>
+    [HttpPost("Recommendations/Ingest")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    public async Task<IActionResult> IngestRecommendations(
+        [FromQuery] int tmdbId,
+        [FromQuery] string type,
+        CancellationToken ct = default)
+    {
+        if (tmdbId <= 0)
+        {
+            return BadRequest(new { code = "invalid_tmdb_id", message = "tmdbId must be a positive integer." });
+        }
+
+        var normalised = type?.Trim().ToLowerInvariant();
+        if (normalised != "movie" && normalised != "series")
+        {
+            return BadRequest(new { code = "invalid_type", message = "type must be 'movie' or 'series'." });
+        }
+
+        var result = await _recommendationIngestor.IngestForFavouriteAsync(tmdbId, normalised, ct).ConfigureAwait(false);
+        return Ok(result);
     }
 
     /// <summary>Returns queue + gostream-reachability status for the admin debug page.</summary>

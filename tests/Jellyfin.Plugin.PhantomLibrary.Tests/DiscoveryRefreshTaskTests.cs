@@ -346,6 +346,18 @@ internal sealed class StubTmdbClient : ITmdbClient
     public List<int> SeriesDetailCalls { get; } = new();
     public HashSet<int> DetailsThrowFor { get; set; } = new();
 
+    // Settable similar/recommendation fixtures keyed by seed tmdb id. Empty
+    // (default) preserves the prior "returns nothing" behaviour for tests that
+    // don't exercise the favourite-recommendation path.
+    public Dictionary<int, IReadOnlyList<TmdbSearchHit>> SimilarMovies { get; } = new();
+    public Dictionary<int, IReadOnlyList<TmdbSearchHit>> MovieRecommendations { get; } = new();
+    public Dictionary<int, IReadOnlyList<TmdbSearchHit>> SimilarSeries { get; } = new();
+    public Dictionary<int, IReadOnlyList<TmdbSearchHit>> SeriesRecommendations { get; } = new();
+    public List<int> SimilarMovieCalls { get; } = new();
+    public List<int> MovieRecommendationCalls { get; } = new();
+    public List<int> SimilarSeriesCalls { get; } = new();
+    public List<int> SeriesRecommendationCalls { get; } = new();
+
     public Task<IReadOnlyList<TmdbSearchHit>> GetTrendingMoviesAsync(string window, string? languageCode, CancellationToken ct)
         => Task.FromResult(TrendingMovies);
 
@@ -495,16 +507,28 @@ internal sealed class StubTmdbClient : ITmdbClient
     }
 
     public Task<IReadOnlyList<TmdbSearchHit>> GetSimilarMoviesAsync(int tmdbId, string? languageCode, CancellationToken ct)
-        => Task.FromResult<IReadOnlyList<TmdbSearchHit>>(Array.Empty<TmdbSearchHit>());
+    {
+        SimilarMovieCalls.Add(tmdbId);
+        return Task.FromResult(SimilarMovies.GetValueOrDefault(tmdbId, Array.Empty<TmdbSearchHit>()));
+    }
 
     public Task<IReadOnlyList<TmdbSearchHit>> GetSimilarSeriesAsync(int tmdbId, string? languageCode, CancellationToken ct)
-        => Task.FromResult<IReadOnlyList<TmdbSearchHit>>(Array.Empty<TmdbSearchHit>());
+    {
+        SimilarSeriesCalls.Add(tmdbId);
+        return Task.FromResult(SimilarSeries.GetValueOrDefault(tmdbId, Array.Empty<TmdbSearchHit>()));
+    }
 
     public Task<IReadOnlyList<TmdbSearchHit>> GetMovieRecommendationsAsync(int tmdbId, string? languageCode, CancellationToken ct)
-        => Task.FromResult<IReadOnlyList<TmdbSearchHit>>(Array.Empty<TmdbSearchHit>());
+    {
+        MovieRecommendationCalls.Add(tmdbId);
+        return Task.FromResult(MovieRecommendations.GetValueOrDefault(tmdbId, Array.Empty<TmdbSearchHit>()));
+    }
 
     public Task<IReadOnlyList<TmdbSearchHit>> GetSeriesRecommendationsAsync(int tmdbId, string? languageCode, CancellationToken ct)
-        => Task.FromResult<IReadOnlyList<TmdbSearchHit>>(Array.Empty<TmdbSearchHit>());
+    {
+        SeriesRecommendationCalls.Add(tmdbId);
+        return Task.FromResult(SeriesRecommendations.GetValueOrDefault(tmdbId, Array.Empty<TmdbSearchHit>()));
+    }
 
     public Task<TmdbSeasonDetails?> GetSeasonAsync(int seriesTmdbId, int seasonNumber, string? languageCode, CancellationToken ct)
         => Task.FromResult<TmdbSeasonDetails?>(null);

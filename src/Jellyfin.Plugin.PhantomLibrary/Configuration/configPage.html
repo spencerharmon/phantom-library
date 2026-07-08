@@ -212,6 +212,17 @@
                         </div>
                         <div class="checkboxContainer checkboxContainer-withDescription">
                             <label>
+                                <input id="FavouriteRecommendationsEnabled" name="FavouriteRecommendationsEnabled" type="checkbox" is="emby-checkbox" />
+                                <span>Ingest recommendations from favourites</span>
+                            </label>
+                            <div class="fieldDescription checkboxFieldDescription">When a user favourites a movie or series, fetch TMDB similar + recommended titles into the discovery catalogue. New movies enqueue availability probing; new series enqueue expansion. Episode/season favourites seed off the parent series.</div>
+                        </div>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="FavouriteRecommendationsMaxPerFavourite">Max recommendation rows ingested per favourite (similar + recommended, de-duplicated then capped; default 40)</label>
+                            <input id="FavouriteRecommendationsMaxPerFavourite" name="FavouriteRecommendationsMaxPerFavourite" type="number" min="0" is="emby-input" />
+                        </div>
+                        <div class="checkboxContainer checkboxContainer-withDescription">
+                            <label>
                                 <input id="AvailabilityProbeEnabled" name="AvailabilityProbeEnabled" type="checkbox" is="emby-checkbox" />
                                 <span>Enable availability probing</span>
                             </label>
@@ -296,6 +307,8 @@
                             document.querySelector('#SuggestionsCatalogueMaxItems').value = cfg.SuggestionsCatalogueMaxItems;
                             document.querySelector('#DiscoverPagesPerRun').value = cfg.DiscoverPagesPerRun ?? 50;
                             document.querySelector('#DiscoverPageDelayMilliseconds').value = cfg.DiscoverPageDelayMilliseconds ?? 100;
+                            document.querySelector('#FavouriteRecommendationsEnabled').checked = cfg.FavouriteRecommendationsEnabled !== false;
+                            document.querySelector('#FavouriteRecommendationsMaxPerFavourite').value = cfg.FavouriteRecommendationsMaxPerFavourite ?? 40;
                             document.querySelector('#AvailabilityProbeEnabled').checked = cfg.AvailabilityProbeEnabled !== false;
                             document.querySelector('#AvailabilityProbeMinIntervalSeconds').value = cfg.AvailabilityProbeMinIntervalSeconds || 4;
                             document.querySelector('#AvailabilityProbeMaxIntervalSeconds').value = cfg.AvailabilityProbeMaxIntervalSeconds || 28;
@@ -345,6 +358,8 @@
                             cfg.SuggestionsCatalogueMaxItems = parseInt(document.querySelector('#SuggestionsCatalogueMaxItems').value, 10);
                             cfg.DiscoverPagesPerRun = parseInt(document.querySelector('#DiscoverPagesPerRun').value, 10);
                             cfg.DiscoverPageDelayMilliseconds = parseInt(document.querySelector('#DiscoverPageDelayMilliseconds').value, 10);
+                            cfg.FavouriteRecommendationsEnabled = document.querySelector('#FavouriteRecommendationsEnabled').checked;
+                            cfg.FavouriteRecommendationsMaxPerFavourite = parseInt(document.querySelector('#FavouriteRecommendationsMaxPerFavourite').value, 10);
                             cfg.AvailabilityProbeEnabled = document.querySelector('#AvailabilityProbeEnabled').checked;
                             cfg.AvailabilityProbeMinIntervalSeconds = parseInt(document.querySelector('#AvailabilityProbeMinIntervalSeconds').value, 10);
                             cfg.AvailabilityProbeMaxIntervalSeconds = parseInt(document.querySelector('#AvailabilityProbeMaxIntervalSeconds').value, 10);

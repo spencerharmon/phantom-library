@@ -3,6 +3,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Channels;
+using Jellyfin.Plugin.PhantomLibrary.Library;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.TV;
 using MediaBrowser.Controller.Library;
@@ -34,17 +35,20 @@ public sealed class UserDataSavedListener : IHostedService
     private readonly IUserDataManager _userData;
     private readonly ISeriesAutopilot _autopilot;
     private readonly IMaterialiser _materialiser;
+    private readonly IFavouriteRecommendationIngestor _recommendationIngestor;
     private readonly ILogger<UserDataSavedListener> _logger;
 
     public UserDataSavedListener(
         IUserDataManager userData,
         ISeriesAutopilot autopilot,
         IMaterialiser materialiser,
+        IFavouriteRecommendationIngestor recommendationIngestor,
         ILogger<UserDataSavedListener> logger)
     {
         _userData = userData ?? throw new ArgumentNullException(nameof(userData));
         _autopilot = autopilot ?? throw new ArgumentNullException(nameof(autopilot));
         _materialiser = materialiser ?? throw new ArgumentNullException(nameof(materialiser));
+        _recommendationIngestor = recommendationIngestor ?? throw new ArgumentNullException(nameof(recommendationIngestor));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
@@ -91,6 +95,7 @@ public sealed class UserDataSavedListener : IHostedService
         if (userData.IsFavorite)
         {
             TryTriggerFavouriteMaterialise(item);
+            TryTriggerFavouriteRecommendations(item);
         }
 
         var played = ComputePlayedPercentage(item, userData);
@@ -158,6 +163,51 @@ public sealed class UserDataSavedListener : IHostedService
                     MaterialiseTrigger.Favourite,
                     CancellationToken.None);
                 break;
+        }
+    }
+
+    /// <summary>
+    /// On a favourite, expand the catalogue toward the user's taste by
+    /// ingesting TMDB similar/recommendations for the favourited title.
+    /// Movies seed movie recommendations; series, season, and episode
+    /// favourites all seed series recommendations off the parent series id
+    /// (an episode's <see cref="ChannelItemId.TmdbId"/> is the series id).
+    /// Fires regardless of the splash guard — a favourite is an explicit
+    /// taste signal even when the play was against the placeholder.
+    /// </summary>
+    private void TryTriggerFavouriteRecommendations(BaseItem item)
+    {
+        if (!ChannelItemId.TryParse(item.ExternalId, out var parsed) || !parsed.TmdbId.HasValue)
+        {
+            return;
+        }
+
+        var type = parsed.Kind switch
+        {
+            ChannelItemId.KindMovie => "movie",
+            ChannelItemId.KindSeries => "series",
+            ChannelItemId.KindSeason => "series",
+            ChannelItemId.KindEpisode => "series",
+            _ => null,
+        };
+
+        if (type is null)
+        {
+            return;
+        }
+
+        _ = IngestFavouriteRecommendationsAsync(parsed.TmdbId.Value, type);
+    }
+
+    private async Task IngestFavouriteRecommendationsAsync(int tmdbId, string type)
+    {
+        try
+        {
+            await _recommendationIngestor.IngestForFavouriteAsync(tmdbId, type, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Favourite-recommendation ingest failed for {Type} {Tmdb}", type, tmdbId);
         }
     }
 

@@ -19,6 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added Phantom source-management APIs and web controls for listing candidates, rejecting the current source, and materialising a selected candidate from stable channel external IDs.
 - Made the Phantom source-management controls usable in a mobile browser: the same detail-page section and kebab (…) action-sheet entries run the identical custom-JS shim, now with >=44px touch targets, `touch-action:manipulation`, a full-width stacked layout under a `max-width:600px` media query, a dropped desktop min-width so the candidate `<select>` never overflows a narrow phone, and a 16px `<select>` font so iOS Safari does not focus-zoom. Backed by executable mobile-viewport DOM/API evidence in `tools/rig-scenarios/phantom-kebab-mobile-dom.mjs` (movie + TV episode).
 - Favourite saves on Phantom movie/episode channel items now trigger materialisation/prewarm using the existing materialiser pipeline.
+- Favouriting a Phantom movie or series now also grows the catalogue toward the
+  user's taste: the title is fanned out to its TMDB "similar" + "recommendations"
+  (24h cached), de-duplicated, capped, and folded into the append-only catalogue
+  under a distinct favourite-recommendation source, so new movies enqueue
+  availability probing and new series enqueue expansion. Episode favourites seed
+  from the parent series. Configurable via **Enable favourite recommendations**
+  (default on) and **Favourite recommendations max per favourite** (default 40)
+  in the Suggestions settings; an admin `POST
+  /Plugins/PhantomLibrary/Recommendations/Ingest?tmdbId=&type=` endpoint triggers
+  the same ingest manually (REQ-M14-RECOMMENDATIONS).
 - Phantom DB retention remains deferred/no-op and is now labelled that way in the admin UI instead of presenting an active retention policy.
 - Legacy per-user preferences admin page/link is hidden until a real per-user preferences API is reintroduced.
 - BREAKING: requires wipe. Phantom DB schema is now v11 to split append-only

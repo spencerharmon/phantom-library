@@ -72,6 +72,8 @@ public class PluginConfiguration : BasePluginConfiguration
         DiscoverPagesPerRun = 50;
         DiscoverPageDelayMilliseconds = 100;
         DiscoveryLanguage = string.Empty;
+        FavouriteRecommendationsEnabled = true;
+        FavouriteRecommendationsMaxPerFavourite = 40;
 
         AvailabilityProbeEnabled = true;
         AvailabilityProbeMinIntervalSeconds = 4;
@@ -319,6 +321,23 @@ public class PluginConfiguration : BasePluginConfiguration
     /// parameter on /trending, /movie/{id}/similar, etc.
     /// </summary>
     public string DiscoveryLanguage { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether favouriting a movie or
+    /// series triggers TMDB similar/recommendations ingestion into the
+    /// append-only discovery catalogue. Default true. When off, the
+    /// favourite still materialises normally; only the taste-based
+    /// catalogue expansion is skipped.
+    /// </summary>
+    public bool FavouriteRecommendationsEnabled { get; set; }
+
+    /// <summary>
+    /// Gets or sets the maximum number of catalogue rows ingested per
+    /// favourite event. TMDB "similar" and "recommendations" hits are
+    /// merged, de-duplicated, the seed title dropped, then capped to this
+    /// many. Default 40; values &lt;= 0 fall back to the default.
+    /// </summary>
+    public int FavouriteRecommendationsMaxPerFavourite { get; set; }
 
     /// <summary>
     /// Filesystem path to the gostream movies FUSE mount. The

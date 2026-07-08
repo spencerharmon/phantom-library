@@ -8,6 +8,7 @@ using Jellyfin.Plugin.PhantomLibrary.Api;
 using Jellyfin.Plugin.PhantomLibrary.Channels;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
 using Jellyfin.Plugin.PhantomLibrary.Configuration;
+using Jellyfin.Plugin.PhantomLibrary.Library;
 using Jellyfin.Plugin.PhantomLibrary.Materialisation;
 using Jellyfin.Plugin.PhantomLibrary.Sources;
 using Jellyfin.Plugin.PhantomLibrary.State;
@@ -155,7 +156,8 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
         IEnumerable<MagnetCandidate> candidates,
         Mock<IGostreamClient>? gostreamMock = null,
         Action<Mock<IGostreamClient>>? gostreamSetup = null,
-        PluginConfiguration? cfg = null)
+        PluginConfiguration? cfg = null,
+        IFavouriteRecommendationIngestor? recommendationIngestor = null)
     {
         cfg ??= new PluginConfiguration
         {
@@ -216,6 +218,9 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
         paths.SetupGet(p => p.PluginConfigurationsPath).Returns(Path.GetTempPath());
         var users = new Mock<IUserManager>(MockBehavior.Loose);
 
+        var recommendations = recommendationIngestor
+            ?? new Mock<IFavouriteRecommendationIngestor>(MockBehavior.Loose).Object;
+
         return new PhantomLibraryController(
             materialiser,
             queue.Object,
@@ -223,7 +228,8 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
             paths.Object,
             users.Object,
             db,
-            sourceManager);
+            sourceManager,
+            recommendations);
     }
 
     [Fact]
@@ -615,5 +621,96 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
         Assert.IsType<UnprocessableEntityObjectResult>(result);
         gostream.Verify(g => g.RemoveAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
         Assert.NotNull(await db.GetMaterialisedStateAsync(201, "episode", 1, 1, CancellationToken.None));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public async Task IngestRecommendations_NonPositiveTmdbId_Returns400WithoutCallingIngestor(int tmdbId)
+    {
+        using var db = await NewDbAsync();
+        var ingestor = new Mock<IFavouriteRecommendationIngestor>(MockBehavior.Strict);
+        var ctrl = BuildController(db, Array.Empty<MagnetCandidate>(), recommendationIngestor: ingestor.Object);
+
+        var result = await ctrl.IngestRecommendations(tmdbId, "movie", CancellationToken.None);
+
+        Assert.IsType<BadRequestObjectResult>(result);
+        ingestor.Verify(
+            i => i.IngestForFavouriteAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("person")]
+    [InlineData("tv")]
+    public async Task IngestRecommendations_InvalidType_Returns400WithoutCallingIngestor(string type)
+    {
+        using var db = await NewDbAsync();
+        var ingestor = new Mock<IFavouriteRecommendationIngestor>(MockBehavior.Strict);
+        var ctrl = BuildController(db, Array.Empty<MagnetCandidate>(), recommendationIngestor: ingestor.Object);
+
+        var result = await ctrl.IngestRecommendations(42, type, CancellationToken.None);
+
+        Assert.IsType<BadRequestObjectResult>(result);
+        ingestor.Verify(
+            i => i.IngestForFavouriteAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task IngestRecommendations_ValidMovie_ReturnsOkAndPassesThroughResult()
+    {
+        using var db = await NewDbAsync();
+        var expected = new FavouriteRecommendationResult(42, "movie", Enabled: true, 10, 8, 8, 8, 8, 0);
+        var ingestor = new Mock<IFavouriteRecommendationIngestor>(MockBehavior.Strict);
+        ingestor
+            .Setup(i => i.IngestForFavouriteAsync(42, "movie", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(expected);
+        var ctrl = BuildController(db, Array.Empty<MagnetCandidate>(), recommendationIngestor: ingestor.Object);
+
+        var result = await ctrl.IngestRecommendations(42, "movie", CancellationToken.None);
+
+        var ok = Assert.IsType<OkObjectResult>(result);
+        Assert.Same(expected, ok.Value);
+        ingestor.Verify(i => i.IngestForFavouriteAsync(42, "movie", It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    // Movie/TV parity (AGENTS.md "Movie/TV parity"): the series seed path must
+    // reach the ingestor exactly as the movie path does.
+    [Fact]
+    public async Task IngestRecommendations_ValidSeries_ReturnsOkAndPassesThroughResult()
+    {
+        using var db = await NewDbAsync();
+        var expected = new FavouriteRecommendationResult(200, "series", Enabled: true, 6, 5, 5, 5, 0, 5);
+        var ingestor = new Mock<IFavouriteRecommendationIngestor>(MockBehavior.Strict);
+        ingestor
+            .Setup(i => i.IngestForFavouriteAsync(200, "series", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(expected);
+        var ctrl = BuildController(db, Array.Empty<MagnetCandidate>(), recommendationIngestor: ingestor.Object);
+
+        var result = await ctrl.IngestRecommendations(200, "series", CancellationToken.None);
+
+        var ok = Assert.IsType<OkObjectResult>(result);
+        Assert.Same(expected, ok.Value);
+        ingestor.Verify(i => i.IngestForFavouriteAsync(200, "series", It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Theory]
+    [InlineData("MOVIE", "movie")]
+    [InlineData("  Series  ", "series")]
+    public async Task IngestRecommendations_NormalisesTypeCasingAndWhitespace(string input, string normalised)
+    {
+        using var db = await NewDbAsync();
+        var ingestor = new Mock<IFavouriteRecommendationIngestor>(MockBehavior.Strict);
+        ingestor
+            .Setup(i => i.IngestForFavouriteAsync(42, normalised, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new FavouriteRecommendationResult(42, normalised, Enabled: true, 0, 0, 0, 0, 0, 0));
+        var ctrl = BuildController(db, Array.Empty<MagnetCandidate>(), recommendationIngestor: ingestor.Object);
+
+        var result = await ctrl.IngestRecommendations(42, input, CancellationToken.None);
+
+        Assert.IsType<OkObjectResult>(result);
+        ingestor.Verify(i => i.IngestForFavouriteAsync(42, normalised, It.IsAny<CancellationToken>()), Times.Once);
     }
 }

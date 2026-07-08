@@ -116,6 +116,75 @@ SPECIAL_SERIES = {
     },
 }
 
+# --- Favourite-recommendation fan-out fixtures -------------------------------
+# When a user favourites a title (or the admin Recommendations/Ingest endpoint
+# is hit), the plugin fetches TMDB similar + recommendations for the seed and
+# folds the results into the append-only catalogue under the
+# favourite-recommendation source bit. These ids are HIGH and DISJOINT from the
+# trending/discover fixture ids above so a scenario can attribute a catalogue
+# row to the favourite-recommendation path (source_mask bit) rather than the
+# periodic discovery walk. Keyed by seed tmdb id -> list of list-shaped hits.
+# Any seed not present here falls through to an empty list (the historical
+# default), so existing scenarios that assume empty similar/recommendations are
+# unaffected.
+REC_MOVIE_SIMILAR = {
+    99000001: [
+        {"id": 99000101, "title": "Phantom Rec Movie Similar One", "release_date": "2023-01-10",
+         "overview": "Similar-to-Alpha one.", "poster_path": "/rec-m101.jpg",
+         "backdrop_path": "/rec-m101-bd.jpg", "vote_average": 7.1, "vote_count": 30,
+         "original_title": "Phantom Rec Movie Similar One", "genre_ids": [28]},
+        {"id": 99000102, "title": "Phantom Rec Movie Similar Two", "release_date": "2023-02-10",
+         "overview": "Similar-to-Alpha two.", "poster_path": "/rec-m102.jpg",
+         "backdrop_path": "/rec-m102-bd.jpg", "vote_average": 6.9, "vote_count": 25,
+         "original_title": "Phantom Rec Movie Similar Two", "genre_ids": [12]},
+    ],
+}
+REC_MOVIE_RECOMMEND = {
+    99000001: [
+        # Overlaps the similar list on 99000102 on purpose: the ingestor must
+        # de-duplicate across the two lists, so the merged distinct set is
+        # {99000101, 99000102, 99000103}.
+        {"id": 99000102, "title": "Phantom Rec Movie Similar Two", "release_date": "2023-02-10",
+         "overview": "Similar-to-Alpha two (dupe).", "poster_path": "/rec-m102.jpg",
+         "backdrop_path": "/rec-m102-bd.jpg", "vote_average": 6.9, "vote_count": 25,
+         "original_title": "Phantom Rec Movie Similar Two", "genre_ids": [12]},
+        {"id": 99000103, "title": "Phantom Rec Movie Recommend One", "release_date": "2023-03-10",
+         "overview": "Recommended-from-Alpha one.", "poster_path": "/rec-m103.jpg",
+         "backdrop_path": "/rec-m103-bd.jpg", "vote_average": 7.4, "vote_count": 55,
+         "original_title": "Phantom Rec Movie Recommend One", "genre_ids": [878]},
+    ],
+}
+REC_SERIES_SIMILAR = {
+    99100001: [
+        {"id": 99100101, "name": "Phantom Rec Series Similar One", "first_air_date": "2023-04-10",
+         "overview": "Similar-to-Delta one.", "poster_path": "/rec-s101.jpg",
+         "backdrop_path": "/rec-s101-bd.jpg", "vote_average": 7.6, "vote_count": 40,
+         "original_name": "Phantom Rec Series Similar One", "genre_ids": [18]},
+        {"id": 99100102, "name": "Phantom Rec Series Similar Two", "first_air_date": "2023-05-10",
+         "overview": "Similar-to-Delta two.", "poster_path": "/rec-s102.jpg",
+         "backdrop_path": "/rec-s102-bd.jpg", "vote_average": 7.0, "vote_count": 22,
+         "original_name": "Phantom Rec Series Similar Two", "genre_ids": [10765]},
+    ],
+}
+REC_SERIES_RECOMMEND = {
+    99100001: [
+        {"id": 99100103, "name": "Phantom Rec Series Recommend One", "first_air_date": "2023-06-10",
+         "overview": "Recommended-from-Delta one.", "poster_path": "/rec-s103.jpg",
+         "backdrop_path": "/rec-s103-bd.jpg", "vote_average": 8.1, "vote_count": 90,
+         "original_name": "Phantom Rec Series Recommend One", "genre_ids": [80]},
+    ],
+}
+
+def _recommendation_hits(kind: str, seed: int, endpoint: str):
+    """Return the seed-specific similar/recommendation list for a favourite
+    fan-out, or [] for any unmapped seed (historical default)."""
+    if kind == "movie":
+        table = REC_MOVIE_SIMILAR if endpoint == "similar" else REC_MOVIE_RECOMMEND
+    else:
+        table = REC_SERIES_SIMILAR if endpoint == "similar" else REC_SERIES_RECOMMEND
+    return table.get(seed, [])
+
+
 ROUTES = {}
 
 def route(path):
@@ -237,11 +306,16 @@ class H(BaseHTTPRequestHandler):
                             return 200, {"imdb_id": f"tt9910000{i+1}"}
                 return 200, {"imdb_id": f"tt9900000{tid % 10}"}
             except ValueError: pass
-        # Movie/Series similar/recommendations -> empty
+        # Movie/Series similar/recommendations
         if len(parts) == 4 and parts[0] == "3" and parts[3] in ("similar", "recommendations", "images"):
             if parts[3] == "images":
                 return 200, {"posters": [], "backdrops": [], "logos": []}
-            return 200, {"page": 1, "results": [], "total_pages": 1, "total_results": 0}
+            try:
+                seed = int(parts[2])
+            except ValueError:
+                seed = None
+            results = _recommendation_hits(parts[1], seed, parts[3]) if seed is not None else []
+            return 200, {"page": 1, "results": results, "total_pages": 1, "total_results": len(results)}
         return 404, {"status_code": 34, "status_message": f"mock has no route for {path}"}
 
 def main():

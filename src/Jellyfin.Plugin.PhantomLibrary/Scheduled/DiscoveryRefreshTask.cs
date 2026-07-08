@@ -211,17 +211,17 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
         progress.Report(45);
 
         // --- Phase 3: favourite-similar enrichment --------------------------
-        // TODO(stage-future): wire favourite-similar enrichment per plan §3.1.
-        // Needs IUserManager + ILibraryManager.GetItemList(IsFavorite=true,
-        // user=...) joined against ProviderIds["Tmdb"], then
-        // SimilarMoviesAsync / SimilarSeriesAsync per favourited id, with
-        // the results upserted into discovery_cache. Deferred for v0.3.0:
-        // TMDB Discover now supplies the bulk catalogue surface, and wiring
-        // the ILibraryManager / favourite query without producing BaseItem-load
-        // churn deserves its own design pass. To re-enable, inject IUserManager
-        // + ILibraryManager here and walk users → favourites →
-        // SimilarMoviesAsync/SimilarSeriesAsync
-        // → UpsertDiscoveryCacheAsync.
+        // Favourite → TMDB similar/recommendations ingestion is NOT driven from
+        // this periodic task. It is event-driven: UserDataSavedListener reacts to
+        // a user favouriting a movie/series and calls
+        // IFavouriteRecommendationIngestor, which fans out via
+        // CachedTmdbReader.SimilarMoviesAsync / MovieRecommendationsAsync (and the
+        // series equivalents) and upserts the hits into the append-only catalogue
+        // under SourceFavouriteRecommendation. That reacts to the actual favourite
+        // signal at the moment it happens rather than re-scanning every user's
+        // favourites on a timer, and reuses the same 24h similar/recommendations
+        // cache this task's trending/discover phases populate. See
+        // FavouriteRecommendationIngestor and REQ-M14-RECOMMENDATIONS.
 
         progress.Report(50);
 
@@ -370,7 +370,7 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
         var rows = new List<TmdbMetadataRow>(hits.Count);
         foreach (var hit in hits)
         {
-            var row = MapSearchHitToMetadata(hit, type);
+            var row = TmdbHitMapper.MapSearchHitToMetadata(hit, type);
             if (string.IsNullOrWhiteSpace(row.Title))
             {
                 _logger.LogDebug("Skipping discovery hit {Type}:{Tmdb} because TMDB returned no title", type, hit.Id);
@@ -381,24 +381,6 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
         }
 
         return await _db.UpsertCatalogueHitsAsync(rows, sourceMask, DateTimeOffset.UtcNow, ct).ConfigureAwait(false);
-    }
-
-    private static TmdbMetadataRow MapSearchHitToMetadata(TmdbSearchHit hit, string type)
-    {
-        var title = !string.IsNullOrWhiteSpace(hit.Title) ? hit.Title! : (hit.OriginalTitle ?? string.Empty);
-        return new TmdbMetadataRow(
-            TmdbId: hit.Id,
-            Type: type,
-            Title: title,
-            Year: ParseYear(hit.ReleaseDate),
-            Overview: hit.Overview,
-            PosterUrl: BuildImageUrl(hit.PosterPath),
-            BackdropUrl: BuildImageUrl(hit.BackdropPath),
-            Genres: null,
-            OfficialRating: null,
-            CommunityRating: hit.VoteAverage,
-            OriginalTitle: hit.OriginalTitle,
-            FetchedAt: DateTimeOffset.UtcNow);
     }
 
     private async Task WarmMetadataAsync(int tmdb, string type, string? language, CancellationToken ct)
@@ -416,10 +398,10 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
                 Type: "movie",
                 Title: !string.IsNullOrWhiteSpace(details.Title) ? details.Title!
                        : (details.OriginalTitle ?? string.Empty),
-                Year: ParseYear(details.ReleaseDate),
+                Year: TmdbHitMapper.ParseYear(details.ReleaseDate),
                 Overview: details.Overview,
-                PosterUrl: BuildImageUrl(details.PosterPath),
-                BackdropUrl: BuildImageUrl(details.BackdropPath),
+                PosterUrl: TmdbHitMapper.BuildImageUrl(details.PosterPath),
+                BackdropUrl: TmdbHitMapper.BuildImageUrl(details.BackdropPath),
                 Genres: details.Genres is { Length: > 0 } ? details.Genres : null,
                 OfficialRating: null, // TMDB /movie/{id} does not expose certifications without /release_dates.
                 CommunityRating: details.VoteAverage,
@@ -446,10 +428,10 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
                 TmdbId: details.Id,
                 Type: "series",
                 Title: !string.IsNullOrWhiteSpace(details.Name) ? details.Name : (details.OriginalName ?? string.Empty),
-                Year: ParseYear(details.FirstAirDate),
+                Year: TmdbHitMapper.ParseYear(details.FirstAirDate),
                 Overview: details.Overview,
-                PosterUrl: BuildImageUrl(details.PosterPath),
-                BackdropUrl: BuildImageUrl(details.BackdropPath),
+                PosterUrl: TmdbHitMapper.BuildImageUrl(details.PosterPath),
+                BackdropUrl: TmdbHitMapper.BuildImageUrl(details.BackdropPath),
                 Genres: details.Genres is { Length: > 0 } ? details.Genres : null,
                 OfficialRating: null,
                 CommunityRating: details.VoteAverage,
@@ -469,35 +451,5 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
     private static string? NormaliseLanguage(string? raw)
     {
         return string.IsNullOrWhiteSpace(raw) ? null : raw;
-    }
-
-    private static int? ParseYear(string? releaseDate)
-    {
-        if (string.IsNullOrWhiteSpace(releaseDate) || releaseDate.Length < 4)
-        {
-            return null;
-        }
-
-        if (int.TryParse(releaseDate.AsSpan(0, 4), NumberStyles.Integer, CultureInfo.InvariantCulture, out var y))
-        {
-            return y;
-        }
-
-        return null;
-    }
-
-    private static string? BuildImageUrl(string? path)
-    {
-        if (string.IsNullOrWhiteSpace(path))
-        {
-            return null;
-        }
-
-        // TMDB CDN convention; w500 is the standard size used by the
-        // Jellyfin TMDB metadata provider for posters / backdrops. We
-        // bypass /configuration since the URL is stable in practice;
-        // the CachedTmdbReader path already absorbs the API calls.
-        var prefixed = path.StartsWith('/') ? path : "/" + path;
-        return "https://image.tmdb.org/t/p/w500" + prefixed;
     }
 }

@@ -99,6 +99,11 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         // channel + suggestions code).
         serviceCollection.AddSingleton<CachedTmdbReader>();
 
+        // Favourite → TMDB similar/recommendations catalogue ingestor.
+        // Event-driven (UserDataSavedListener) + admin-triggerable
+        // (PhantomLibraryController). Reuses CachedTmdbReader's 24h cache.
+        serviceCollection.AddSingleton<IFavouriteRecommendationIngestor, FavouriteRecommendationIngestor>();
+
         // SplashSourceProvider — lazily extracts the embedded splash.mp4
         // on first CreateMediaSource() call (synchronous, idempotent),
         // so it's on disk before any channel emits a MediaSourceInfo

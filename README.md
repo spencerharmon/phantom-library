@@ -153,6 +153,13 @@ for the full list. Highlights:
   per-user via a toggle in user preferences)
 - **Materialisation concurrency** (global + per-indexer caps)
 - **Series autopilot** (enabled, prefetch window, minimum available/materialised episodes before showing a series; default 1)
+- **Favourite recommendations** (enabled by default; max titles per
+  favourite, default 40) — favouriting a movie or series fans it out to
+  its TMDB *similar* + *recommendations* and folds the results into the
+  catalogue, so the library grows toward each user's demonstrated taste.
+  Episode favourites seed from the parent series. Admins can trigger the
+  same ingest manually via `POST
+  /Plugins/PhantomLibrary/Recommendations/Ingest?tmdbId=&type=movie|series`.
 - **Eager pre-resolve** (background indexer queries on Phantom items
   before user clicks)
 
