@@ -69,6 +69,10 @@ fixed before handoff.
 | REQ-M14-SEARCH-GATING | Native remote-search availability gating must be evaluated against channel-only availability gating. | EVALUATE | Written evaluation + operator disposition. |
 | REQ-M14-SPLASH | Splash/fake-button/dynamic overlay remnants must be evaluated after native-open refactor and either removed, repurposed, or operator-approved as historical. | EVALUATE | Written evaluation + code/UI cleanup if still exposed. |
 
+Evidence audit for the already-IMPLEMENT rows above (REQ-M14-SOURCE-API, REQ-M14-SOURCE-UI,
+REQ-M14-FAV-MATERIALISE) with cited `file:line` tests/code lives in
+`docs/plans/m14-ledger-evidence-audit.md`; see it before treating any of those three rows as done.
+
 ### M14 source-management implementation contract
 
 Source-management work must use the current channel architecture and stable
@@ -271,7 +275,9 @@ contributors can see the rationale.
 3. **TV series scope.** Series support is an MVP requirement. Current M14
    channel flow supports series → season → episode browse, episode
    materialise-on-play, and next-episode autopilot after completed playback.
-   Movie sequel autopilot and favourite-triggered prewarming are deferred.
+   Movie sequel autopilot remains deferred; favourite-triggered materialisation/
+   prewarming is implemented (see REQ-M14-FAV-MATERIALISE, evidence cited in
+   `docs/plans/m14-ledger-evidence-audit.md`).
 4. **Library scope and metadata ownership.** The plugin's library and the
    play / favourite system are explicitly decoupled. Virtual items appear
    inline with materialised items in normal Jellyfin views; users do not
@@ -448,15 +454,16 @@ Jellyfin library scanner/CollectionFolder binding for phantom channel items.
 Transitions are driven by:
 
 - **User actions** — attempting to play via native-open source, manual
-  materialise actions, watching, and un-favouriting/eviction interactions.
-  Favourite-to-materialise is not wired in the current M14 slice.
+  materialise actions, watching, favouriting (triggers materialisation/prewarm
+  per REQ-M14-FAV-MATERIALISE), and un-favouriting/eviction interactions.
 - **Discovery / availability surfaces** — Discover and trending populate
   catalogue rows; the availability worker probes sources before making
   unmaterialised phantoms visible. Similar/recommendation ingestion remains
   deferred.
 - **Series autopilot** — when a user completes an episode, the next episode
   can be queued/materialised according to server-wide autopilot settings.
-  Movie sequel autopilot and favourite-triggered materialisation are deferred.
+  Movie sequel autopilot remains deferred; favourite-triggered materialisation
+  is implemented (REQ-M14-FAV-MATERIALISE).
 - **gostream sync engine** — continues to pre-populate trending content
   independently of the plugin. The plugin's eviction sweeper does not
   remove items it does not own; sync-engine stubs are gostream's
