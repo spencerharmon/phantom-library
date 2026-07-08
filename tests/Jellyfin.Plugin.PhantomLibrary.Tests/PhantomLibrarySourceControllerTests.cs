@@ -91,6 +91,28 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
         await db.SetImdbIdAsync(tmdb, "movie", imdb, CancellationToken.None);
     }
 
+    // Series metadata is looked up under type "series" even though the
+    // channel/source-manager external id kind is "episode" — episodes
+    // resolve IMDb/metadata via their parent series (movie/TV parity for
+    // RejectCurrent: see AGENTS.md "Movie/TV parity").
+    private async Task SeedSeriesAsync(PhantomDb db, int tmdb, string? imdb = "tt0000099")
+    {
+        await db.UpsertTmdbMetadataAsync(new TmdbMetadataRow(
+            TmdbId: tmdb,
+            Type: "series",
+            Title: "Test Show",
+            Year: 2020,
+            Overview: null,
+            PosterUrl: null,
+            BackdropUrl: null,
+            Genres: null,
+            OfficialRating: null,
+            CommunityRating: null,
+            OriginalTitle: null,
+            FetchedAt: DateTimeOffset.UtcNow), CancellationToken.None);
+        await db.SetImdbIdAsync(tmdb, "series", imdb, CancellationToken.None);
+    }
+
     private static MagnetCandidate Candidate(string label, int seeders = 100)
         => new(
             "magnet:?xt=urn:btih:" + label,
@@ -99,11 +121,21 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
             seeders,
             "fake");
 
-    private async Task CacheCurrentAsync(PhantomDb db, int tmdb, MagnetCandidate current, string stubPath = "/stub/current.mkv", string fusePath = "/fuse/current.mkv")
+    private async Task CacheCurrentAsync(
+        PhantomDb db,
+        int tmdb,
+        MagnetCandidate current,
+        string stubPath = "/stub/current.mkv",
+        string fusePath = "/fuse/current.mkv",
+        string type = "movie",
+        int? season = null,
+        int? episode = null,
+        string imdb = "tt0000042")
     {
-        await db.InsertMaterialisedStateAsync(tmdb, "movie", -1, -1, stubPath, fusePath, CancellationToken.None);
+        var (sSentinel, eSentinel) = ChannelItemId.ToSentinels(season, episode);
+        await db.InsertMaterialisedStateAsync(tmdb, type, sSentinel, eSentinel, stubPath, fusePath, CancellationToken.None);
         await db.PutCachedMagnetAsync(
-            new MagnetCacheKey(tmdb, "tt0000042", "movie", null, null, "test"),
+            new MagnetCacheKey(tmdb, imdb, type, season, episode, "test"),
             new MagnetCacheEntry
             {
                 Magnet = current.Magnet,
@@ -378,5 +410,210 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
         Assert.IsType<UnprocessableEntityObjectResult>(result);
         gostream.Verify(g => g.RemoveAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
         Assert.NotNull(await db.GetMaterialisedStateAsync(43, "movie", -1, -1, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task RejectCurrent_BadExternalId_Returns404()
+    {
+        using var db = await NewDbAsync();
+        var ctrl = BuildController(db, Array.Empty<MagnetCandidate>());
+
+        var result = await ctrl.RejectCurrent("not-a-channel-id", CancellationToken.None);
+
+        var notFound = Assert.IsType<NotFoundObjectResult>(result);
+        var payload = Assert.IsType<PhantomSourceOperationResult>(notFound.Value);
+        Assert.Equal(PhantomSourceOperationStatus.NotFound, payload.Status);
+    }
+
+    [Fact]
+    public async Task RejectCurrent_NextCandidateExists_MaterialisesNextRankedCandidate()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 42);
+        var current = Candidate("CURRENT", 100);
+        var alt = Candidate("ALT", 50);
+        await CacheCurrentAsync(db, 42, current, "/stub/current.mkv", "/fuse/current.mkv");
+        var altFuse = Path.Combine(_fuseRoot, "alt.mkv");
+        File.WriteAllText(altFuse, "x");
+        GostreamAddRequest? captured = null;
+        var gostream = new Mock<IGostreamClient>(MockBehavior.Loose);
+        gostream.Setup(g => g.RemoveAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        gostream.Setup(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()))
+            .Returns<GostreamAddRequest, CancellationToken>((req, _) =>
+            {
+                captured = req;
+                return Task.FromResult(new GostreamAddResult
+                {
+                    StubPath = "/stub/alt.mkv",
+                    FusePath = altFuse,
+                    Hash = alt.InfoHash,
+                    Size = alt.Size,
+                });
+            });
+        var ctrl = BuildController(db, new[] { current, alt }, gostream);
+
+        var result = await ctrl.RejectCurrent("movie_42", CancellationToken.None);
+
+        var ok = Assert.IsType<OkObjectResult>(result);
+        var payload = Assert.IsType<PhantomSourceOperationResult>(ok.Value);
+        Assert.Equal(PhantomSourceOperationStatus.Success, payload.Status);
+        Assert.NotNull(captured);
+        Assert.Equal(alt.Magnet, captured!.Magnet);
+
+        // Old source: rejected (magnet_failure_cache) and its materialised_state
+        // removed; gostream remove called exactly once for the old (unshared) stub.
+        var failure = await db.GetMagnetFailureAsync(
+            new MagnetFailureKey(42, "tt0000042", "movie", null, null, "test", current.Magnet),
+            CancellationToken.None);
+        Assert.NotNull(failure);
+        Assert.Equal("operator_rejected", failure!.Reason);
+        gostream.Verify(g => g.RemoveAsync("/stub/current.mkv", It.IsAny<CancellationToken>()), Times.Once);
+
+        // New source: the next ranked non-rejected candidate is now materialised.
+        var row = await db.GetMaterialisedStateAsync(42, "movie", -1, -1, CancellationToken.None);
+        Assert.NotNull(row);
+        Assert.Equal("/stub/alt.mkv", row!.StubPath);
+    }
+
+    [Fact]
+    public async Task RejectCurrent_SkipsPreviouslyRejectedCandidate_MaterialisesNextNonRejected()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 42);
+        var current = Candidate("CURRENT", 100);
+        var alreadyRejected = Candidate("ALT1-PREREJECTED", 80);
+        var clean = Candidate("ALT2-CLEAN", 50);
+        await CacheCurrentAsync(db, 42, current, "/stub/current.mkv", "/fuse/current.mkv");
+
+        // ALT1 was rejected in a previous RejectCurrent call; its retry window
+        // has not elapsed, so it must be skipped in favour of ALT2 even though
+        // ALT1 outranks ALT2 on raw seeders.
+        var now = DateTimeOffset.UtcNow;
+        await db.MarkMagnetFailedAsync(
+            new MagnetFailureKey(42, "tt0000042", "movie", null, null, "test", alreadyRejected.Magnet),
+            new MagnetFailureEntry
+            {
+                InfoHash = alreadyRejected.InfoHash,
+                Reason = "operator_rejected",
+                FailedAt = now,
+                RetryAfter = now.AddDays(3650),
+            },
+            CancellationToken.None);
+
+        var cleanFuse = Path.Combine(_fuseRoot, "clean.mkv");
+        File.WriteAllText(cleanFuse, "x");
+        GostreamAddRequest? captured = null;
+        var gostream = new Mock<IGostreamClient>(MockBehavior.Loose);
+        gostream.Setup(g => g.RemoveAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        gostream.Setup(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()))
+            .Returns<GostreamAddRequest, CancellationToken>((req, _) =>
+            {
+                captured = req;
+                return Task.FromResult(new GostreamAddResult
+                {
+                    StubPath = "/stub/clean.mkv",
+                    FusePath = cleanFuse,
+                    Hash = clean.InfoHash,
+                    Size = clean.Size,
+                });
+            });
+        var ctrl = BuildController(db, new[] { current, alreadyRejected, clean }, gostream);
+
+        var result = await ctrl.RejectCurrent("movie_42", CancellationToken.None);
+
+        var ok = Assert.IsType<OkObjectResult>(result);
+        var payload = Assert.IsType<PhantomSourceOperationResult>(ok.Value);
+        Assert.Equal(PhantomSourceOperationStatus.Success, payload.Status);
+        Assert.NotNull(captured);
+        Assert.Equal(clean.Magnet, captured!.Magnet);
+        Assert.NotEqual(alreadyRejected.Magnet, captured.Magnet);
+    }
+
+    [Fact]
+    public async Task RejectCurrent_Episode_NextCandidateExists_MaterialisesNextRankedCandidate()
+    {
+        // Movie/TV parity for the reject -> reselect flow (AGENTS.md "Movie/TV
+        // parity"): the movie-only tests above must not be the sole coverage.
+        using var db = await NewDbAsync();
+        await SeedSeriesAsync(db, 200);
+        var current = Candidate("EP-CURRENT", 100);
+        var alt = Candidate("EP-ALT", 50);
+        await CacheCurrentAsync(
+            db, 200, current, "/stub/ep-current.mkv", "/fuse/ep-current.mkv",
+            type: "episode", season: 1, episode: 1, imdb: "tt0000099");
+        var altFuse = Path.Combine(_fuseRoot, "ep-alt.mkv");
+        File.WriteAllText(altFuse, "x");
+        GostreamAddRequest? captured = null;
+        var gostream = new Mock<IGostreamClient>(MockBehavior.Loose);
+        gostream.Setup(g => g.RemoveAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        gostream.Setup(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()))
+            .Returns<GostreamAddRequest, CancellationToken>((req, _) =>
+            {
+                captured = req;
+                return Task.FromResult(new GostreamAddResult
+                {
+                    StubPath = "/stub/ep-alt.mkv",
+                    FusePath = altFuse,
+                    Hash = alt.InfoHash,
+                    Size = alt.Size,
+                });
+            });
+        var ctrl = BuildController(db, new[] { current, alt }, gostream);
+
+        var result = await ctrl.RejectCurrent("episode_200_s01e01", CancellationToken.None);
+
+        var ok = Assert.IsType<OkObjectResult>(result);
+        var payload = Assert.IsType<PhantomSourceOperationResult>(ok.Value);
+        Assert.Equal(PhantomSourceOperationStatus.Success, payload.Status);
+        Assert.NotNull(captured);
+        Assert.Equal(alt.Magnet, captured!.Magnet);
+        Assert.Equal(1, captured.Season);
+        Assert.Equal(1, captured.Episode);
+
+        gostream.Verify(g => g.RemoveAsync("/stub/ep-current.mkv", It.IsAny<CancellationToken>()), Times.Once);
+        var row = await db.GetMaterialisedStateAsync(200, "episode", 1, 1, CancellationToken.None);
+        Assert.NotNull(row);
+        Assert.Equal("/stub/ep-alt.mkv", row!.StubPath);
+    }
+
+    [Fact]
+    public async Task RejectCurrent_Episode_SharedSource_DoesNotRemoveGostreamStub()
+    {
+        // Movie/TV parity for the most safety-critical property: a gostream
+        // hash still referenced by another materialised row must never be
+        // removed, for episodes exactly as for movies.
+        using var db = await NewDbAsync();
+        await SeedSeriesAsync(db, 200);
+        await SeedSeriesAsync(db, 201);
+        var current = Candidate("EP-SHARED", 100);
+        await CacheCurrentAsync(
+            db, 200, current, "/stub/ep-shared.mkv", "/fuse/ep-a.mkv",
+            type: "episode", season: 1, episode: 1, imdb: "tt0000099");
+        await db.InsertMaterialisedStateAsync(201, "episode", 1, 1, "/stub/ep-other.mkv", "/fuse/ep-b.mkv", CancellationToken.None);
+        await db.PutCachedMagnetAsync(
+            new MagnetCacheKey(201, "tt0000099", "episode", 1, 1, "test"),
+            new MagnetCacheEntry
+            {
+                Magnet = "magnet:?xt=urn:btih:OTHER-EP",
+                InfoHash = current.InfoHash,
+                Size = current.Size,
+                Seeders = current.Seeders,
+                Indexer = current.Indexer,
+                CachedAt = DateTimeOffset.UtcNow,
+                Ttl = TimeSpan.FromDays(7),
+                Source = "user",
+            },
+            CancellationToken.None);
+        var gostream = new Mock<IGostreamClient>(MockBehavior.Loose);
+        var ctrl = BuildController(db, new[] { current }, gostream);
+
+        var result = await ctrl.RejectCurrent("episode_200_s01e01", CancellationToken.None);
+
+        Assert.IsType<UnprocessableEntityObjectResult>(result);
+        gostream.Verify(g => g.RemoveAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        Assert.NotNull(await db.GetMaterialisedStateAsync(201, "episode", 1, 1, CancellationToken.None));
     }
 }
