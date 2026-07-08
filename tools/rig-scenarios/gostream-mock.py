@@ -81,7 +81,15 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         return self.rfile.read(length) if length else b""
 
+    def _send_no_content(self) -> None:
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_POST(self):
+        if self.path == "/api/library/remove":
+            self._handle_remove()
+            return
         if self.path != "/api/library/add":
             self._send_json(404, {"error": "not found"})
             log(f"POST {self.path} -> 404")
@@ -123,6 +131,46 @@ class Handler(BaseHTTPRequestHandler):
         }
         self._send_json(200, resp)
         log(f"POST /api/library/add body={body!r} tmdb={tmdb} title={title!r} -> 200 real={fuse} response_fuse={response_fuse}")
+
+    def _handle_remove(self):
+        # Mirrors gostream POST /api/library/remove: deletes the stub and the
+        # real backing file it points at, returning 204. A missing stub yields
+        # 404 (GostreamClient treats that as "already gone"). This makes the
+        # source-safety rig able to assert *actual* removal vs preservation:
+        # PhantomSourceManager only calls this when no other materialised item
+        # still references the source, so a preserved file proves the
+        # shared-hash guard fired.
+        body = json.loads(self._read_body() or b"{}")
+        lower = {str(k).lower(): v for k, v in body.items()}
+        stub_path = lower.get("stub_path")
+        if not stub_path:
+            self._send_json(400, {"error": "stub_path required"})
+            log("POST /api/library/remove -> 400 (missing stub_path)")
+            return
+        stub = Path(str(stub_path))
+        if not stub.exists():
+            self._send_json(404, {"error": "not found"})
+            log(f"POST /api/library/remove stub={stub_path} -> 404 (absent)")
+            return
+        fuse_txt = ""
+        try:
+            fuse_txt = stub.read_text().strip()
+        except OSError:
+            fuse_txt = ""
+        removed = []
+        try:
+            stub.unlink()
+            removed.append(str(stub))
+        except FileNotFoundError:
+            pass
+        if fuse_txt:
+            try:
+                Path(fuse_txt).unlink()
+                removed.append(fuse_txt)
+            except FileNotFoundError:
+                pass
+        self._send_no_content()
+        log(f"POST /api/library/remove stub={stub_path} -> 204 removed={removed}")
 
 
 def main() -> None:
