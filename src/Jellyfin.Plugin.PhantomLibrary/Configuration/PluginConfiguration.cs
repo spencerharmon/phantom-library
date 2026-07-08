@@ -41,6 +41,9 @@ public class PluginConfiguration : BasePluginConfiguration
         EvictionScheduleCron = "0 4 * * *";
         ProtectFavourites = true;
 
+        VaultModeEnabled = true;
+        VaultPrestagePriority = 50;
+
         MaterialisationConcurrencyGlobal = 4;
         MaterialisationConcurrencyPerIndexer = 2;
 
@@ -175,6 +178,27 @@ public class PluginConfiguration : BasePluginConfiguration
     /// Defaults to true (Stage 6.1).
     /// </summary>
     public bool ProtectFavourites { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether Vault Mode prestaging is
+    /// active. When true (default) and the gostream server exposes the
+    /// Vault Mode endpoints, favouriting a materialised movie/episode asks
+    /// gostream to keep its bytes resident (prestage); de-favouriting or
+    /// evicting releases that footprint (unprestage). When false, no
+    /// prestage calls are made, but in-flight footprints are still released
+    /// on de-favourite/eviction so turning the flag off drains cleanly.
+    /// If the gostream server has no Vault Mode endpoints this flag has no
+    /// effect regardless of value.
+    /// </summary>
+    public bool VaultModeEnabled { get; set; }
+
+    /// <summary>
+    /// Gets or sets the priority forwarded to gostream's
+    /// <c>POST /api/library/prestage</c> when a favourited item is
+    /// prestaged. Higher means gostream should keep it resident more
+    /// aggressively; negatives are clamped to 0. Defaults to 50.
+    /// </summary>
+    public int VaultPrestagePriority { get; set; }
 
     /// <summary>Gets or sets the total concurrent materialisations across all lanes.</summary>
     public int MaterialisationConcurrencyGlobal { get; set; }

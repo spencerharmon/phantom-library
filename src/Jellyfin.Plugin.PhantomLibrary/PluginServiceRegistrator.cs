@@ -82,6 +82,12 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         serviceCollection.AddSingleton<IMaterialisationQueue>(sp => sp.GetRequiredService<MaterialisationQueue>());
         serviceCollection.AddHostedService(sp => sp.GetRequiredService<MaterialisationQueue>());
 
+        // Vault Mode coordinator: bridges favourite/eviction lifecycle to
+        // gostream prestage/unprestage. Consumed by UserDataSavedListener
+        // (favourite → prestage, unfavourite → unprestage) and EvictionSweeper
+        // (evict → unprestage). Best-effort + gated on gostream Vault Mode.
+        serviceCollection.AddSingleton<IVaultManager, VaultManager>();
+
         // Channel-arch listeners. Heavy autopilot logic lands in
         // Stage 5.2; the listeners wired here forward to ISeriesAutopilot
         // and fire-and-forget materialise via IMaterialiser.

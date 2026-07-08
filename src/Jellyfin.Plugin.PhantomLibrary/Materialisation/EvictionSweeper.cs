@@ -46,6 +46,7 @@ public sealed class EvictionSweeper : IHostedService, IDisposable
     private readonly IUserManager _userManager;
     private readonly IUserDataManager _userDataManager;
     private readonly IChannelItemRefreshManager _refreshManager;
+    private readonly IVaultManager _vault;
     private readonly ChannelStateProvider _state;
     private readonly ILogger<EvictionSweeper> _logger;
     private readonly Func<PluginConfiguration> _configProvider;
@@ -60,9 +61,10 @@ public sealed class EvictionSweeper : IHostedService, IDisposable
         IUserManager userManager,
         IUserDataManager userDataManager,
         IChannelItemRefreshManager refreshManager,
+        IVaultManager vault,
         ChannelStateProvider state,
         ILogger<EvictionSweeper> logger)
-        : this(db, gostream, libraryManager, userManager, userDataManager, refreshManager, state, logger,
+        : this(db, gostream, libraryManager, userManager, userDataManager, refreshManager, vault, state, logger,
                () => Plugin.Instance?.Configuration ?? new PluginConfiguration())
     {
     }
@@ -74,6 +76,7 @@ public sealed class EvictionSweeper : IHostedService, IDisposable
         IUserManager userManager,
         IUserDataManager userDataManager,
         IChannelItemRefreshManager refreshManager,
+        IVaultManager vault,
         ChannelStateProvider state,
         ILogger<EvictionSweeper> logger,
         Func<PluginConfiguration> configProvider)
@@ -84,6 +87,7 @@ public sealed class EvictionSweeper : IHostedService, IDisposable
         _userManager = userManager ?? throw new ArgumentNullException(nameof(userManager));
         _userDataManager = userDataManager ?? throw new ArgumentNullException(nameof(userDataManager));
         _refreshManager = refreshManager ?? throw new ArgumentNullException(nameof(refreshManager));
+        _vault = vault ?? throw new ArgumentNullException(nameof(vault));
         _state = state ?? throw new ArgumentNullException(nameof(state));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _configProvider = configProvider ?? throw new ArgumentNullException(nameof(configProvider));
@@ -327,6 +331,13 @@ public sealed class EvictionSweeper : IHostedService, IDisposable
                 skippedYoung++;
                 continue;
             }
+
+            // Release any Vault Mode footprint before removing the stub. Best-
+            // effort and idempotent (gostream swallows 404); done first so the
+            // vault stops keeping bytes we're about to delete resident. A vault
+            // failure must not block eviction, so this never throws (except on
+            // cancellation, which propagates like the rest of the loop).
+            await _vault.UnprestageStubAsync(row.StubPath, ct).ConfigureAwait(false);
 
             try
             {

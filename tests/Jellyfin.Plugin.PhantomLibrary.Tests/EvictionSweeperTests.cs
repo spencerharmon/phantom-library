@@ -80,6 +80,7 @@ public class EvictionSweeperTests : IDisposable
              Mock<IUserManager> userMgr,
              Mock<IUserDataManager> userData,
              Mock<IChannelItemRefreshManager> refresh,
+             Mock<IVaultManager> vault,
              ChannelStateProvider state,
              PluginConfiguration cfg) BuildSut(PhantomDb db, IEnumerable<User>? users = null)
     {
@@ -101,6 +102,16 @@ public class EvictionSweeperTests : IDisposable
                 It.IsAny<ChannelItemRefreshOptions>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
+        var vault = new Mock<IVaultManager>(MockBehavior.Loose);
+        vault.Setup(v => v.UnprestageStubAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        vault.Setup(v => v.UnprestageAsync(
+                It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        vault.Setup(v => v.PrestageAsync(
+                It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
         var state = new ChannelStateProvider(db);
 
         var cfg = new PluginConfiguration
@@ -114,11 +125,11 @@ public class EvictionSweeperTests : IDisposable
         var sut = new EvictionSweeper(
             db, gostream.Object, lib.Object,
             userMgr.Object, userData.Object,
-            refresh.Object, state,
+            refresh.Object, vault.Object, state,
             NullLogger<EvictionSweeper>.Instance,
             () => cfg);
 
-        return (sut, gostream, lib, userMgr, userData, refresh, state, cfg);
+        return (sut, gostream, lib, userMgr, userData, refresh, vault, state, cfg);
     }
 
     private static void SetupExternalIdLookup(Mock<ILibraryManager> lib, string externalId, BaseItem item)
@@ -158,7 +169,7 @@ public class EvictionSweeperTests : IDisposable
         await db.InsertMaterialisedStateAsync(42, "movie", -1, -1, "/stub/a.mkv", "/fuse/a.mkv", CancellationToken.None);
         await BackdateMaterialisedAtAsync(42, "movie", -1, -1, DateTimeOffset.UtcNow.AddDays(-45));
 
-        var (sut, gostream, lib, _, _, refresh, _, _) = BuildSut(db);
+        var (sut, gostream, lib, _, _, refresh, _, _, _) = BuildSut(db);
         var item = MakeChannelMovie(42);
         SetupExternalIdLookup(lib, item.ExternalId, item);
 
@@ -178,7 +189,7 @@ public class EvictionSweeperTests : IDisposable
         using var db = await NewDbAsync();
         await db.InsertMaterialisedStateAsync(43, "movie", -1, -1, "/stub/b.mkv", "/fuse/b.mkv", CancellationToken.None);
 
-        var (sut, gostream, lib, _, userData, _, _, _) = BuildSut(db);
+        var (sut, gostream, lib, _, userData, _, _, _, _) = BuildSut(db);
         var item = MakeChannelMovie(43);
         SetupExternalIdLookup(lib, item.ExternalId, item);
 
@@ -204,7 +215,7 @@ public class EvictionSweeperTests : IDisposable
         await db.InsertMaterialisedStateAsync(44, "movie", -1, -1, "/stub/c.mkv", "/fuse/c.mkv", CancellationToken.None);
         await BackdateMaterialisedAtAsync(44, "movie", -1, -1, DateTimeOffset.UtcNow.AddDays(-90));
 
-        var (sut, gostream, lib, _, userData, refresh, _, _) = BuildSut(db);
+        var (sut, gostream, lib, _, userData, refresh, _, _, _) = BuildSut(db);
         var item = MakeChannelMovie(44);
         SetupExternalIdLookup(lib, item.ExternalId, item);
 
@@ -230,7 +241,7 @@ public class EvictionSweeperTests : IDisposable
         await db.InsertMaterialisedStateAsync(45, "movie", -1, -1, "/stub/d.mkv", "/fuse/d.mkv", CancellationToken.None);
         await BackdateMaterialisedAtAsync(45, "movie", -1, -1, DateTimeOffset.UtcNow.AddDays(-90));
 
-        var (sut, gostream, lib, _, userData, _, _, _) = BuildSut(db);
+        var (sut, gostream, lib, _, userData, _, _, _, _) = BuildSut(db);
         var item = MakeChannelMovie(45);
         SetupExternalIdLookup(lib, item.ExternalId, item);
 
@@ -254,7 +265,7 @@ public class EvictionSweeperTests : IDisposable
         // Default materialised_at = now → well within the 30-day idle window.
         await db.InsertMaterialisedStateAsync(46, "movie", -1, -1, "/stub/e.mkv", "/fuse/e.mkv", CancellationToken.None);
 
-        var (sut, gostream, lib, _, _, _, _, _) = BuildSut(db);
+        var (sut, gostream, lib, _, _, _, _, _, _) = BuildSut(db);
         var item = MakeChannelMovie(46);
         SetupExternalIdLookup(lib, item.ExternalId, item);
 
@@ -273,7 +284,7 @@ public class EvictionSweeperTests : IDisposable
         await db.InsertMaterialisedStateAsync(47, "movie", -1, -1, "/stub/f.mkv", "/fuse/f.mkv", CancellationToken.None);
         await BackdateMaterialisedAtAsync(47, "movie", -1, -1, DateTimeOffset.UtcNow.AddDays(-60));
 
-        var (sut, gostream, lib, _, _, refresh, _, _) = BuildSut(db);
+        var (sut, gostream, lib, _, _, refresh, _, _, _) = BuildSut(db);
         gostream.Reset();
         gostream.Setup(g => g.RemoveAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new InvalidOperationException("gostream down"));
@@ -298,7 +309,7 @@ public class EvictionSweeperTests : IDisposable
         await db.InsertMaterialisedStateAsync(48, "movie", -1, -1, "/stub/g.mkv", "/fuse/g.mkv", CancellationToken.None);
         await BackdateMaterialisedAtAsync(48, "movie", -1, -1, DateTimeOffset.UtcNow.AddDays(-60));
 
-        var (sut, gostream, lib, _, _, refresh, _, _) = BuildSut(db);
+        var (sut, gostream, lib, _, _, refresh, _, _, _) = BuildSut(db);
         // No SetupExternalIdLookup → default returns null/empty.
         lib.Setup(l => l.GetItemList(It.IsAny<InternalItemsQuery>())).Returns(Array.Empty<BaseItem>());
 
@@ -320,7 +331,7 @@ public class EvictionSweeperTests : IDisposable
         await db.InsertMaterialisedStateAsync(1399, "episode", 1, 2, "/stub/ep.mkv", "/fuse/ep.mkv", CancellationToken.None);
         await BackdateMaterialisedAtAsync(1399, "episode", 1, 2, DateTimeOffset.UtcNow.AddDays(-90));
 
-        var (sut, gostream, lib, _, _, refresh, _, _) = BuildSut(db);
+        var (sut, gostream, lib, _, _, refresh, _, _, _) = BuildSut(db);
         var item = MakeChannelEpisode(1399, 1, 2);
         SetupExternalIdLookup(lib, item.ExternalId, item);
 
@@ -332,5 +343,60 @@ public class EvictionSweeperTests : IDisposable
             ChannelIds.Shows, item.ExternalId,
             It.Is<ChannelItemRefreshOptions>(o => o.ForceUpdate && !o.ForceProbe && o.InvalidateMediaInfoCache),
             It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    // ---- Vault Mode: footprint released before stub removal (movie + episode parity) ----
+
+    [Fact]
+    public async Task IdleMovie_UnprestagesVaultBeforeGostreamRemove()
+    {
+        using var db = await NewDbAsync();
+        await db.InsertMaterialisedStateAsync(50, "movie", -1, -1, "/stub/v.mkv", "/fuse/v.mkv", CancellationToken.None);
+        await BackdateMaterialisedAtAsync(50, "movie", -1, -1, DateTimeOffset.UtcNow.AddDays(-60));
+
+        var (sut, gostream, lib, _, _, _, vault, _, _) = BuildSut(db);
+        var calls = new List<string>();
+        vault.Reset();
+        vault.Setup(v => v.UnprestageStubAsync("/stub/v.mkv", It.IsAny<CancellationToken>()))
+            .Callback(() => calls.Add("unprestage"))
+            .Returns(Task.CompletedTask);
+        gostream.Reset();
+        gostream.Setup(g => g.RemoveAsync("/stub/v.mkv", It.IsAny<CancellationToken>()))
+            .Callback(() => calls.Add("remove"))
+            .Returns(Task.CompletedTask);
+
+        var item = MakeChannelMovie(50);
+        SetupExternalIdLookup(lib, item.ExternalId, item);
+
+        await sut.RunOnceAsync(CancellationToken.None);
+
+        // Vault footprint must be released before the stub is removed from gostream.
+        Assert.Equal(new[] { "unprestage", "remove" }, calls);
+    }
+
+    [Fact]
+    public async Task IdleEpisode_UnprestagesVaultBeforeGostreamRemove()
+    {
+        using var db = await NewDbAsync();
+        await db.InsertMaterialisedStateAsync(1400, "episode", 2, 5, "/stub/vep.mkv", "/fuse/vep.mkv", CancellationToken.None);
+        await BackdateMaterialisedAtAsync(1400, "episode", 2, 5, DateTimeOffset.UtcNow.AddDays(-60));
+
+        var (sut, gostream, lib, _, _, _, vault, _, _) = BuildSut(db);
+        var calls = new List<string>();
+        vault.Reset();
+        vault.Setup(v => v.UnprestageStubAsync("/stub/vep.mkv", It.IsAny<CancellationToken>()))
+            .Callback(() => calls.Add("unprestage"))
+            .Returns(Task.CompletedTask);
+        gostream.Reset();
+        gostream.Setup(g => g.RemoveAsync("/stub/vep.mkv", It.IsAny<CancellationToken>()))
+            .Callback(() => calls.Add("remove"))
+            .Returns(Task.CompletedTask);
+
+        var item = MakeChannelEpisode(1400, 2, 5);
+        SetupExternalIdLookup(lib, item.ExternalId, item);
+
+        await sut.RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal(new[] { "unprestage", "remove" }, calls);
     }
 }

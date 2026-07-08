@@ -123,6 +123,22 @@
                     </fieldset>
 
                     <fieldset class="verticalSection">
+                        <legend>Vault Mode</legend>
+                        <div class="checkboxContainer">
+                            <label>
+                                <input id="VaultModeEnabled" name="VaultModeEnabled" type="checkbox" is="emby-checkbox" />
+                                <span>Prestage favourites</span>
+                            </label>
+                            <div class="fieldDescription">When gostream exposes Vault Mode, favouriting a materialised movie/episode asks gostream to keep its bytes resident; de-favouriting or eviction releases that footprint. No effect if the gostream server has no Vault Mode. Turning this off stops new prestaging but still releases footprint on de-favourite/eviction.</div>
+                        </div>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="VaultPrestagePriority">Prestage priority</label>
+                            <input id="VaultPrestagePriority" name="VaultPrestagePriority" type="number" min="0" is="emby-input" />
+                            <div class="fieldDescription">Priority forwarded to gostream's prestage endpoint. Higher keeps items resident more aggressively. Default 50.</div>
+                        </div>
+                    </fieldset>
+
+                    <fieldset class="verticalSection">
                         <legend>Materialisation</legend>
                         <div class="inputContainer">
                             <label class="inputLabel inputLabelUnfocused" for="MaterialisationConcurrencyGlobal">Global concurrency</label>
@@ -280,6 +296,8 @@
                             document.querySelector('#EvictionIdleDays').value = cfg.EvictionIdleDays;
                             document.querySelector('#EvictionScheduleCron').value = cfg.EvictionScheduleCron || '';
                             document.querySelector('#PhantomRetentionDays').value = cfg.PhantomRetentionDays;
+                            document.querySelector('#VaultModeEnabled').checked = cfg.VaultModeEnabled !== false;
+                            document.querySelector('#VaultPrestagePriority').value = cfg.VaultPrestagePriority ?? 50;
                             document.querySelector('#MaterialisationConcurrencyGlobal').value = cfg.MaterialisationConcurrencyGlobal;
                             document.querySelector('#MaterialisationConcurrencyPerIndexer').value = cfg.MaterialisationConcurrencyPerIndexer;
                             document.querySelector('#EagerResolveEnabled').checked = !!cfg.EagerResolveEnabled;
@@ -327,6 +345,8 @@
                             cfg.EvictionEnabled = document.querySelector('#EvictionEnabled').checked;
                             cfg.EvictionIdleDays = parseInt(document.querySelector('#EvictionIdleDays').value, 10);
                             cfg.EvictionScheduleCron = document.querySelector('#EvictionScheduleCron').value;
+                            cfg.VaultModeEnabled = document.querySelector('#VaultModeEnabled').checked;
+                            cfg.VaultPrestagePriority = Math.max(0, parseInt(document.querySelector('#VaultPrestagePriority').value, 10) || 0);
                             // PhantomRetentionDays remains config-backed for compatibility, but retention is deferred/no-op.
                             // Keep existing value instead of saving a disabled input as an accidental destructive-policy signal.
                             cfg.MaterialisationConcurrencyGlobal = parseInt(document.querySelector('#MaterialisationConcurrencyGlobal').value, 10);

@@ -64,7 +64,7 @@ fixed before handoff.
 | REQ-M14-PER-USER | Per-user preferences/favourite eviction protection/show-hide/source-probing controls must be implemented or re-evaluated with operator after channel refactor. | IMPLEMENT | API/UI/tests for per-user behavior, or operator-approved disposition change. |
 | REQ-M14-RECOMMENDATIONS | Favourite-similar/recommendation ingestion must be re-evaluated after channel refactor; do not silently drop it. | EVALUATE | Written evaluation against current channel surfaces + operator disposition. |
 | REQ-M14-RETENTION | Phantom/catalogue retention must be re-evaluated after schema v11 append-only catalogue design; config must not imply active pruning unless implemented. | EVALUATE | Written evaluation + either implementation/tests or operator-approved no-op/defer. |
-| REQ-M14-VAULT | Vault Mode/prestage/favourite-driven persistence must be re-evaluated against current gostream and eviction model. | EVALUATE | Written evaluation + implementation/tests or operator-approved disposition. |
+| REQ-M14-VAULT | Vault Mode/prestage/favourite-driven persistence must be re-evaluated against current gostream and eviction model. | EVALUATE | Written evaluation + implementation/tests or operator-approved disposition. **MET (implemented):** written evaluation in `docs/plans/m14-ledger-evaluation.md`; `VaultManager` wires favourite→prestage / de-favourite+eviction→unprestage against the current gostream Vault Mode client; tests `VaultManagerTests`, `UserDataSavedListenerTests`, `EvictionSweeperTests`. Live-gostream rig check remains an operator step. |
 | REQ-M14-CONCURRENCY | Per-indexer concurrency cap must be implemented or removed/renamed so config does not overpromise. | EVALUATE | Concurrency tests or config/UI cleanup with operator-approved disposition. |
 | REQ-M14-SEARCH-GATING | Native remote-search availability gating must be evaluated against channel-only availability gating. | EVALUATE | Written evaluation + operator disposition. |
 | REQ-M14-SPLASH | Splash/fake-button/dynamic overlay remnants must be evaluated after native-open refactor and either removed, repurposed, or operator-approved as historical. | EVALUATE | Written evaluation + code/UI cleanup if still exposed. |
@@ -617,10 +617,16 @@ until a real per-user contract is implemented.
    `IChannelItemRefreshManager`. Materialised rows are emitted with real
    FUSE media sources; unmaterialised rows use Jellyfin's native
    `RequiresOpening` media-source flow.
-9. Vault Mode endpoints exist in the client interface, but favourite-driven
-   prestage/persist wiring is deferred in the current M14 slice. Eviction
-   favourite protection is server-wide and prevents removal; it does not yet
-   force full-file gostream persistence.
+9. Vault Mode wiring (REQ-M14-VAULT) is live via `VaultManager`. Favouriting a
+   channel movie/episode materialises then prestages its stub against gostream
+   (`POST /api/library/prestage`) at `VaultPrestagePriority`, keeping the file
+   resident; de-favouriting unprestages it, and the eviction sweeper unprestages
+   before `POST /api/library/remove`. Prestage is gated on the `VaultModeEnabled`
+   admin setting and on the discrete favourite/rating save reasons; unprestage is
+   ungated so disabling Vault Mode drains footprint. All calls are presence-probed
+   and best-effort, so a gostream without Vault Mode endpoints is a clean no-op.
+   Eviction favourite protection remains server-wide and still prevents removal of
+   a favourited materialised row.
 
 ### State persistence
 
