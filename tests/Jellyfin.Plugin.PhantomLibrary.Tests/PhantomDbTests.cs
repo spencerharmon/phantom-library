@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -47,7 +48,7 @@ public class PhantomDbTests : IDisposable
     // ----------------------------------------------------------------
 
     [Fact]
-    public async Task FreshDb_CreatesSchemaV11_WithAllExpectedTables()
+    public async Task FreshDb_CreatesSchemaV12_WithAllExpectedTables()
     {
         using var db = await NewDbAsync();
 
@@ -66,7 +67,7 @@ public class PhantomDbTests : IDisposable
             version = Convert.ToInt32(await v.ExecuteScalarAsync());
         }
 
-        Assert.Equal(11, version);
+        Assert.Equal(12, version);
 
         var expectedTables = new[]
         {
@@ -85,6 +86,9 @@ public class PhantomDbTests : IDisposable
             "magnet_failure_cache",
             "unavailable_marker",
             "plugin_meta",
+            // v12 additive per-user tables (REQ-M14-PER-USER branch B).
+            "user_prefs",
+            "user_hidden_items",
         };
 
         foreach (var tbl in expectedTables)
@@ -102,10 +106,15 @@ public class PhantomDbTests : IDisposable
     [InlineData(7)]
     [InlineData(8)]
     [InlineData(9)]
+    [InlineData(10)]
+    [InlineData(11)]
     public async Task HardRefuse_OldSchemaVersion_ThrowsWithWipePointer(int oldVersion)
     {
         // Pre-create a DB with an older user_version (v5 = pre-channel-arch,
-        // v7/v8 = intermediate channel-arch schemas without tmdb_episode_cache).
+        // v7/v8 = intermediate channel-arch schemas without tmdb_episode_cache,
+        // v10/v11 = pre per-user-schema channel-arch versions). v12 adds the
+        // additive per-user tables but ships no runtime migration, so every
+        // pre-v12 version is still HARD-REFUSED with the wipe pointer.
         var cs = new SqliteConnectionStringBuilder { DataSource = _dbPath, Mode = SqliteOpenMode.ReadWriteCreate }.ToString();
         await using (var conn = new SqliteConnection(cs))
         {
@@ -121,7 +130,7 @@ public class PhantomDbTests : IDisposable
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => db.SetMetaAsync("test", "1", CancellationToken.None));
 
-        Assert.Contains("version 11", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("version 12", ex.Message, StringComparison.Ordinal);
         Assert.Contains("wipe", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -151,6 +160,90 @@ public class PhantomDbTests : IDisposable
         using var db = await NewDbAsync();
         var v = await db.GetMetaAsync("__init__", CancellationToken.None);
         Assert.Equal("1", v);
+    }
+
+    // ----------------------------------------------------------------
+    // v12 per-user schema (REQ-M14-PER-USER branch B) — additive tables
+    // created on a fresh DB. These are schema-shape assertions; the
+    // read/write accessors land with the dependent per-user backend task.
+    // ----------------------------------------------------------------
+
+    [Fact]
+    public async Task FreshDb_UserPrefsTable_HasTogglesKeyedByUserId()
+    {
+        using var db = await NewDbAsync();
+        var cols = await ReadColumnsAsync("user_prefs");
+
+        Assert.Equal(
+            new[] { "allow_eager", "protect_favourites", "show_phantoms", "updated_at", "user_id" },
+            cols.Keys.OrderBy(k => k, StringComparer.Ordinal).ToArray());
+
+        // user_id is the sole primary key (one prefs row per Jellyfin user).
+        Assert.Equal(1, cols["user_id"].Pk);
+        Assert.Equal(0, cols["updated_at"].Pk);
+
+        // The three toggles default ON so an absent explicit choice reads as
+        // enabled, and are NOT NULL. Favourites are intentionally absent —
+        // favourite state comes from Jellyfin UserData, not this table.
+        Assert.Equal("1", cols["protect_favourites"].Default);
+        Assert.Equal("1", cols["show_phantoms"].Default);
+        Assert.Equal("1", cols["allow_eager"].Default);
+        Assert.Equal(1, cols["protect_favourites"].NotNull);
+        Assert.Equal(1, cols["show_phantoms"].NotNull);
+        Assert.Equal(1, cols["allow_eager"].NotNull);
+    }
+
+    [Fact]
+    public async Task FreshDb_UserHiddenItemsTable_HasCompositePrimaryKey()
+    {
+        using var db = await NewDbAsync();
+        var cols = await ReadColumnsAsync("user_hidden_items");
+
+        Assert.Equal(
+            new[] { "hidden_at", "tmdb_id", "type", "user_id" },
+            cols.Keys.OrderBy(k => k, StringComparer.Ordinal).ToArray());
+
+        // Composite PK (user_id, tmdb_id, type): the hidden set is per
+        // (user, catalogue title), so one user hiding a title never collides
+        // with another user's identical hide.
+        Assert.Equal(1, cols["user_id"].Pk);
+        Assert.Equal(2, cols["tmdb_id"].Pk);
+        Assert.Equal(3, cols["type"].Pk);
+        Assert.Equal(0, cols["hidden_at"].Pk);
+    }
+
+    /// <summary>
+    /// Reads <c>PRAGMA table_info</c> for <paramref name="table"/> from a
+    /// read-only connection, returning per-column (NotNull, Default, Pk).
+    /// <c>Pk</c> is the 1-based position of the column within the primary
+    /// key (0 = not part of the PK), matching SQLite's table_info contract.
+    /// </summary>
+    private async Task<Dictionary<string, (int NotNull, string? Default, int Pk)>> ReadColumnsAsync(string table)
+    {
+        var cs = new SqliteConnectionStringBuilder
+        {
+            DataSource = _dbPath,
+            Mode = SqliteOpenMode.ReadOnly,
+        }.ToString();
+        await using var conn = new SqliteConnection(cs);
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        // table is a test-local constant, not user input: PRAGMA does not
+        // accept a bound parameter for the table name.
+        cmd.CommandText = $"PRAGMA table_info({table});";
+        var result = new Dictionary<string, (int, string?, int)>(StringComparer.Ordinal);
+        await using var r = await cmd.ExecuteReaderAsync();
+        while (await r.ReadAsync())
+        {
+            // cid=0, name=1, type=2, notnull=3, dflt_value=4, pk=5
+            var name = r.GetString(1);
+            var notnull = r.GetInt32(3);
+            var dflt = await r.IsDBNullAsync(4) ? null : r.GetValue(4).ToString();
+            var pk = r.GetInt32(5);
+            result[name] = (notnull, dflt, pk);
+        }
+
+        return result;
     }
 
     // ----------------------------------------------------------------

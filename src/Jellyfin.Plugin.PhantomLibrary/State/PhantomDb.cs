@@ -142,7 +142,7 @@ public sealed record TmdbEpisodeRow(
 
 /// <summary>
 /// SQLite-backed persistence for the plugin's private state under the
-/// channel architecture (schema v11). Single writer, serialised via a
+/// channel architecture (schema v12). Single writer, serialised via a
 /// process-wide <see cref="SemaphoreSlim"/>; concurrent readers
 /// permitted via separate short-lived connections.
 ///
@@ -152,14 +152,23 @@ public sealed record TmdbEpisodeRow(
 /// for per-episode display metadata at refresh time; v10 adds
 /// <c>magnet_failure_cache</c> so rejected pack candidates do not
 /// block viable alternatives; v11 adds append-only catalogue and
-/// availability scheduler state). Per
-/// AGENTS.md "No database migrations until v1.0", existing databases
-/// at any pre-v11 user_version are HARD-REFUSED and the operator must
-/// run <c>scripts/phantom-wipe.sh</c> before restart.
+/// availability scheduler state; v12 adds the two <b>additive</b>
+/// per-user preference tables <c>user_prefs</c> (one row per Jellyfin
+/// user carrying the per-user toggles) and <c>user_hidden_items</c>
+/// (a user's per-item hidden set) — the foundation for REQ-M14-PER-USER
+/// (branch B). Favourite state is <b>not</b> stored here; it is read
+/// live from Jellyfin's own <c>UserData</c>. The v12 tables touch no
+/// existing table, but per AGENTS.md "No database migrations until v1.0"
+/// this class still ships no runtime migration: existing databases at
+/// any pre-v12 user_version are HARD-REFUSED and the operator must run
+/// <c>scripts/phantom-wipe.sh</c> before restart. A no-wipe upgrade path
+/// is deliberately out of scope here and tracked separately as
+/// <c>db-migration-script</c>, gated by the project's v1.0 migration
+/// policy; until then, schema evolution means wipe-and-rebuild.
 /// </summary>
 public sealed class PhantomDb : IDisposable
 {
-    private const int CurrentSchemaVersion = 11;
+    private const int CurrentSchemaVersion = 12;
 
     private readonly string _connectionString;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
@@ -256,7 +265,7 @@ public sealed class PhantomDb : IDisposable
                 + $" version {CurrentSchemaVersion}. Downgrade is not supported. Wipe and rebuild.");
         }
 
-        // version == 0: fresh / never-initialised DB. Create the v11 schema.
+        // version == 0: fresh / never-initialised DB. Create the v12 schema.
         using var tx = conn.BeginTransaction();
         using (var cmd = conn.CreateCommand())
         {
@@ -529,6 +538,39 @@ CREATE TABLE IF NOT EXISTS tmdb_episode_cache (
 );
 CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
     ON tmdb_episode_cache(fetched_at);
+
+-- v12 per-user preferences (additive; REQ-M14-PER-USER branch B). One row
+-- per Jellyfin user holding that user's Phantom toggles. Favourites are NOT
+-- stored here — favourite state is read live from Jellyfin's own UserData;
+-- this table only persists the explicit per-user toggle choices. A user with
+-- no row falls back to the code-level defaults (all toggles on); the backend
+-- task interprets an absent row, the schema only persists explicit writes.
+-- protect_favourites / show_phantoms / allow_eager are the three toggles the
+-- (removed, now being revived) per-user admin surface exposed.
+CREATE TABLE IF NOT EXISTS user_prefs (
+    user_id            TEXT NOT NULL PRIMARY KEY,   -- Jellyfin user GUID (canonical string form)
+    protect_favourites INTEGER NOT NULL DEFAULT 1 CHECK(protect_favourites IN (0,1)),
+    show_phantoms      INTEGER NOT NULL DEFAULT 1 CHECK(show_phantoms IN (0,1)),
+    allow_eager        INTEGER NOT NULL DEFAULT 1 CHECK(allow_eager IN (0,1)),
+    updated_at         INTEGER NOT NULL
+);
+
+-- v12 per-user hidden set (additive; REQ-M14-PER-USER branch B, Surface 3).
+-- The set of catalogue titles a specific user has explicitly hidden from
+-- their channel browse. A separate table from user_prefs because it is a
+-- multi-row set per user (0..N hidden titles) rather than a single toggle
+-- row. Keyed (user_id, tmdb_id, type) to match the catalogue's identity;
+-- type is 'movie' or 'series' (hiding is title-level, matching the movie/TV
+-- visibility queries — episodes are not independently hidden).
+CREATE TABLE IF NOT EXISTS user_hidden_items (
+    user_id   TEXT NOT NULL,
+    tmdb_id   INTEGER NOT NULL,
+    type      TEXT NOT NULL CHECK(type IN ('movie','series')),
+    hidden_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, tmdb_id, type)
+);
+CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
+    ON user_hidden_items(user_id);
 ";
 
     // ---- magnet_cache ----

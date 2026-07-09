@@ -31,6 +31,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same ingest manually (REQ-M14-RECOMMENDATIONS).
 - Phantom DB retention remains deferred/no-op and is now labelled that way in the admin UI instead of presenting an active retention policy.
 - Legacy per-user preferences admin page/link is hidden until a real per-user preferences API is reintroduced.
+- BREAKING: requires wipe. Phantom DB schema is now v12, adding two additive
+  per-user tables — `user_prefs` (one row per Jellyfin user holding the
+  `protect_favourites` / `show_phantoms` / `allow_eager` toggles, all defaulting
+  on) and `user_hidden_items` (a user's per-title hidden set, keyed
+  `(user_id, tmdb_id, type)`). This is schema-only groundwork for
+  REQ-M14-PER-USER (branch B); favourite state is not stored here (it stays in
+  Jellyfin's own `UserData`), and the read/write accessors land with the
+  per-user backend change. Although the delta only adds tables, the plugin still
+  ships no runtime migration pre-v1.0: databases at any older schema version are
+  hard-refused, so wipe and rebuild with `scripts/phantom-wipe.sh` before
+  restarting into this build (see `docs/operator-wipe-validation.md`).
 - BREAKING: requires wipe. Phantom DB schema is now v11 to split append-only
   TMDB catalogue discovery from source availability. Discovery no longer prunes
   rows simply because TMDB stops returning them, and channel visibility is gated
