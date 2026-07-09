@@ -31,6 +31,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same ingest manually (REQ-M14-RECOMMENDATIONS).
 - Phantom DB retention remains deferred/no-op and is now labelled that way in the admin UI instead of presenting an active retention policy.
 - Legacy per-user preferences admin page/link is hidden until a real per-user preferences API is reintroduced.
+- Added `scripts/phantom-migrate-v11-to-v12.sh`, an offline operator script that
+  performs the v11 → v12 schema bump in place instead of wiping. Because the v12
+  delta is purely additive (it only creates `user_prefs`, `user_hidden_items`,
+  and `idx_user_hidden_items_user` and touches no existing table), the migrated
+  DB is byte-identical to a fresh v12 build. The script is dry-run by default,
+  requires `--commit` plus a typed `MIGRATE` confirmation, backs the DB up first
+  (with `-wal`/`-shm` sidecars), is `PRAGMA user_version`-guarded (migrates only
+  v11, treats v12 as a verified no-op, hard-refuses any other version and directs
+  the operator to wipe), applies the DDL + version bump in one atomic
+  transaction, verifies the result, and is idempotent/resumable. It mirrors
+  `scripts/phantom-wipe.sh` and must be run with `jellyfin.service` stopped; wipe
+  remains a valid alternative. Regression-tested by
+  `scripts/tests/phantom-migrate-v11-to-v12.test.sh`, wired into the non-rig CI
+  gate; permitted by the additive-only carve-out documented in `AGENTS.md`
+  § "No database migrations until v1.0".
 - BREAKING: requires wipe. Phantom DB schema is now v12, adding two additive
   per-user tables — `user_prefs` (one row per Jellyfin user holding the
   `protect_favourites` / `show_phantoms` / `allow_eager` toggles, all defaulting
@@ -40,8 +55,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Jellyfin's own `UserData`), and the read/write accessors land with the
   per-user backend change. Although the delta only adds tables, the plugin still
   ships no runtime migration pre-v1.0: databases at any older schema version are
-  hard-refused, so wipe and rebuild with `scripts/phantom-wipe.sh` before
-  restarting into this build (see `docs/operator-wipe-validation.md`).
+  hard-refused at startup. Before restarting into this build, either wipe and
+  rebuild with `scripts/phantom-wipe.sh` (see `docs/operator-wipe-validation.md`)
+  or, when upgrading specifically from v11, run the offline
+  `scripts/phantom-migrate-v11-to-v12.sh` (above) to add the tables in place.
 - BREAKING: requires wipe. Phantom DB schema is now v11 to split append-only
   TMDB catalogue discovery from source availability. Discovery no longer prunes
   rows simply because TMDB stops returning them, and channel visibility is gated

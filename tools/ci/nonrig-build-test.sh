@@ -165,6 +165,31 @@ build_and_test() {
     fi
 }
 
+# --- 0. In-repo additive-migration regression (sqlite3 only, no toolchain) --
+# Exercises scripts/phantom-migrate-v11-to-v12.sh against a clone of a
+# synthetic v11 phantom.db: dry-run no-op, --commit migrate, idempotency,
+# resumability, and the user_version guard. Needs only bash + sqlite3, so it
+# runs before the heavy Jellyfin clone/build and fails the gate fast. Skips
+# (green) if sqlite3 is unavailable so it never breaks a node lacking it.
+migration_regression() {
+    local t="$REPO_ROOT/scripts/tests/phantom-migrate-v11-to-v12.test.sh"
+    log "additive-migration regression (phantom-migrate-v11-to-v12)"
+    if [ ! -x "$t" ]; then
+        note "SKIP: $t not present/executable"
+        return 0
+    fi
+    if [ "$DRYRUN" = 1 ]; then
+        note "DRYRUN: bash $t"
+        return 0
+    fi
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        note "SKIP: sqlite3 not available on this node"
+        return 0
+    fi
+    bash "$t"
+}
+
+migration_regression
 restore_jellyfin
 build_and_test
 

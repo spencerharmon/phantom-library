@@ -43,9 +43,14 @@ routing rule here.
 **Pre-v1.0, this project does not ship database migrations.** Not
 for `phantom.db`, not for `jellyfin.db`, not for any persistent
 state the plugin owns. If the schema changes — a new column, a
-new table, a renamed field, a rekeyed primary key, a change to
+renamed field, a rekeyed primary key, a change to
 what any existing column stores — the upgrade path is **wipe and
-rebuild**, not migrate.
+rebuild**, not migrate. The sole softened exception is a **purely
+additive** delta (new tables / indexes only, touching no existing
+table): it MAY *additionally* ship ONE narrow, offline,
+`user_version`-guarded, tested `vN→vM` operator script — see
+*Softened rule* below. Wipe stays valid and remains the default,
+and a runtime / in-plugin migration stays absolutely forbidden.
 
 What "wipe and rebuild" means concretely:
 
@@ -68,9 +73,11 @@ Forbidden patterns under this rule:
   reasons. This rule additionally forbids it for state-evolution
   reasons.)
 - Shipping a bash script in the repo that migrates between two
-  pre-v1.0 schema versions. One-off recovery scripts for a
-  specific botched upgrade are fine (they live in `/tmp/`, not
-  the repo), but no general-purpose migration tooling.
+  pre-v1.0 schema versions — **except** the single additive-only
+  `vN→vM` operator script permitted by *Softened rule* below. A
+  non-additive migration (anything that touches an existing table)
+  stays forbidden in the repo; one-off recovery scripts for a
+  specific botched upgrade still belong in `/tmp/`, not the repo.
 - Adding an `ALTER TABLE` or `ADD COLUMN` branch keyed on a
   detected old schema version. Bump the schema, expect a wipe.
 - Writing code that reads old-format rows and rewrites them on
@@ -93,7 +100,10 @@ What to do instead when you change schema or persistent format:
 5. Add the wipe procedure to the operator handoff at the end of
    the PR message. The operator runs the wipe before installing
    the new plugin DLL.
-6. **Do not** write a migration to bridge between old and new.
+6. **Do not** write a migration to bridge between old and new —
+   unless the delta is *purely additive*, in which case you MAY
+   *additionally* ship the offline `vN→vM` operator script of
+   *Softened rule* below (wipe stays a valid path either way).
 
 Why this rule exists:
 
@@ -117,6 +127,51 @@ Why this rule exists:
   rows from older plugin versions, half-materialised state from
   crashed operations. Migrations preserve all of this, often
   invisibly. Wipes do not.
+
+### Softened rule: additive-only deltas may ship an offline `vN→vM` script
+
+A schema bump whose delta is **purely additive** — it only
+*creates* new tables and/or indexes and touches **no** existing
+table (no `ALTER`, no column change, no re-key, no rewrite of any
+existing row) — MAY, in *addition* to the wipe path above, ship one
+offline operator migration script in the repo. This is a narrow
+carve-out, not a reversal: wipe stays valid and remains the
+default, and the runtime / in-plugin migration ban is untouched —
+`PhantomDb` still hard-refuses an old-versioned DB at startup rather
+than migrating it. Because the delta only *adds* objects, a migrated
+DB is byte-for-byte the schema a fresh `EnsureSchemaAsync` produces,
+so the script carries none of the old-row-rewriting risk that sank
+v0.2.0.0. It is an operator convenience — skip the TMDB
+repopulation tick — never a new obligation.
+
+Every such script MUST:
+
+1. **Be offline and out-of-band** — a standalone script the
+   operator runs with Jellyfin stopped; never an `IHostedService`,
+   startup hook, or anything the plugin invokes.
+2. **Guard on `PRAGMA user_version`** — migrate only vN → vM, treat
+   an already-vM DB as a verified no-op, and **hard-refuse** any
+   other version (directing the operator to wipe) rather than guess.
+3. **Be additive-only in SQL** — only `CREATE TABLE` / `CREATE
+   INDEX` for the new objects, DDL kept **byte-identical** to
+   `PhantomDb`'s schema constant so the result equals a fresh build;
+   no statement may touch an existing table.
+4. **Default to dry-run**, gate writes behind an explicit `--commit`
+   plus a typed confirmation, back the DB up first (with its
+   `-wal`/`-shm` sidecars), and apply the DDL + version bump in one
+   atomic transaction.
+5. **Be idempotent and resumable**, verify the result (version,
+   object presence/shape, new tables empty, existing-table counts
+   unchanged), and report predicted-before / actual-after counts.
+6. **Ship a regression test** that builds a synthetic vN DB, runs
+   the script, and asserts the migrated schema matches a real vM
+   build — wired into the non-rig CI gate.
+7. **Mirror `scripts/phantom-wipe.sh`** in structure and safety
+   posture, and be named `phantom-migrate-vN-to-vM.sh`.
+
+The first instance is `scripts/phantom-migrate-v11-to-v12.sh`: v11
+→ v12 adds `user_prefs`, `user_hidden_items`, and
+`idx_user_hidden_items_user`, and touches no existing table.
 
 **At v1.0**, this rule lifts: real migrations become required
 because the project will then have a stable on-disk format that
