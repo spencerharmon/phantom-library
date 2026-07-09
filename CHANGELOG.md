@@ -67,6 +67,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on season detail pages so the native episode list is populated without
   broadening the Jellyfin patch surface.
 
+### Removed
+
+- Removed the unused gostream Vault Mode client surface
+  (`IGostreamClient.PrestageAsync`/`UnprestageAsync`/`IsVaultModePresentAsync`
+  and their `GostreamClient` implementations/tests). REQ-M14-VAULT was
+  evaluated and the operator dispositioned **DEFER** on 2026-07-09:
+  favourite→materialise plus favourite-protected eviction are the M14
+  persistence answer, and the standalone prestage path had zero `src/`
+  callers. No behavior change for any deployment — nothing called this
+  surface. See `docs/plans/m14-ledger-evaluation.md` REQ-M14-VAULT row.
+
 ### Fixed
 
 - Fixed the admin settings "Enable availability probing" checkbox markup so

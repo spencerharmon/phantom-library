@@ -64,7 +64,7 @@ fixed before handoff.
 | REQ-M14-PER-USER | Per-user preferences/favourite eviction protection/show-hide/source-probing controls must be implemented or re-evaluated with operator after channel refactor. | IMPLEMENT | API/UI/tests for per-user behavior, or operator-approved disposition change. |
 | REQ-M14-RECOMMENDATIONS | Favourite-similar/recommendation ingestion must be re-evaluated after channel refactor; do not silently drop it. | EVALUATE | Written evaluation against current channel surfaces + operator disposition. |
 | REQ-M14-RETENTION | Phantom/catalogue retention must be re-evaluated after schema v11 append-only catalogue design; config must not imply active pruning unless implemented. | EVALUATE | Written evaluation + either implementation/tests or operator-approved no-op/defer. |
-| REQ-M14-VAULT | Vault Mode/prestage/favourite-driven persistence must be re-evaluated against current gostream and eviction model. | EVALUATE | Written evaluation + implementation/tests or operator-approved disposition. |
+| REQ-M14-VAULT | Vault Mode/prestage/favourite-driven persistence must be re-evaluated against current gostream and eviction model. | DEFER (operator 2026-07-09) | Resolved: favourite→materialise (`UserDataSavedListener`) + favourite-protected eviction (`EvictionSweeper`) are the M14 persistence answer; no persist-without-materialise trigger is in scope. See `docs/plans/m14-ledger-evaluation.md` REQ-M14-VAULT row. Dead Vault-Mode client surface (`PrestageAsync`/`UnprestageAsync`/`IsVaultModePresentAsync` on `IGostreamClient`/`GostreamClient`) removed along with its orphaned unit tests; zero `src/` callers existed. |
 | REQ-M14-CONCURRENCY | Per-indexer concurrency cap must be implemented or removed/renamed so config does not overpromise. | EVALUATE | Concurrency tests or config/UI cleanup with operator-approved disposition. |
 | REQ-M14-SEARCH-GATING | Native remote-search availability gating must be evaluated against channel-only availability gating. | EVALUATE | Written evaluation + operator disposition. |
 | REQ-M14-SPLASH | Splash/fake-button/dynamic overlay remnants must be evaluated after native-open refactor and either removed, repurposed, or operator-approved as historical. | EVALUATE | Written evaluation + code/UI cleanup if still exposed. |
@@ -310,9 +310,13 @@ contributors can see the rationale.
    real source to the client.
 8. **Gostream integration.** The plugin talks to gostream through patched
    library-control endpoints: materialisation uses `POST /api/library/add`,
-   eviction uses `POST /api/library/remove`, and Vault Mode/prestage endpoints
-   are optional/deferred. No raw stub writes, no dependency on the JSON stub
-   format, no four-step orchestration.
+   eviction uses `POST /api/library/remove`. Vault Mode/prestage client
+   integration was evaluated (REQ-M14-VAULT) and operator-dispositioned
+   DEFER on 2026-07-09: it had zero `src/` callers and has been removed
+   from `IGostreamClient`/`GostreamClient`; favourite persistence is
+   delivered entirely via materialisation + eviction favourite-protection.
+   No raw stub writes, no dependency on the JSON stub format, no four-step
+   orchestration.
 9. **Auth between plugin and gostream.** Punt. Plugin and gostream are
    assumed reachable on a trusted network (loopback for the common
    single-host case, private LAN otherwise). README documents this; a
@@ -617,10 +621,14 @@ until a real per-user contract is implemented.
    `IChannelItemRefreshManager`. Materialised rows are emitted with real
    FUSE media sources; unmaterialised rows use Jellyfin's native
    `RequiresOpening` media-source flow.
-9. Vault Mode endpoints exist in the client interface, but favourite-driven
-   prestage/persist wiring is deferred in the current M14 slice. Eviction
-   favourite protection is server-wide and prevents removal; it does not yet
-   force full-file gostream persistence.
+9. Vault Mode client integration (`PrestageAsync`/`UnprestageAsync`/
+   `IsVaultModePresentAsync`) had zero `src/` callers and was removed
+   per the operator-dispositioned DEFER on REQ-M14-VAULT (2026-07-09;
+   see `docs/plans/m14-ledger-evaluation.md`). Favourite persistence is
+   delivered by favourite→materialise plus server-wide favourite-protected
+   eviction, which prevents removal of materialised rows; it does not
+   force full-file gostream persistence for unmaterialised titles, and no
+   persist-without-materialise trigger is in M14 scope.
 
 ### State persistence
 
