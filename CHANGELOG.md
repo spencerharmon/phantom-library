@@ -246,6 +246,16 @@ database safety").
 
 ### Added
 
+- **`tools/rig-scenarios/41-discovery-from-empty.sh`** — cold-start
+  synthetic-provenance rig scenario. From an empty `phantom.db` it runs the
+  real `DiscoveryRefresh` walk against the TMDB mock and asserts the catalogue
+  rebuilds to exactly the synthetic fixtures (tmdb-keyed, `source_mask`
+  trending|discover, every id `>= 99000000` so zero operator PII), then that a
+  discovered movie *and* episode surface as tmdb-keyed phantom channel items
+  whose native-open playback still materialises through the gostream mock —
+  proving the scenario-35/36 flow works from a discovered (not hand-seeded)
+  catalogue. Self-contained (builds, `rig-up --reset`, EXIT-trap teardown).
+  See `docs/tasks/discovery-from-empty-scenario.md`.
 - **Channel architecture (M-channel).** Phantom Movies + Phantom
   Shows IChannel implementations replacing the file-on-disk
   stub-symlink layout. Per-channel item discovery, per-item

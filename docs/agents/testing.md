@@ -149,6 +149,16 @@ tools/rig-scenarios/35-channel-e2e-playback.sh
 tools/rig-scenarios/36-channel-episode-e2e-playback.sh
 # TV channel: series → season → episode browse, badge scope,
 # native-open episode materialise, real TV stream, DB sanity.
+
+tools/rig-scenarios/41-discovery-from-empty.sh
+# Cold-start provenance: from an empty phantom.db, run the real
+# DiscoveryRefresh walk against the TMDB mock and assert the catalogue
+# rebuilds to exactly the synthetic fixtures (tmdb-keyed, source_mask
+# trending|discover, zero operator PII), then that the channel surfaces a
+# discovered movie AND episode as tmdb-keyed phantom items whose native-open
+# playback still materialises through gostream (35/36 parity from a
+# discovered — not hand-seeded — catalogue). Self-contained: builds, brings
+# the rig up --reset, and tears it down via an EXIT trap.
 ```
 
 Not every scenario needs a live Jellyfin. The source-management UX is
