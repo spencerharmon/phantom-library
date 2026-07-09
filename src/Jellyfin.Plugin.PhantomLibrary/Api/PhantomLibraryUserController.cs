@@ -2,6 +2,7 @@ using System;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Jellyfin.Plugin.PhantomLibrary.Channels;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
@@ -40,10 +41,12 @@ namespace Jellyfin.Plugin.PhantomLibrary.Api;
 public sealed class PhantomLibraryUserController : ControllerBase
 {
     private readonly PhantomDb _db;
+    private readonly ChannelStateProvider _state;
 
-    public PhantomLibraryUserController(PhantomDb db)
+    public PhantomLibraryUserController(PhantomDb db, ChannelStateProvider state)
     {
         _db = db;
+        _state = state;
     }
 
     /// <summary>Returns the calling user's Phantom preferences (defaults if unset).</summary>
@@ -152,6 +155,7 @@ public sealed class PhantomLibraryUserController : ControllerBase
         }
 
         await _db.AddHiddenItemAsync(userId, tmdbId, canonical, ct).ConfigureAwait(false);
+        BumpChannelDataVersion(canonical);
         return NoContent();
     }
 
@@ -176,8 +180,25 @@ public sealed class PhantomLibraryUserController : ControllerBase
         }
 
         await _db.RemoveHiddenItemAsync(userId, tmdbId, canonical, ct).ConfigureAwait(false);
+        BumpChannelDataVersion(canonical);
         return NoContent();
     }
+
+    /// <summary>
+    /// Bumps the affected channel's <see cref="ChannelStateProvider"/> DataVersion
+    /// after a hide/unhide mutation (REQ-M14-PER-USER Surface 3). Jellyfin's
+    /// per-channel-item cache is keyed on channel + folder + DataVersion (plus,
+    /// as of this task, the requesting user via <c>IHasCacheKey</c> — see
+    /// <see cref="Jellyfin.Plugin.PhantomLibrary.Channels.PhantomMoviesChannel.GetCacheKey"/>)
+    /// and defaults to a 3-hour TTL; without this bump, the hiding user's own
+    /// next browse could still serve their pre-mutation cache entry for up to
+    /// that long. Bumping is channel-wide (every user's cache entry for the
+    /// affected channel is invalidated, not just the caller's) — a deliberate,
+    /// simple tradeoff over a more complex per-user version scheme, acceptable
+    /// at this project's single-operator/small-user-count scale.
+    /// </summary>
+    private void BumpChannelDataVersion(string canonicalType)
+        => _state.BumpDataVersion(canonicalType == "movie" ? ChannelStateProvider.KindMovies : ChannelStateProvider.KindShows);
 
     /// <summary>
     /// Resolves the acting user from the <c>Jellyfin-UserId</c> claim Jellyfin

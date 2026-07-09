@@ -29,9 +29,18 @@ namespace Jellyfin.Plugin.PhantomLibrary.Channels;
 /// (Plan §3.3 + critic round 3 BLOCKER 1.) The id stays the same
 /// across the phantom → materialised transition so UserData
 /// (favourites, watched, playback position) is preserved.
+///
+/// Per-user visibility (REQ-M14-PER-USER Surface 3): <see cref="GetChannelItems"/>
+/// filters the visible catalogue — and any gostream-file variant matching the
+/// same tmdb id — by the querying <see cref="InternalChannelItemQuery.UserId"/>'s
+/// hidden set, so a title a user hides never leaks back in via a real on-disk
+/// file. <see cref="IHasCacheKey"/> partitions Jellyfin's on-disk channel-item
+/// cache per user (it is otherwise channel+folder+DataVersion keyed, not
+/// per-user — see <c>docs/plans/channel-architecture.md</c>), so one user's
+/// filtered result is never served to another.
 /// </summary>
 public sealed class PhantomMoviesChannel
-    : IChannel, ISupportsLatestMedia, IChannelItemRefresh, ISupportsMediaProbe
+    : IChannel, ISupportsLatestMedia, IChannelItemRefresh, ISupportsMediaProbe, IHasCacheKey
 {
     private readonly PhantomDb _db;
     private readonly GostreamFilesystemEnumerator _enumerator;
@@ -65,6 +74,19 @@ public sealed class PhantomMoviesChannel
 
     /// <inheritdoc />
     public string DataVersion => _state.DataVersion(ChannelStateProvider.KindMovies) + ":fs:" + _enumerator.MoviesVersion();
+
+    /// <summary>
+    /// Partitions Jellyfin's on-disk channel-item cache
+    /// (<c>ChannelManager.GetChannelDataCachePath</c>) by requesting user, on
+    /// top of the existing <see cref="DataVersion"/> partition. Required for
+    /// per-user visibility (REQ-M14-PER-USER Surface 3): that cache is keyed by
+    /// channel + folder + <see cref="DataVersion"/> only, with no user
+    /// component unless the channel implements this interface — so without it,
+    /// one user's hidden-filtered browse result would be served verbatim to the
+    /// next user who happens to hit the same folder before the cache entry
+    /// expires (eval Surface 3's "cache cross-contamination" risk).
+    /// </summary>
+    public string? GetCacheKey(string? userId) => userId;
 
     /// <inheritdoc />
     public string HomePageUrl => string.Empty;
@@ -142,8 +164,14 @@ public sealed class PhantomMoviesChannel
 
         // --- 1. Visible catalogue movies. Materialised rows are always visible;
         // unmaterialised phantoms are visible only after availability probing
-        // found a viable candidate. ---
-        var visible = await _db.ListVisibleMovieRowsAsync(cancellationToken).ConfigureAwait(false);
+        // found a viable candidate. A real (non-empty) query.UserId additionally
+        // subtracts that user's hidden set (REQ-M14-PER-USER Surface 3); Guid.Empty
+        // (system/anonymous callers, e.g. GetLatestMedia's materialised-only path)
+        // gets the server-wide list unchanged. ---
+        var userId = query.UserId;
+        var visible = userId == Guid.Empty
+            ? await _db.ListVisibleMovieRowsAsync(cancellationToken).ConfigureAwait(false)
+            : await _db.ListVisibleMovieRowsAsync(userId, cancellationToken).ConfigureAwait(false);
         foreach (var row in visible)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -183,6 +211,15 @@ public sealed class PhantomMoviesChannel
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (emittedTmdbs.Contains(kvp.Key))
+            {
+                continue;
+            }
+
+            // A hidden movie must disappear even when a real gostream file
+            // backs it — step 1 already excluded it from `visible`/`emittedTmdbs`,
+            // so without this check the on-disk variant would leak it straight
+            // back in here.
+            if (await IsHiddenForUserAsync(userId, kvp.Key, cancellationToken).ConfigureAwait(false))
             {
                 continue;
             }
@@ -256,6 +293,15 @@ public sealed class PhantomMoviesChannel
         ArgumentNullException.ThrowIfNull(request);
         // ChannelLatestMediaSearch (Jellyfin 10.11) carries UserId only;
         // no Limit field. Default to 20 as the conventional "Latest" row size.
+        //
+        // Scope note (REQ-M14-PER-USER Surface 3): this "Latest" row is
+        // deliberately NOT filtered by request.UserId's hidden set. Every
+        // upstream citation of the per-user browse requirement (the backend
+        // task's doc, the eval, and the arbitration ruling) scopes "channel-
+        // browse wiring" to the main GetChannelItems query path; there is no
+        // per-user overload for ListMaterialisedStateAsync, and this method
+        // never took a userId before this task. Adding one here would be a
+        // speculative, uncited behaviour change beyond this rework's scope.
         const int defaultLimit = 20;
 
         var materialised = await _db.ListMaterialisedStateAsync("movie", cancellationToken).ConfigureAwait(false);
@@ -311,6 +357,17 @@ public sealed class PhantomMoviesChannel
                 return null!;
         }
     }
+
+    /// <summary>
+    /// True iff <paramref name="userId"/> is a real caller (not
+    /// <see cref="Guid.Empty"/>) and has hidden this movie tmdb id
+    /// (REQ-M14-PER-USER Surface 3). <see cref="Guid.Empty"/> — no user context,
+    /// e.g. a system/background caller — never filters.
+    /// </summary>
+    private Task<bool> IsHiddenForUserAsync(Guid userId, int tmdbId, CancellationToken ct)
+        => userId == Guid.Empty
+            ? Task.FromResult(false)
+            : _db.IsItemHiddenAsync(userId, tmdbId, "movie", ct);
 
     /// <summary>
     /// Build a single movie ChannelItemInfo. <paramref name="materialised"/>

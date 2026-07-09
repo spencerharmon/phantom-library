@@ -5,6 +5,7 @@ using System.Security.Claims;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Api;
+using Jellyfin.Plugin.PhantomLibrary.Channels;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
@@ -54,9 +55,9 @@ public class PhantomLibraryUserControllerTests : IDisposable
         return db;
     }
 
-    private static PhantomLibraryUserController MakeController(PhantomDb db, Guid? userId)
+    private static PhantomLibraryUserController MakeController(PhantomDb db, Guid? userId, ChannelStateProvider? state = null)
     {
-        var ctrl = new PhantomLibraryUserController(db);
+        var ctrl = new PhantomLibraryUserController(db, state ?? new ChannelStateProvider(db));
 
         // userId == null models an authenticated request that is somehow
         // missing the Jellyfin-UserId claim → every action must 401.
@@ -198,6 +199,53 @@ public class PhantomLibraryUserControllerTests : IDisposable
 
         Assert.True(Prop<bool>(await ctrl.GetHiddenState("movie", 777, CancellationToken.None), "hidden"));
         Assert.False(Prop<bool>(await ctrl.GetHiddenState("series", 777, CancellationToken.None), "hidden"));
+    }
+
+    // ---- channel cache invalidation (REQ-M14-PER-USER Surface 3) --------
+
+    [Fact]
+    public async Task Hide_Movie_BumpsMoviesDataVersionOnly()
+    {
+        using var db = await NewDbAsync();
+        var state = new ChannelStateProvider(db);
+        var ctrl = MakeController(db, Guid.NewGuid(), state);
+        var moviesBefore = state.DataVersion(ChannelStateProvider.KindMovies);
+        var showsBefore = state.DataVersion(ChannelStateProvider.KindShows);
+
+        Assert.IsType<NoContentResult>(await ctrl.Hide("movie", 550, CancellationToken.None));
+
+        Assert.NotEqual(moviesBefore, state.DataVersion(ChannelStateProvider.KindMovies));
+        Assert.Equal(showsBefore, state.DataVersion(ChannelStateProvider.KindShows));
+    }
+
+    [Fact]
+    public async Task Hide_Series_BumpsShowsDataVersionOnly()
+    {
+        using var db = await NewDbAsync();
+        var state = new ChannelStateProvider(db);
+        var ctrl = MakeController(db, Guid.NewGuid(), state);
+        var moviesBefore = state.DataVersion(ChannelStateProvider.KindMovies);
+        var showsBefore = state.DataVersion(ChannelStateProvider.KindShows);
+
+        Assert.IsType<NoContentResult>(await ctrl.Hide("series", 1399, CancellationToken.None));
+
+        Assert.Equal(moviesBefore, state.DataVersion(ChannelStateProvider.KindMovies));
+        Assert.NotEqual(showsBefore, state.DataVersion(ChannelStateProvider.KindShows));
+    }
+
+    [Fact]
+    public async Task Unhide_Movie_AlsoBumpsMoviesDataVersion()
+    {
+        using var db = await NewDbAsync();
+        var state = new ChannelStateProvider(db);
+        var ctrl = MakeController(db, Guid.NewGuid(), state);
+        await ctrl.Hide("movie", 550, CancellationToken.None);
+        var afterHide = state.DataVersion(ChannelStateProvider.KindMovies);
+        await Task.Delay(5, CancellationToken.None); // BumpDataVersion's tie-breaker is unix-milliseconds.
+
+        Assert.IsType<NoContentResult>(await ctrl.Unhide("movie", 550, CancellationToken.None));
+
+        Assert.NotEqual(afterHide, state.DataVersion(ChannelStateProvider.KindMovies));
     }
 
     // ---- validation ------------------------------------------------------

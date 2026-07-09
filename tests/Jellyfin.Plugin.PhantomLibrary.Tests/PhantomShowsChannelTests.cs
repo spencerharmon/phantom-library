@@ -425,6 +425,132 @@ public class PhantomShowsChannelTests : IDisposable
     }
 
     // ----------------------------------------------------------------
+    // Per-user visibility (REQ-M14-PER-USER Surface 3)
+    // ----------------------------------------------------------------
+
+    [Fact]
+    public async Task GetChannelItems_TopLevel_HiddenSeriesForUser_OmittedForHider_ButVisibleForOtherUserAndAnonymous()
+    {
+        await SeedSeriesMetaAsync(1399, "Game of Thrones");
+        await SeedAvailableEpisodeAsync(1399, 1, 1);
+        var hider = Guid.NewGuid();
+        var other = Guid.NewGuid();
+        await _db.AddHiddenItemAsync(hider, 1399, "series", CancellationToken.None);
+
+        var hiderResult = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = hider }, CancellationToken.None);
+        var otherResult = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = other }, CancellationToken.None);
+        var anonymousResult = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+
+        Assert.Empty(hiderResult.Items);
+        Assert.Single(otherResult.Items);
+        Assert.Equal("series_1399", otherResult.Items[0].Id);
+        Assert.Single(anonymousResult.Items);
+    }
+
+    [Fact]
+    public async Task GetChannelItems_SeriesFolder_HiddenForUser_ReturnsEmpty_BeforeAnyTmdbCall()
+    {
+        // _tmdb is a MockBehavior.Strict mock with NO setups in this test: if
+        // the hidden short-circuit did not run before SafeGetSeriesAsync /
+        // FindExternalSeriesByTmdbAsync's TMDB calls, this would throw
+        // MockException instead of returning an empty result.
+        await SeedSeriesMetaAsync(1399, "Game of Thrones");
+        await SeedAvailableEpisodeAsync(1399, 1, 1);
+        await SeedAvailableEpisodeAsync(1399, 2, 1);
+        var hider = Guid.NewGuid();
+        await _db.AddHiddenItemAsync(hider, 1399, "series", CancellationToken.None);
+
+        var q = new InternalChannelItemQuery { FolderId = "series_1399", UserId = hider };
+        var result = await _channel.GetChannelItems(q, CancellationToken.None);
+
+        Assert.Empty(result.Items);
+    }
+
+    [Fact]
+    public async Task GetChannelItems_SeriesFolder_HiddenForHider_ButOtherUserStillSeesSeasons()
+    {
+        await SeedSeriesMetaAsync(1399, "Game of Thrones");
+        await SeedAvailableEpisodeAsync(1399, 1, 1);
+        _tmdb.Setup(t => t.GetSeriesAsync(1399, null, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MakeSeriesDetails(1399, 1));
+        var hider = Guid.NewGuid();
+        var other = Guid.NewGuid();
+        await _db.AddHiddenItemAsync(hider, 1399, "series", CancellationToken.None);
+
+        var hiderResult = await _channel.GetChannelItems(
+            new InternalChannelItemQuery { FolderId = "series_1399", UserId = hider }, CancellationToken.None);
+        var otherResult = await _channel.GetChannelItems(
+            new InternalChannelItemQuery { FolderId = "series_1399", UserId = other }, CancellationToken.None);
+
+        Assert.Empty(hiderResult.Items);
+        Assert.Single(otherResult.Items);
+        Assert.Equal("season_1399_s01", otherResult.Items[0].Id);
+    }
+
+    [Fact]
+    public async Task GetChannelItems_SeasonFolder_HiddenForUser_ReturnsEmpty_BeforeAnyTmdbCall()
+    {
+        // Same Strict-mock-with-no-setups proof as the series-folder case,
+        // for the season → episodes path.
+        await SeedSeriesMetaAsync(1399, "Game of Thrones");
+        await SeedAvailableEpisodeAsync(1399, 1, 1);
+        var hider = Guid.NewGuid();
+        await _db.AddHiddenItemAsync(hider, 1399, "series", CancellationToken.None);
+
+        var q = new InternalChannelItemQuery { FolderId = "season_1399_s01", UserId = hider };
+        var result = await _channel.GetChannelItems(q, CancellationToken.None);
+
+        Assert.Empty(result.Items);
+    }
+
+    [Fact]
+    public async Task GetChannelItems_SeasonFolder_HiddenForHider_ButOtherUserStillSeesEpisodes()
+    {
+        await SeedSeriesMetaAsync(1399, "Game of Thrones");
+        await SeedAvailableEpisodeAsync(1399, 1, 1);
+        _tmdb.Setup(t => t.GetSeasonAsync(1399, 1, null, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MakeSeasonDetails(1399, 1, 1));
+        var hider = Guid.NewGuid();
+        var other = Guid.NewGuid();
+        await _db.AddHiddenItemAsync(hider, 1399, "series", CancellationToken.None);
+
+        var hiderResult = await _channel.GetChannelItems(
+            new InternalChannelItemQuery { FolderId = "season_1399_s01", UserId = hider }, CancellationToken.None);
+        var otherResult = await _channel.GetChannelItems(
+            new InternalChannelItemQuery { FolderId = "season_1399_s01", UserId = other }, CancellationToken.None);
+
+        Assert.Empty(hiderResult.Items);
+        Assert.Single(otherResult.Items);
+        Assert.Equal("episode_1399_s01e01", otherResult.Items[0].Id);
+    }
+
+    [Fact]
+    public async Task GetChannelItems_HiddenForUser_ThenUnhidden_ReappearsForThatUser()
+    {
+        await SeedSeriesMetaAsync(1399, "Game of Thrones");
+        await SeedAvailableEpisodeAsync(1399, 1, 1);
+        var userId = Guid.NewGuid();
+        await _db.AddHiddenItemAsync(userId, 1399, "series", CancellationToken.None);
+        Assert.Empty((await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = userId }, CancellationToken.None)).Items);
+
+        await _db.RemoveHiddenItemAsync(userId, 1399, "series", CancellationToken.None);
+
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = userId }, CancellationToken.None);
+        Assert.Single(result.Items);
+    }
+
+    [Fact]
+    public void GetCacheKey_EchoesUserId_ForPerUserCachePartitioning()
+    {
+        // REQ-M14-PER-USER Surface 3: Jellyfin's on-disk channel-item cache is
+        // otherwise channel+folder+DataVersion keyed with no user component
+        // (ChannelManager.GetChannelDataCachePath), so without this, one
+        // user's hidden-filtered result could be served to another.
+        Assert.Equal("abc-user-id", _channel.GetCacheKey("abc-user-id"));
+        Assert.Null(_channel.GetCacheKey(null));
+    }
+
+    // ----------------------------------------------------------------
     // ID stability across phantom → materialised transition
     // ----------------------------------------------------------------
 

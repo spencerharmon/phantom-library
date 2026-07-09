@@ -346,6 +346,80 @@ public class PhantomMoviesChannelTests : IDisposable
         Assert.Empty(result.Items);
     }
 
+    // ----------------------------------------------------------------
+    // Per-user visibility (REQ-M14-PER-USER Surface 3)
+    // ----------------------------------------------------------------
+
+    [Fact]
+    public async Task GetChannelItems_HiddenForUser_OmittedForHider_ButVisibleForOtherUserAndAnonymous()
+    {
+        await SeedMetaAsync(550, "Fight Club");
+        await SeedAvailableMovieAsync(550);
+        var hider = Guid.NewGuid();
+        var other = Guid.NewGuid();
+        await _db.AddHiddenItemAsync(hider, 550, "movie", CancellationToken.None);
+
+        var hiderResult = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = hider }, CancellationToken.None);
+        var otherResult = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = other }, CancellationToken.None);
+        var anonymousResult = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+
+        Assert.Empty(hiderResult.Items);
+        Assert.Single(otherResult.Items);
+        Assert.Equal("movie_550", otherResult.Items[0].Id);
+        Assert.Single(anonymousResult.Items);
+    }
+
+    [Fact]
+    public async Task GetChannelItems_HiddenForUser_ThenUnhidden_ReappearsForThatUser()
+    {
+        await SeedMetaAsync(550, "Fight Club");
+        await SeedAvailableMovieAsync(550);
+        var userId = Guid.NewGuid();
+        await _db.AddHiddenItemAsync(userId, 550, "movie", CancellationToken.None);
+        Assert.Empty((await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = userId }, CancellationToken.None)).Items);
+
+        await _db.RemoveHiddenItemAsync(userId, 550, "movie", CancellationToken.None);
+
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = userId }, CancellationToken.None);
+        Assert.Single(result.Items);
+    }
+
+    [Fact]
+    public async Task GetChannelItems_HiddenForUser_AlsoOmitsRealGostreamVariant_NoLeak()
+    {
+        // Regression coverage for the arbitration-required cache/visibility fix:
+        // a hidden movie must disappear even when a real on-disk gostream file
+        // also resolves to the same tmdb id (step 2 of GetChannelItems, which
+        // runs independently of the `visible` catalogue step 1 that the hidden
+        // filter was originally applied to).
+        await SeedMetaAsync(4242, "Some Movie");
+        await SeedAvailableMovieAsync(4242);
+        var path = Path.Combine(_moviesRoot, "Some_Movie_2026_1080p_abcd1234.mkv");
+        File.WriteAllText(path, string.Empty);
+        _tmdb.Setup(t => t.SearchMoviesAsync("Some Movie", 2026, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[]
+            {
+                new TmdbSearchHit(4242, "Some Movie", "Some Movie", "hit", null, null, "2026-01-01", 8.1, 10),
+            });
+        var hider = Guid.NewGuid();
+        await _db.AddHiddenItemAsync(hider, 4242, "movie", CancellationToken.None);
+
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = hider }, CancellationToken.None);
+
+        Assert.Empty(result.Items);
+    }
+
+    [Fact]
+    public void GetCacheKey_EchoesUserId_ForPerUserCachePartitioning()
+    {
+        // REQ-M14-PER-USER Surface 3: Jellyfin's on-disk channel-item cache is
+        // otherwise channel+folder+DataVersion keyed with no user component
+        // (ChannelManager.GetChannelDataCachePath), so without this, one
+        // user's hidden-filtered result could be served to another.
+        Assert.Equal("abc-user-id", _channel.GetCacheKey("abc-user-id"));
+        Assert.Null(_channel.GetCacheKey(null));
+    }
+
     [Fact]
     public async Task GetChannelItemMediaInfo_Materialised_ReturnsFusePath()
     {

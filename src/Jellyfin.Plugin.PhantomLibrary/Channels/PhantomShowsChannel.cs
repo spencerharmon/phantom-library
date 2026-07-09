@@ -39,9 +39,20 @@ namespace Jellyfin.Plugin.PhantomLibrary.Channels;
 /// UserData survives.
 ///
 /// Stage 5.1 implementation per <c>docs/plans/channel-handoff.md</c>.
+///
+/// Per-user visibility (REQ-M14-PER-USER Surface 3): every browse path
+/// (top-level series list, series → seasons, season → episodes, and their
+/// orphan/external-file equivalents) filters by the querying
+/// <see cref="InternalChannelItemQuery.UserId"/>'s hidden set. Hiding is
+/// title-level — a hidden series short-circuits its seasons/episodes browse
+/// entirely, matching <c>PhantomDb.IsEpisodeVisibleAsync(userId,…)</c>'s own
+/// "episode visible iff parent series is both server-visible and not hidden"
+/// contract, so there is no separate per-episode hide call needed here.
+/// <see cref="IHasCacheKey"/> partitions Jellyfin's on-disk channel-item cache
+/// per user (see <see cref="PhantomMoviesChannel"/> for why).
 /// </summary>
 public sealed partial class PhantomShowsChannel
-    : IChannel, ISupportsLatestMedia, IChannelItemRefresh, ISupportsMediaProbe
+    : IChannel, ISupportsLatestMedia, IChannelItemRefresh, ISupportsMediaProbe, IHasCacheKey
 {
     private const string OrphanSeriesPrefix = "orphanseries_";
     private const string OrphanSeasonPrefix = "orphanseason_";
@@ -102,6 +113,13 @@ public sealed partial class PhantomShowsChannel
     /// <inheritdoc />
     public string DataVersion => _state.DataVersion(ChannelStateProvider.KindShows) + ":fs:" + _enumerator.ShowsVersion() + ":" + DataVersionSalt;
 
+    /// <summary>
+    /// Partitions Jellyfin's on-disk channel-item cache by requesting user —
+    /// see <see cref="PhantomMoviesChannel.GetCacheKey"/> for the full rationale
+    /// (REQ-M14-PER-USER Surface 3 cache cross-contamination fix).
+    /// </summary>
+    public string? GetCacheKey(string? userId) => userId;
+
     /// <inheritdoc />
     public string HomePageUrl => string.Empty;
 
@@ -125,20 +143,21 @@ public sealed partial class PhantomShowsChannel
     public async Task<ChannelItemResult> GetChannelItems(InternalChannelItemQuery query, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(query);
+        var userId = query.UserId;
 
         if (string.IsNullOrEmpty(query.FolderId))
         {
-            return await GetTopLevelSeriesAsync(cancellationToken).ConfigureAwait(false);
+            return await GetTopLevelSeriesAsync(userId, cancellationToken).ConfigureAwait(false);
         }
 
         if (TryParseOrphanSeriesId(query.FolderId, out var orphanSeriesHash))
         {
-            return await GetOrphanSeasonsAsync(orphanSeriesHash, cancellationToken).ConfigureAwait(false);
+            return await GetOrphanSeasonsAsync(userId, orphanSeriesHash, cancellationToken).ConfigureAwait(false);
         }
 
         if (TryParseOrphanSeasonId(query.FolderId, out var orphanSeasonSeriesHash, out var orphanSeason))
         {
-            return await GetOrphanEpisodesAsync(orphanSeasonSeriesHash, orphanSeason, cancellationToken).ConfigureAwait(false);
+            return await GetOrphanEpisodesAsync(userId, orphanSeasonSeriesHash, orphanSeason, cancellationToken).ConfigureAwait(false);
         }
 
         if (!ChannelItemId.TryParse(query.FolderId, out var parsed))
@@ -149,9 +168,9 @@ public sealed partial class PhantomShowsChannel
         return parsed.Kind switch
         {
             ChannelItemId.KindSeries =>
-                await GetSeasonsForSeriesAsync(parsed.TmdbId!.Value, cancellationToken).ConfigureAwait(false),
+                await GetSeasonsForSeriesAsync(userId, parsed.TmdbId!.Value, cancellationToken).ConfigureAwait(false),
             ChannelItemId.KindSeason =>
-                await GetEpisodesForSeasonAsync(parsed.TmdbId!.Value, parsed.Season!.Value, cancellationToken).ConfigureAwait(false),
+                await GetEpisodesForSeasonAsync(userId, parsed.TmdbId!.Value, parsed.Season!.Value, cancellationToken).ConfigureAwait(false),
             _ => EmptyResult(),
         };
     }
@@ -290,19 +309,38 @@ public sealed partial class PhantomShowsChannel
     private int SeriesMinAvailableEpisodes()
         => Math.Max(1, _configProvider().SeriesMinAvailableEpisodes);
 
+    /// <summary>
+    /// True iff <paramref name="userId"/> is a real caller (not
+    /// <see cref="Guid.Empty"/>) and has hidden this series tmdb id
+    /// (REQ-M14-PER-USER Surface 3). <see cref="Guid.Empty"/> — no user context,
+    /// e.g. a system/background caller — never filters. Hiding is title-level:
+    /// this single series-level check is sufficient to hide the series's
+    /// seasons and episodes too (every browse method that reaches a season or
+    /// episode listing calls this, or the per-user <c>IsSeriesVisibleAsync</c>
+    /// overload composing the identical check, first).
+    /// </summary>
+    private Task<bool> IsHiddenForUserAsync(Guid userId, int seriesTmdbId, CancellationToken ct)
+        => userId == Guid.Empty
+            ? Task.FromResult(false)
+            : _db.IsItemHiddenAsync(userId, seriesTmdbId, "series", ct);
+
     // ----------------------------------------------------------------
     // Browse paths
     // ----------------------------------------------------------------
 
-    private async Task<ChannelItemResult> GetTopLevelSeriesAsync(CancellationToken ct)
+    private async Task<ChannelItemResult> GetTopLevelSeriesAsync(Guid userId, CancellationToken ct)
     {
         var seen = new HashSet<int>();
         var items = new List<ChannelItemInfo>();
 
         // Visible series are derived from available episode phantoms plus
         // materialised episodes. Raw discovery-only series stay hidden until
-        // the availability worker finds at least one playable episode.
-        var visible = await _db.ListVisibleSeriesRowsAsync(SeriesMinAvailableEpisodes(), ct).ConfigureAwait(false);
+        // the availability worker finds at least one playable episode. A real
+        // (non-empty) userId additionally subtracts that user's hidden set
+        // (REQ-M14-PER-USER Surface 3).
+        var visible = userId == Guid.Empty
+            ? await _db.ListVisibleSeriesRowsAsync(SeriesMinAvailableEpisodes(), ct).ConfigureAwait(false)
+            : await _db.ListVisibleSeriesRowsAsync(userId, SeriesMinAvailableEpisodes(), ct).ConfigureAwait(false);
         foreach (var row in visible)
         {
             ct.ThrowIfCancellationRequested();
@@ -341,6 +379,15 @@ public sealed partial class PhantomShowsChannel
                     continue;
                 }
 
+                // A hidden series must disappear even when it is backed by a
+                // real gostream directory — the visible-series query above
+                // already excluded it from `seen`, so without this check the
+                // external resolution would leak it straight back in here.
+                if (await IsHiddenForUserAsync(userId, enriched.TmdbId, ct).ConfigureAwait(false))
+                {
+                    continue;
+                }
+
                 items.Add(BuildExternalSeriesItemFromMetadata(enriched.Metadata));
                 seen.Add(enriched.TmdbId);
                 continue;
@@ -356,13 +403,28 @@ public sealed partial class PhantomShowsChannel
         };
     }
 
-    private async Task<ChannelItemResult> GetSeasonsForSeriesAsync(int seriesTmdb, CancellationToken ct)
+    private async Task<ChannelItemResult> GetSeasonsForSeriesAsync(Guid userId, int seriesTmdb, CancellationToken ct)
     {
+        // Title-level hide short-circuits the whole seasons browse for this
+        // series (REQ-M14-PER-USER Surface 3). This must happen BEFORE the
+        // visible-seasons/external-seasons union below: unlike the top-level
+        // series list, `ListVisibleSeasonsAsync` and the external-file season
+        // scan below are not themselves user-filtered, so without this early
+        // return a hidden series's seasons would still leak through if this
+        // folder is reached directly (e.g. a stale client-side id).
+        if (await IsHiddenForUserAsync(userId, seriesTmdb, ct).ConfigureAwait(false))
+        {
+            return EmptyResult();
+        }
+
         var visibleSeasons = await _db.ListVisibleSeasonsAsync(seriesTmdb, ct).ConfigureAwait(false);
         var externalSeries = await FindExternalSeriesByTmdbAsync(seriesTmdb, ct).ConfigureAwait(false);
         var externalSeasonNumbers = await ListExternalSeasonNumbersAsync(externalSeries, ct).ConfigureAwait(false);
         var seasonNumbers = visibleSeasons.Select(s => s.Season).Concat(externalSeasonNumbers).ToHashSet();
-        if (await _db.IsSeriesVisibleAsync(seriesTmdb, SeriesMinAvailableEpisodes(), ct).ConfigureAwait(false))
+        var seriesVisible = userId == Guid.Empty
+            ? await _db.IsSeriesVisibleAsync(seriesTmdb, SeriesMinAvailableEpisodes(), ct).ConfigureAwait(false)
+            : await _db.IsSeriesVisibleAsync(userId, seriesTmdb, SeriesMinAvailableEpisodes(), ct).ConfigureAwait(false);
+        if (seriesVisible)
         {
             var details = await SafeGetSeriesAsync(seriesTmdb, ct).ConfigureAwait(false);
             if (details is not null)
@@ -411,8 +473,18 @@ public sealed partial class PhantomShowsChannel
         };
     }
 
-    private async Task<ChannelItemResult> GetEpisodesForSeasonAsync(int seriesTmdb, int season, CancellationToken ct)
+    private async Task<ChannelItemResult> GetEpisodesForSeasonAsync(Guid userId, int seriesTmdb, int season, CancellationToken ct)
     {
+        // Title-level hide short-circuits the whole episodes browse for this
+        // series (REQ-M14-PER-USER Surface 3) — before any TMDB/cache work, for
+        // the same completeness reason as GetSeasonsForSeriesAsync: the known-
+        // episode rows and external-file episodes below are not themselves
+        // user-filtered.
+        if (await IsHiddenForUserAsync(userId, seriesTmdb, ct).ConfigureAwait(false))
+        {
+            return EmptyResult();
+        }
+
         // Re-fetch the season from TMDB on browse so newly aired episodes
         // appear, but fall back to tmdb_episode_cache when TMDB is down or
         // rate-limiting. A transient season fetch failure must not make an
@@ -466,7 +538,10 @@ public sealed partial class PhantomShowsChannel
             .GroupBy(e => e.Episode)
             .ToDictionary(g => g.Key, g => g.First().Entry);
         var hasExternalSeries = externalSeries.Count > 0;
-        var exposeFullSeries = hasExternalSeries || await _db.IsSeriesVisibleAsync(seriesTmdb, SeriesMinAvailableEpisodes(), ct).ConfigureAwait(false);
+        var seriesVisible = userId == Guid.Empty
+            ? await _db.IsSeriesVisibleAsync(seriesTmdb, SeriesMinAvailableEpisodes(), ct).ConfigureAwait(false)
+            : await _db.IsSeriesVisibleAsync(userId, seriesTmdb, SeriesMinAvailableEpisodes(), ct).ConfigureAwait(false);
+        var exposeFullSeries = hasExternalSeries || seriesVisible;
         var externalSeriesName = hasExternalSeries ? externalSeries[0].Metadata.Title : null;
         var items = new List<ChannelItemInfo>(rows.Count + externalEpisodes.Count);
         var emittedEpisodes = new HashSet<int>();
@@ -514,7 +589,7 @@ public sealed partial class PhantomShowsChannel
         };
     }
 
-    private async Task<ChannelItemResult> GetOrphanSeasonsAsync(string seriesHash, CancellationToken ct)
+    private async Task<ChannelItemResult> GetOrphanSeasonsAsync(Guid userId, string seriesHash, CancellationToken ct)
     {
         var series = await FindOrphanSeriesAsync(seriesHash, ct).ConfigureAwait(false);
         if (series is null)
@@ -525,6 +600,15 @@ public sealed partial class PhantomShowsChannel
         var enriched = await TryResolveEnrichedGostreamSeriesAsync(series, ct).ConfigureAwait(false);
         if (enriched is not null)
         {
+            // The gostream directory has since resolved to a tmdb id (it was
+            // still unresolved, hence orphan-prefixed, when the caller's stale
+            // folder id was first minted) — apply the same title-level hide
+            // guard as the normal series_<tmdb> path for parity.
+            if (await IsHiddenForUserAsync(userId, enriched.TmdbId, ct).ConfigureAwait(false))
+            {
+                return EmptyResult();
+            }
+
             var seasonNumbers = await ListExternalSeasonNumbersAsync(new[] { enriched }, ct).ConfigureAwait(false);
             var enrichedItems = new List<ChannelItemInfo>();
             foreach (var seasonNumber in seasonNumbers.Order())
@@ -547,7 +631,7 @@ public sealed partial class PhantomShowsChannel
         return new ChannelItemResult { Items = items, TotalRecordCount = items.Count };
     }
 
-    private async Task<ChannelItemResult> GetOrphanEpisodesAsync(string seriesHash, int seasonNumber, CancellationToken ct)
+    private async Task<ChannelItemResult> GetOrphanEpisodesAsync(Guid userId, string seriesHash, int seasonNumber, CancellationToken ct)
     {
         var series = await FindOrphanSeriesAsync(seriesHash, ct).ConfigureAwait(false);
         var season = series?.Seasons.FirstOrDefault(s => s.SeasonNumber == seasonNumber);
@@ -559,7 +643,7 @@ public sealed partial class PhantomShowsChannel
         var enriched = await TryResolveEnrichedGostreamSeriesAsync(series, ct).ConfigureAwait(false);
         if (enriched is not null)
         {
-            return await GetEpisodesForSeasonAsync(enriched.TmdbId, seasonNumber, ct).ConfigureAwait(false);
+            return await GetEpisodesForSeasonAsync(userId, enriched.TmdbId, seasonNumber, ct).ConfigureAwait(false);
         }
 
         var items = SelectExternalEpisodeVariants(season.Episodes)
