@@ -22,7 +22,10 @@ namespace Jellyfin.Plugin.PhantomLibrary.Materialisation;
 /// items (plan §6.1). For each row in <c>materialised_state</c>:
 ///
 ///   * resolves the channel BaseItem via its ExternalId,
-///   * checks per-user LastPlayedDate / IsFavorite across all users,
+///   * checks per-user LastPlayedDate / IsFavorite across all users
+///     (a favourite pins the shared file only while at least one
+///     favouriting user keeps their per-user protect_favourites toggle
+///     on — REQ-M14-PER-USER, Surface 2),
 ///   * skips if favourite-protected, recently played, or recently
 ///     materialised-but-never-played within the idle window,
 ///   * otherwise calls <c>gostream.RemoveAsync</c>, deletes the state
@@ -207,6 +210,15 @@ public sealed class EvictionSweeper : IHostedService, IDisposable
 
         var users = _userManager.GetUsers().ToList();
 
+        // Per-user favourite-protection toggles (REQ-M14-PER-USER, Surface 2).
+        // A user with no user_prefs row falls back to defaults (protect on), so
+        // an empty table reproduces the historical any-user-favourite behaviour.
+        var prefsByUser = new Dictionary<Guid, UserPrefs>(users.Count);
+        foreach (var user in users)
+        {
+            prefsByUser[user.Id] = await _db.GetUserPrefsAsync(user.Id, ct).ConfigureAwait(false);
+        }
+
         _logger.LogInformation(
             "[Eviction] tick start: {Total} candidate row(s) ({Movies} movies + {Episodes} episodes), idleCutoff={Days}d, protectFavourites={Protect}, users={UserCount}",
             allRows.Count, movieRows.Count, episodeRows.Count, idleCutoff.TotalDays, protectFavourites, users.Count);
@@ -279,7 +291,7 @@ public sealed class EvictionSweeper : IHostedService, IDisposable
             }
 
             DateTime? lastPlayed = null;
-            bool isFav = false;
+            bool favProtected = false;
             foreach (var user in users)
             {
                 var ud = SafeGetUserData(user, baseItem);
@@ -296,13 +308,22 @@ public sealed class EvictionSweeper : IHostedService, IDisposable
                     }
                 }
 
+                // Per-user favourite protection: this user's favourite pins the
+                // shared file only while they keep protect_favourites on. A
+                // missing prefs row means defaults (protect on). The shared file
+                // stops being pinned once the last opted-in favouriting user
+                // drops the favourite or turns the toggle off.
                 if (ud.IsFavorite)
                 {
-                    isFav = true;
+                    var prefs = prefsByUser.TryGetValue(user.Id, out var p) ? p : UserPrefs.Defaults;
+                    if (prefs.ProtectFavourites)
+                    {
+                        favProtected = true;
+                    }
                 }
             }
 
-            if (protectFavourites && isFav)
+            if (protectFavourites && favProtected)
             {
                 _logger.LogDebug(
                     "[Eviction] favourite-protected, skipping ExternalId={External}",

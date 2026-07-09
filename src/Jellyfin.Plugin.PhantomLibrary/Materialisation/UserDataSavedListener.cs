@@ -4,6 +4,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Channels;
 using Jellyfin.Plugin.PhantomLibrary.Library;
+using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.TV;
 using MediaBrowser.Controller.Library;
@@ -36,6 +37,7 @@ public sealed class UserDataSavedListener : IHostedService
     private readonly ISeriesAutopilot _autopilot;
     private readonly IMaterialiser _materialiser;
     private readonly IFavouriteRecommendationIngestor _recommendationIngestor;
+    private readonly PhantomDb _db;
     private readonly ILogger<UserDataSavedListener> _logger;
 
     public UserDataSavedListener(
@@ -43,12 +45,14 @@ public sealed class UserDataSavedListener : IHostedService
         ISeriesAutopilot autopilot,
         IMaterialiser materialiser,
         IFavouriteRecommendationIngestor recommendationIngestor,
+        PhantomDb db,
         ILogger<UserDataSavedListener> logger)
     {
         _userData = userData ?? throw new ArgumentNullException(nameof(userData));
         _autopilot = autopilot ?? throw new ArgumentNullException(nameof(autopilot));
         _materialiser = materialiser ?? throw new ArgumentNullException(nameof(materialiser));
         _recommendationIngestor = recommendationIngestor ?? throw new ArgumentNullException(nameof(recommendationIngestor));
+        _db = db ?? throw new ArgumentNullException(nameof(db));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
@@ -92,9 +96,28 @@ public sealed class UserDataSavedListener : IHostedService
             return;
         }
 
+        // Per-user eager-probe gate (REQ-M14-PER-USER, Surface 4): a user's own
+        // interactions drive eager source probing / materialise only when their
+        // allow_eager toggle is on. Evaluated at most once per event, lazily
+        // (only when a probe is actually about to fire) and fail-open — a pref
+        // read that throws is treated as "allowed" so a transient DB hiccup
+        // never silently suppresses probing.
+        bool? allowEagerCache = null;
+        bool AllowEager()
+        {
+            allowEagerCache ??= ReadAllowEager(userId);
+            return allowEagerCache.Value;
+        }
+
         if (userData.IsFavorite)
         {
-            TryTriggerFavouriteMaterialise(item);
+            if (AllowEager())
+            {
+                TryTriggerFavouriteMaterialise(item);
+            }
+
+            // Recommendations are catalogue expansion off an explicit taste
+            // signal, not this user's own source-probe budget — left ungated.
             TryTriggerFavouriteRecommendations(item);
         }
 
@@ -128,12 +151,41 @@ public sealed class UserDataSavedListener : IHostedService
             return;
         }
 
+        // Autopilot prefetch is eager source probing driven by this user's
+        // playback — same per-user allow_eager gate as favourite-materialise.
+        if (!AllowEager())
+        {
+            return;
+        }
+
         // Fire-and-forget; autopilot handles its own errors.
         _ = _autopilot.OnEpisodePlaybackProgressAsync(
             userId,
             episode,
             played,
             CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Read the acting user's <c>allow_eager</c> toggle via the async
+    /// <see cref="PhantomDb"/> accessor, bridged synchronously (the
+    /// UserDataSaved event handler is sync). Microsoft.Data.Sqlite's async
+    /// API runs synchronously, so this does not deadlock (same pattern as
+    /// <c>ChannelStateProvider</c>). Fails OPEN: a read error returns
+    /// <see langword="true"/> so probing is never silently disabled.
+    /// </summary>
+    private bool ReadAllowEager(Guid userId)
+    {
+        try
+        {
+            return _db.GetUserPrefsAsync(userId, CancellationToken.None)
+                .GetAwaiter().GetResult().AllowEager;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "UserDataSavedListener could not read allow_eager for {User}; treating as allowed", userId);
+            return true;
+        }
     }
 
     private void TryTriggerFavouriteMaterialise(BaseItem item)

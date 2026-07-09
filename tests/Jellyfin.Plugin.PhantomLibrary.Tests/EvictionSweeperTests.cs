@@ -74,6 +74,15 @@ public class EvictionSweeperTests : IDisposable
         };
     }
 
+    /// <summary>Seed a user's per-user <c>protect_favourites</c> toggle (other toggles left on).</summary>
+    private static async Task SetProtectFavouritesAsync(PhantomDb db, User user, bool protect)
+    {
+        await db.UpsertUserPrefsAsync(
+            user.Id,
+            new UserPrefs(ProtectFavourites: protect, ShowPhantoms: true, AllowEager: true),
+            CancellationToken.None);
+    }
+
     private (EvictionSweeper sut,
              Mock<IGostreamClient> gostream,
              Mock<ILibraryManager> lib,
@@ -221,6 +230,110 @@ public class EvictionSweeperTests : IDisposable
             It.IsAny<Guid>(), It.IsAny<string>(),
             It.IsAny<ChannelItemRefreshOptions>(), It.IsAny<CancellationToken>()), Times.Never);
         Assert.NotNull(await db.GetMaterialisedStateAsync(44, "movie", -1, -1, CancellationToken.None));
+    }
+
+    // ---- per-user favourite protection (REQ-M14-PER-USER, Surface 2) ----
+    //
+    // A favourite pins the shared materialised file only while at least one
+    // favouriting user keeps their per-user protect_favourites toggle on. A
+    // user with no user_prefs row falls back to defaults (protect on), so the
+    // empty-table case still reproduces the historical any-favourite-protects
+    // behaviour (covered by FavouriteProtected_NoEviction above).
+
+    [Fact]
+    public async Task PerUserFavourite_ExplicitProtectOn_NoEviction()
+    {
+        using var db = await NewDbAsync();
+        await db.InsertMaterialisedStateAsync(50, "movie", -1, -1, "/stub/pf1.mkv", "/fuse/pf1.mkv", CancellationToken.None);
+        await BackdateMaterialisedAtAsync(50, "movie", -1, -1, DateTimeOffset.UtcNow.AddDays(-90));
+
+        var fan = MakeUser("fan");
+        var (sut, gostream, lib, _, userData, _, _, _) = BuildSut(db, new[] { fan });
+        var item = MakeChannelMovie(50);
+        SetupExternalIdLookup(lib, item.ExternalId, item);
+        userData.Setup(u => u.GetUserData(fan, item)).Returns(new UserItemData { Key = "k", IsFavorite = true });
+
+        // Explicit protect-on row (distinct from the missing-row default path).
+        await SetProtectFavouritesAsync(db, fan, true);
+
+        await sut.RunOnceAsync(CancellationToken.None);
+
+        gostream.Verify(g => g.RemoveAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        Assert.NotNull(await db.GetMaterialisedStateAsync(50, "movie", -1, -1, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task PerUserFavourite_ProtectOff_OnlyFavouriter_Evicts()
+    {
+        using var db = await NewDbAsync();
+        await db.InsertMaterialisedStateAsync(51, "movie", -1, -1, "/stub/pf2.mkv", "/fuse/pf2.mkv", CancellationToken.None);
+        await BackdateMaterialisedAtAsync(51, "movie", -1, -1, DateTimeOffset.UtcNow.AddDays(-90));
+
+        var fan = MakeUser("optout");
+        var (sut, gostream, lib, _, userData, _, _, _) = BuildSut(db, new[] { fan });
+        var item = MakeChannelMovie(51);
+        SetupExternalIdLookup(lib, item.ExternalId, item);
+        userData.Setup(u => u.GetUserData(fan, item)).Returns(new UserItemData { Key = "k", IsFavorite = true });
+
+        // The sole favouriting user opted OUT of favourite-protection: the
+        // shared file is no longer pinned and the idle row evicts.
+        await SetProtectFavouritesAsync(db, fan, false);
+
+        await sut.RunOnceAsync(CancellationToken.None);
+
+        gostream.Verify(g => g.RemoveAsync("/stub/pf2.mkv", It.IsAny<CancellationToken>()), Times.Once);
+        Assert.Null(await db.GetMaterialisedStateAsync(51, "movie", -1, -1, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task PerUserFavourite_OneUserOffOneUserOn_Protected()
+    {
+        using var db = await NewDbAsync();
+        await db.InsertMaterialisedStateAsync(52, "movie", -1, -1, "/stub/pf3.mkv", "/fuse/pf3.mkv", CancellationToken.None);
+        await BackdateMaterialisedAtAsync(52, "movie", -1, -1, DateTimeOffset.UtcNow.AddDays(-90));
+
+        var optOut = MakeUser("optout");
+        var keeper = MakeUser("keeper");
+        var (sut, gostream, lib, _, userData, _, _, _) = BuildSut(db, new[] { optOut, keeper });
+        var item = MakeChannelMovie(52);
+        SetupExternalIdLookup(lib, item.ExternalId, item);
+        userData.Setup(u => u.GetUserData(optOut, item)).Returns(new UserItemData { Key = "a", IsFavorite = true });
+        userData.Setup(u => u.GetUserData(keeper, item)).Returns(new UserItemData { Key = "b", IsFavorite = true });
+
+        await SetProtectFavouritesAsync(db, optOut, false);
+        await SetProtectFavouritesAsync(db, keeper, true);
+
+        await sut.RunOnceAsync(CancellationToken.None);
+
+        // keeper still pins the shared file even though optOut turned protection off.
+        gostream.Verify(g => g.RemoveAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        Assert.NotNull(await db.GetMaterialisedStateAsync(52, "movie", -1, -1, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task PerUserFavourite_Episode_ProtectOff_OnlyFavouriter_Evicts()
+    {
+        // Movie/TV parity: per-user favourite-protection applies identically to
+        // episode materialised_state rows (same user loop, no type branch).
+        using var db = await NewDbAsync();
+        await db.InsertMaterialisedStateAsync(1400, "episode", 1, 3, "/stub/pf-ep.mkv", "/fuse/pf-ep.mkv", CancellationToken.None);
+        await BackdateMaterialisedAtAsync(1400, "episode", 1, 3, DateTimeOffset.UtcNow.AddDays(-90));
+
+        var fan = MakeUser("optout");
+        var (sut, gostream, lib, _, userData, refresh, _, _) = BuildSut(db, new[] { fan });
+        var item = MakeChannelEpisode(1400, 1, 3);
+        SetupExternalIdLookup(lib, item.ExternalId, item);
+        userData.Setup(u => u.GetUserData(fan, item)).Returns(new UserItemData { Key = "k", IsFavorite = true });
+
+        await SetProtectFavouritesAsync(db, fan, false);
+
+        await sut.RunOnceAsync(CancellationToken.None);
+
+        gostream.Verify(g => g.RemoveAsync("/stub/pf-ep.mkv", It.IsAny<CancellationToken>()), Times.Once);
+        Assert.Null(await db.GetMaterialisedStateAsync(1400, "episode", 1, 3, CancellationToken.None));
+        refresh.Verify(r => r.RefreshChannelItemAsync(
+            ChannelIds.Shows, item.ExternalId,
+            It.IsAny<ChannelItemRefreshOptions>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]

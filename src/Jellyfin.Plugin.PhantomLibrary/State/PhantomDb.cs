@@ -141,6 +141,40 @@ public sealed record TmdbEpisodeRow(
     DateTimeOffset FetchedAt);
 
 /// <summary>
+/// The three per-user Phantom toggles persisted in <c>user_prefs</c> (one
+/// row per Jellyfin user). A user with no row falls back to
+/// <see cref="Defaults"/> (all on): only explicit toggle choices are stored,
+/// so an absent row means "this user has never changed a toggle", never a
+/// denial. Favourite state is <b>not</b> stored here — it is read live from
+/// Jellyfin's own <c>UserData</c>.
+///
+/// <list type="bullet">
+/// <item><c>ProtectFavourites</c> — this user's favourites pin the shared
+///   materialised file against idle eviction (the server-wide master switch
+///   in <c>PluginConfiguration.ProtectFavourites</c> still applies).</item>
+/// <item><c>ShowPhantoms</c> — not-yet-materialised phantom titles appear in
+///   this user's channel browse. Persisted here for the show/hide surface;
+///   the channel-visible wiring lands in the dependent show/hide + rig
+///   tasks (its cache is not per-user keyed — see the m14-per-user eval).</item>
+/// <item><c>AllowEager</c> — this user's own interactions (favouriting,
+///   playback progress) may trigger eager source probing / materialise.</item>
+/// </list>
+/// </summary>
+public sealed record UserPrefs(bool ProtectFavourites, bool ShowPhantoms, bool AllowEager)
+{
+    /// <summary>The all-on defaults applied when a user has no <c>user_prefs</c> row.</summary>
+    public static UserPrefs Defaults { get; } = new(true, true, true);
+}
+
+/// <summary>
+/// Row of the <c>user_hidden_items</c> table: one catalogue title a user has
+/// explicitly hidden from their channel browse. <see cref="Type"/> is
+/// <c>movie</c> or <c>series</c> — hiding is title-level, so an episode is
+/// hidden iff its parent series is.
+/// </summary>
+public sealed record HiddenItemRow(int TmdbId, string Type, DateTimeOffset HiddenAt);
+
+/// <summary>
 /// SQLite-backed persistence for the plugin's private state under the
 /// channel architecture (schema v12). Single writer, serialised via a
 /// process-wide <see cref="SemaphoreSlim"/>; concurrent readers
@@ -1954,6 +1988,270 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
         cmd.Parameters.AddWithValue("$episode", episode);
         var v = await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
         return v is not null and not DBNull;
+    }
+
+    // ---- user_prefs (per-user toggles) ----
+
+    /// <summary>
+    /// Read a user's toggles. A user with no <c>user_prefs</c> row falls back
+    /// to <see cref="UserPrefs.Defaults"/> (all on) — an absent row means the
+    /// user has never changed a toggle, not that anything is denied.
+    /// </summary>
+    public async Task<UserPrefs> GetUserPrefsAsync(Guid userId, CancellationToken ct)
+    {
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT protect_favourites, show_phantoms, allow_eager
+            FROM user_prefs WHERE user_id=$uid LIMIT 1;";
+        cmd.Parameters.AddWithValue("$uid", UserKey(userId));
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (!await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            return UserPrefs.Defaults;
+        }
+
+        return new UserPrefs(r.GetInt32(0) != 0, r.GetInt32(1) != 0, r.GetInt32(2) != 0);
+    }
+
+    /// <summary>
+    /// Upsert a user's toggles, replacing any existing row for the user.
+    /// </summary>
+    public async Task UpsertUserPrefsAsync(Guid userId, UserPrefs prefs, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(prefs);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"INSERT INTO user_prefs
+                    (user_id, protect_favourites, show_phantoms, allow_eager, updated_at)
+                    VALUES ($uid, $pf, $sp, $ae, $now)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    protect_favourites = excluded.protect_favourites,
+                    show_phantoms      = excluded.show_phantoms,
+                    allow_eager        = excluded.allow_eager,
+                    updated_at         = excluded.updated_at;";
+            cmd.Parameters.AddWithValue("$uid", UserKey(userId));
+            cmd.Parameters.AddWithValue("$pf", prefs.ProtectFavourites ? 1 : 0);
+            cmd.Parameters.AddWithValue("$sp", prefs.ShowPhantoms ? 1 : 0);
+            cmd.Parameters.AddWithValue("$ae", prefs.AllowEager ? 1 : 0);
+            cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    // ---- user_hidden_items (per-user hidden set) ----
+
+    /// <summary>
+    /// Hide a catalogue title for a user. Idempotent — re-hiding just refreshes
+    /// <c>hidden_at</c>. <paramref name="type"/> is <c>movie</c> or
+    /// <c>series</c> (title-level; episodes follow their parent series).
+    /// </summary>
+    public async Task AddHiddenItemAsync(Guid userId, int tmdbId, string type, CancellationToken ct)
+    {
+        var normType = NormalizeHiddenType(type);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"INSERT INTO user_hidden_items (user_id, tmdb_id, type, hidden_at)
+                    VALUES ($uid, $tmdb, $type, $now)
+                ON CONFLICT(user_id, tmdb_id, type) DO UPDATE SET
+                    hidden_at = excluded.hidden_at;";
+            cmd.Parameters.AddWithValue("$uid", UserKey(userId));
+            cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+            cmd.Parameters.AddWithValue("$type", normType);
+            cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Un-hide a title for a user. Idempotent — a no-op if not currently hidden.
+    /// </summary>
+    public async Task RemoveHiddenItemAsync(Guid userId, int tmdbId, string type, CancellationToken ct)
+    {
+        var normType = NormalizeHiddenType(type);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"DELETE FROM user_hidden_items
+                WHERE user_id=$uid AND tmdb_id=$tmdb AND type=$type;";
+            cmd.Parameters.AddWithValue("$uid", UserKey(userId));
+            cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+            cmd.Parameters.AddWithValue("$type", normType);
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// True iff the user has explicitly hidden this (tmdb_id, type) title.
+    /// </summary>
+    public async Task<bool> IsItemHiddenAsync(Guid userId, int tmdbId, string type, CancellationToken ct)
+    {
+        var normType = NormalizeHiddenType(type);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT 1 FROM user_hidden_items
+            WHERE user_id=$uid AND tmdb_id=$tmdb AND type=$type LIMIT 1;";
+        cmd.Parameters.AddWithValue("$uid", UserKey(userId));
+        cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+        cmd.Parameters.AddWithValue("$type", normType);
+        var v = await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
+        return v is not null and not DBNull;
+    }
+
+    /// <summary>
+    /// All titles a user has hidden, most-recently-hidden first.
+    /// </summary>
+    public async Task<IReadOnlyList<HiddenItemRow>> ListHiddenItemsAsync(Guid userId, CancellationToken ct)
+    {
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT tmdb_id, type, hidden_at FROM user_hidden_items
+            WHERE user_id=$uid ORDER BY hidden_at DESC, tmdb_id;";
+        cmd.Parameters.AddWithValue("$uid", UserKey(userId));
+        var list = new List<HiddenItemRow>();
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            list.Add(new HiddenItemRow(r.GetInt32(0), r.GetString(1), DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(2))));
+        }
+
+        return list;
+    }
+
+    private async Task<HashSet<int>> HiddenTmdbIdsAsync(Guid userId, string type, CancellationToken ct)
+    {
+        var normType = NormalizeHiddenType(type);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT tmdb_id FROM user_hidden_items
+            WHERE user_id=$uid AND type=$type;";
+        cmd.Parameters.AddWithValue("$uid", UserKey(userId));
+        cmd.Parameters.AddWithValue("$type", normType);
+        var set = new HashSet<int>();
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            set.Add(r.GetInt32(0));
+        }
+
+        return set;
+    }
+
+    // ---- per-user visibility (composition over the server-wide queries) ----
+    //
+    // These filter the server-wide visibility results by the user's hidden set.
+    // They are deliberately NOT wired into the cached channel-browse path (that
+    // cache is not keyed per user — see docs/plans/channel-architecture.md and
+    // the m14-per-user eval Surface 3); the per-user show/hide surface + rig
+    // task consume them. Hiding is title-level: an episode is visible to a user
+    // iff its parent series is both server-visible and not hidden by that user.
+
+    public async Task<IReadOnlyList<VisibleMovieRow>> ListVisibleMovieRowsAsync(Guid userId, CancellationToken ct)
+    {
+        var baseRows = await ListVisibleMovieRowsAsync(ct).ConfigureAwait(false);
+        var hidden = await HiddenTmdbIdsAsync(userId, "movie", ct).ConfigureAwait(false);
+        if (hidden.Count == 0)
+        {
+            return baseRows;
+        }
+
+        var list = new List<VisibleMovieRow>(baseRows.Count);
+        foreach (var row in baseRows)
+        {
+            if (!hidden.Contains(row.Metadata.TmdbId))
+            {
+                list.Add(row);
+            }
+        }
+
+        return list;
+    }
+
+    public async Task<IReadOnlyList<VisibleSeriesRow>> ListVisibleSeriesRowsAsync(Guid userId, int minAvailableEpisodes, CancellationToken ct)
+    {
+        var baseRows = await ListVisibleSeriesRowsAsync(minAvailableEpisodes, ct).ConfigureAwait(false);
+        var hidden = await HiddenTmdbIdsAsync(userId, "series", ct).ConfigureAwait(false);
+        if (hidden.Count == 0)
+        {
+            return baseRows;
+        }
+
+        var list = new List<VisibleSeriesRow>(baseRows.Count);
+        foreach (var row in baseRows)
+        {
+            if (!hidden.Contains(row.Metadata.TmdbId))
+            {
+                list.Add(row);
+            }
+        }
+
+        return list;
+    }
+
+    public Task<IReadOnlyList<VisibleSeriesRow>> ListVisibleSeriesRowsAsync(Guid userId, CancellationToken ct)
+        => ListVisibleSeriesRowsAsync(userId, 1, ct);
+
+    public async Task<bool> IsSeriesVisibleAsync(Guid userId, int seriesTmdbId, int minAvailableEpisodes, CancellationToken ct)
+    {
+        if (await IsItemHiddenAsync(userId, seriesTmdbId, "series", ct).ConfigureAwait(false))
+        {
+            return false;
+        }
+
+        return await IsSeriesVisibleAsync(seriesTmdbId, minAvailableEpisodes, ct).ConfigureAwait(false);
+    }
+
+    public async Task<bool> IsEpisodeVisibleAsync(Guid userId, int seriesTmdbId, int season, int episode, CancellationToken ct)
+    {
+        // Hiding is title-level: an episode disappears for a user exactly when
+        // its parent series is hidden. Otherwise defer to server-wide episode
+        // visibility.
+        if (await IsItemHiddenAsync(userId, seriesTmdbId, "series", ct).ConfigureAwait(false))
+        {
+            return false;
+        }
+
+        return await IsEpisodeVisibleAsync(seriesTmdbId, season, episode, ct).ConfigureAwait(false);
+    }
+
+    private static string UserKey(Guid userId)
+        => userId.ToString("D", CultureInfo.InvariantCulture);
+
+    /// <summary>
+    /// Validate and normalise a hidden-item type to the canonical
+    /// <c>movie</c>/<c>series</c> tokens the <c>user_hidden_items.type</c>
+    /// CHECK constraint accepts. Throws for anything else so a bad caller fails
+    /// loudly instead of writing a row that can never match a query.
+    /// </summary>
+    private static string NormalizeHiddenType(string type)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        return type.ToLowerInvariant() switch
+        {
+            "movie" => "movie",
+            "series" => "series",
+            _ => throw new ArgumentException(
+                "Hidden-item type must be 'movie' or 'series', got: " + type, nameof(type)),
+        };
     }
 
     private static TmdbMetadataRow ReadTmdbMetadata(SqliteDataReader r, int offset)

@@ -247,6 +247,238 @@ public class PhantomDbTests : IDisposable
     }
 
     // ----------------------------------------------------------------
+    // v12 per-user accessors (REQ-M14-PER-USER branch B, backend task):
+    // user_prefs read/write, user_hidden_items set ops, and the
+    // userId-aware visibility overloads (composition over the server-wide
+    // queries).
+    // ----------------------------------------------------------------
+
+    [Fact]
+    public async Task UserPrefs_MissingRow_ReturnsDefaultsAllOn()
+    {
+        using var db = await NewDbAsync();
+        var prefs = await db.GetUserPrefsAsync(Guid.NewGuid(), CancellationToken.None);
+
+        Assert.Equal(UserPrefs.Defaults, prefs);
+        Assert.True(prefs.ProtectFavourites);
+        Assert.True(prefs.ShowPhantoms);
+        Assert.True(prefs.AllowEager);
+    }
+
+    [Fact]
+    public async Task UserPrefs_UpsertThenGet_RoundtripsEachToggle()
+    {
+        using var db = await NewDbAsync();
+        var user = Guid.NewGuid();
+        await db.UpsertUserPrefsAsync(user, new UserPrefs(ProtectFavourites: false, ShowPhantoms: true, AllowEager: false), CancellationToken.None);
+
+        var got = await db.GetUserPrefsAsync(user, CancellationToken.None);
+        Assert.False(got.ProtectFavourites);
+        Assert.True(got.ShowPhantoms);
+        Assert.False(got.AllowEager);
+    }
+
+    [Fact]
+    public async Task UserPrefs_UpsertTwice_OverwritesPrevious()
+    {
+        using var db = await NewDbAsync();
+        var user = Guid.NewGuid();
+        await db.UpsertUserPrefsAsync(user, new UserPrefs(false, false, false), CancellationToken.None);
+        await db.UpsertUserPrefsAsync(user, new UserPrefs(true, false, true), CancellationToken.None);
+
+        var got = await db.GetUserPrefsAsync(user, CancellationToken.None);
+        Assert.True(got.ProtectFavourites);
+        Assert.False(got.ShowPhantoms);
+        Assert.True(got.AllowEager);
+    }
+
+    [Fact]
+    public async Task UserPrefs_IsolatedPerUser()
+    {
+        using var db = await NewDbAsync();
+        var a = Guid.NewGuid();
+        var b = Guid.NewGuid();
+        await db.UpsertUserPrefsAsync(a, new UserPrefs(false, false, false), CancellationToken.None);
+
+        var pa = await db.GetUserPrefsAsync(a, CancellationToken.None);
+        var pb = await db.GetUserPrefsAsync(b, CancellationToken.None);
+
+        Assert.Equal(new UserPrefs(false, false, false), pa);
+        // b never wrote a row -> defaults, unaffected by a's write.
+        Assert.Equal(UserPrefs.Defaults, pb);
+    }
+
+    [Fact]
+    public async Task HiddenItems_AddIsListRemove_Cycle()
+    {
+        using var db = await NewDbAsync();
+        var user = Guid.NewGuid();
+
+        Assert.False(await db.IsItemHiddenAsync(user, 42, "movie", CancellationToken.None));
+
+        await db.AddHiddenItemAsync(user, 42, "movie", CancellationToken.None);
+        Assert.True(await db.IsItemHiddenAsync(user, 42, "movie", CancellationToken.None));
+
+        var list = await db.ListHiddenItemsAsync(user, CancellationToken.None);
+        Assert.Single(list);
+        Assert.Equal(42, list[0].TmdbId);
+        Assert.Equal("movie", list[0].Type);
+
+        await db.RemoveHiddenItemAsync(user, 42, "movie", CancellationToken.None);
+        Assert.False(await db.IsItemHiddenAsync(user, 42, "movie", CancellationToken.None));
+        Assert.Empty(await db.ListHiddenItemsAsync(user, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task HiddenItems_AddIdempotent_SingleRow()
+    {
+        using var db = await NewDbAsync();
+        var user = Guid.NewGuid();
+        await db.AddHiddenItemAsync(user, 42, "series", CancellationToken.None);
+        await db.AddHiddenItemAsync(user, 42, "series", CancellationToken.None);
+
+        var list = await db.ListHiddenItemsAsync(user, CancellationToken.None);
+        Assert.Single(list);
+    }
+
+    [Fact]
+    public async Task HiddenItems_RemoveMissing_IsNoOp()
+    {
+        using var db = await NewDbAsync();
+        var user = Guid.NewGuid();
+        // Must not throw and must leave the set empty.
+        await db.RemoveHiddenItemAsync(user, 404, "movie", CancellationToken.None);
+        Assert.Empty(await db.ListHiddenItemsAsync(user, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task HiddenItems_IsolatedPerUser()
+    {
+        using var db = await NewDbAsync();
+        var a = Guid.NewGuid();
+        var b = Guid.NewGuid();
+        await db.AddHiddenItemAsync(a, 42, "movie", CancellationToken.None);
+
+        Assert.True(await db.IsItemHiddenAsync(a, 42, "movie", CancellationToken.None));
+        Assert.False(await db.IsItemHiddenAsync(b, 42, "movie", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task HiddenItems_TypeIsolation_MovieAndSeriesIndependent()
+    {
+        using var db = await NewDbAsync();
+        var user = Guid.NewGuid();
+        await db.AddHiddenItemAsync(user, 42, "movie", CancellationToken.None);
+
+        Assert.True(await db.IsItemHiddenAsync(user, 42, "movie", CancellationToken.None));
+        Assert.False(await db.IsItemHiddenAsync(user, 42, "series", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task HiddenItems_InvalidType_Throws()
+    {
+        using var db = await NewDbAsync();
+        var user = Guid.NewGuid();
+        // 'episode' is not a valid title-level hide type (movie/series only).
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => db.AddHiddenItemAsync(user, 42, "episode", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task ListVisibleMovieRows_UserId_ExcludesOnlyThatUsersHidden()
+    {
+        using var db = await NewDbAsync();
+        await SeedVisibleMovieAsync(db, 42);
+        await SeedVisibleMovieAsync(db, 43);
+        var a = Guid.NewGuid();
+        var b = Guid.NewGuid();
+        await db.AddHiddenItemAsync(a, 42, "movie", CancellationToken.None);
+
+        var serverWide = await db.ListVisibleMovieRowsAsync(CancellationToken.None);
+        Assert.Equal(2, serverWide.Count);
+
+        var forA = await db.ListVisibleMovieRowsAsync(a, CancellationToken.None);
+        Assert.Single(forA);
+        Assert.Equal(43, forA[0].Metadata.TmdbId);
+
+        // b hid nothing -> sees the full server-wide set.
+        var forB = await db.ListVisibleMovieRowsAsync(b, CancellationToken.None);
+        Assert.Equal(2, forB.Count);
+    }
+
+    [Fact]
+    public async Task ListVisibleSeriesRows_UserId_ExcludesOnlyThatUsersHidden()
+    {
+        using var db = await NewDbAsync();
+        await SeedVisibleSeriesAsync(db, 98);
+        await SeedVisibleSeriesAsync(db, 99);
+        var a = Guid.NewGuid();
+        await db.AddHiddenItemAsync(a, 98, "series", CancellationToken.None);
+
+        var serverWide = await db.ListVisibleSeriesRowsAsync(CancellationToken.None);
+        Assert.Equal(2, serverWide.Count);
+
+        var forA = await db.ListVisibleSeriesRowsAsync(a, CancellationToken.None);
+        Assert.Single(forA);
+        Assert.Equal(99, forA[0].Metadata.TmdbId);
+    }
+
+    [Fact]
+    public async Task IsSeriesVisible_UserId_FalseWhenHiddenByUser()
+    {
+        using var db = await NewDbAsync();
+        await SeedVisibleSeriesAsync(db, 99);
+        var a = Guid.NewGuid();
+        var b = Guid.NewGuid();
+        await db.AddHiddenItemAsync(a, 99, "series", CancellationToken.None);
+
+        Assert.True(await db.IsSeriesVisibleAsync(99, 1, CancellationToken.None));
+        Assert.False(await db.IsSeriesVisibleAsync(a, 99, 1, CancellationToken.None));
+        Assert.True(await db.IsSeriesVisibleAsync(b, 99, 1, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task IsEpisodeVisible_UserId_FalseWhenParentSeriesHiddenByUser()
+    {
+        using var db = await NewDbAsync();
+        await SeedVisibleSeriesAsync(db, 99); // seeds episode (1,1)
+        var a = Guid.NewGuid();
+        var b = Guid.NewGuid();
+        await db.AddHiddenItemAsync(a, 99, "series", CancellationToken.None);
+
+        Assert.True(await db.IsEpisodeVisibleAsync(99, 1, 1, CancellationToken.None));
+        // Hiding is title-level: hiding the series hides its episodes for a.
+        Assert.False(await db.IsEpisodeVisibleAsync(a, 99, 1, 1, CancellationToken.None));
+        Assert.True(await db.IsEpisodeVisibleAsync(b, 99, 1, 1, CancellationToken.None));
+    }
+
+    /// <summary>
+    /// Make a movie server-wide-visible: a tmdb_metadata row plus a
+    /// materialised_state row (the movie visibility query surfaces a movie
+    /// when it is materialised OR marked available).
+    /// </summary>
+    private static async Task SeedVisibleMovieAsync(PhantomDb db, int tmdbId)
+    {
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(tmdbId, "movie", "Movie " + tmdbId, null, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await db.InsertMaterialisedStateAsync(tmdbId, "movie", -1, -1, "/s/m" + tmdbId, "/f/m" + tmdbId, CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Make a series server-wide-visible: a tmdb_metadata row plus one
+    /// materialised episode (season 1, episode 1) so the series clears the
+    /// min-available-episode display gate.
+    /// </summary>
+    private static async Task SeedVisibleSeriesAsync(PhantomDb db, int tmdbId)
+    {
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(tmdbId, "series", "Series " + tmdbId, null, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await db.InsertMaterialisedStateAsync(tmdbId, "episode", 1, 1, "/s/e" + tmdbId, "/f/e" + tmdbId, CancellationToken.None);
+    }
+
+    // ----------------------------------------------------------------
     // discovery_cache
     // ----------------------------------------------------------------
 
