@@ -15,14 +15,28 @@ using Microsoft.AspNetCore.Mvc;
 namespace Jellyfin.Plugin.PhantomLibrary.Api;
 
 /// <summary>
+/// Wire DTO for <c>POST /Plugins/PhantomLibrary/UserPrefs/{userId}</c> — the
+/// admin per-user-preferences sub-page (userPrefsPage.html) posts one of these
+/// per user row it edits.
+/// </summary>
+public sealed class UserPrefsDto
+{
+    public bool ProtectFavourites { get; set; }
+    public bool ShowPhantoms { get; set; }
+    public bool AllowEager { get; set; }
+}
+
+/// <summary>
 /// Admin-only REST surface for debug / manual operations against the
 /// materialisation pipeline.
 /// </summary>
 /// <remarks>
-/// The per-user-preferences endpoints were removed in Stage 2.2; the
-/// underlying <c>user_prefs</c> table is gone with the file-on-disk
-/// architecture. Channel-arch may re-introduce per-user controls in a
-/// later stage.
+/// The admin per-user-preferences endpoints (<c>GET UserPrefs</c> /
+/// <c>POST UserPrefs/{userId}</c>) back the userPrefsPage.html sub-page and
+/// were re-introduced for the m14 per-user show/hide surface on the
+/// channel-arch <c>user_prefs</c> table (schema v12). The calling-user
+/// (non-elevated) show/hide + own-prefs endpoints live on
+/// <see cref="PhantomLibraryUserController"/>, which is not elevation-gated.
 /// </remarks>
 [ApiController]
 [Authorize(Policy = "RequiresElevation")]
@@ -166,7 +180,9 @@ public sealed class PhantomLibraryController : ControllerBase
             return BadRequest(new { code = "invalid_tmdb_id", message = "tmdbId must be a positive integer." });
         }
 
+#pragma warning disable CA1308 // Canonical hidden-item tokens are lowercase ('movie'/'series'), not identifiers used for round-trip display.
         var normalised = type?.Trim().ToLowerInvariant();
+#pragma warning restore CA1308
         if (normalised != "movie" && normalised != "series")
         {
             return BadRequest(new { code = "invalid_type", message = "type must be 'movie' or 'series'." });
@@ -181,8 +197,6 @@ public sealed class PhantomLibraryController : ControllerBase
     [ProducesResponseType(StatusCodes.Status200OK)]
     public async Task<IActionResult> Status(CancellationToken ct = default)
     {
-        _ = _userManager;
-        _ = _db;
         var reachable = false;
         try
         {
@@ -200,6 +214,54 @@ public sealed class PhantomLibraryController : ControllerBase
             dbPath = System.IO.Path.Combine(_paths.PluginConfigurationsPath, "PhantomLibrary", "phantom.db"),
             gostreamReachable = reachable,
         });
+    }
+
+    /// <summary>
+    /// Returns one preference row per Jellyfin user for the admin sub-page.
+    /// Users with no stored row report <see cref="UserPrefs.Defaults"/>.
+    /// </summary>
+    [HttpGet("UserPrefs")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    public async Task<IActionResult> ListUserPrefs(CancellationToken ct = default)
+    {
+        var result = new List<object>();
+        foreach (var user in _userManager.GetUsers())
+        {
+            var prefs = await _db.GetUserPrefsAsync(user.Id, ct).ConfigureAwait(false);
+            result.Add(new
+            {
+                userId = user.Id.ToString("N"),
+                userName = user.Username,
+                protectFavourites = prefs.ProtectFavourites,
+                showPhantoms = prefs.ShowPhantoms,
+                allowEager = prefs.AllowEager,
+            });
+        }
+
+        return Ok(result);
+    }
+
+    /// <summary>Upserts the preference row for the given user (admin sub-page).</summary>
+    [HttpPost("UserPrefs/{userId}")]
+    [ProducesResponseType(StatusCodes.Status204NoContent)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> UpsertUserPrefs(
+        [FromRoute] Guid userId,
+        [FromBody] UserPrefsDto body,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(body);
+        var user = _userManager.GetUserById(userId);
+        if (user is null)
+        {
+            return NotFound();
+        }
+
+        await _db.UpsertUserPrefsAsync(
+            userId,
+            new UserPrefs(body.ProtectFavourites, body.ShowPhantoms, body.AllowEager),
+            ct).ConfigureAwait(false);
+        return NoContent();
     }
 
     private ObjectResult ToActionResult(PhantomSourceOperationResult result)

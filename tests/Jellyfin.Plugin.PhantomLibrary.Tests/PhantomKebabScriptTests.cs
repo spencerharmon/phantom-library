@@ -106,6 +106,63 @@ public class PhantomKebabScriptTests
     }
 
     [Fact]
+    public void ShowHide_MapsEveryPhantomNodeToItsHideTarget_MovieAndTv()
+    {
+        var js = ReadScript();
+
+        // Movie hides itself; every TV node (series/season/episode) maps to the
+        // series tmdb — the first numeric group — so hiding any of them hides the
+        // whole series for the calling user.
+        Assert.Contains("parsePhantomHideTarget", js);
+        Assert.Contains("/^movie_(\\d+)$/", js);
+        Assert.Contains("/^series_(\\d+)$/", js);
+        Assert.Contains("/^season_(\\d+)_s\\d+$/", js);
+        Assert.Contains("/^episode_(\\d+)_s\\d+e\\d+$/", js);
+        Assert.Contains("type: 'movie'", js);
+        Assert.Contains("type: 'series'", js);
+        // getHideablePhantomItem accepts all four node types (not just the
+        // materialisable movie/episode leaves the source section gates to).
+        Assert.Contains("getHideablePhantomItem", js);
+        Assert.Contains("item.Type !== 'Series' && item.Type !== 'Season'", js);
+    }
+
+    [Fact]
+    public void ShowHide_UsesAuthorizedUserHiddenEndpoints_WithMethodPerAction()
+    {
+        var js = ReadScript();
+
+        Assert.Contains("Plugins/PhantomLibrary/User/Hidden/", js);
+        Assert.Contains("encodeURIComponent(target.type)", js);
+        Assert.Contains("encodeURIComponent(target.tmdbId)", js);
+        // GET reports state; POST hides; DELETE unhides.
+        Assert.Contains("fetchHiddenState", js);
+        Assert.Contains("fireHide", js);
+        Assert.Contains("fireUnhide", js);
+        Assert.Matches(new Regex(@"function fireHide\(target\)\s*\{[\s\S]*?type:\s*'POST'"), js);
+        Assert.Matches(new Regex(@"function fireUnhide\(target\)\s*\{[\s\S]*?type:\s*'DELETE'"), js);
+    }
+
+    [Fact]
+    public void ShowHide_RendersDetailSectionAndActionSheetEntry_TouchSized()
+    {
+        var js = ReadScript();
+
+        // A standalone visibility section, distinct from the source section, so
+        // it renders for series/season too. It reuses the touch-sized
+        // .phantom-source-* classes for mobile parity.
+        Assert.Contains("phantom-visibility-section", js);
+        Assert.Contains("Phantom Visibility", js);
+        Assert.Contains("phantom-visibility-button", js);
+        Assert.Contains("phantom-source-button", js); // reused touch-sized class
+        Assert.Contains("Hide from my library", js);
+        Assert.Contains("Unhide from my library", js);
+        // Kebab action-sheet entry (primary mobile affordance).
+        Assert.Contains("injectVisibilityIntoSheet", js);
+        Assert.Contains("HIDE_DATA_ID", js);
+        Assert.Contains("UNHIDE_DATA_ID", js);
+    }
+
+    [Fact]
     public void MobileDomEvidence_HarnessPasses()
     {
         // Executes the real shim against a phone-sized DOM and asserts the injected
