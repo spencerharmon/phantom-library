@@ -30,7 +30,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   /Plugins/PhantomLibrary/Recommendations/Ingest?tmdbId=&type=` endpoint triggers
   the same ingest manually (REQ-M14-RECOMMENDATIONS).
 - Phantom DB retention remains deferred/no-op and is now labelled that way in the admin UI instead of presenting an active retention policy.
-- Legacy per-user preferences admin page/link is hidden until a real per-user preferences API is reintroduced.
 - Added `scripts/phantom-migrate-v11-to-v12.sh`, an offline operator script that
   performs the v11 → v12 schema bump in place instead of wiping. Because the v12
   delta is purely additive (it only creates `user_prefs`, `user_hidden_items`,
@@ -46,6 +45,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `scripts/tests/phantom-migrate-v11-to-v12.test.sh`, wired into the non-rig CI
   gate; permitted by the additive-only carve-out documented in `AGENTS.md`
   § "No database migrations until v1.0".
+- Per-user show/hide (REQ-M14-PER-USER 3/4): each Jellyfin user can now hide or
+  unhide an individual Phantom title from their own library view — via a **Hide
+  from my library** / **Unhide from my library** entry on the detail-page Phantom
+  section and the kebab (…) action sheet, for movies and TV series alike
+  (title-level; hiding a series also hides its episodes). A hidden title drops out
+  of that user's Phantom channel browse only; other users and global/admin state
+  are unaffected. Backed by new authenticated `/Plugins/PhantomLibrary/User/*`
+  endpoints — the caller's own preferences (`protect_favourites` / `show_phantoms`
+  / `allow_eager`) via `GET`/`POST User/Prefs`, and the hidden set via `GET
+  User/Hidden` and `GET`/`POST`/`DELETE User/Hidden/{type}/{tmdbId}`. The admin
+  per-user preferences page is also restored (it had been temporarily hidden
+  pending this API) and now lists and edits every user's toggles over
+  `GET`/`POST Plugins/PhantomLibrary/UserPrefs`.
 - BREAKING: requires wipe. Phantom DB schema is now v12, adding two additive
   per-user tables — `user_prefs` (one row per Jellyfin user holding the
   `protect_favourites` / `show_phantoms` / `allow_eager` toggles, all defaulting

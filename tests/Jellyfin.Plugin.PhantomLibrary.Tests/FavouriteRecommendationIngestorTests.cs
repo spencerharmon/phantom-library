@@ -23,6 +23,12 @@ public sealed class FavouriteRecommendationIngestorTests : IDisposable
     {
         _dbPath = Path.Combine(Path.GetTempPath(), "phantom-favrec-tests-" + Guid.NewGuid().ToString("N") + ".db");
         _db = new PhantomDb(_dbPath);
+        // Force schema creation, mirroring the other DB-backed test fixtures.
+        // The disabled-ingest no-op path writes nothing, so without this the
+        // catalogue_items table would not exist when ListCatalogueAsync reads it.
+        // Microsoft.Data.Sqlite's async API runs synchronously, so bridging the
+        // one-time init here does not deadlock.
+        _db.SetMetaAsync("__init__", "1", CancellationToken.None).GetAwaiter().GetResult();
     }
 
     public void Dispose()
@@ -135,8 +141,8 @@ public sealed class FavouriteRecommendationIngestorTests : IDisposable
         var series = await ListCatalogueAsync("series");
         Assert.Equal(new[] { 601, 602 }, series);
         Assert.Equal(2, await ScalarCountAsync("SELECT COUNT(*) FROM series_expansion_state;"));
-        Assert.Equal(1, tmdb.SimilarSeriesCalls.Count);
-        Assert.Equal(1, tmdb.SeriesRecommendationCalls.Count);
+        Assert.Single(tmdb.SimilarSeriesCalls);
+        Assert.Single(tmdb.SeriesRecommendationCalls);
     }
 
     [Fact]

@@ -63,6 +63,20 @@ public class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
                     "{0}.Configuration.configPage.html",
                     GetType().Namespace),
             },
+            // Admin per-user preferences page. Lists every Jellyfin user
+            // with their three Phantom toggles (protect-favourites, show-
+            // phantoms, allow-eager). Backed by the admin UserPrefs REST
+            // endpoints on PhantomLibraryController. Re-added for the
+            // m14 per-user show/hide surface (reverse of 92e5b84); the
+            // <EmbeddedResource> ships at csproj:73.
+            new PluginPageInfo
+            {
+                Name = Name + " \u2014 User Prefs",
+                EmbeddedResourcePath = string.Format(
+                    CultureInfo.InvariantCulture,
+                    "{0}.Configuration.userPrefsPage.html",
+                    GetType().Namespace),
+            },
             // PhantomKebab: browser-side JS shim that injects a
             // 'Materialise' entry into the item kebab/action-sheet
             // menu on detail pages. Served via this PluginPageInfo so

@@ -2245,7 +2245,9 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
     private static string NormalizeHiddenType(string type)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(type);
+#pragma warning disable CA1308 // Canonical hidden-item tokens are lowercase ('movie'/'series'), not identifiers used for round-trip display.
         return type.ToLowerInvariant() switch
+#pragma warning restore CA1308
         {
             "movie" => "movie",
             "series" => "series",

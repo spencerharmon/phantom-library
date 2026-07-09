@@ -303,8 +303,11 @@ function makeSessionStorage() {
 }
 
 /* --- API mock (real endpoint shapes) -------------------------------------- */
-function makeApi(itemGuid, item, sourcesState) {
+function makeApi(itemGuid, item, sourcesState, initialHidden) {
     const calls = [];
+    // Per-user hidden state is mutable so a POST hide / DELETE unhide flips what
+    // a following GET reports — this drives the section's re-render on toggle.
+    let hidden = !!initialHidden;
     return {
         calls,
         getCurrentUserId: () => 'user-0001',
@@ -324,6 +327,13 @@ function makeApi(itemGuid, item, sourcesState) {
         },
         ajax: (opts) => {
             calls.push({ kind: 'ajax', type: opts.type, url: opts.url, data: opts.data, contentType: opts.contentType });
+            // Per-user show/hide surface: GET reports state; POST hides; DELETE unhides.
+            const hiddenMatch = opts.url.match(/\/User\/Hidden\/([^/]+)\/(\d+)$/);
+            if (hiddenMatch) {
+                if (opts.type === 'POST') { hidden = true; return Promise.resolve({}); }
+                if (opts.type === 'DELETE') { hidden = false; return Promise.resolve({}); }
+                return Promise.resolve({ tmdbId: parseInt(hiddenMatch[2], 10), type: hiddenMatch[1], hidden });
+            }
             if (/\/Sources$/.test(opts.url)) return Promise.resolve(sourcesState);
             if (/\/Sources\/MaterialiseCandidate$/.test(opts.url)) {
                 return Promise.resolve({ Status: 'materialised', Code: 'materialised', Message: 'Source materialised', FusePath: '/fuse/new.mkv' });
@@ -341,14 +351,14 @@ function makeApi(itemGuid, item, sourcesState) {
 }
 
 /* --- environment factory (fresh per scenario) ----------------------------- */
-function makeEnv({ guid, item, sourcesState }) {
+function makeEnv({ guid, item, sourcesState, hidden }) {
     const document = new FakeDocument();
     // A phantom detail page host, as jellyfin-web renders it.
     const detailHost = document.createElement('div');
     detailHost.className = 'detailPageContent';
     document.body.appendChild(detailHost);
 
-    const api = makeApi(guid, item, sourcesState);
+    const api = makeApi(guid, item, sourcesState, hidden);
     const alerts = [];
     const window = {
         // Phone viewport (iPhone 12-ish CSS px). matchMedia mirrors the shim's
@@ -608,6 +618,82 @@ async function nonPhantomScenario() {
     loadShim(env);
     await settle();
     ok(env.document.getElementById('phantom-source-section') === null, 'control: no section injected for a non-phantom item');
+    ok(env.document.getElementById('phantom-visibility-section') === null, 'control: no visibility section injected for a non-phantom item');
+}
+
+/* Per-user show/hide detail-page section. Movie/series/season/episode all get a
+ * visibility section (hiding is title-level), unlike the source section which is
+ * movie/episode-only. Tapping the toggle POSTs (hide) / DELETEs (unhide) the
+ * User/Hidden endpoint for the mapped { type, tmdbId } and re-renders. */
+async function visibilitySectionScenario(label, fx, startHidden) {
+    console.log('\n[' + label + '] show/hide section @ 390px viewport [' + (startHidden ? 'hidden' : 'visible') + ']');
+    const env = makeEnv({ guid: fx.guid, item: fx.item, sourcesState: {}, hidden: startHidden });
+    loadShim(env);
+    await settle();
+
+    const { document } = env;
+    const section = document.getElementById('phantom-visibility-section');
+    ok(!!section, label + ': visibility section is injected into the detail page');
+    if (!section) return;
+    ok(section.closest('.detailPageContent') !== null, label + ': section lives inside the detail page content host');
+    ok(section.querySelector('h2') && section.querySelector('h2').textContent === 'Phantom Visibility', label + ': section has "Phantom Visibility" heading');
+    ok(section.textContent.includes(startHidden ? 'Hidden from your library' : 'Visible in your library'), label + ': current state summary reflects server state');
+
+    const toggle = section.querySelector('.phantom-visibility-button');
+    ok(!!toggle, label + ': a toggle button is rendered');
+    if (!toggle) return;
+    ok(toggle.classList.contains('phantom-source-button'), label + ': toggle reuses the touch-sized .phantom-source-button class');
+    ok(toggle.textContent === (startHidden ? 'Unhide from my library' : 'Hide from my library'), label + ': toggle label matches state');
+
+    // --- touch sizing read from the SHIPPED injected CSS (button reuses the class) ---
+    const css = document.getElementById('phantom-source-styles').textContent;
+    ok(/\.phantom-source-button\{[^}]*min-height:44px/.test(css), label + ': toggle declares a >=44px touch target');
+    ok(/\.phantom-source-button\{[^}]*touch-action:manipulation/.test(css), label + ': toggle sets touch-action:manipulation');
+
+    // --- API flow: tapping toggles per-user hidden state for the mapped title ---
+    env.api.calls.length = 0;
+    toggle.click();
+    await settle();
+    const expectMethod = startHidden ? 'DELETE' : 'POST';
+    const call = env.api.calls.find((c) => c.kind === 'ajax'
+        && new RegExp('/User/Hidden/' + fx.hideType + '/' + fx.hideTmdb + '$').test(c.url)
+        && c.type === expectMethod);
+    ok(!!call, label + ': tapping ' + (startHidden ? 'unhide DELETEs' : 'hide POSTs') + ' the User/Hidden endpoint for {' + fx.hideType + ',' + fx.hideTmdb + '}');
+
+    // --- re-render: after the toggle, the section flips to the opposite action ---
+    const toggle2 = document.getElementById('phantom-visibility-section').querySelector('.phantom-visibility-button');
+    ok(!!toggle2 && toggle2.textContent === (startHidden ? 'Hide from my library' : 'Unhide from my library'), label + ': section re-renders to the opposite action after the toggle');
+}
+
+async function visibilityActionSheetScenario(label, fx, startHidden) {
+    console.log('\n[' + label + '] show/hide action sheet @ 390px viewport [' + (startHidden ? 'hidden' : 'visible') + ']');
+    const env = makeEnv({ guid: fx.guid, item: fx.item, sourcesState: unmaterialisedState(fx.externalId, fx.type, fx.tmdb, fx.season, fx.episode), hidden: startHidden });
+    loadShim(env);
+    await settle();
+
+    const { document } = env;
+    const { sheet, wasClosed } = buildActionSheet(document);
+    document.body.appendChild(sheet); // triggers the shim's MutationObserver
+    await settle();
+
+    const dataId = startHidden ? 'phantom-unhide' : 'phantom-hide';
+    const expectLabel = startHidden ? 'Unhide from my library (Phantom Library)' : 'Hide from my library (Phantom Library)';
+    const injected = sheet.querySelector('[data-id="' + dataId + '"]');
+    ok(!!injected, label + ' [' + (startHidden ? 'hidden' : 'visible') + ']: a show/hide entry is injected into the action sheet');
+    if (!injected) return;
+    ok(injected.textContent.includes(expectLabel), label + ': entry carries the correct label');
+    ok(injected.style.minHeight === '44px', label + ': injected entry is a >=44px touch target');
+    ok(injected.style.touchAction === 'manipulation', label + ': injected entry sets touch-action:manipulation');
+
+    env.api.calls.length = 0;
+    injected.click();
+    await settle();
+    ok(wasClosed(), label + ': tapping the entry closes the action sheet');
+    const expectMethod = startHidden ? 'DELETE' : 'POST';
+    const call = env.api.calls.find((c) => c.kind === 'ajax'
+        && new RegExp('/User/Hidden/' + fx.hideType + '/' + fx.hideTmdb + '$').test(c.url)
+        && c.type === expectMethod);
+    ok(!!call, label + ': tap fires the ' + expectMethod + ' User/Hidden call for {' + fx.hideType + ',' + fx.hideTmdb + '}');
 }
 
 /* --- run ------------------------------------------------------------------- */
@@ -616,6 +702,8 @@ const MOVIE = {
     externalId: 'movie_603',
     type: 'Movie',
     tmdb: 603,
+    hideType: 'movie',
+    hideTmdb: 603,
     item: { Id: '11111111-2222-3333-4444-555555555555', Name: 'The Matrix', Type: 'Movie', ExternalId: 'movie_603' },
 };
 const EPISODE = {
@@ -625,11 +713,32 @@ const EPISODE = {
     tmdb: 1399,
     season: 1,
     episode: 1,
+    hideType: 'series',
+    hideTmdb: 1399,
     item: { Id: '99999999-8888-7777-6666-555555555555', Name: 'Winter Is Coming', Type: 'Episode', ExternalId: 'episode_1399_s1e1' },
+};
+const SERIES = {
+    guid: 'aaaaaaaa-1111-2222-3333-444444444444',
+    externalId: 'series_1399',
+    type: 'Series',
+    tmdb: 1399,
+    hideType: 'series',
+    hideTmdb: 1399,
+    item: { Id: 'aaaaaaaa-1111-2222-3333-444444444444', Name: 'Game of Thrones', Type: 'Series', ExternalId: 'series_1399' },
+};
+const SEASON = {
+    guid: 'bbbbbbbb-1111-2222-3333-444444444444',
+    externalId: 'season_1399_s01',
+    type: 'Season',
+    tmdb: 1399,
+    season: 1,
+    hideType: 'series',
+    hideTmdb: 1399,
+    item: { Id: 'bbbbbbbb-1111-2222-3333-444444444444', Name: 'Season 1', Type: 'Season', ExternalId: 'season_1399_s01' },
 };
 
 async function main() {
-    console.log('=== Phantom Library mobile-viewport source-management DOM/API evidence ===');
+    console.log('=== Phantom Library mobile-viewport source-management + show/hide DOM/API evidence ===');
     // Movie + TV episode parity (AGENTS.md movie/TV parity rule).
     await detailSectionScenario('movie', MOVIE);
     await detailSectionScenario('episode', EPISODE);
@@ -637,6 +746,20 @@ async function main() {
     await actionSheetScenario('episode', EPISODE, 'materialised');
     await actionSheetScenario('movie', MOVIE, 'unmaterialised');
     await actionSheetScenario('episode', EPISODE, 'unmaterialised');
+
+    // Per-user show/hide surface — movie, series, season, episode; visible + hidden.
+    await visibilitySectionScenario('movie', MOVIE, false);
+    await visibilitySectionScenario('movie', MOVIE, true);
+    await visibilitySectionScenario('series', SERIES, false);
+    await visibilitySectionScenario('series', SERIES, true);
+    await visibilitySectionScenario('season', SEASON, false);
+    await visibilitySectionScenario('episode', EPISODE, false);
+    await visibilitySectionScenario('episode', EPISODE, true);
+    await visibilityActionSheetScenario('movie', MOVIE, false);
+    await visibilityActionSheetScenario('series', SERIES, true);
+    await visibilityActionSheetScenario('season', SEASON, false);
+    await visibilityActionSheetScenario('episode', EPISODE, true);
+
     await nonPhantomScenario();
 
     console.log('\n=== ' + (failures.length ? 'FAILED' : 'PASSED') + ': ' + (checks - failures.length) + '/' + checks + ' checks ===');

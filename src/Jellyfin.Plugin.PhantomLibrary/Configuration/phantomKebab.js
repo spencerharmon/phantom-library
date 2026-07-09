@@ -9,6 +9,14 @@
  * shim only renders controls for channel items whose stable item.ExternalId
  * parses as movie_<tmdb> or episode_<tmdb>_s<season>e<episode>.
  *
+ * Also adds a per-user show/hide control to every Phantom detail page (movie,
+ * series, season, episode) and its action sheet: the calling user hides or
+ * unhides a title for THEMSELVES via the [Authorize] User/Hidden endpoints.
+ * Hiding is title-level and movie/TV symmetric — a movie maps to
+ * {movie, <tmdb>}; a series/season/episode all map to {series, <series tmdb>}
+ * (the first numeric group of the ExternalId), so hiding any TV node hides the
+ * whole series for that user.
+ *
  * No external dependencies. No build step. Pure browser JS.
  */
 (function () {
@@ -19,7 +27,12 @@
     var REJECT_LABEL = 'Reject current source (Phantom Library)';
     var MATERIALISE_DATA_ID = 'phantom-materialise';
     var REJECT_DATA_ID = 'phantom-reject-current-source';
+    var HIDE_LABEL = 'Hide from my library (Phantom Library)';
+    var UNHIDE_LABEL = 'Unhide from my library (Phantom Library)';
+    var HIDE_DATA_ID = 'phantom-hide';
+    var UNHIDE_DATA_ID = 'phantom-unhide';
     var SECTION_ID = 'phantom-source-section';
+    var VIS_SECTION_ID = 'phantom-visibility-section';
     var STYLE_ID = 'phantom-source-styles';
 
     function log() {
@@ -88,6 +101,42 @@
             if (!parsed) { return null; }
             if (item.Type && item.Type !== 'Movie' && item.Type !== 'Episode') { return null; }
             return { item: item, externalId: item.ExternalId, parsed: parsed };
+        });
+    }
+
+    /* Map any Phantom ExternalId to the per-user hide target the User/Hidden
+     * endpoints accept. Hiding is title-level and movie/TV symmetric:
+     *   movie_<tmdb>                  -> { type:'movie',  tmdbId:<tmdb> }
+     *   series_<tmdb>                 -> { type:'series', tmdbId:<tmdb> }
+     *   season_<tmdb>_s<NN>           -> { type:'series', tmdbId:<tmdb> }
+     *   episode_<tmdb>_s<NN>e<NN>     -> { type:'series', tmdbId:<tmdb> }
+     * so hiding any TV node (series/season/episode) hides the whole series for
+     * the calling user. orphan_<hex> has no tmdb and is not hideable. */
+    function parsePhantomHideTarget(externalId) {
+        if (typeof externalId !== 'string') { return null; }
+        var movie = externalId.match(/^movie_(\d+)$/);
+        if (movie) { return { type: 'movie', tmdbId: parseInt(movie[1], 10) }; }
+        var series = externalId.match(/^series_(\d+)$/);
+        if (series) { return { type: 'series', tmdbId: parseInt(series[1], 10) }; }
+        var seasonMatch = externalId.match(/^season_(\d+)_s\d+$/);
+        if (seasonMatch) { return { type: 'series', tmdbId: parseInt(seasonMatch[1], 10) }; }
+        var episode = externalId.match(/^episode_(\d+)_s\d+e\d+$/);
+        if (episode) { return { type: 'series', tmdbId: parseInt(episode[1], 10) }; }
+        return null;
+    }
+
+    /* Like getPlayablePhantomItem, but for the show/hide surface: accepts every
+     * Phantom detail node (movie, series, season, episode) since hiding is
+     * title-level, not just the materialisable movie/episode leaves. */
+    function getHideablePhantomItem() {
+        return getCurrentItem().then(function (item) {
+            if (!item || !item.ExternalId) { return null; }
+            var target = parsePhantomHideTarget(item.ExternalId);
+            if (!target) { return null; }
+            if (item.Type
+                && item.Type !== 'Movie' && item.Type !== 'Episode'
+                && item.Type !== 'Series' && item.Type !== 'Season') { return null; }
+            return { item: item, externalId: item.ExternalId, target: target };
         });
     }
 
@@ -254,6 +303,73 @@
         });
     }
 
+    function hiddenPath(target) {
+        return 'Plugins/PhantomLibrary/User/Hidden/'
+            + encodeURIComponent(target.type) + '/' + encodeURIComponent(target.tmdbId);
+    }
+
+    /* GET the calling user's hidden state for a title. Returns the parsed
+     * { tmdbId, type, hidden } body, or null if the lookup fails (treated as
+     * "state unknown" by callers, which then render nothing). */
+    function fetchHiddenState(target) {
+        var url = apiUrl(hiddenPath(target));
+        if (!url) { return Promise.resolve(null); }
+        return ajaxJson({
+            type: 'GET',
+            url: url,
+            dataType: 'json'
+        }).then(function (result) {
+            return result || null;
+        }, function (err) {
+            warn('hidden-state lookup failed', err);
+            return null;
+        });
+    }
+
+    /* POST to hide this title for the calling user (idempotent, 204). No
+     * dataType: the endpoint returns an empty 204 body, so asking for JSON
+     * would reject on the empty parse. */
+    function fireHide(target) {
+        var url = apiUrl(hiddenPath(target));
+        if (!url) {
+            alert('Phantom Library: ApiClient not found. Reload page and try again.');
+            return Promise.reject(new Error('ApiClient not found'));
+        }
+        return ajaxJson({
+            type: 'POST',
+            url: url
+        }).then(function (result) {
+            return result;
+        }, function (err) {
+            warn('hide failed', err);
+            alert('Phantom Library: hide failed\n' + extractErrorMessage(err));
+            throw err;
+        });
+    }
+
+    /* DELETE to unhide this title for the calling user (idempotent, 204). */
+    function fireUnhide(target) {
+        var url = apiUrl(hiddenPath(target));
+        if (!url) {
+            alert('Phantom Library: ApiClient not found. Reload page and try again.');
+            return Promise.reject(new Error('ApiClient not found'));
+        }
+        return ajaxJson({
+            type: 'DELETE',
+            url: url
+        }).then(function (result) {
+            return result;
+        }, function (err) {
+            warn('unhide failed', err);
+            alert('Phantom Library: unhide failed\n' + extractErrorMessage(err));
+            throw err;
+        });
+    }
+
+    function isHiddenState(state) {
+        return !!(state && (state.Hidden || state.hidden));
+    }
+
     function candidateRequest(candidate) {
         return {
             magnet: candidate.Magnet || candidate.magnet,
@@ -281,8 +397,8 @@
         var style = document.createElement('style');
         style.id = STYLE_ID;
         style.textContent = [
-            '#phantom-source-section{margin:1.25em 0;padding:1em;border:1px solid rgba(255,255,255,.18);border-radius:10px;}',
-            '#phantom-source-section h2{margin:.1em 0 .75em;font-size:1.2em;}',
+            '#phantom-source-section,#phantom-visibility-section{margin:1.25em 0;padding:1em;border:1px solid rgba(255,255,255,.18);border-radius:10px;}',
+            '#phantom-source-section h2,#phantom-visibility-section h2{margin:.1em 0 .75em;font-size:1.2em;}',
             '.phantom-source-summary{margin:.4em 0 .9em;opacity:.92;}',
             '.phantom-source-row{display:flex;gap:.6em;align-items:center;flex-wrap:wrap;margin:.6em 0;}',
             '.phantom-source-row label{font-weight:600;}',
@@ -469,6 +585,13 @@
             || document.body;
     }
 
+    /* True when a node lives inside either Phantom-owned section, so the
+     * MutationObserver ignores our own DOM writes and never self-triggers. */
+    function isInPhantomSection(node) {
+        if (!node || node.nodeType !== 1 || !node.closest) { return false; }
+        return !!(node.closest('#' + SECTION_ID) || node.closest('#' + VIS_SECTION_ID));
+    }
+
     function refreshSourceSection() {
         var seenItemId = currentItemId();
         if (!seenItemId) {
@@ -483,6 +606,98 @@
             return fetchSources(ctx.externalId).then(function (state) {
                 if (currentItemId() !== seenItemId) { return; }
                 renderSourceSection(ctx, state);
+            });
+        });
+    }
+
+    /* The per-user show/hide surface. A standalone section (distinct from the
+     * source section) so it renders for EVERY Phantom node — movie, series,
+     * season, episode — not just the materialisable movie/episode leaves. It
+     * reuses the .phantom-source-* classes so it inherits the same touch sizing
+     * and mobile responsive layout. */
+    function renderVisibilitySection(ctx, hidden) {
+        if (!ctx) {
+            removeVisibilitySection();
+            return;
+        }
+        ensureStyles();
+        var existing = document.getElementById(VIS_SECTION_ID);
+        if (existing && existing.dataset.externalId !== ctx.externalId) {
+            existing.remove();
+            existing = null;
+        }
+
+        var section = existing || document.createElement('section');
+        section.id = VIS_SECTION_ID;
+        section.dataset.externalId = ctx.externalId;
+        section.setAttribute('aria-label', 'Phantom Visibility');
+        section.innerHTML = '';
+
+        var heading = document.createElement('h2');
+        heading.textContent = 'Phantom Visibility';
+        section.appendChild(heading);
+
+        var summary = document.createElement('div');
+        summary.className = 'phantom-source-summary';
+        summary.textContent = hidden
+            ? 'Hidden from your library'
+            : 'Visible in your library';
+        section.appendChild(summary);
+
+        var actions = document.createElement('div');
+        actions.className = 'phantom-source-row';
+
+        var toggle = document.createElement('button');
+        toggle.type = 'button';
+        toggle.className = 'raised phantom-source-button phantom-visibility-button';
+        toggle.textContent = hidden ? 'Unhide from my library' : 'Hide from my library';
+        toggle.setAttribute('data-id', hidden ? UNHIDE_DATA_ID : HIDE_DATA_ID);
+        toggle.addEventListener('click', function () {
+            toggle.disabled = true;
+            var op = hidden ? fireUnhide(ctx.target) : fireHide(ctx.target);
+            op.then(refreshVisibilitySection, function () {
+                toggle.disabled = false;
+            });
+        });
+        actions.appendChild(toggle);
+        section.appendChild(actions);
+
+        if (!existing) {
+            var host = findDetailsHost();
+            var src = document.getElementById(SECTION_ID);
+            if (src && src.parentNode === host) {
+                host.insertBefore(section, src.nextSibling || null);
+            } else if (host.firstChild) {
+                host.insertBefore(section, host.firstChild);
+            } else {
+                host.appendChild(section);
+            }
+        }
+    }
+
+    function removeVisibilitySection() {
+        var existing = document.getElementById(VIS_SECTION_ID);
+        if (existing) { existing.remove(); }
+    }
+
+    function refreshVisibilitySection() {
+        var seenItemId = currentItemId();
+        if (!seenItemId) {
+            removeVisibilitySection();
+            return Promise.resolve();
+        }
+        return getHideablePhantomItem().then(function (ctx) {
+            if (!ctx || currentItemId() !== seenItemId) {
+                removeVisibilitySection();
+                return;
+            }
+            return fetchHiddenState(ctx.target).then(function (state) {
+                if (currentItemId() !== seenItemId) { return; }
+                if (!state) {
+                    removeVisibilitySection();
+                    return;
+                }
+                renderVisibilitySection(ctx, isHiddenState(state));
             });
         });
     }
@@ -542,6 +757,50 @@
         });
     }
 
+    /* Inject the per-user show/hide entry into the kebab action sheet. Separate
+     * from injectIntoSheet (its own dataset guard) so a series/season sheet —
+     * which has no source entry — still gets a hide/unhide entry, and a
+     * movie/episode sheet gets both. */
+    function injectVisibilityIntoSheet(sheet) {
+        if (!sheet || sheet.dataset.phantomVisInjected === '1') {
+            return;
+        }
+        var content = sheet.querySelector('.actionSheetContent') || sheet.querySelector('.actionSheetScroller') || sheet;
+        if (!content) {
+            return;
+        }
+
+        var itemId = currentItemId();
+        if (!itemId) {
+            return;
+        }
+
+        getHideablePhantomItem().then(function (ctx) {
+            if (!ctx) {
+                sheet.dataset.phantomVisInjected = '1';
+                return;
+            }
+            return fetchHiddenState(ctx.target).then(function (state) {
+                if (!state) {
+                    sheet.dataset.phantomVisInjected = '1';
+                    return;
+                }
+                if (isHiddenState(state)) {
+                    injectButton(sheet, content, UNHIDE_LABEL, UNHIDE_DATA_ID, 'visibility', function () {
+                        closeSheet(sheet);
+                        fireUnhide(ctx.target).then(refreshVisibilitySection, function () { /* alert already shown */ });
+                    });
+                } else {
+                    injectButton(sheet, content, HIDE_LABEL, HIDE_DATA_ID, 'visibility_off', function () {
+                        closeSheet(sheet);
+                        fireHide(ctx.target).then(refreshVisibilitySection, function () { /* alert already shown */ });
+                    });
+                }
+                sheet.dataset.phantomVisInjected = '1';
+            });
+        });
+    }
+
     function injectButton(sheet, content, label, dataId, iconText, onClick) {
         if (content.querySelector('[data-id="' + dataId + '"]')) { return; }
 
@@ -585,9 +844,11 @@
     function start() {
         ensureStyles();
         refreshSourceSection();
+        refreshVisibilitySection();
         prehydratePhantomSeasonChildren();
         window.addEventListener('hashchange', function () {
             window.setTimeout(refreshSourceSection, 50);
+            window.setTimeout(refreshVisibilitySection, 50);
             window.setTimeout(prehydratePhantomSeasonChildren, 50);
             window.setTimeout(prehydratePhantomSeasonChildren, 500);
         });
@@ -596,23 +857,25 @@
             var sawExternalDom = false;
             for (var i = 0; i < mutations.length; i++) {
                 var target = mutations[i].target;
-                if (target && target.nodeType === 1 && target.closest && target.closest('#' + SECTION_ID)) {
+                if (isInPhantomSection(target)) {
                     continue;
                 }
                 var added = mutations[i].addedNodes;
                 for (var j = 0; j < added.length; j++) {
                     var node = added[j];
                     if (node.nodeType !== 1) { continue; }
-                    if (node.id === SECTION_ID || (node.closest && node.closest('#' + SECTION_ID))) {
+                    if (node.id === SECTION_ID || node.id === VIS_SECTION_ID || isInPhantomSection(node)) {
                         continue;
                     }
                     sawExternalDom = true;
                     if (node.classList && node.classList.contains('actionSheet')) {
                         injectIntoSheet(node);
+                        injectVisibilityIntoSheet(node);
                     } else if (node.querySelector) {
                         var sheets = node.querySelectorAll('.actionSheet');
                         for (var k = 0; k < sheets.length; k++) {
                             injectIntoSheet(sheets[k]);
+                            injectVisibilityIntoSheet(sheets[k]);
                         }
                     }
                 }
@@ -622,6 +885,7 @@
                 window.setTimeout(function () {
                     scheduled = false;
                     refreshSourceSection();
+                    refreshVisibilitySection();
                     prehydratePhantomSeasonChildren();
                 }, 150);
             }
