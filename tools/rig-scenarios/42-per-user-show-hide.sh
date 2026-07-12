@@ -213,12 +213,16 @@ TASKID=$(curl -s -H "X-Emby-Token: $TOK" "$BASE/ScheduledTasks" \
   | python3 -c "import json,sys; d=json.load(sys.stdin); print(next((t['Id'] for t in d if t.get('Key')=='$DISCOVERY_TASK_ID'),''))")
 [ -n "$TASKID" ] || fail "DiscoveryRefreshTask not registered — plugin DI broken."
 curl -s -o /dev/null -X POST -H "X-Emby-Token: $TOK" "$BASE/ScheduledTasks/Running/$TASKID"
+discovery_ok=0
 for i in $(seq 1 120); do
   state=$(curl -s -H "X-Emby-Token: $TOK" "$BASE/ScheduledTasks/$TASKID" \
     | python3 -c "import json,sys; print(json.load(sys.stdin).get('State','?'))")
-  [ "$state" = "Idle" ] && { echo "  discovery completed after ${i}s"; break; }
+  [ "$state" = "Idle" ] && { echo "  discovery completed after ${i}s"; discovery_ok=1; break; }
   sleep 1
 done
+# Fail loudly on a stuck task rather than silently proceeding to a confusing
+# "fixture not visible" baseline failure 100+ lines later.
+[ "$discovery_ok" = "1" ] || fail "DiscoveryRefreshTask did not return to Idle within 120s (last state=$state) — rig discovery is stuck; check the rig Jellyfin log."
 
 CH_MOVIES=$(channel_id "Phantom Movies"); [ -n "$CH_MOVIES" ] || fail "Phantom Movies channel not registered"
 CH_SHOWS=$(channel_id "Phantom Shows");   [ -n "$CH_SHOWS" ]  || fail "Phantom Shows channel not registered"
