@@ -17,26 +17,6 @@ public interface IGostreamClient
 
     /// <summary>Probes endpoint reachability. Used for the legacy-fallback decision in PLAN.</summary>
     Task<bool> ProbeAsync(CancellationToken ct);
-
-    /// <summary>
-    /// Best-effort: asks the gostream Vault Mode endpoint to prestage the
-    /// given stub at the supplied priority. Throws on 5xx / connection
-    /// errors; callers wrap and log.
-    /// </summary>
-    Task PrestageAsync(string stubPath, int priority, CancellationToken ct);
-
-    /// <summary>
-    /// True if the gostream server exposes the Vault Mode prestage /
-    /// prestage-status endpoints. Probes once and caches the answer for
-    /// the process lifetime.
-    /// </summary>
-    Task<bool> IsVaultModePresentAsync(CancellationToken ct);
-
-    /// <summary>
-    /// Best-effort: clears the Vault Mode persistence marker for the given
-    /// stub. 404 is swallowed (idempotent); 5xx throws.
-    /// </summary>
-    Task UnprestageAsync(string stubPath, CancellationToken ct);
 }
 
 public sealed record GostreamAddRequest

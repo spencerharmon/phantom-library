@@ -87,14 +87,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added Phantom Prometheus metrics on Jellyfin's normal `/metrics` endpoint when
   Jellyfin metrics are enabled.
 - Added `SeriesMinAvailableEpisodes` (default `1`) so TV series appear after a
-  configurable number of distinct available/materialised episodes; once visible,
-  all known episodes in the series are shown.
+   configurable number of distinct available/materialised episodes; once visible,
+   all known episodes in the series are shown.
 - Phantom Shows season folders now use TMDB season details when browsing a
   series, adding season poster/overview/air year plus episode availability
   counts, and now emit Jellyfin `Season` channel items so web opens the rich
   native season details view. The web shim prehydrates channel season children
   on season detail pages so the native episode list is populated without
   broadening the Jellyfin patch surface.
+- **M14 done.** Every M14 operator requirements ledger row (`PLAN.md` §
+  "M14 operator requirements ledger") is now satisfied: all `IMPLEMENT` rows
+  (REQ-M14-SOURCE-API/UI/SAFETY/MOBILE/FAV-MATERIALISE/PER-USER) are
+  implemented and evidence-cited; all former `EVALUATE` rows
+  (REQ-M14-RECOMMENDATIONS, REQ-M14-RETENTION, REQ-M14-VAULT,
+  REQ-M14-CONCURRENCY, REQ-M14-SEARCH-GATING, REQ-M14-SPLASH) carry a written
+  evaluation and either an implementation or an operator-approved disposition
+  (see `docs/plans/m14-ledger-evaluation.md` and
+  `docs/plans/m14-ledger-evidence-audit.md`). No unapproved deferrals remain.
+  Movie/TV channel parity is covered by `tools/rig-scenarios/35-channel-e2e-playback.sh`
+  and `36-channel-episode-e2e-playback.sh`; the channel source-safety scenario is
+  covered by `tools/rig-scenarios/39-channel-source-safety.sh`.
+
+### Removed
+
+- Removed the dead Vault Mode client surface (`PrestageAsync`/`UnprestageAsync`/
+  `IsVaultModePresentAsync` on `IGostreamClient`/`GostreamClient`) and its
+  orphaned unit tests, per the operator-approved DEFER disposition on
+  REQ-M14-VAULT (2026-07-09): favourite-driven materialisation plus
+  favourite-protected eviction are the M14 persistence answer, and no
+  persist-without-materialise trigger is in scope. No live `src/` caller
+  referenced these methods.
 
 ### Fixed
 

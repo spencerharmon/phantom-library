@@ -44,7 +44,7 @@ Mascot: *Stygiomedusa gigantea*, the giant phantom jelly.
 | M12 — Dedupe-gap heal-on-rediscovery           | ✅ | (unreleased) |
 | M13 — Per-series subdir stub layout for TV phantoms | ✅ | (unreleased) |
 | Spike — Jellyfin-native `[tmdbid-<id>]` stub layout | ✅ | merged into main as `a931379` (file-on-disk architecture; deployed to operator v0.2.0.0; **slated for replacement by M14**) |
-| M14 — IChannel migration + Jellyfin patch | 🚧 IN FLIGHT on main | Channel architecture implemented behind schema v11; remaining work is hardening, operator validation, and cleanup of stale design docs. |
+| M14 — IChannel migration + Jellyfin patch | ✅ DONE | Channel architecture implemented behind schema v11; all M14 operator requirements ledger rows are satisfied (`IMPLEMENT` rows evidence-cited, former `EVALUATE` rows evaluated + implemented or operator-dispositioned); no unapproved deferrals. See `docs/plans/m14-ledger-evaluation.md` and `docs/plans/m14-ledger-evidence-audit.md`. |
 
 ### M14 operator requirements ledger
 
@@ -62,12 +62,12 @@ fixed before handoff.
 | REQ-M14-MOBILE | Source-management UX is usable in mobile browser; native mobile limitations must have diagnostics/channel fallback or explicit operator-approved limitation. | IMPLEMENT | Mobile-browser DOM/API evidence or documented fallback with test coverage. |
 | REQ-M14-FAV-MATERIALISE | Favourite-triggered materialisation/prewarming behavior must be implemented or explicitly re-approved by operator as not desired after channel refactor. | IMPLEMENT | UserData/favourite tests showing materialise/prewarm trigger, or operator-approved disposition change. |
 | REQ-M14-PER-USER | Per-user preferences/favourite eviction protection/show-hide/source-probing controls must be implemented or re-evaluated with operator after channel refactor. | IMPLEMENT | API/UI/tests for per-user behavior, or operator-approved disposition change. |
-| REQ-M14-RECOMMENDATIONS | Favourite-similar/recommendation ingestion must be re-evaluated after channel refactor; do not silently drop it. | EVALUATE | Written evaluation against current channel surfaces + operator disposition. |
-| REQ-M14-RETENTION | Phantom/catalogue retention must be re-evaluated after schema v11 append-only catalogue design; config must not imply active pruning unless implemented. | EVALUATE | Written evaluation + either implementation/tests or operator-approved no-op/defer. |
-| REQ-M14-VAULT | Vault Mode/prestage/favourite-driven persistence must be re-evaluated against current gostream and eviction model. | EVALUATE | Written evaluation + implementation/tests or operator-approved disposition. |
-| REQ-M14-CONCURRENCY | Per-indexer concurrency cap must be implemented or removed/renamed so config does not overpromise. | EVALUATE | Concurrency tests or config/UI cleanup with operator-approved disposition. |
-| REQ-M14-SEARCH-GATING | Native remote-search availability gating must be evaluated against channel-only availability gating. | EVALUATE | Written evaluation + operator disposition. |
-| REQ-M14-SPLASH | Splash/fake-button/dynamic overlay remnants must be evaluated after native-open refactor and either removed, repurposed, or operator-approved as historical. | EVALUATE | Written evaluation + code/UI cleanup if still exposed. |
+| REQ-M14-RECOMMENDATIONS | Favourite-similar/recommendation ingestion must be re-evaluated after channel refactor; do not silently drop it. | IMPLEMENTED (resolved from EVALUATE) | Written evaluation + `FavouriteRecommendationIngestor` implementation, tests, and rig scenario 40; see `docs/plans/m14-ledger-evaluation.md`. |
+| REQ-M14-RETENTION | Phantom/catalogue retention must be re-evaluated after schema v11 append-only catalogue design; config must not imply active pruning unless implemented. | RESOLVED (config/UI no-op, no operator objection) | Written evaluation + config/UI cleanup (retention field disabled/no-op); see `docs/plans/m14-ledger-evaluation.md`. |
+| REQ-M14-VAULT | Vault Mode/prestage/favourite-driven persistence must be re-evaluated against current gostream and eviction model. | DEFER (operator 2026-07-09) | Written evaluation + operator-approved DEFER (branch A); dead Vault-Mode client surface removed (`Clients/IGostreamClient.cs`, `Clients/GostreamClient.cs`, `GostreamClientTests.cs`); see `docs/plans/m14-ledger-evaluation.md`. |
+| REQ-M14-CONCURRENCY | Per-indexer concurrency cap must be implemented or removed/renamed so config does not overpromise. | RESOLVED (already enforced) | Written evaluation: `MaterialisationQueue.GetIndexerLimit()`/`MagnetSelector` already enforce the cap; no code change needed; see `docs/plans/m14-ledger-evaluation.md`. |
+| REQ-M14-SEARCH-GATING | Native remote-search availability gating must be evaluated against channel-only availability gating. | RESOLVED (no operator objection) | Written evaluation: no separate native remote-search gate needed for current channel contract; see `docs/plans/m14-ledger-evaluation.md`. |
+| REQ-M14-SPLASH | Splash/fake-button/dynamic overlay remnants must be evaluated after native-open refactor and either removed, repurposed, or operator-approved as historical. | RESOLVED (historical, verified by rig) | Written evaluation: verified by `35-channel-e2e-playback.sh`/`36-channel-episode-e2e-playback.sh`; no cleanup required; see `docs/plans/m14-ledger-evaluation.md`. |
 
 Evidence audit for the already-IMPLEMENT rows above (REQ-M14-SOURCE-API, REQ-M14-SOURCE-UI,
 REQ-M14-FAV-MATERIALISE) with cited `file:line` tests/code lives in
@@ -164,13 +164,12 @@ Required coverage:
 - Live rig scenario proving reject current source → next ranked source →
   playback through real Jellyfin channel/native-open flow.
 
-### M14 remaining-deferral evaluation plan
+### M14 remaining-deferral evaluation plan (closed)
 
-Rows marked `EVALUATE` in the ledger are not approved deferrals. For each row,
-inspect current channel-refactor code, write a short finding in PLAN.md or a
-companion plan doc, and either implement the still-relevant behavior or obtain
-operator disposition. Evaluation must cover user-visible behavior, current code
-entry points, risks, and exact tests needed if implemented.
+All rows formerly marked `EVALUATE` in the ledger have been resolved: each
+carries a written finding plus either an implementation or an operator-approved
+disposition (no self-approved deferrals). See the "M14 operator requirements
+ledger" table above for the resolved `Disposition` per row.
 
 Current written evaluation lives in `docs/plans/m14-ledger-evaluation.md`.
 
@@ -183,10 +182,11 @@ by tests, not re-defer it.
 - **Custom `QualityPreset` falls back to `GostreamDefault`** with a
   warning log (M4 decision). Revisit when a real custom-scoring use
   case appears.
-- **Per-user preferences are tracked by REQ-M14-PER-USER.** Earlier admin
-  sub-page wiring was removed from the active API surface; this is not an
-  approved deferral until the operator accepts the post-channel-refactor
-  disposition.
+- **Per-user preferences are implemented (REQ-M14-PER-USER, resolved).**
+  `PhantomLibraryUserController` exposes `GET`/`POST User/Prefs` and
+  `GET`/`POST`/`DELETE User/Hidden/{type}/{tmdbId}`; the admin
+  `UserPrefs`/`UserPrefs/{userId}` sub-page endpoints are restored on
+  `PhantomLibraryController`. Not a deferral.
 - **Series-level `Materialise` returns `Error`** (M8). Correct
   behaviour: a Series is a container, not a streamable file.
   Materialise individual Episodes (the autopilot does this for the
@@ -310,9 +310,10 @@ contributors can see the rationale.
    real source to the client.
 8. **Gostream integration.** The plugin talks to gostream through patched
    library-control endpoints: materialisation uses `POST /api/library/add`,
-   eviction uses `POST /api/library/remove`, and Vault Mode/prestage endpoints
-   are optional/deferred. No raw stub writes, no dependency on the JSON stub
-   format, no four-step orchestration.
+   eviction uses `POST /api/library/remove`. Vault Mode/prestage endpoints
+   were evaluated and DEFERRED (REQ-M14-VAULT, operator 2026-07-09); the
+   dead client surface has been removed. No raw stub writes, no dependency
+   on the JSON stub format, no four-step orchestration.
 9. **Auth between plugin and gostream.** Punt. Plugin and gostream are
    assumed reachable on a trusted network (loopback for the common
    single-host case, private LAN otherwise). README documents this; a
@@ -617,10 +618,13 @@ until a real per-user contract is implemented.
    `IChannelItemRefreshManager`. Materialised rows are emitted with real
    FUSE media sources; unmaterialised rows use Jellyfin's native
    `RequiresOpening` media-source flow.
-9. Vault Mode endpoints exist in the client interface, but favourite-driven
-   prestage/persist wiring is deferred in the current M14 slice. Eviction
-   favourite protection is server-wide and prevents removal; it does not yet
-   force full-file gostream persistence.
+ 9. Vault Mode prestage/persist wiring was evaluated (REQ-M14-VAULT) and
+    DEFERRED by operator decision (2026-07-09): favourite-driven materialise
+    plus favourite-protected eviction are the M14 persistence answer, so the
+    dead Vault-Mode client surface (`PrestageAsync`/`UnprestageAsync`/
+    presence probe) was removed from `IGostreamClient`/`GostreamClient`.
+    Eviction favourite protection is server-wide and prevents removal; it
+    does not force full-file gostream persistence.
 
 ### State persistence
 

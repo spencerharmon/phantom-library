@@ -228,13 +228,6 @@ Real issues hit during M2 and M5 install / smoke testing. Check
   in the admin page. If you run many users, also consider lowering
   the suggestions refresh frequency.
 
-- **Vault Mode prestage appears to no-op.** The gostream
-  [`phantom-library/vault-mode`](https://github.com/spencerharmon/gostream/tree/phantom-library/vault-mode)
-  branch isn't deployed. This is harmless: the plugin detects the
-  patch at runtime and silently skips `persist=true` when absent.
-  Deploy the branch (or accept the degradation) to enable
-  full-file SSD caching for favourites.
-
 ## Auth & network model
 
 The plugin assumes it can reach gostream over a trusted network —
@@ -252,11 +245,13 @@ optional but increasingly capable:
 |-------|---------|--------|
 | `POST /api/library/add` + `/remove` (M1) | One-shot torrent registration + FUSE path return | branch `phantom-library/api-add` on the fork; PR pending |
 | Jellyfin watchlist adapter | Replace Plex watchlist source with Jellyfin favourites | future |
-| Vault Mode (`persist=true` stubs) | Per-stub full-file SSD cache, protects favourites from swarm rot | future |
 
-The plugin's runtime detects which patches are present and adjusts
-behaviour (e.g. a `persist` flag is only written if Vault Mode is
-available).
+The plugin's runtime detects patch presence and adjusts behaviour
+accordingly. Vault Mode (`persist=true` stubs) was evaluated
+(REQ-M14-VAULT) and DEFERRED by operator decision (2026-07-09):
+favourite-driven materialisation plus favourite-protected eviction are
+the M14 persistence answer, so the plugin's Vault Mode client surface
+has been removed rather than kept as an unused code path.
 
 ## Project layout
 
