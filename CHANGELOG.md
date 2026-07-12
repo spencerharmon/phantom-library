@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Milestone
+
+- **M14 (IChannel migration + Jellyfin patch) recorded DONE against its operator
+  requirements ledger.** Every ledger row is satisfied — the `IMPLEMENT` rows
+  (source-management API/UI/safety, mobile UX, favourite-materialise, per-user
+  preferences/show-hide) are evidence-cited, and the `EVALUATE` rows
+  (recommendations, retention, vault, concurrency, search-gating, splash) are
+  resolved with explicit operator dispositions recorded in `ROI.md` — with no
+  unapproved deferrals. Movie/TV parity (`35`/`36` channel e2e rig scenarios plus
+  the `39` source-safety scenario) remains the gate. See `PLAN.md` § "M14 ledger
+  closure" and `docs/tasks/m14-ledger-done.md`.
+
 ### Documentation
 
 - Added durable design/testing/deploy protocols for native phantom

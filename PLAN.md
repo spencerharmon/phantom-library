@@ -44,7 +44,7 @@ Mascot: *Stygiomedusa gigantea*, the giant phantom jelly.
 | M12 — Dedupe-gap heal-on-rediscovery           | ✅ | (unreleased) |
 | M13 — Per-series subdir stub layout for TV phantoms | ✅ | (unreleased) |
 | Spike — Jellyfin-native `[tmdbid-<id>]` stub layout | ✅ | merged into main as `a931379` (file-on-disk architecture; deployed to operator v0.2.0.0; **slated for replacement by M14**) |
-| M14 — IChannel migration + Jellyfin patch | 🚧 IN FLIGHT on main | Channel architecture implemented behind schema v11; remaining work is hardening, operator validation, and cleanup of stale design docs. |
+| M14 — IChannel migration + Jellyfin patch | ✅ DONE against ledger (2026-07-12) | Channel architecture on schema v11/v12. Every ledger row satisfied — IMPLEMENT rows evidence-cited, EVALUATE rows resolved with operator dispositions, no unapproved deferrals. See "M14 ledger closure" below. |
 
 ### M14 operator requirements ledger
 
@@ -72,6 +72,32 @@ fixed before handoff.
 Evidence audit for the already-IMPLEMENT rows above (REQ-M14-SOURCE-API, REQ-M14-SOURCE-UI,
 REQ-M14-FAV-MATERIALISE) with cited `file:line` tests/code lives in
 `docs/plans/m14-ledger-evidence-audit.md`; see it before treating any of those three rows as done.
+
+### M14 ledger closure (2026-07-12)
+
+M14 is recorded DONE against this ledger. Every row is satisfied — no row was silently
+deferred and every non-`IMPLEMENT` disposition traces to an explicit operator decision
+recorded in `ROI.md`. Row-by-row closure:
+
+| ID | Disposition | Closure evidence |
+|---|---|---|
+| REQ-M14-SOURCE-API | IMPLEMENT | Evidence-cited in `docs/plans/m14-ledger-evidence-audit.md` (routes/handlers + `PhantomLibrarySourceControllerTests`); rig `tools/rig-scenarios/35-channel-e2e-playback.sh` step [8]. |
+| REQ-M14-SOURCE-UI | IMPLEMENT | Evidence-cited in `docs/plans/m14-ledger-evidence-audit.md` (`phantomKebab.js` gating/render + `PhantomKebabScriptTests`). |
+| REQ-M14-SOURCE-SAFETY | IMPLEMENT | Unit/API safety tests (`m14-source-safety-tests`) + rig `tools/rig-scenarios/39-channel-source-safety.sh` (`m14-source-safety-rig`): reject → next ranked → playback, shared-hash never removed. |
+| REQ-M14-MOBILE | IMPLEMENT | Mobile source-mgmt UX + executable DOM/API evidence `tools/rig-scenarios/38-mobile-source-dom.sh` / `phantom-kebab-mobile-dom.mjs` (movie + episode) (`m14-mobile-source-mgmt`). |
+| REQ-M14-FAV-MATERIALISE | IMPLEMENT | Evidence-cited in `docs/plans/m14-ledger-evidence-audit.md` (`UserDataSavedListener` + `UserDataSavedListenerTests`). |
+| REQ-M14-PER-USER | IMPLEMENT (operator 2026-07-09, branch B, split) | Additive v11→v12 schema (`user_prefs`/`user_hidden_items`) + backend/eviction/show-hide threading + admin sub-page (`m14-per-user-schema`/`-backend`/`-showhide`); mandatory two-user rig `tools/rig-scenarios/42-per-user-show-hide.sh` (movie + episode) landed in-tree (`m14-per-user-rig`). |
+| REQ-M14-RECOMMENDATIONS | EVALUATE → IMPLEMENTED | `FavouriteRecommendationIngestor` + tests + rig `tools/rig-scenarios/40-favourite-recommendations.sh`; written eval in `docs/plans/m14-ledger-evaluation.md` (`m14-recommendations-resolve`). |
+| REQ-M14-RETENTION | EVALUATE → resolved (config/UI no-op) | Written eval in `docs/plans/m14-ledger-evaluation.md`; retention field disabled/no-op (`ConfigPageMarkupTests`). Operator resolved (ROI 2026-07-09). |
+| REQ-M14-VAULT | EVALUATE → operator DEFER (branch A, 2026-07-09) | Favourite→materialise + favourite-protected eviction accepted as the persistence answer; dead Vault-prestage surface handling per `m14-vault-resolve`. Recorded in `ROI.md`. |
+| REQ-M14-CONCURRENCY | EVALUATE → resolved (implemented) | Per-indexer `SemaphoreSlim` cap + sequential probe; written eval in `docs/plans/m14-ledger-evaluation.md`. Operator resolved (ROI 2026-07-09). |
+| REQ-M14-SEARCH-GATING | EVALUATE → resolved (channel-only gating) | Written eval in `docs/plans/m14-ledger-evaluation.md`; no code change needed. Operator resolved (ROI 2026-07-09). |
+| REQ-M14-SPLASH | EVALUATE → resolved (historical) | Native `RequiresOpening` playback; splash is legacy/support only, verified by 35/36. Operator resolved (ROI 2026-07-09). |
+
+Movie/TV parity holds: `tools/rig-scenarios/35-channel-e2e-playback.sh` (movie) and
+`36-channel-episode-e2e-playback.sh` (episode) remain the parity gate, with the
+source-safety scenario (`39-channel-source-safety.sh`) covering reject→next→playback.
+Full closure narrative: `docs/tasks/m14-ledger-done.md`.
 
 ### M14 source-management implementation contract
 

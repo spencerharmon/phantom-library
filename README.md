@@ -24,8 +24,10 @@ Mascot: *Stygiomedusa gigantea*, the giant phantom jelly.
 > [`docs/plans/channel-handoff.md`](docs/plans/channel-handoff.md)
 > for the architectural rationale.
 
-> **Status: pre-alpha**, v0.1.0 is the immediate target (all M1–M9
-> milestones complete; see [`PLAN.md`](PLAN.md#status-as-of-2026-06-04)).
+> **Status: pre-alpha**, v0.1.0 is the immediate target (M1–M9
+> milestones complete; M14 IChannel/channel-architecture migration
+> recorded DONE against its operator ledger — see
+> [`PLAN.md`](PLAN.md#status-as-of-2026-06-19)).
 > Bumps to *Beta* once `v0.1.0` is tagged. Full design, milestone
 > breakdown, and resolved decisions in [`PLAN.md`](PLAN.md);
 > per-release notes in [`CHANGELOG.md`](CHANGELOG.md).
