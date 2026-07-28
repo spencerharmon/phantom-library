@@ -1,0 +1,25 @@
+phantom-library deployed as release {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
+
+Colors rendered: {{ join ", " .Values.colorList }}
+Roles:  prod -> {{ .Values.roles.prod }}   dev -> {{ .Values.roles.dev }}
+
+URLs (served once external-dns + traefik reconcile; TLS via the *.{{ .Values.domain }} wildcard):
+  prod   https://{{ .Values.domain }}            (-> {{ .Values.roles.prod }})
+  dev    https://dev.{{ .Values.domain }}        (-> {{ .Values.roles.dev }})
+  blue   https://blue.{{ .Values.domain }}
+  green  https://green.{{ .Values.domain }}
+{{- if .Values.gostream.exposeUi }}
+  gostorm (prod) https://gostorm.{{ .Values.domain }}      (-> gostorm-{{ .Values.roles.prod }})
+  gostorm (dev)  https://gostorm-dev.{{ .Values.domain }}  (-> gostorm-{{ .Values.roles.dev }})
+{{- end }}
+
+PREREQUISITES in namespace {{ .Release.Namespace }} (NOT created by this chart — provisioned out of band):
+  - imagePullSecret  {{ .Values.imagePullSecret }}   (dockerconfigjson for the gitea OCI registry)
+  - config secret    {{ .Values.configSecretName }}  (Opaque, key config.secret.json)
+Without these the Pods stay ImagePullBackOff / fail to mount the gostream secret.
+
+Cutover (promote the staged color to prod): swap roles.prod<->roles.dev in the HelmRelease values and
+commit — the DNSEndpoint targets AND the role-host Ingress rules both follow, no pod restart.
+
+Warmup sizing is single-source: warmup.quotaGb ({{ .Values.warmup.quotaGb }}) drives BOTH the ConfigMap
+disk_warmup_quota_gb and the gostream-warmup PVC size ({{ add (.Values.warmup.quotaGb | int) (.Values.warmup.headroomGi | int) }}Gi).

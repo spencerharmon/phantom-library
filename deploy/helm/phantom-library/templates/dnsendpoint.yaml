@@ -1,0 +1,38 @@
+{{/*
+Role-CNAME DNSEndpoint (external-dns crd source). The role hostnames follow .Values.roles — cutover is
+a swap of roles.prod<->roles.dev here (+ commit), no pod restart. Targets point at the color A-records
+published by the per-color Ingresses (external-dns).
+  <domain>            (prod) -> <prodColor>.<domain>
+  dev.<domain>        (dev)  -> <devColor>.<domain>
+  gostorm.<domain>    (prod, when exposeUi) -> gostorm-<prodColor>.<domain>
+  gostorm-dev.<domain>(dev,  when exposeUi) -> gostorm-<devColor>.<domain>
+*/}}
+{{- $domain := .Values.domain }}
+{{- $prod := .Values.roles.prod }}
+{{- $dev := .Values.roles.dev }}
+apiVersion: externaldns.k8s.io/v1alpha1
+kind: DNSEndpoint
+metadata:
+  name: phantom-library-role-cnames
+  labels:
+    {{- include "phantom-library.labels" . | nindent 4 }}
+spec:
+  endpoints:
+    - dnsName: {{ $domain }} # prod role
+      recordType: CNAME
+      recordTTL: 60
+      targets: ["{{ $prod }}.{{ $domain }}"]
+    - dnsName: dev.{{ $domain }} # dev/staging role
+      recordType: CNAME
+      recordTTL: 60
+      targets: ["{{ $dev }}.{{ $domain }}"]
+    {{- if .Values.gostream.exposeUi }}
+    - dnsName: gostorm.{{ $domain }} # gostorm UI, prod role
+      recordType: CNAME
+      recordTTL: 60
+      targets: ["gostorm-{{ $prod }}.{{ $domain }}"]
+    - dnsName: gostorm-dev.{{ $domain }} # gostorm UI, dev role
+      recordType: CNAME
+      recordTTL: 60
+      targets: ["gostorm-{{ $dev }}.{{ $domain }}"]
+    {{- end }}

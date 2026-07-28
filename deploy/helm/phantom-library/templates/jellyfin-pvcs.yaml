@@ -1,0 +1,39 @@
+{{/*
+Independent per-color Jellyfin persistence (var-lib = library DB/metadata/plugins; etc = network.xml +
+encoding config). Blue and green NEVER share a library DB/config, so a bad rollout on the inactive color
+can never touch the color serving prod.
+*/}}
+{{- range $color := .Values.colorList }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jellyfin-var-lib-{{ $color }}
+  labels:
+    {{- include "phantom-library.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: jellyfin-var-lib
+    color: {{ $color }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: {{ $.Values.persistence.storageClassName }}
+  resources:
+    requests:
+      storage: {{ $.Values.persistence.jellyfinVarLib.size }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jellyfin-etc-{{ $color }}
+  labels:
+    {{- include "phantom-library.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: jellyfin-etc
+    color: {{ $color }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: {{ $.Values.persistence.storageClassName }}
+  resources:
+    requests:
+      storage: {{ $.Values.persistence.jellyfinEtc.size }}
+{{- if ne $color (last $.Values.colorList) }}
+---
+{{- end }}
+{{- end }}

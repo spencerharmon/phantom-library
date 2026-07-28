@@ -1,0 +1,36 @@
+{{/*
+Shared gostream state + warmup PVCs (RWO, one node, co-resident across both colors).
+  gostream-state : GOSTREAM_ROOT_PATH — holds <root>/STATE/gostream.db (inode map, SACRED) and
+                   <root>/config.db (gostorm BoltDB: torrents + TorrentsSavePath + settings).
+  gostream-warmup: the warmup cache, mounted at gostorm's TorrentsSavePath (/usr/local/warmup).
+WARMUP-SIZING INVARIANT: the PVC capacity is DERIVED here as warmup.quotaGb + warmup.headroomGi, so it
+can never be smaller than the quota gostream enforces (quota = quotaGb * 1024^3). Both this size and the
+ConfigMap's disk_warmup_quota_gb come from .Values.warmup — the single source Helm gives us.
+*/}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gostream-state
+  labels:
+    {{- include "phantom-library.labels" . | nindent 4 }}
+    app.kubernetes.io/component: state
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: {{ .Values.persistence.storageClassName }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.state.size }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gostream-warmup
+  labels:
+    {{- include "phantom-library.labels" . | nindent 4 }}
+    app.kubernetes.io/component: warmup-cache
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: {{ .Values.persistence.storageClassName }}
+  resources:
+    requests:
+      storage: {{ printf "%dGi" (add (.Values.warmup.quotaGb | int) (.Values.warmup.headroomGi | int)) }}

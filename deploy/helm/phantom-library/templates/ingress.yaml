@@ -1,0 +1,63 @@
+{{/*
+Per-color Ingress. Hosts served by a color:
+  Jellyfin (:8096):  <color>.<domain>  ALWAYS, plus the ROLE host this color currently holds
+                     (prod -> <domain>, dev -> dev.<domain>). A bare CNAME does not rewrite the HTTP
+                     Host header, so the role hostname must appear in the ACTIVE color's Ingress to
+                     serve; cutover moves the role-host rule between colors in lockstep with the
+                     DNSEndpoint targets (both follow .Values.roles).
+  gostorm UI (:8090, when gostream.exposeUi): gostorm-<color>.<domain> ALWAYS, plus the gostorm ROLE
+                     host (prod -> gostorm.<domain>, dev -> gostorm-dev.<domain>).
+No tls: block — traefik's default TLSStore serves the *.<domain> wildcard by SNI.
+*/}}
+{{- $domain := .Values.domain }}
+{{- range $color := .Values.colorList }}
+{{- $role := include "phantom-library.roleOf" (dict "color" $color "root" $) }}
+{{- $jellyHosts := list (printf "%s.%s" $color $domain) }}
+{{- if eq $role "prod" }}{{ $jellyHosts = append $jellyHosts $domain }}{{ end }}
+{{- if eq $role "dev" }}{{ $jellyHosts = append $jellyHosts (printf "dev.%s" $domain) }}{{ end }}
+{{- $gostormHosts := list }}
+{{- if $.Values.gostream.exposeUi }}
+{{- $gostormHosts = append $gostormHosts (printf "gostorm-%s.%s" $color $domain) }}
+{{- if eq $role "prod" }}{{ $gostormHosts = append $gostormHosts (printf "gostorm.%s" $domain) }}{{ end }}
+{{- if eq $role "dev" }}{{ $gostormHosts = append $gostormHosts (printf "gostorm-dev.%s" $domain) }}{{ end }}
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: phantom-library-{{ $color }}
+  labels:
+    {{- include "phantom-library.labels" $ | nindent 4 }}
+    color: {{ $color }}
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+spec:
+  ingressClassName: traefik
+  rules:
+    {{- range $h := $jellyHosts }}
+    - host: {{ $h }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: phantom-library-{{ $color }}
+                port:
+                  number: {{ $.Values.jellyfin.httpPort }}
+    {{- end }}
+    {{- range $h := $gostormHosts }}
+    - host: {{ $h }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: phantom-library-{{ $color }}
+                port:
+                  number: {{ $.Values.gostream.ports.gostorm }}
+    {{- end }}
+{{- if ne $color (last $.Values.colorList) }}
+---
+{{- end }}
+{{- end }}

@@ -1,0 +1,19 @@
+apiVersion: v2
+name: phantom-library
+description: >-
+  Co-located gostream (FUSE torrent producer) + patched Jellyfin (FUSE consumer) true blue/green
+  stack with CNAME role cutover. Renders BOTH colors, shared gostream state/warmup PVCs, per-color
+  Jellyfin PVCs, per-color Service/Ingress (Jellyfin :8096 + gostorm UI :8090), and the role-CNAME
+  DNSEndpoint (prod/dev/gostorm) from a single set of values. Consumed by flux as a HelmRelease.
+type: application
+# Chart version — MUST be bumped on every change (flux GitRepository/HelmRelease revs off it and,
+# if ever OCI-published, Helm requires the pushed tag to equal this).
+version: 0.1.0
+# Tracks the app milestone, not a container tag (images are digest-pinned in values).
+appVersion: "m14"
+keywords:
+  - jellyfin
+  - gostream
+  - blue-green
+  - phantom-library
+home: https://github.com/spencerharmon/phantom-library

@@ -1,0 +1,31 @@
+{{/*
+Per-color Service. Fronts Jellyfin :8096 (the Ingress backend). When gostream.exposeUi, also fronts
+the gostorm web UI :8090 for its own Ingress. Selector is color-scoped so a Service never receives the
+other color's traffic.
+*/}}
+{{- range $color := .Values.colorList }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: phantom-library-{{ $color }}
+  labels:
+    {{- include "phantom-library.labels" $ | nindent 4 }}
+    color: {{ $color }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: phantom-library
+    color: {{ $color }}
+  ports:
+    - name: http
+      port: {{ $.Values.jellyfin.httpPort }}
+      targetPort: http
+    {{- if $.Values.gostream.exposeUi }}
+    - name: gostorm
+      port: {{ $.Values.gostream.ports.gostorm }}
+      targetPort: gostorm
+    {{- end }}
+{{- if ne $color (last $.Values.colorList) }}
+---
+{{- end }}
+{{- end }}

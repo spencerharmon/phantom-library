@@ -1,0 +1,164 @@
+# ============================================================================================
+# phantom-library Helm chart values — the SINGLE interface for the blue/green gostream+Jellyfin
+# stack. Faithful port of the raw manifests that lived in flux's infrastructure/phantom-library
+# (deployment-{blue,green}, service-{blue,green}, jellyfin-pvcs, gostream-state-pvc, configmap,
+# dnsendpoint-role-cnames), now parameterised so ONE chart renders both colors + shared state +
+# the role-CNAME DNSEndpoint. See docs/deploy/helm.md.
+# ============================================================================================
+
+# Namespace the release deploys into. The flux HelmRelease sets targetNamespace/createNamespace;
+# this value is only used for informational output and cross-references in NOTES.
+namespace: phantom-library
+
+# Public DNS zone the colors + roles live under. Color hosts are "<color>.<domain>", the prod role
+# host is "<domain>" itself, dev is "dev.<domain>", gostorm roles are "gostorm[-dev].<domain>".
+domain: jellyfin.polyfam.studio
+
+# TLS: ingresses carry NO tls: block — traefik's default TLSStore serves the *.jellyfin.polyfam.studio
+# wildcard (secret wildcard-jellyfin-polyfam-studio-tls in kube-system) by SNI. Nothing to set here.
+
+# Which color currently holds each ROLE. Cutover = swap prod<->dev here and commit; the DNSEndpoint
+# targets AND the role-host Ingress rules both follow these two values in lockstep (no pod restart).
+roles:
+  prod: blue
+  dev: green
+
+# The colors to render. Order is deterministic; each must have an entry in `colors` below.
+colorList:
+  - blue
+  - green
+
+# Per-color settings. virtualMkvHostPath MUST differ per color: two FUSE servers cannot both mount
+# the same host path concurrently on the one node (the in-container mount path stays identical, so
+# config/library folders need no per-color patch). Optional per-color `images:` overrides the
+# shared digests below to repin ONE color at a time (blue/green independent image pinning).
+colors:
+  blue:
+    virtualMkvHostPath: /var/gostream/gostream-mkv-virtual-blue
+    # images:
+    #   gostream: { repository: ..., digest: sha256:... }
+    #   jellyfin: { repository: ..., digest: sha256:... }
+  green:
+    virtualMkvHostPath: /var/gostream/gostream-mkv-virtual-green
+
+# Container images — pinned BY REGISTRY-SERVED DIGEST (never a floating tag). Built in-cluster by
+# Zuul/buildah, served from the gitea OCI registry. Pull secret below must exist in the namespace.
+images:
+  gostream:
+    repository: git.spencerharmon.com/zuul/gostream
+    digest: sha256:8fbd795c03f8f11d465e68e62fd39921fd810827993c83f6bdf5c478f3af6031
+  jellyfin:
+    repository: git.spencerharmon.com/zuul/jellyfin-phantom
+    digest: sha256:13feea2c828e72f1f5c0610432cff742d6b1df92e92fd8d1cbe2f0a1c11f993b
+  pullPolicy: IfNotPresent
+
+# Pull secret (kubernetes.io/dockerconfigjson) for the gitea OCI registry. Provisioned into the
+# namespace OUT OF BAND (bridge script / copied from the gostream ns) — the chart only references it.
+imagePullSecret: gitea-oci-pull
+
+# gostream config secret (Opaque, single key config.secret.json). Provisioned OUT OF BAND. The chart
+# mounts it read-only; gostream deep-merges it over the ConfigMap tuning JSON.
+configSecretName: gostream-config-secret
+
+# fsGroup so both apps' UIDs can write the local-path PVCs (jellyfin entrypoint mkdir -p's under them).
+podSecurityContext:
+  fsGroup: 1000
+
+terminationGracePeriodSeconds: 60
+
+# ------------------------------------------------------------------ gostream (per Pod) --
+gostream:
+  # gostorm web UI exposure. When true, each color gets a Service port + Ingress
+  # (gostorm-<color>.<domain>) and the DNSEndpoint publishes a gostorm role CNAME. gostorm has its
+  # own auth layer (internal/gostorm/web/auth); set/verify the credential via the gostorm UI/config.
+  exposeUi: true
+  env:
+    GOSTREAM_ROOT_PATH: /usr/local/state
+    GOSTREAM_MOUNT_PATH: /mnt/gostream-mkv-virtual
+    GOSTREAM_SOURCE_PATH: /mnt/gostream-mkv-real
+    MKV_PROXY_CONFIG_PATH: /etc/gostream/config.json
+    MKV_PROXY_CONFIG_TUNING_PATH: /config-src/tuning/config.tuning.json
+    MKV_PROXY_CONFIG_SECRET_PATH: /config-src/secret/config.secret.json
+    GOMEMLIMIT: 2200MiB
+  ports:
+    proxy: 8080
+    metrics: 9080
+    gostorm: 8090
+  resources:
+    requests: { cpu: "500m", memory: 1Gi }
+    limits: { cpu: "2", memory: 3Gi }
+
+# ------------------------------------------------------------------ jellyfin (per Pod) --
+jellyfin:
+  httpPort: 8096
+  resources:
+    requests: { cpu: "500m", memory: 1Gi }
+    limits: { cpu: "2", memory: 4Gi }
+
+# ------------------------------------------------------------------------ warmup cache --
+# SINGLE SOURCE OF TRUTH for the warmup sizing (what kustomize could not template). gostream enforces
+# quotaGb as GiB (quota = quotaGb * 1024^3) and evicts toward it; the warmup PVC is sized quotaGb +
+# headroomGi so the quota can never exceed the volume. Both the ConfigMap value and the PVC storage
+# below derive from these two numbers — change here only.
+warmup:
+  quotaGb: 45
+  headroomGi: 5   # PVC capacity = quotaGb + headroomGi (Gi)
+
+# ---------------------------------------------------------------------------- storage --
+persistence:
+  storageClassName: local-path
+  # Shared across both colors (RWO, co-resident on the one node).
+  state:
+    size: 5Gi
+  # warmup size is DERIVED from warmup.quotaGb + warmup.headroomGi (see state-pvcs.yaml) — not set here.
+  # Independent PER COLOR.
+  jellyfinVarLib:
+    size: 100Gi   # real library metadata ≈ 84G; local-path does not enforce, sized honestly
+  jellyfinEtc:
+    size: 256Mi
+
+# gostream non-secret tuning config (rendered verbatim to the ConfigMap's config.tuning.json). This
+# is the structured form of gostream's reference config; disk_warmup_quota_gb is injected from
+# warmup.quotaGb by the template, so DO NOT set it here.
+config:
+  master_concurrency_limit: 25
+  read_ahead_budget_mb: 256
+  metadata_cache_size_mb: 50
+  write_buffer_size_kb: 64
+  read_buffer_size_kb: 1024
+  fuse_block_size_bytes: 1048576
+  streaming_threshold_kb: 128
+  log_level: "INFO"
+  attr_timeout_seconds: 1
+  entry_timeout_seconds: 1
+  negative_timeout_seconds: 0
+  http_client_timeout_seconds: 30
+  max_retry_attempts: 6
+  retry_delay_ms: 500
+  rescue_grace_period_seconds: 240
+  rescue_cooldown_hours: 24
+  preload_workers_count: 4
+  preload_initial_delay_ms: 1000
+  warm_start_idle_seconds: 6
+  max_concurrent_prefetch: 3
+  cache_cleanup_interval_min: 5
+  max_cache_entries: 10000
+  gostorm_url: "http://127.0.0.1:8090"
+  proxy_listen_port: 8080
+  metrics_port: 9080
+  blocklist_url: "https://github.com/Naunter/BT_BlockLists/raw/master/bt_blocklists.gz"
+  physical_source_path: "/mnt/gostream-mkv-real"
+  fuse_mount_path: "/mnt/gostream-mkv-virtual"
+  warmup_head_size_mb: 64
+  natpmp:
+    enabled: false
+    gateway: ""
+    local_port: 8091
+    vpn_interface: "wg0"
+    lifetime: 60
+    refresh: 45
+  plex:
+    url: "http://127.0.0.1:32400"
+    library_id: 0
+  library_add_timeout_sec: 45
+  library_validation_lease_minutes: 10
