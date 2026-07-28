@@ -7,7 +7,7 @@ published by the per-color Ingresses (external-dns).
   gostorm.<domain>    (prod, when exposeUi) -> gostorm-<prodColor>.<domain>
   gostorm-dev.<domain>(dev,  when exposeUi) -> gostorm-<devColor>.<domain>
 */}}
-{{- if .Values.expose.enabled }}
+{{- if or .Values.expose.prod .Values.expose.dev }}
 {{- $domain := .Values.domain }}
 {{- $prod := .Values.roles.prod }}
 {{- $dev := .Values.roles.dev }}
@@ -19,22 +19,28 @@ metadata:
     {{- include "phantom-library.labels" . | nindent 4 }}
 spec:
   endpoints:
+  {{- if .Values.expose.prod }}
     - dnsName: {{ $domain }} # prod role
       recordType: CNAME
       recordTTL: 60
       targets: ["{{ $prod }}.{{ $domain }}"]
-    - dnsName: dev.{{ $domain }} # dev/staging role
-      recordType: CNAME
-      recordTTL: 60
-      targets: ["{{ $dev }}.{{ $domain }}"]
     {{- if .Values.gostream.exposeUi }}
     - dnsName: gostorm.{{ $domain }} # gostorm UI, prod role
       recordType: CNAME
       recordTTL: 60
       targets: ["gostorm-{{ $prod }}.{{ $domain }}"]
+    {{- end }}
+  {{- end }}
+  {{- if .Values.expose.dev }}
+    - dnsName: dev.{{ $domain }} # dev/staging role
+      recordType: CNAME
+      recordTTL: 60
+      targets: ["{{ $dev }}.{{ $domain }}"]
+    {{- if .Values.gostream.exposeUi }}
     - dnsName: gostorm-dev.{{ $domain }} # gostorm UI, dev role
       recordType: CNAME
       recordTTL: 60
       targets: ["gostorm-{{ $dev }}.{{ $domain }}"]
     {{- end }}
+  {{- end }}
 {{- end }}

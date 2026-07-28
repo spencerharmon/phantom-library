@@ -21,13 +21,19 @@ Without these the Pods stay ImagePullBackOff / fail to mount the gostream secret
 Cutover (promote the staged color to prod): swap roles.prod<->roles.dev in the HelmRelease values and
 commit — the DNSEndpoint targets AND the role-host Ingress rules both follow, no pod restart.
 
-{{ if .Values.expose.enabled -}}
-Exposure: ON — Ingress + DNSEndpoint rendered; this release owns the *.{{ .Values.domain }} hostnames.
+{{ if and .Values.expose.prod .Values.expose.dev -}}
+Exposure: prod+dev — this release owns ALL *.{{ .Values.domain }} role hostnames (apex + dev).
+{{- else if .Values.expose.dev -}}
+Exposure: DEV only — this release fronts dev.{{ .Values.domain }} (+ gostorm-dev) on its dev color for
+validation, while a predecessor still holds prod (apex). Reach prod's future color at the dev URL. Flip
+expose.prod=true at cutover (one commit that also retires the predecessor's prod side).
+{{- else if .Values.expose.prod -}}
+Exposure: PROD only — this release fronts the apex {{ .Values.domain }} (+ gostorm) on its prod color.
 {{- else -}}
 Exposure: OFF — NO Ingress/DNSEndpoint (staging alongside a live predecessor). Pods run healthy; reach
 them via `kubectl -n {{ .Release.Namespace }} port-forward svc/phantom-library-<color> 8096:8096` (or
-8090 for gostorm). Cut over by flipping expose.enabled=true in ONE commit that also retires the
-predecessor owning these hostnames.
+8090 for gostorm). Front a role by setting expose.dev / expose.prod true in a commit that also retires
+the predecessor owning that role's hostnames.
 {{- end }}
 
 Warmup sizing is single-source: warmup.quotaGb ({{ .Values.warmup.quotaGb }}) drives BOTH the ConfigMap

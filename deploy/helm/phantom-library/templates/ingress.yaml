@@ -8,11 +8,16 @@ Per-color Ingress. Hosts served by a color:
   gostorm UI (:8090, when gostream.exposeUi): gostorm-<color>.<domain> ALWAYS, plus the gostorm ROLE
                      host (prod -> gostorm.<domain>, dev -> gostorm-dev.<domain>).
 No tls: block — traefik's default TLSStore serves the *.<domain> wildcard by SNI.
+
+A color's Ingress renders ONLY when its ROLE is exposed (.Values.expose.<role>) — so a half-handover
+can front the dev color alone (expose.dev=true, expose.prod=false) while a predecessor still holds
+prod. Each rendered Ingress is preceded by its own `---` (a leading empty document is valid YAML).
 */}}
-{{- if .Values.expose.enabled }}
 {{- $domain := .Values.domain }}
 {{- range $color := .Values.colorList }}
 {{- $role := include "phantom-library.roleOf" (dict "color" $color "root" $) }}
+{{- $show := or (and (eq $role "prod") $.Values.expose.prod) (and (eq $role "dev") $.Values.expose.dev) }}
+{{- if $show }}
 {{- $jellyHosts := list (printf "%s.%s" $color $domain) }}
 {{- if eq $role "prod" }}{{ $jellyHosts = append $jellyHosts $domain }}{{ end }}
 {{- if eq $role "dev" }}{{ $jellyHosts = append $jellyHosts (printf "dev.%s" $domain) }}{{ end }}
@@ -22,6 +27,7 @@ No tls: block — traefik's default TLSStore serves the *.<domain> wildcard by S
 {{- if eq $role "prod" }}{{ $gostormHosts = append $gostormHosts (printf "gostorm.%s" $domain) }}{{ end }}
 {{- if eq $role "dev" }}{{ $gostormHosts = append $gostormHosts (printf "gostorm-dev.%s" $domain) }}{{ end }}
 {{- end }}
+---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -58,8 +64,5 @@ spec:
                 port:
                   number: {{ $.Values.gostream.ports.gostorm }}
     {{- end }}
-{{- if ne $color (last $.Values.colorList) }}
----
-{{- end }}
 {{- end }}
 {{- end }}

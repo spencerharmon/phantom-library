@@ -23,15 +23,18 @@ roles:
   prod: blue
   dev: green
 
-# MASTER exposure gate for the shared public hostnames. When false, NO Ingress and NO DNSEndpoint are
-# rendered — the Pods/Services/PVCs still deploy and run fully healthy, they are just not fronted on
-# the *.jellyfin.polyfam.studio names. This is REQUIRED while an OLDER deployment (e.g. the ns
-# `gostream` install this chart migrates from) still serves those exact hostnames: two Ingresses /
-# two DNSEndpoints claiming the same host would fight over live prod DNS. Bring-up in a fresh
-# namespace alongside a live predecessor: deploy with expose.enabled=false, migrate data, then in ONE
-# commit flip this to true AND retire the predecessor so exactly one owner holds the hostnames.
+# Per-ROLE exposure gates for the shared public hostnames. Each color's Ingress (its
+# `<color>.<domain>` host + the ROLE host that color currently holds) and the matching role CNAMEs
+# render ONLY when that role is exposed. A role left false renders NO Ingress/DNSEndpoint for it — the
+# Pods/Services/PVCs still deploy and run fully healthy, just unfronted on those names. This split is
+# REQUIRED while an OLDER deployment (e.g. the ns `gostream` install this chart migrates from) still
+# serves those exact hostnames: two Ingresses / two DNSEndpoints claiming one host fight over live
+# DNS. It also enables a HALF-handover: a fresh namespace takes the DEV role for validation
+# (dev: true) while the predecessor still holds PROD (prod: false), then flip prod: true at cutover
+# once the predecessor's prod side is retired — exactly one owner of each shared host at a time.
 expose:
-  enabled: true
+  prod: true
+  dev: true
 
 # The colors to render. Order is deterministic; each must have an entry in `colors` below.
 colorList:
