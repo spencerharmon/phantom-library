@@ -9,6 +9,7 @@ Per-color Ingress. Hosts served by a color:
                      host (prod -> gostorm.<domain>, dev -> gostorm-dev.<domain>).
 No tls: block — traefik's default TLSStore serves the *.<domain> wildcard by SNI.
 */}}
+{{- if .Values.expose.enabled }}
 {{- $domain := .Values.domain }}
 {{- range $color := .Values.colorList }}
 {{- $role := include "phantom-library.roleOf" (dict "color" $color "root" $) }}
@@ -59,5 +60,6 @@ spec:
     {{- end }}
 {{- if ne $color (last $.Values.colorList) }}
 ---
+{{- end }}
 {{- end }}
 {{- end }}

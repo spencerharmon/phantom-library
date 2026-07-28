@@ -23,6 +23,16 @@ roles:
   prod: blue
   dev: green
 
+# MASTER exposure gate for the shared public hostnames. When false, NO Ingress and NO DNSEndpoint are
+# rendered — the Pods/Services/PVCs still deploy and run fully healthy, they are just not fronted on
+# the *.jellyfin.polyfam.studio names. This is REQUIRED while an OLDER deployment (e.g. the ns
+# `gostream` install this chart migrates from) still serves those exact hostnames: two Ingresses /
+# two DNSEndpoints claiming the same host would fight over live prod DNS. Bring-up in a fresh
+# namespace alongside a live predecessor: deploy with expose.enabled=false, migrate data, then in ONE
+# commit flip this to true AND retire the predecessor so exactly one owner holds the hostnames.
+expose:
+  enabled: true
+
 # The colors to render. Order is deterministic; each must have an entry in `colors` below.
 colorList:
   - blue

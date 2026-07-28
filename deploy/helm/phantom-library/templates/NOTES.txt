@@ -21,5 +21,14 @@ Without these the Pods stay ImagePullBackOff / fail to mount the gostream secret
 Cutover (promote the staged color to prod): swap roles.prod<->roles.dev in the HelmRelease values and
 commit — the DNSEndpoint targets AND the role-host Ingress rules both follow, no pod restart.
 
+{{ if .Values.expose.enabled -}}
+Exposure: ON — Ingress + DNSEndpoint rendered; this release owns the *.{{ .Values.domain }} hostnames.
+{{- else -}}
+Exposure: OFF — NO Ingress/DNSEndpoint (staging alongside a live predecessor). Pods run healthy; reach
+them via `kubectl -n {{ .Release.Namespace }} port-forward svc/phantom-library-<color> 8096:8096` (or
+8090 for gostorm). Cut over by flipping expose.enabled=true in ONE commit that also retires the
+predecessor owning these hostnames.
+{{- end }}
+
 Warmup sizing is single-source: warmup.quotaGb ({{ .Values.warmup.quotaGb }}) drives BOTH the ConfigMap
 disk_warmup_quota_gb and the gostream-warmup PVC size ({{ add (.Values.warmup.quotaGb | int) (.Values.warmup.headroomGi | int) }}Gi).

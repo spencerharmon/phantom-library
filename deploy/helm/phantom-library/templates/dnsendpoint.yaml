@@ -7,6 +7,7 @@ published by the per-color Ingresses (external-dns).
   gostorm.<domain>    (prod, when exposeUi) -> gostorm-<prodColor>.<domain>
   gostorm-dev.<domain>(dev,  when exposeUi) -> gostorm-<devColor>.<domain>
 */}}
+{{- if .Values.expose.enabled }}
 {{- $domain := .Values.domain }}
 {{- $prod := .Values.roles.prod }}
 {{- $dev := .Values.roles.dev }}
@@ -36,3 +37,4 @@ spec:
       recordTTL: 60
       targets: ["gostorm-{{ $dev }}.{{ $domain }}"]
     {{- end }}
+{{- end }}
