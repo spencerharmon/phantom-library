@@ -62,7 +62,7 @@ images:
     digest: sha256:8fbd795c03f8f11d465e68e62fd39921fd810827993c83f6bdf5c478f3af6031
   jellyfin:
     repository: git.spencerharmon.com/zuul/jellyfin-phantom
-    digest: sha256:d8b92f3b34a740c81efdd6e1e087414930c66f9b27861e0ccda9f0062a17b4d4
+    digest: sha256:c08ec83e3427506c39084dbc7096b93b7958664050d5e5885007568202d1b2d9
   pullPolicy: IfNotPresent
 
 # Pull secret (kubernetes.io/dockerconfigjson) for the gitea OCI registry. Provisioned into the
@@ -107,6 +107,33 @@ jellyfin:
   resources:
     requests: { cpu: "500m", memory: 1Gi }
     limits: { cpu: "2", memory: 4Gi }
+
+# ------------------------------------------------------- prowlarr (standalone, shared) --
+# Indexer aggregator the plugin's source search calls (ProwlarrBaseUrl / ProwlarrApiKey). Runs as
+# its OWN Deployment+Service (NOT a Jellyfin sidecar) — ONE shared instance for all colors, per the
+# horizontal-scale ROI (phantom-library P4 Stage C). We seed Prowlarr's config.xml with the SAME
+# API key the migrated plugin config already carries so the two authenticate out of the box.
+# INDEXERS are host-local operator data and were NOT part of the migration import — add them in the
+# Prowlarr UI after deploy (`kubectl -n phantom-library port-forward svc/prowlarr 9696:9696`).
+prowlarr:
+  enabled: true
+  image:
+    repository: ghcr.io/linuxserver/prowlarr
+    # Immutable multi-arch index digest (linuxserver "latest" at pin time). Bump deliberately.
+    digest: sha256:2f3d31307beba3ba2dd226d191f5f5c14ee3b4d8b49277c64683f5ed97083179
+  port: 9696
+  # API key the plugin sends. MUST match the migrated Jellyfin.Plugin.PhantomLibrary.xml ProwlarrApiKey.
+  # TODO(operator): move to a SOPS-managed Secret; kept inline to match the already-plaintext plugin config.
+  apiKey: "4ba9056005b247f4b3ed78acb5f00fbf"
+  env:
+    PUID: "1000"
+    PGID: "1000"
+    TZ: "Etc/UTC"
+  storage:
+    size: 2Gi
+  resources:
+    requests: { cpu: "50m", memory: 128Mi }
+    limits: { cpu: "1", memory: 512Mi }
 
 # ------------------------------------------------------------------------ warmup cache --
 # SINGLE SOURCE OF TRUTH for the warmup sizing (what kustomize could not template). gostream enforces
