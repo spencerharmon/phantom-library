@@ -44,7 +44,7 @@ Mascot: *Stygiomedusa gigantea*, the giant phantom jelly.
 | M12 — Dedupe-gap heal-on-rediscovery           | ✅ | (unreleased) |
 | M13 — Per-series subdir stub layout for TV phantoms | ✅ | (unreleased) |
 | Spike — Jellyfin-native `[tmdbid-<id>]` stub layout | ✅ | merged into main as `a931379` (file-on-disk architecture; deployed to operator v0.2.0.0; **slated for replacement by M14**) |
-| M14 — IChannel migration + Jellyfin patch | 🚧 IN FLIGHT on main | Channel architecture implemented behind schema v11; remaining work is hardening, operator validation, and cleanup of stale design docs. |
+| M14 — IChannel migration + Jellyfin patch | 🚧 IN FLIGHT on main | Channel architecture implemented behind schema v13; remaining work is hardening, operator validation, and cleanup of stale design docs. |
 
 ### M14 operator requirements ledger
 
@@ -179,6 +179,35 @@ reported it was implemented in another session; future agents should verify it
 by tests, not re-defer it.
 
 ### Documented partials
+
+- **Gostream path→tmdb resolution cache is now persistent (implemented).**
+  Cold channel browse previously re-ran TMDB `SearchMovies`+`GetMovie`
+  per orphan movie (~40s) and `FindTmdbMetadataByTitleYear` full-scans
+  per orphan series (~5.3s) on every restart, because the path→tmdb map
+  was in-memory only. Persisted to `phantom.db` table `gostream_path_tmdb`
+  (schema v15); both channels resolve in-mem dict → DB → search and
+  write-through on resolve. `GostreamFilesystemEnumerator` adds a 30s
+  single-flight FUSE-walk cache keyed on `MoviesVersion()`/`ShowsVersion()`.
+  BREAKING: schema bump v14→v15 requires wipe (no migration).
+
+- **Home "Latest in Phantom Movies/Shows" rows are suppressed**
+  (operator decision 2026-06-28, Option 3). Phantom channels no
+  longer implement `ISupportsLatestMedia`, because Jellyfin core's
+  `RefreshLatestChannelItems` ignores `GetLatestMedia` and instead
+  deep-enumerates the entire channel (`GetChannelItems`: series →
+  season → build) on every Home load. On production-shaped data that
+  enumeration ran for seconds-to-minutes, hanging the Home screen
+  loading indicator on **every** client (web and native/Xbox).
+  Dropping the interface makes `GetLatestChannelItemsInternal`
+  short-circuit to empty instantly. **Deferred fix (Option 2,
+  operator-approved):** restore the Latest rows cheaply by giving the
+  latest-refresh-root channel query an O(latest) fast-path backed by
+  `materialised_state` (instead of O(catalogue)), then re-add
+  `ISupportsLatestMedia`. Guarded by
+  `tools/rig-scenarios/40-channel-latest-suppressed.sh` (asserts the
+  Latest call stays fast + empty until Option 2 lands). See the
+  `TODO(operator-approved):` markers in `PhantomMoviesChannel.cs` /
+  `PhantomShowsChannel.cs`.
 
 - **Custom `QualityPreset` falls back to `GostreamDefault`** with a
   warning log (M4 decision). Revisit when a real custom-scoring use
@@ -499,7 +528,7 @@ phantom-library/
 │   │                                  playback/user-data listeners)
 │   ├── Sources/                     (MagnetSelector ranked probing)
 │   ├── Clients/                     (TMDB, gostream, Prowlarr, Torrentio)
-│   ├── State/PhantomDb.cs           (schema v11, catalogue/availability/materialise state)
+│   ├── State/PhantomDb.cs           (schema v13, catalogue/availability/materialise state)
 │   └── Playback/                    (splash metadata/legacy support helpers)
 ├── tests/Jellyfin.Plugin.PhantomLibrary.Tests/
 └── tools/rig-scenarios/             (live Jellyfin rig scenarios)

@@ -4,11 +4,11 @@ cd /home/spencer/git-repos/spencerharmon/phantom-library
 BASE=http://localhost:18096
 TOK=testtoken00000000000000000000000
 LOG=/tmp/phantom-channel-integration2.log
-DATA=/tmp/jf-test/data
+DATA=/var/tmp/jf-test/data
 CONF="$DATA/plugins/configurations/Jellyfin.Plugin.PhantomLibrary.xml"
 PLUGIN_DIR="$DATA/plugins/Jellyfin.Plugin.PhantomLibrary_0.3.0.0"
 PHDB="$DATA/plugins/configurations/PhantomLibrary/phantom.db"
-EMPTY=/tmp/jf-test/empty-gostream
+EMPTY=/var/tmp/jf-test/empty-gostream
 
 setup_plugin() {
   mkdir -p "$PLUGIN_DIR" "$EMPTY/movies" "$EMPTY/tv"
@@ -37,7 +37,7 @@ PY
 
 start_jf() {
   : > "$LOG"
-  /tmp/jf-test/start.sh >"$LOG" 2>&1 &
+  /var/tmp/jf-test/start.sh >"$LOG" 2>&1 &
   JF=$!
   for i in $(seq 1 70); do
     if ! kill -0 "$JF" 2>/dev/null; then echo "PROCESS_EXITED"; tail -160 "$LOG"; exit 1; fi

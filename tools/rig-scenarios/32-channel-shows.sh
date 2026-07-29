@@ -30,7 +30,7 @@
 # *** OPERATOR-RUN-ONLY ***
 #
 # Like scenarios 30 and 31, this requires the patched Jellyfin build
-# from scripts/jellyfin-patches/. The shared /tmp/jf-test/ rig ships
+# from scripts/jellyfin-patches/. The shared /var/tmp/jf-test/ rig ships
 # unmodified Jellyfin; the shows-channel post-flight refresh path
 # depends on the patched IChannelItemRefreshManager and won't exercise
 # correctly there. Phase 7.2 wires "build patched Jellyfin into the
@@ -83,12 +83,14 @@
 #
 # The rig steps below are the operator-runnable scaffold the Phase 7.x
 # patched-Jellyfin rig will lift into an automated bash flow once the
-# patched build is bootstrapped into /tmp/jf-test/.
+# patched build is bootstrapped into /var/tmp/jf-test/.
 
 set -euo pipefail
 
-PHANTOM_DB=${PHANTOM_DB:-/var/lib/jellyfin/plugins/configurations/PhantomLibrary/phantom.db}
-JELLYFIN_DB=${JELLYFIN_DB:-/var/lib/jellyfin/data/jellyfin.db}
+PHANTOM_DB=${PHANTOM_DB:-/var/tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db}
+JELLYFIN_DB=${JELLYFIN_DB:-/var/tmp/jf-test/data/data/jellyfin.db}
+# Default DB paths point at the existing rig clone. Override only with another
+# sandbox clone; never point scenario tests at production DBs.
 # Default to TMDB id 1399 (Game of Thrones) — long-running series with
 # multiple seasons makes the cross-season autopilot path easy to drive.
 SERIES_TMDB=${SERIES_TMDB:-1399}
@@ -183,5 +185,5 @@ echo "       splash play must not kick the autopilot."
 
 echo ""
 echo "Stage 5.3 scaffold complete. Once Phase 7.2 wires the patched"
-echo "Jellyfin into /tmp/jf-test/, the above steps lift directly into"
+echo "Jellyfin into /var/tmp/jf-test/, the above steps lift directly into"
 echo "an automated bash flow with assertions."

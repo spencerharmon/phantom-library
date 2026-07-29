@@ -319,6 +319,30 @@ public class PhantomLibraryBadgesControllerTests : IDisposable
     }
 
     [Fact]
+    public async Task RealLibraryItem_SkipsComputedChannelMap()
+    {
+        PhantomLibraryBadgesController.ResetComputedChannelIdMapCacheForTests();
+        using var db = await NewDbAsync();
+        // Seed a visible movie so a fresh computed-id map build WOULD enumerate
+        // the catalogue and hash rows via GetNewItemId.
+        await db.InsertMaterialisedStateAsync(7777, "movie", -1, -1, "/stub", "/fuse", CancellationToken.None);
+
+        var id = Guid.NewGuid();
+        var realItem = new Movie { Id = id, Name = "regular library movie" }; // SourceType = Library
+        var lib = new Mock<ILibraryManager>(MockBehavior.Loose);
+        lib.Setup(l => l.GetItemById(id)).Returns(realItem);
+
+        var ctrl = MakeController(lib.Object, db);
+        var res = await ctrl.States(new PhantomLibraryStatesRequest { Ids = new() { id.ToString() } }, CancellationToken.None);
+
+        Assert.Empty(Cast(res));
+        // A concrete non-channel library item (e.g. a Continue Watching card)
+        // must never trigger the catalogue-wide computed-id scan + per-row
+        // GetNewItemId hashing — that was the Home-screen slowdown.
+        lib.Verify(l => l.GetNewItemId(It.IsAny<string>(), It.IsAny<Type>()), Times.Never);
+    }
+
+    [Fact]
     public async Task MalformedGuid_Ignored()
     {
         using var db = await NewDbAsync();

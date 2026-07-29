@@ -11,6 +11,7 @@ using Jellyfin.Plugin.PhantomLibrary.Materialisation;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
+using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.MediaInfo;
@@ -33,14 +34,16 @@ public sealed class PhantomMaterialisingMediaSourceProvider : IMediaSourceProvid
 
     private readonly PhantomDb _db;
     private readonly IMaterialiser _materialiser;
+    private readonly IMediaEncoder? _mediaEncoder;
     private readonly Func<PluginConfiguration> _configProvider;
     private readonly ILogger<PhantomMaterialisingMediaSourceProvider> _logger;
 
     public PhantomMaterialisingMediaSourceProvider(
         PhantomDb db,
         IMaterialiser materialiser,
+        IMediaEncoder mediaEncoder,
         ILogger<PhantomMaterialisingMediaSourceProvider> logger)
-        : this(db, materialiser, logger, () => Plugin.Instance?.Configuration ?? new PluginConfiguration())
+        : this(db, materialiser, mediaEncoder, logger, () => Plugin.Instance?.Configuration ?? new PluginConfiguration())
     {
     }
 
@@ -49,9 +52,20 @@ public sealed class PhantomMaterialisingMediaSourceProvider : IMediaSourceProvid
         IMaterialiser materialiser,
         ILogger<PhantomMaterialisingMediaSourceProvider> logger,
         Func<PluginConfiguration> configProvider)
+        : this(db, materialiser, null, logger, configProvider)
+    {
+    }
+
+    internal PhantomMaterialisingMediaSourceProvider(
+        PhantomDb db,
+        IMaterialiser materialiser,
+        IMediaEncoder? mediaEncoder,
+        ILogger<PhantomMaterialisingMediaSourceProvider> logger,
+        Func<PluginConfiguration> configProvider)
     {
         _db = db ?? throw new ArgumentNullException(nameof(db));
         _materialiser = materialiser ?? throw new ArgumentNullException(nameof(materialiser));
+        _mediaEncoder = mediaEncoder;
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _configProvider = configProvider ?? throw new ArgumentNullException(nameof(configProvider));
     }
@@ -235,7 +249,8 @@ public sealed class PhantomMaterialisingMediaSourceProvider : IMediaSourceProvid
         await WaitForFileAsync(path, cancellationToken).ConfigureAwait(false);
 
         _logger.LogInformation("Phantom native-open resolved {Type}/{Tmdb} to {Path}", type, parsed.TmdbId, path);
-        return new PhantomOpenedLiveStream(FuseMediaSource(path, parsed.Encode()));
+        var source = await FuseMediaSourceAsync(path, parsed.Encode(), cancellationToken).ConfigureAwait(false);
+        return new PhantomOpenedLiveStream(source);
     }
 
     private bool IsConfiguredGostreamPath(string? path, string kind)
@@ -325,32 +340,14 @@ public sealed class PhantomMaterialisingMediaSourceProvider : IMediaSourceProvid
         return ChannelItemId.Parse(encoded);
     }
 
-    private static MediaSourceInfo FuseMediaSource(string path, string logicalId)
-    {
-        var ext = Path.GetExtension(path).TrimStart('.');
-#pragma warning disable CA1308
-        var container = string.IsNullOrEmpty(ext) ? "mkv" : ext.ToLowerInvariant();
-#pragma warning restore CA1308
-        return new MediaSourceInfo
-        {
-            Id = MediaSourceIds.ForFilePath(path),
-            Name = "Materialised",
-            Path = path,
-            Container = container,
-            Protocol = MediaProtocol.File,
-            Type = MediaSourceType.Default,
-            VideoType = VideoType.VideoFile,
-            SupportsDirectPlay = true,
-            SupportsDirectStream = true,
-            SupportsTranscoding = true,
-            SupportsProbing = true,
-            RequiresOpening = false,
-            RequiresClosing = true,
-            LiveStreamId = "phantom-open:" + logicalId + ":" + MediaSourceIds.ForFilePath(path),
-            IsRemote = false,
-            MediaStreams = new List<MediaStream>(),
-        };
-    }
+    private Task<MediaSourceInfo> FuseMediaSourceAsync(string path, string logicalId, CancellationToken cancellationToken)
+        => PhantomMediaSourceBuilder.CreateFileMediaSourceAsync(
+            path,
+            _mediaEncoder,
+            _logger,
+            cancellationToken,
+            name: "Materialised",
+            liveStreamId: "phantom-open:" + logicalId + ":" + MediaSourceIds.ForFilePath(path));
 
     private sealed class PhantomOpenedLiveStream : ILiveStream
     {

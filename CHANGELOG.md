@@ -6,6 +6,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: requires wipe.** Phantom DB schema bumped v14→v15: adds
+  `gostream_path_tmdb` (path→tmdb resolution cache). Pre-v1.0 has no
+  migrations — stop Jellyfin, run `sudo bash scripts/phantom-wipe.sh
+  --commit`, then restart. The cache repopulates on next browse.
+
+### Fixed
+
+- Phantom channel cold-cache browse is fast again. The gostream FUSE
+  path→tmdb resolution map is now persisted to `phantom.db` instead of
+  living only in memory, so a Jellyfin restart no longer forces a fresh
+  TMDB search per orphan movie (~40s) and a TMDB title/year full-scan
+  per orphan series (~5.3s). FUSE tree walks are also deduped via a 30s
+  single-flight cache keyed on the gostream movies/shows version.
+
+- Home screen no longer hangs with a perpetual loading indicator on
+  native clients (Xbox, mobile) and is faster on web. Phantom channels
+  no longer implement `ISupportsLatestMedia`, so Jellyfin core's
+  `RefreshLatestChannelItems` no longer deep-enumerates the whole
+  channel (series → season → build) to populate the "Latest in Phantom
+  Movies/Shows" Home rows on every load — an enumeration that ran for
+  seconds-to-minutes on production-shaped data and affected every
+  client. Tradeoff: the "Latest in Phantom Movies/Shows" Home rows are
+  removed for now; a cheap O(latest) replacement is deferred (see
+  PLAN.md "Documented partials"). Guarded by
+  `tools/rig-scenarios/40-channel-latest-suppressed.sh`.
+- Home-screen badge state lookups (`POST /Plugins/PhantomLibrary/States`) no
+  longer enumerate and MD5-hash the entire visible phantom catalogue
+  (~540k movie+episode rows on the operator's data) on every request. Real
+  (non-channel) library cards — Continue Watching items, library view tiles —
+  now short-circuit before the catalogue scan, and the residual virtual-card
+  fallback map is cached across requests (60s TTL, single-flight). This
+  removes the sustained per-poll latency that kept the web loading indicator
+  lit and slowed the Continue Watching section. Covered by
+  `tools/rig-scenarios/39-channel-badge-states-perf.sh`.
+
 ### Documentation
 
 - Added durable design/testing/deploy protocols for native phantom
@@ -15,10 +52,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Added an allowed video-container materialisation setting; Phantom defaults gostream selection/validation to MKV files for client compatibility while allowing operators to opt into other containers.
+- `install.sh --build` now builds and saves the gostream `docker.io/mrrobotogit/gostream:testing` image from the in-repo `gostream/` checkout before loading it into root podman storage, preventing stale `/tmp/gostream-testing.tar` deployments.
+- BREAKING: requires offline migration. Phantom DB schema is now v14 to persist source-candidate validation state, magnet-failure validation policy versions, and durable bulk materialise queue tables; run `scripts/migrate-source-validation-v14.sh` with Jellyfin stopped before starting this build.
+- Added an optional gostream library-control shared token setting; Phantom now sends `X-Gostream-Token` on protected gostream add/remove calls when configured.
+- Patched Jellyfin now exposes server-advertised item actions through `GET/POST /Items/{itemId}/Actions`, and Phantom registers Materialise, Reset Phantom, and Reject current source actions for Phantom movie/episode items.
+- BREAKING: patched Jellyfin deploy now requires replacing `MediaBrowser.Model.dll` and `Jellyfin.Api.dll` in addition to `MediaBrowser.Controller.dll` and `Jellyfin.LiveTv.dll`, because native item actions add model DTOs and an API controller.
+- BREAKING: requires wipe. Phantom DB schema is now v13 to persist TMDB movie runtime minutes; this lets Phantom movie channel items expose `RunTimeTicks` so Jellyfin can save playback progress and list movies in Continue Watching.
+- Added rig coverage for Phantom movie and episode `RunTimeTicks`, playback-progress reporting, and `/Users/{userId}/Items/Resume` Continue Watching results.
 - Added `scripts/prestage-materialised.sh`, an operator dry-run/commit helper that reads `materialised_state` and asks gostream Vault Mode to prestage existing materialised movies and episodes.
+- BREAKING: requires offline migration. Phantom DB schema is now v12 to persist ranked source candidates in `source_candidates`; run `scripts/migrate-source-candidates-v12.sh` with Jellyfin stopped before starting this build.
 - Added Phantom source-management APIs and web controls for listing candidates, rejecting the current source, and materialising a selected candidate from stable channel external IDs.
 - Made the Phantom source-management controls usable in a mobile browser: the same detail-page section and kebab (…) action-sheet entries run the identical custom-JS shim, now with >=44px touch targets, `touch-action:manipulation`, a full-width stacked layout under a `max-width:600px` media query, a dropped desktop min-width so the candidate `<select>` never overflows a narrow phone, and a 16px `<select>` font so iOS Safari does not focus-zoom. Backed by executable mobile-viewport DOM/API evidence in `tools/rig-scenarios/phantom-kebab-mobile-dom.mjs` (movie + TV episode).
-- Favourite saves on Phantom movie/episode channel items now trigger materialisation/prewarm using the existing materialiser pipeline.
+- Favourite saves on Phantom movie/episode channel items now trigger materialisation/prewarm using the existing materialiser pipeline; favouriting a Phantom season or series now materialises every episode in that season or series.
 - Favouriting a Phantom movie or series now also grows the catalogue toward the
   user's taste: the title is fanned out to its TMDB "similar" + "recommendations"
   (24h cached), de-duplicated, capped, and folded into the append-only catalogue
@@ -29,6 +75,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in the Suggestions settings; an admin `POST
   /Plugins/PhantomLibrary/Recommendations/Ingest?tmdbId=&type=` endpoint triggers
   the same ingest manually (REQ-M14-RECOMMENDATIONS).
+- Episode source selection now ranks exact `SxxEyy` releases ahead of season/series packs, reducing long materialisation loops through bad pack candidates.
 - Phantom DB retention remains deferred/no-op and is now labelled that way in the admin UI instead of presenting an active retention policy.
 - Added `scripts/phantom-migrate-v11-to-v12.sh`, an offline operator script that
   performs the v11 → v12 schema bump in place instead of wiping. Because the v12
@@ -98,6 +145,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fixed reject-current re-materialisation so rejection blocks the rejected source by info-hash, not only by exact magnet URL, preventing the same torrent from being immediately selected again through a duplicate tracker/magnet row.
+- Fixed reject-current re-materialisation so rejection no longer tries only the first unvalidated alternate candidate; it now rejects the current magnet, clears current state, and runs the normal materialisation pipeline so later valid alternates can be selected.
+- Renamed the Phantom kebab rejection item to "Reject current source" and start detail-page polling immediately when reject/materialise actions are submitted so the UI can transition into materialising while the action is still running.
+- Fixed Phantom Source and kebab action loading latency by making source/action lookups use cached DB state by default; fresh indexer discovery now runs on materialise or explicit "Refresh sources" instead of blocking every detail-page/poll/action lookup.
+- Fixed episode materialisation post-refresh ordering so Jellyfin invalidates stale dynamic media-source cache before probing the new FUSE file, preventing a newly materialised episode from inheriting runtime/size/media-info from a different episode in the same pack.
+- Fixed manual materialisation source discovery so materialise always launches a fresh indexer probe while cached candidates validate, adds newly discovered candidates to the queue, and treats transient validation cancellations as short-retry failures instead of poisoning the item for 24 hours.
+- Fixed Prowlarr movie discovery to query both IMDb ID and title/year, deduplicating by info hash so title-only tracker results are not missed.
+- Added light Phantom detail-page polling after materialise/reset/reject actions to refresh source controls, kebab actions, visible item containers, and trigger one reload when native Jellyfin detail state must be rebuilt.
+- Fixed gostream episode validation treating `EpisodeMinBytes` as 1 GiB instead of 1 byte, which incorrectly rejected short animated episodes with `target_episode_not_found` before matching the requested episode file.
+- Fixed Phantom Movies/Shows root browse regression introduced by audio stream selection: channel browse now emits unprobed file media sources and reserves FFprobe/audio-stream extraction for playback/media-info paths.
+- Patched Jellyfin audio stream selection now honors the user's preferred audio language ahead of the container default track, matching Phantom's selector and preventing non-preferred default tracks from winning at play time.
+- Phantom web now lets Jellyfin's native item-page kebab open for Phantom channel items by caching channel DTOs for Jellyfin's `/Users/{userId}/Items/{channelItemId}` refetch (including media-source ids selected by the detail page), then injects only Reset Phantom and Reject current Phantom source into the default command menu.
+- Fixed server-advertised item-action routes to accept Jellyfin web's dashless item ids, restoring Phantom kebab actions in the browser shim.
+- Phantom materialised/native-open movie and episode media sources now carry probed audio streams from the current gostream/FUSE file so Jellyfin can apply normal audio-language and remembered-track selection.
+- Phantom materialisation now validates source candidates through gostream before `/api/library/add`, persists valid/invalid/transient validation state, bounds gostream-heavy validation/add calls, and disables failed candidates in source controls and item actions.
+- Added a Reset Phantom operation that clears materialised state and unavailable markers without rejecting the current source, allowing a bad/stale materialisation to be retried through the normal Phantom materialiser after gostream-side picker fixes.
 - Fixed the admin settings "Enable availability probing" checkbox markup so
   Jellyfin's `emby-checkbox` initializer can attach and the setting can be toggled.
 - TV season browse now displays unknown and unavailable sibling episodes for any

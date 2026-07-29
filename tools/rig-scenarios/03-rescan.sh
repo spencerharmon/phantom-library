@@ -5,7 +5,7 @@ set -u
 exec > /tmp/jf-rig/logs/scenario-rescan.log 2>&1
 BASE=http://localhost:18096
 TOK=testtoken00000000000000000000000
-JFDB=/tmp/jf-test/data/data/jellyfin.db
+JFDB=/var/tmp/jf-test/data/data/jellyfin.db
 
 echo "=== Scenario: rescan after suggestions ==="
 date

@@ -335,6 +335,22 @@ function makeApi(itemGuid, item, sourcesState, initialHidden) {
                 return Promise.resolve({ tmdbId: parseInt(hiddenMatch[2], 10), type: hiddenMatch[1], hidden });
             }
             if (/\/Sources$/.test(opts.url)) return Promise.resolve(sourcesState);
+            // Server-advertised item actions (e4ea500 IItemActionProvider).
+            // GET /Items/{id}/Actions lists actions; the custom shim injects only
+            // the reset/rejectCurrent kebab actions (materialise is native).
+            if (/\/Items\/[^/]+\/Actions\/[^/?]+/.test(opts.url)) {
+                return Promise.resolve({ Status: 'ok' });
+            }
+            if (/\/Items\/[^/]+\/Actions(\?|$)/.test(opts.url)) {
+                var acts = [];
+                if (/materialised/i.test(sourcesState.Status || '')) {
+                    acts.push({ Id: 'phantom.reset', Name: 'Reset Phantom', Icon: 'restart_alt', IsEnabled: true, RequiresConfirmation: true, ConfirmationText: 'Reset?' });
+                    if (sourcesState.CanRejectCurrent) {
+                        acts.push({ Id: 'phantom.rejectCurrent', Name: 'Reject current source', Icon: 'block', IsEnabled: true, RequiresConfirmation: true, ConfirmationText: 'Reject?' });
+                    }
+                }
+                return Promise.resolve(acts);
+            }
             if (/\/Sources\/MaterialiseCandidate$/.test(opts.url)) {
                 return Promise.resolve({ Status: 'materialised', Code: 'materialised', Message: 'Source materialised', FusePath: '/fuse/new.mkv' });
             }
@@ -373,6 +389,14 @@ function makeEnv({ guid, item, sourcesState, hidden }) {
         addEventListener: () => {},
         setTimeout: (fn, ms) => setTimeout(fn, ms),
         clearTimeout: (h) => clearTimeout(h),
+        // The merged shim's start() registers a periodic scanActionSheets poll
+        // via setInterval; the DOM-evidence harness does not need a live repeating
+        // timer, so stub it as a no-op that returns a dummy handle.
+        setInterval: () => 0,
+        clearInterval: () => {},
+        // e4ea500 kebab item-actions can carry RequiresConfirmation, which the
+        // shim gates behind window.confirm; accept in the harness.
+        confirm: () => true,
     };
     const alert = (m) => alerts.push(m);
     return { document, window, api, alerts, alert, detailHost };
@@ -494,7 +518,7 @@ async function detailSectionScenario(label, { guid, item, externalId, type, tmdb
     ok(options.some((o) => o.textContent.includes('Alt 2160p HDR')), label + ': candidate labels are human-readable');
 
     const buttons = section.querySelectorAll('.phantom-source-button');
-    ok(buttons.length === 2, label + ': materialise + reject buttons rendered');
+    ok(buttons.length >= 2, label + ': materialise + reject buttons rendered (' + buttons.length + ' phantom-source buttons incl. e4ea500 refresh/reset)');
     const matBtn = buttons.find((b) => b.textContent === 'Materialise selected source');
     const rejBtn = buttons.find((b) => b.textContent === 'Reject current source');
     ok(!!matBtn && !!rejBtn, label + ': both action buttons present with labels');
@@ -586,27 +610,35 @@ async function actionSheetScenario(label, { guid, item, externalId, type, tmdb, 
     document.body.appendChild(sheet); // triggers the shim's MutationObserver
     await settle();
 
-    const dataId = mode === 'materialised' ? 'phantom-reject-current-source' : 'phantom-materialise';
-    const expectLabel = mode === 'materialised'
-        ? 'Reject current source (Phantom Library)'
-        : 'Materialise (Phantom Library)';
-    const injected = sheet.querySelector('[data-id="' + dataId + '"]');
-    ok(!!injected, label + ' [' + mode + ']: a Phantom entry is injected into the action sheet');
-    if (!injected) return;
-    ok(injected.textContent.includes(expectLabel), label + ' [' + mode + ']: entry carries the correct label');
-    ok(injected.style.minHeight === '44px', label + ' [' + mode + ']: injected entry is a >=44px touch target');
-    ok(injected.style.touchAction === 'manipulation', label + ' [' + mode + ']: injected entry sets touch-action:manipulation');
-
-    env.api.calls.length = 0;
-    injected.click();
-    await settle();
-    ok(wasClosed(), label + ' [' + mode + ']: tapping the entry closes the action sheet');
     if (mode === 'materialised') {
-        const call = env.api.calls.find((c) => c.kind === 'ajax' && /\/Sources\/RejectCurrent$/.test(c.url));
-        ok(!!call && call.type === 'POST', label + ' [' + mode + ']: tap fires RejectCurrent POST');
+        // Merged behavior (e4ea500 IItemActionProvider): the kebab source actions
+        // are advertised by the server via GET /Items/{id}/Actions and injected by
+        // the shim (reset + reject-current). This supersedes HEAD's old client-side
+        // source-button injection; see merge note in this file's history.
+        const injected = sheet.querySelector('[data-id="phantom-action-phantom-rejectCurrent"]');
+        ok(!!injected, label + ' [' + mode + ']: the server-advertised "Reject current source" item-action is injected into the action sheet');
+        if (!injected) return;
+        ok(injected.textContent.includes('Reject current source'), label + ' [' + mode + ']: entry carries the server action label');
+        ok(injected.style.minHeight === '44px', label + ' [' + mode + ']: injected entry is a >=44px touch target');
+        ok(injected.style.touchAction === 'manipulation', label + ' [' + mode + ']: injected entry sets touch-action:manipulation');
+
+        env.api.calls.length = 0;
+        injected.click();
+        await settle();
+        ok(wasClosed(), label + ' [' + mode + ']: tapping the entry closes the action sheet');
+        const call = env.api.calls.find((c) => c.kind === 'ajax' && /\/Actions\/phantom\.rejectCurrent(\?|$)/.test(c.url) && c.type === 'POST');
+        ok(!!call, label + ' [' + mode + ']: tap fires the phantom.rejectCurrent item-action POST');
     } else {
-        const call = env.api.calls.find((c) => c.kind === 'ajax' && /\/Materialise\//.test(c.url) && c.type === 'POST');
-        ok(!!call, label + ' [' + mode + ']: tap fires Materialise POST');
+        // Unmaterialised: materialise is a NATIVE server item-action rendered by
+        // Jellyfin's own UI, not injected by the custom shim (isKebabAction only
+        // covers reset/rejectCurrent). Assert the shim injects no stale/duplicate
+        // source entry and does not resurrect HEAD's superseded client-side ids.
+        const strayReject = sheet.querySelector('[data-id="phantom-action-phantom-rejectCurrent"]');
+        const strayReset = sheet.querySelector('[data-id="phantom-action-phantom-reset"]');
+        const legacy = sheet.querySelector('[data-id="phantom-materialise"]')
+            || sheet.querySelector('[data-id="phantom-reject-current-source"]');
+        ok(!strayReject && !strayReset, label + ' [' + mode + ']: no reset/reject kebab item-action is injected for a fresh virtual item');
+        ok(!legacy, label + ' [' + mode + ']: the superseded client-side source entries are not injected (materialise is a native item-action)');
     }
 }
 

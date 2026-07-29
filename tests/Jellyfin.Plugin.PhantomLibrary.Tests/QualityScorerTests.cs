@@ -124,6 +124,21 @@ public class QualityScorerTests
     }
 
     [Fact]
+    public void ResolutionSeeders_Does_Not_Drop_Undersized_Preferred_Resolution()
+    {
+        var cands = new List<IndexerCandidate>
+        {
+            C("Avatar The Last Airbender 2024 S01E05 480p x264 RUBiK", 419398944L, 10),
+            C("Avatar The Last Airbender 2024 S01E05 Spirited Away 1080p NF WEB", 2995739648L, 160),
+        };
+
+        var b = New().PickBest(cands, QualityPreset.ResolutionSeeders, 5, 4, 20,
+            "1080p,2160p,4k,720p,480p,unknown", 0, "1080p");
+
+        Assert.Contains("1080p", b!.Title);
+    }
+
+    [Fact]
     public void ResolutionSeeders_SeederWeight_Can_Outrank_Within_FallbackPolicy()
     {
         var cands = new List<IndexerCandidate>

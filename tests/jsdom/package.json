@@ -1,0 +1,10 @@
+{
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "test": "node phantom-kebab-action-sheet.test.cjs"
+  },
+  "devDependencies": {
+    "jsdom": "24.1.3"
+  }
+}

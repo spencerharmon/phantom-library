@@ -15,9 +15,9 @@ set -u
 exec > /tmp/jf-rig/logs/scenario-scanner-discovery.log 2>&1
 BASE=http://localhost:18096
 TOK=testtoken00000000000000000000000
-JFDB=/tmp/jf-test/data/data/jellyfin.db
-PHDB=/tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db
-SPLASH=/tmp/jf-test/cache/PhantomLibrary/splash.mp4
+JFDB=/var/tmp/jf-test/data/data/jellyfin.db
+PHDB=/var/tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db
+SPLASH=/var/tmp/jf-test/cache/PhantomLibrary/splash.mp4
 
 echo "=== Scenario: scanner discovers phantom symlinks ==="
 date
@@ -35,16 +35,16 @@ DELETE FROM UserData WHERE ItemId IN (
 DELETE FROM BaseItems WHERE Path LIKE '%__phantom_tmdb%';
 SQL
 sqlite3 $PHDB "DELETE FROM phantom_items;"
-find /tmp/jf-test/data/phantom-library -type l -delete 2>/dev/null || true
+find /var/tmp/jf-test/data/phantom-library -type l -delete 2>/dev/null || true
 echo "  state wiped"
 
 # Plant 3 symlinks DIRECTLY, bypassing the plugin.
 # These look exactly like what the plugin produces but are not paired
 # with any phantom_items row or in-memory BaseItem.
-ln -s $SPLASH /tmp/jf-test/data/phantom-library/movies/Orphan_One__phantom_tmdb88800001.mp4
-ln -s $SPLASH /tmp/jf-test/data/phantom-library/movies/Orphan_Two__phantom_tmdb88800002.mp4
-ln -s $SPLASH /tmp/jf-test/data/phantom-library/shows/Orphan_Series__phantom_tmdb88810001.mp4
-ls -la /tmp/jf-test/data/phantom-library/movies/ /tmp/jf-test/data/phantom-library/shows/ 2>&1 | head -10
+ln -s $SPLASH /var/tmp/jf-test/data/phantom-library/movies/Orphan_One__phantom_tmdb88800001.mp4
+ln -s $SPLASH /var/tmp/jf-test/data/phantom-library/movies/Orphan_Two__phantom_tmdb88800002.mp4
+ln -s $SPLASH /var/tmp/jf-test/data/phantom-library/shows/Orphan_Series__phantom_tmdb88810001.mp4
+ls -la /var/tmp/jf-test/data/phantom-library/movies/ /var/tmp/jf-test/data/phantom-library/shows/ 2>&1 | head -10
 
 echo
 echo "=== trigger library scan ==="

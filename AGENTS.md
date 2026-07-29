@@ -24,6 +24,7 @@ areas, read the linked source doc before editing code.
 | Testing / rig usage | `docs/agents/testing.md`, `tools/rig-scenarios/` | Required live Jellyfin rig workflow; unit tests are not enough |
 | Movie channel playback/materialise regression coverage | `tools/rig-scenarios/35-channel-e2e-playback.sh` | Movie browse → playback → native-open materialise → stream assertions |
 | TV episode playback/materialise regression coverage | `tools/rig-scenarios/36-channel-episode-e2e-playback.sh` | Series → season → episode browse, badge scope, native-open playback |
+| Badge state endpoint performance (Home screen) | `tools/rig-scenarios/39-channel-badge-states-perf.sh` | `POST /Plugins/PhantomLibrary/States` must stay sub-second under phantomBadges.js polling on production-shaped data |
 | Operator deployment | `docs/operator-deploy.md`, `install.sh` | Patched Jellyfin DLL deployment models, package-manager clobber checks |
 | Jellyfin patch maintenance | `scripts/jellyfin-patches/REBASE.md`, `scripts/jellyfin-patches/` | Patch stack, exact upstream tag, rebase workflow |
 | Wipe / rebuild validation | `docs/operator-wipe-validation.md`, `scripts/phantom-wipe.sh` | Pre-v1.0 schema-change path, wipe verification |
@@ -417,7 +418,7 @@ dirty files: <git status --short, plus git -C gostream status --short>
 plugin schema source: <PhantomDb CurrentSchemaVersion>
 plugin built sha256: <sha256sum src/.../Jellyfin.Plugin.PhantomLibrary.dll>
 plugin deployed sha256: <sha256sum /var/lib/jellyfin/plugins/.../Jellyfin.Plugin.PhantomLibrary.dll>
-patched Jellyfin sha256: <MediaBrowser.Controller.dll + Jellyfin.LiveTv.dll>
+patched Jellyfin sha256: <MediaBrowser.Controller.dll + MediaBrowser.Model.dll + Jellyfin.Api.dll + Jellyfin.LiveTv.dll>
 gostream commit/dirty: <git -C gostream rev-parse HEAD + status>
 gostream deployed version/hash: <image id or binary sha, if known>
 phantom.db schema: <sqlite PRAGMA user_version>
@@ -480,19 +481,34 @@ worry about. The plugin reads it on startup to decide whether to
 emit a "migration not yet run" warning, but does not perform the
 migration itself.
 
-## Jellyfin patch dependency
+## Jellyfin/gostream submodules and patch dependency
+
+`jellyfin/` and `gostream/` are git submodules. A fresh clone must be
+installable with:
+
+```bash
+git submodule update --init --recursive
+./install.sh --build
+```
+
+`install.sh --build` may initialise missing submodules, but correctness
+must never depend on untracked local checkout state. Keep the submodule
+SHA recorded in the phantom-library commit aligned with the patches and
+plugin code in that same commit.
 
 This plugin depends on patches applied to Jellyfin core, stored at
 `scripts/jellyfin-patches/`. `install.sh --build` applies them at
 build time (idempotently — second run reports `already applied`)
-against the `jellyfin/` source clone at exact tag v10.11.9 (base SHA
+against the `jellyfin/` submodule at exact tag v10.11.9 (base SHA
 `e83a7e62f2`). The patches add `IChannelItemRefresh` (an opt-in
-channel-side interface) and `IChannelItemRefreshManager` (a new
-service sibling to `IChannelManager`) — both purely additive. No
-existing API is modified.
+channel-side interface), `IChannelItemRefreshManager` (a new
+service sibling to `IChannelManager`), and a server-advertised
+item-action API (`IItemActionProvider` + `/Items/{itemId}/Actions`) —
+all purely additive. No existing API is modified.
 
 The plugin DLL alone is **not sufficient** at runtime; the patched
-`MediaBrowser.Controller.dll` + `Jellyfin.LiveTv.dll` must also be
+`MediaBrowser.Controller.dll` + `MediaBrowser.Model.dll` +
+`Jellyfin.Api.dll` + `Jellyfin.LiveTv.dll` must also be
 deployed into the operator's Jellyfin install dir (default
 `/usr/lib/jellyfin/`). `install.sh --build` prints the exact
 `sudo cp` commands at the end of its output, pre-filled for the
@@ -503,9 +519,29 @@ procedure.
 
 On Jellyfin upstream updates, the patches may need rebasing.
 `install.sh --build` aborts with an actionable error if a patch
-fails to apply. Rebase by applying via `git am`, resolving
+fails to apply. **Never ignore, skip, or special-case a patch that
+does not apply cleanly.** A broken patch means the repository is not in
+an installable state. Fix the patch stack or advance the `jellyfin/`
+submodule to the commit the patch stack targets, then verify from a
+fresh submodule checkout. Rebase by applying via `git am`, resolving
 conflicts, and re-exporting via `git format-patch`. See
 `scripts/jellyfin-patches/REBASE.md`.
+
+When changing Jellyfin-dependent behavior:
+
+1. Update `scripts/jellyfin-patches/`.
+2. Verify the patch series applies from the recorded `jellyfin/`
+   submodule commit with no pre-existing local modifications.
+3. Build patched Jellyfin from that submodule.
+4. Commit any required `jellyfin/` submodule SHA change together with
+   the plugin/patch changes.
+5. Leave `jellyfin/` clean enough that `git submodule update --init`
+   plus `./install.sh --build` reproduces the intended state.
+
+When changing gostream-dependent behavior, update and commit the
+`gostream/` submodule SHA in the same phantom-library commit as the
+plugin or install-script change that requires it. Do not rely on a
+locally built image or an untracked gostream checkout.
 
 Phase 8 (deferred): upstream PR. Per Jellyfin's LLM/AI
 contribution policy, this PR must be operator-authored with the
@@ -536,15 +572,13 @@ body, or responses to review comments.
 - Plugin DB: SQLite at
   `/var/lib/jellyfin/plugins/configurations/PhantomLibrary/phantom.db`
   on the operator's box, cloned into the rig per test.
-- Companion service: `gostream` (separate repo,
-  `phantom-library/api-add` and `phantom-library/vault-mode`
-  branches). Local instance on `:9080` (API) / `:8090`
-  (diagnostics).
+- Companion service: `gostream/` submodule. Local instance on `:9080`
+  (API) / `:8090` (diagnostics).
 
 ## Build
 
 ```bash
-dotnet build -c Release
+MSBUILDDISABLENODEREUSE=1 dotnet build -c Release -p:UseSharedCompilation=false
 ```
 
 Output DLL:
@@ -552,10 +586,60 @@ Output DLL:
 
 ## Test
 
+### Build/test process cleanup is mandatory
+
+Agents must not leave `dotnet`, `MSBuild.dll`, `VBCSCompiler`,
+`testhost`, or rig Jellyfin processes running after any build,
+test, install, or rig scenario. This box is memory-constrained;
+orphaned build servers and rig servers have caused OOMs.
+
+Always run builds/tests with reusable build servers disabled unless a
+specific command cannot work that way:
+
+```bash
+MSBUILDDISABLENODEREUSE=1 dotnet build -c Release -p:UseSharedCompilation=false
+MSBUILDDISABLENODEREUSE=1 dotnet test -p:UseSharedCompilation=false
+```
+
+Every shell invocation that starts `dotnet build`, `dotnet test`,
+`install.sh --build`, or a rig Jellyfin instance must include cleanup
+on exit:
+
+```bash
+cleanup_dotnet() {
+  dotnet build-server shutdown >/dev/null 2>&1 || true
+  pkill -u "$USER" -f 'jellyfin.dll --datadir /tmp/jf-test' || true
+}
+trap cleanup_dotnet EXIT INT TERM
+```
+
+At end of task, verify no agent-owned leftovers remain:
+
+```bash
+ps -u "$USER" -o pid,ppid,pgid,stat,etime,rss,cmd \
+  | grep -E 'dotnet|MSBuild.dll|VBCSCompiler|testhost|jellyfin.dll --datadir /tmp/jf-test' \
+  | grep -v grep || true
+ss -ltnp | grep ':18096' || true
+```
+
+If leftovers exist, clean them before handoff:
+
+```bash
+dotnet build-server shutdown || true
+pkill -u "$USER" -f 'MSBuild.dll /noautoresponse' || true
+pkill -u "$USER" -f VBCSCompiler || true
+pkill -u "$USER" -f testhost || true
+pkill -u "$USER" -f 'jellyfin.dll --datadir /tmp/jf-test' || true
+```
+
+Never kill production Jellyfin (`/usr/bin/jellyfin`, user `jellyfin`,
+port `:8096`) as part of agent cleanup. Only clean agent-owned rig
+Jellyfin bound to `:18096` / `/tmp/jf-test`.
+
 ### Unit tests are necessary but not sufficient
 
 ```bash
-dotnet test
+MSBUILDDISABLENODEREUSE=1 dotnet test -p:UseSharedCompilation=false
 ```
 
 Always keep unit tests green. If you need to weaken a test to

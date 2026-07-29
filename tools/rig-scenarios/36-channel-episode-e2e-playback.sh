@@ -8,16 +8,18 @@
 # - materialised episode stream opens
 set -euo pipefail
 
-ROOT=${PHANTOM_REPO_ROOT:-/home/spencer/git-repos/spencerharmon/phantom-library}
+ROOT=${PHANTOM_REPO_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}
 RIG=/tmp/jf-rig
 API=http://localhost:18096
 TOK=testtoken00000000000000000000000
-PHDB=/tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db
-JDB=/tmp/jf-test/data/data/jellyfin.db
+PHDB=/var/tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db
+JDB=/var/tmp/jf-test/data/data/jellyfin.db
 LOG=$RIG/logs/scenario-channel-episode-e2e-playback.log
 SERIES=99100001
 SEASON=1
 EPISODE=1
+USER_ID=
+USER_AUTH_TOKEN=
 
 mkdir -p "$RIG/logs"
 exec > >(tee "$LOG") 2>&1
@@ -26,6 +28,9 @@ cd "$ROOT"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 api() { curl -sS --fail -H "X-Emby-Token: $TOK" "$@"; }
 api_post() { curl -sS --fail -X POST -H "X-Emby-Token: $TOK" "$@"; }
+json_post() { curl -sS --fail -X POST -H "X-Emby-Token: $TOK" -H 'Content-Type: application/json' "$@"; }
+user_api() { curl -sS --fail -H "X-Emby-Token: $USER_AUTH_TOKEN" "$@"; }
+user_json_post() { curl -sS --fail -X POST -H "X-Emby-Token: $USER_AUTH_TOKEN" -H "X-Emby-Authorization: MediaBrowser Client=\"phantom-rig\", Device=\"phantom-rig\", DeviceId=\"phantom-rig-device\", Version=\"1\", Token=\"$USER_AUTH_TOKEN\"" -H 'Content-Type: application/json' "$@"; }
 hyphen() { python3 - "$1" <<'PY'
 import sys
 s=sys.argv[1]
@@ -168,6 +173,90 @@ uuid.UUID(s.get('Id'))
 PY
 }
 
+assert_runtime_ticks() {
+  local file=$1 id=$2 min_ticks=$3 label=$4
+  python3 - "$file" "$id" "$min_ticks" "$label" <<'PY'
+import json,sys
+file,id,min_ticks,label=sys.argv[1],sys.argv[2],int(sys.argv[3]),sys.argv[4]
+j=json.load(open(file))
+x=next((i for i in j.get('Items',[]) if i.get('Id')==id), None)
+if x is None:
+    raise SystemExit(f'{label}: item {id} missing')
+rt=x.get('RunTimeTicks') or 0
+print(f'  {label} runtime_ticks={rt}')
+if rt < min_ticks:
+    raise SystemExit(f'{label}: expected RunTimeTicks >= {min_ticks}, got {rt}')
+PY
+}
+
+report_resume_progress_and_assert() {
+  local id=$1 label=$2 position_ticks=$3
+  local gid source_id play_session
+  gid=$(hyphen "$id")
+  play_session="phantom-rig-$label"
+  source_id=$(python3 - <<'PY'
+import json
+try:
+    j=json.load(open('/tmp/pb-materialised.json'))
+    print(((j.get('MediaSources') or [{}])[0]).get('Id') or '')
+except FileNotFoundError:
+    print('')
+PY
+)
+  echo "[resume-progress] $label guid=$gid position=$position_ticks source=$source_id"
+  python3 - "$gid" "$source_id" "$play_session" "$position_ticks" > /tmp/playback-progress.json <<'PY'
+import json,sys
+item,source,session,pos=sys.argv[1],sys.argv[2],sys.argv[3],int(sys.argv[4])
+print(json.dumps({
+  'ItemId': item,
+  'MediaSourceId': source,
+  'PlaySessionId': session,
+  'PositionTicks': pos,
+  'CanSeek': True,
+  'IsPaused': True,
+  'PlayMethod': 'DirectPlay'
+}))
+PY
+  user_json_post --data-binary @/tmp/playback-progress.json "$API/Sessions/Playing" -o /tmp/playback-start.out || true
+  user_json_post --data-binary @/tmp/playback-progress.json "$API/Sessions/Playing/Progress" -o /tmp/playback-progress.out || fail "$label playback progress failed"
+  local persisted_runtime resume_ticks
+  persisted_runtime=$(sqlite3 "$JDB" "SELECT COALESCE(RunTimeTicks,0) FROM BaseItems WHERE Id=upper('$gid');")
+  resume_ticks=$position_ticks
+  if [ "${persisted_runtime:-0}" -gt 0 ] && [ "$resume_ticks" -ge "$persisted_runtime" ]; then
+    resume_ticks=$((persisted_runtime / 2))
+  fi
+  python3 - "$resume_ticks" > /tmp/userdata-resume.json <<'PY'
+import json,sys
+pos=int(sys.argv[1])
+print(json.dumps({'PlaybackPositionTicks': pos, 'Played': False, 'PlayCount': 0, 'IsFavorite': False}))
+PY
+  user_json_post --data-binary @/tmp/userdata-resume.json "$API/Users/$USER_ID/Items/$gid/UserData" -o /tmp/userdata-resume.out || fail "$label userdata resume update failed"
+  for _ in $(seq 1 20); do
+    user_api "$API/Users/$USER_ID/Items/Resume?Fields=UserData,ProviderIds,RunTimeTicks&MediaTypes=Video&EnableUserData=true&Limit=50" -o /tmp/resume.json || fail "$label resume query failed"
+    if python3 - "$id" "$label" <<'PY'
+import json,sys
+wanted=sys.argv[1].lower()
+j=json.load(open('/tmp/resume.json'))
+for x in j.get('Items',[]):
+    if (x.get('Id') or '').replace('-','').lower() == wanted:
+        ud=x.get('UserData') or {}
+        print('  resume_hit=', x.get('Name'), x.get('Id'), x.get('RunTimeTicks'), ud)
+        if (ud.get('PlaybackPositionTicks') or 0) <= 0:
+            raise SystemExit('resume hit missing PlaybackPositionTicks')
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+    then return 0; fi
+    sleep 1
+  done
+  python3 - <<'PY'
+import json
+j=json.load(open('/tmp/resume.json'))
+print('RESUME_ITEMS=', [(x.get('Name'), x.get('Id'), x.get('RunTimeTicks'), x.get('UserData')) for x in j.get('Items',[])])
+PY
+  fail "$label did not appear in Continue Watching"
+}
+
 assert_materialised_playback_info() {
   local id=$1 label=$2
   echo "[materialised-playback-info] $label id=$id"
@@ -202,10 +291,28 @@ bash tools/rig-scenarios/rig-up.sh --reset
 
 for _ in $(seq 1 60); do
   [ -f "$PHDB" ] && schema=$(sqlite3 "$PHDB" 'PRAGMA user_version;' 2>/dev/null || echo 0) || schema=0
-  [ "$schema" = "11" ] && break
+  [ "$schema" = "14" ] && break
   sleep 1
 done
-[ "${schema:-0}" = "11" ] || fail "phantom schema not v11, got ${schema:-0}"
+[ "${schema:-0}" = "14" ] || fail "phantom schema not v14, got ${schema:-0}"
+curl -sS --fail -X POST -H 'Content-Type: application/json' \
+  -H 'X-Emby-Authorization: MediaBrowser Client="phantom-rig", Device="phantom-rig", DeviceId="phantom-rig-login", Version="1"' \
+  -d '{"Username":"a","Pw":"a"}' "$API/Users/AuthenticateByName" -o /tmp/auth-user.json \
+  || fail 'test user login failed'
+USER_ID=$(python3 - <<'PY'
+import json
+j=json.load(open('/tmp/auth-user.json'))
+print((j.get('User') or {}).get('Id') or '')
+PY
+)
+USER_AUTH_TOKEN=$(python3 - <<'PY'
+import json
+j=json.load(open('/tmp/auth-user.json'))
+print(j.get('AccessToken') or '')
+PY
+)
+[ -n "$USER_ID" ] || fail 'test user id missing'
+[ -n "$USER_AUTH_TOKEN" ] || fail 'test user token missing'
 
 echo '[1] trigger discovery task'
 api "$API/ScheduledTasks" -o /tmp/tasks.json
@@ -274,7 +381,7 @@ for x in j.get('Items', []):
 raise SystemExit(1)
 PY
 ) || fail 'Delta season 1 not found or not enriched'
-api "$API/Channels/$SHOWS_CH/Items?FolderId=$SEASON_ID&Fields=Tags,ProviderIds,MediaSources,Path,Overview,ExternalId&Limit=50" -o /tmp/episodes.json
+api "$API/Channels/$SHOWS_CH/Items?FolderId=$SEASON_ID&Fields=Tags,ProviderIds,MediaSources,Path,Overview,ExternalId,RunTimeTicks&Limit=50" -o /tmp/episodes.json
 EP_ID=$(python3 - <<'PY'
 import json
 j=json.load(open('/tmp/episodes.json'))
@@ -284,7 +391,8 @@ for x in j.get('Items', []):
 raise SystemExit(1)
 PY
 ) || fail 'Delta S01E01 episode not found'
-api "$API/Users/$(sqlite3 $JDB 'select Id from Users limit 1')/Items?ParentId=$SEASON_ID&Fields=Tags,IndexNumber,ParentIndexNumber,Overview&Limit=20" -o /tmp/season-parent-children.json
+assert_runtime_ticks /tmp/episodes.json "$EP_ID" 25200000000 'phantom-episode-browse'
+api "$API/Users/$USER_ID/Items?ParentId=$SEASON_ID&Fields=Tags,IndexNumber,ParentIndexNumber,Overview,RunTimeTicks&Limit=20" -o /tmp/season-parent-children.json
 python3 - <<'PY'
 import json
 j=json.load(open('/tmp/season-parent-children.json'))
@@ -333,7 +441,7 @@ state_count=$(sqlite3 "$PHDB" "SELECT COUNT(*) FROM materialised_state WHERE tmd
 [ "$state_count" = "1" ] || fail 'materialised_state missing for episode'
 
 for _ in $(seq 1 20); do
-  api "$API/Channels/$SHOWS_CH/Items?FolderId=$SEASON_ID&Fields=Tags,ProviderIds,MediaSources,Path,Overview,ExternalId&Limit=50" -o /tmp/episodes.json
+  api "$API/Channels/$SHOWS_CH/Items?FolderId=$SEASON_ID&Fields=Tags,ProviderIds,MediaSources,Path,Overview,ExternalId,RunTimeTicks&Limit=50" -o /tmp/episodes.json
   if python3 - "$EP_ID" <<'PY'
 import json,sys
 id=sys.argv[1]
@@ -358,15 +466,17 @@ path=(x.get('MediaSources') or [{}])[0].get('Path') or ''
 if '/tmp/jf-rig/gostream/tv/' not in path:
     raise SystemExit(f'episode source not refreshed to gostream tv path: {path}')
 PY
+assert_runtime_ticks /tmp/episodes.json "$EP_ID" 1 'materialised-episode-browse'
 assert_stream_opens "$EP_ID" 'mkv' 'materialised-episode'
 assert_materialised_playback_info "$EP_ID" 'materialised-episode-second-play'
 assert_stream_opens "$EP_ID" 'mkv' 'materialised-episode-second-play'
+report_resume_progress_and_assert "$EP_ID" 'materialised-episode' 10000000000
 
 echo '[6] DB sanity: episode BaseItem persisted with episode external id + tv path'
-row=$(sqlite3 "$JDB" "SELECT ExternalId || '|' || Path FROM BaseItems WHERE Id=upper(substr('$EP_ID',1,8)||'-'||substr('$EP_ID',9,4)||'-'||substr('$EP_ID',13,4)||'-'||substr('$EP_ID',17,4)||'-'||substr('$EP_ID',21));")
+row=$(sqlite3 "$JDB" "SELECT ExternalId || '|' || Path || '|' || COALESCE(RunTimeTicks,0) FROM BaseItems WHERE Id=upper(substr('$EP_ID',1,8)||'-'||substr('$EP_ID',9,4)||'-'||substr('$EP_ID',13,4)||'-'||substr('$EP_ID',17,4)||'-'||substr('$EP_ID',21));")
 echo "BASEITEM_EPISODE=$row"
 case "$row" in
-  episode_${SERIES}_s01e01\|/tmp/jf-rig/gostream/tv/*) : ;;
+  episode_${SERIES}_s01e01\|/tmp/jf-rig/gostream/tv/*\|[1-9]*) : ;;
   *) fail "bad episode BaseItem row: $row" ;;
 esac
 

@@ -39,6 +39,11 @@
                             <div class="fieldDescription">Target for POST /api/library/add (primary patch).</div>
                         </div>
                         <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="GostreamApiToken">Library-control shared token</label>
+                            <input id="GostreamApiToken" name="GostreamApiToken" type="password" is="emby-input" autocomplete="off" />
+                            <div class="fieldDescription">Optional shared secret sent as X-Gostream-Token to gostream library add/remove endpoints.</div>
+                        </div>
+                        <div class="inputContainer">
                             <label class="inputLabel inputLabelUnfocused" for="GostreamDiagnosticsBaseUrl">Diagnostics base URL (port 8090)</label>
                             <input id="GostreamDiagnosticsBaseUrl" name="GostreamDiagnosticsBaseUrl" type="url" is="emby-input" />
                         </div>
@@ -96,6 +101,11 @@
                         <div class="inputContainer">
                             <label class="inputLabel inputLabelUnfocused" for="MinSizeGb4K">Minimum 4K size (GB)</label>
                             <input id="MinSizeGb4K" name="MinSizeGb4K" type="number" min="0" is="emby-input" />
+                        </div>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="AllowedVideoContainers">Allowed video containers</label>
+                            <input id="AllowedVideoContainers" name="AllowedVideoContainers" type="text" is="emby-input" />
+                            <div class="fieldDescription">Comma-separated extensions used during gostream file selection. Default: mkv. Empty allows all recognized video containers.</div>
                         </div>
                     </fieldset>
 
@@ -276,6 +286,7 @@
                         ApiClient.getPluginConfiguration(PluginId).then(function (cfg) {
                             document.querySelector('#TmdbApiKey').value = cfg.TmdbApiKey || '';
                             document.querySelector('#GostreamBaseUrl').value = cfg.GostreamBaseUrl || '';
+                            document.querySelector('#GostreamApiToken').value = cfg.GostreamApiToken || '';
                             document.querySelector('#GostreamDiagnosticsBaseUrl').value = cfg.GostreamDiagnosticsBaseUrl || '';
                             document.querySelector('#ProwlarrBaseUrl').value = cfg.ProwlarrBaseUrl || '';
                             document.querySelector('#ProwlarrApiKey').value = cfg.ProwlarrApiKey || '';
@@ -287,6 +298,7 @@
                             document.querySelector('#MinSeeders').value = cfg.MinSeeders;
                             document.querySelector('#MinSizeGb1080p').value = cfg.MinSizeGb1080p;
                             document.querySelector('#MinSizeGb4K').value = cfg.MinSizeGb4K;
+                            document.querySelector('#AllowedVideoContainers').value = cfg.AllowedVideoContainers ?? 'mkv';
                             document.querySelector('#EvictionEnabled').checked = !!cfg.EvictionEnabled;
                             document.querySelector('#EvictionIdleDays').value = cfg.EvictionIdleDays;
                             document.querySelector('#EvictionScheduleCron').value = cfg.EvictionScheduleCron || '';
@@ -326,6 +338,7 @@
                         ApiClient.getPluginConfiguration(PluginId).then(function (cfg) {
                             cfg.TmdbApiKey = document.querySelector('#TmdbApiKey').value;
                             cfg.GostreamBaseUrl = document.querySelector('#GostreamBaseUrl').value;
+                            cfg.GostreamApiToken = document.querySelector('#GostreamApiToken').value;
                             cfg.GostreamDiagnosticsBaseUrl = document.querySelector('#GostreamDiagnosticsBaseUrl').value;
                             cfg.ProwlarrBaseUrl = document.querySelector('#ProwlarrBaseUrl').value;
                             cfg.ProwlarrApiKey = document.querySelector('#ProwlarrApiKey').value;
@@ -337,6 +350,7 @@
                             cfg.MinSeeders = parseInt(document.querySelector('#MinSeeders').value, 10);
                             cfg.MinSizeGb1080p = parseInt(document.querySelector('#MinSizeGb1080p').value, 10);
                             cfg.MinSizeGb4K = parseInt(document.querySelector('#MinSizeGb4K').value, 10);
+                            cfg.AllowedVideoContainers = document.querySelector('#AllowedVideoContainers').value;
                             cfg.EvictionEnabled = document.querySelector('#EvictionEnabled').checked;
                             cfg.EvictionIdleDays = parseInt(document.querySelector('#EvictionIdleDays').value, 10);
                             cfg.EvictionScheduleCron = document.querySelector('#EvictionScheduleCron').value;

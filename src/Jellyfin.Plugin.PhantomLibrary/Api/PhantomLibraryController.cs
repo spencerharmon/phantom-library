@@ -52,6 +52,7 @@ public sealed class PhantomLibraryController : ControllerBase
     private readonly PhantomDb _db;
     private readonly PhantomSourceManager _sourceManager;
     private readonly IFavouriteRecommendationIngestor _recommendationIngestor;
+    private readonly ILibraryManager _libraryManager;
 
     public PhantomLibraryController(
         IMaterialiser materialiser,
@@ -61,7 +62,8 @@ public sealed class PhantomLibraryController : ControllerBase
         IUserManager userManager,
         PhantomDb db,
         PhantomSourceManager sourceManager,
-        IFavouriteRecommendationIngestor recommendationIngestor)
+        IFavouriteRecommendationIngestor recommendationIngestor,
+        ILibraryManager libraryManager)
     {
         _materialiser = materialiser;
         _queue = queue;
@@ -71,6 +73,7 @@ public sealed class PhantomLibraryController : ControllerBase
         _db = db;
         _sourceManager = sourceManager;
         _recommendationIngestor = recommendationIngestor;
+        _libraryManager = libraryManager;
     }
 
     /// <summary>
@@ -125,13 +128,38 @@ public sealed class PhantomLibraryController : ControllerBase
         return Accepted();
     }
 
+    [HttpGet("Items/ResolveExternalId/{itemId}")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public IActionResult ResolveExternalId([FromRoute] Guid itemId)
+    {
+        var item = _libraryManager.GetItemById(itemId);
+        if (item is null || string.IsNullOrWhiteSpace(item.ExternalId))
+        {
+            return NotFound(new { code = "not_found" });
+        }
+
+        return Ok(new { externalId = item.ExternalId });
+    }
+
     [HttpGet("Items/{externalId}/Sources")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public async Task<IActionResult> Sources([FromRoute] string externalId, CancellationToken ct = default)
+    public async Task<IActionResult> Sources([FromRoute] string externalId, [FromQuery] bool refresh = false, CancellationToken ct = default)
     {
-        var response = await _sourceManager.GetSourcesAsync(externalId, ct).ConfigureAwait(false);
+        var response = await _sourceManager.GetSourcesAsync(externalId, refresh, ct).ConfigureAwait(false);
         return response is null ? NotFound(new { code = "not_found" }) : Ok(response);
+    }
+
+    [HttpPost("Items/{externalId}/Sources/Reset")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status409Conflict)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+    public async Task<IActionResult> ResetCurrent([FromRoute] string externalId, CancellationToken ct = default)
+    {
+        var result = await _sourceManager.ResetCurrentAsync(externalId, ct).ConfigureAwait(false);
+        return ToActionResult(result);
     }
 
     [HttpPost("Items/{externalId}/Sources/RejectCurrent")]

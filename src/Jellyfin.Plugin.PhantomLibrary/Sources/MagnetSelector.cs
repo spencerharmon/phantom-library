@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
@@ -61,6 +63,7 @@ public sealed record MagnetProbeResult(
 public sealed class MagnetSelector
 {
     private readonly IEnumerable<IIndexerClient> _indexers;
+    private static readonly Regex EpisodeToken = new(@"\bS(?<s>\d{1,2})E(?<e>\d{1,3})\b|\b(?<s2>\d{1,2})x(?<e2>\d{1,3})\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private readonly QualityScorer _scorer;
     private readonly Func<PluginConfiguration> _configProvider;
     private readonly ILogger<MagnetSelector> _logger;
@@ -225,7 +228,18 @@ public sealed class MagnetSelector
             return MagnetProbeResult.DefinitiveUnavailable();
         }
 
-        var candidates = ranked.Select(picked =>
+        var episodeRanked = string.Equals(type, "episode", StringComparison.OrdinalIgnoreCase)
+            && season.HasValue
+            && episode.HasValue
+                ? ranked
+                    .Select((candidate, index) => new { candidate, index })
+                    .OrderByDescending(x => EpisodeSpecificityScore(x.candidate.Title, season.Value, episode.Value))
+                    .ThenBy(x => x.index)
+                    .Select(x => x.candidate)
+                    .ToList()
+                : ranked;
+
+        var candidates = episodeRanked.Select(picked =>
         {
             var indexerLabel = !string.IsNullOrWhiteSpace(picked.IndexerName)
                 ? picked.IndexerName!
@@ -238,5 +252,48 @@ public sealed class MagnetSelector
         }).ToList();
 
         return MagnetProbeResult.Available(candidates);
+    }
+
+    internal static int EpisodeSpecificityScore(string? title, int season, int episode)
+    {
+        if (string.IsNullOrWhiteSpace(title))
+        {
+            return 0;
+        }
+
+        var score = 0;
+        foreach (Match match in EpisodeToken.Matches(title))
+        {
+            var seasonText = match.Groups["s"].Success ? match.Groups["s"].Value : match.Groups["s2"].Value;
+            var episodeText = match.Groups["e"].Success ? match.Groups["e"].Value : match.Groups["e2"].Value;
+            if (!int.TryParse(seasonText, NumberStyles.Integer, CultureInfo.InvariantCulture, out var s)
+                || !int.TryParse(episodeText, NumberStyles.Integer, CultureInfo.InvariantCulture, out var e))
+            {
+                continue;
+            }
+
+            if (s == season && e == episode)
+            {
+                score += 1000;
+            }
+            else if (s == season)
+            {
+                score -= 100;
+            }
+            else
+            {
+                score -= 200;
+            }
+        }
+
+        if (title.Contains("complete", StringComparison.OrdinalIgnoreCase)
+            || title.Contains("season 1-", StringComparison.OrdinalIgnoreCase)
+            || title.Contains("s01-s", StringComparison.OrdinalIgnoreCase)
+            || title.Contains("s01 to s", StringComparison.OrdinalIgnoreCase))
+        {
+            score -= 50;
+        }
+
+        return score;
     }
 }

@@ -14,8 +14,8 @@ set -u
 exec > /tmp/jf-rig/logs/scenario-suggestions.log 2>&1
 BASE=http://localhost:18096
 TOK=testtoken00000000000000000000000
-JFDB=/tmp/jf-test/data/data/jellyfin.db
-PHDB=/tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db
+JFDB=/var/tmp/jf-test/data/data/jellyfin.db
+PHDB=/var/tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db
 
 echo "=== Scenario: suggestions (baseline current code) ==="
 date
@@ -29,7 +29,7 @@ DELETE FROM BaseItemImageInfos WHERE ItemId IN (
 DELETE FROM BaseItems WHERE Path LIKE '%__phantom_tmdb%';
 SQL
 sqlite3 $PHDB "DELETE FROM phantom_items; DELETE FROM tmdb_cache;"
-find /tmp/jf-test/data/phantom-library -type l -delete 2>/dev/null || true
+find /var/tmp/jf-test/data/phantom-library -type l -delete 2>/dev/null || true
 echo "  state wiped"
 
 # Start observer in background (managed via systemd transient)
@@ -89,8 +89,8 @@ SELECT item_guid, tmdb_id, type, state, stub_path
 FROM phantom_items WHERE tmdb_id IN (99000001,99000002,99000003,99100001,99100002);"
 
 echo "--- symlinks on disk ---"
-ls -la /tmp/jf-test/data/phantom-library/movies/ 2>&1 | head -10
-ls -la /tmp/jf-test/data/phantom-library/shows/ 2>&1 | head -10
+ls -la /var/tmp/jf-test/data/phantom-library/movies/ 2>&1 | head -10
+ls -la /var/tmp/jf-test/data/phantom-library/shows/ 2>&1 | head -10
 
 echo
 echo "=== ASSERTIONS ==="

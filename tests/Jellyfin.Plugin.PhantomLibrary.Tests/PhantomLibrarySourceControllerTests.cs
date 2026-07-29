@@ -174,6 +174,14 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
         var gostream = gostreamMock ?? new Mock<IGostreamClient>(MockBehavior.Loose);
         gostream.Setup(g => g.RemoveAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
+        gostream.Setup(g => g.ValidateAsync(It.IsAny<GostreamValidateRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((GostreamValidateRequest req, CancellationToken _) => new GostreamValidateResult
+            {
+                Status = "valid",
+                Hash = "abc",
+                SelectedFile = new GostreamSelectedFile { Id = 0, Path = "selected.mkv", Size = 100 },
+                ValidationSessionId = req.ValidationSessionId,
+            });
         gostreamSetup?.Invoke(gostream);
 
         var scorer = new QualityScorer(NullLogger<QualityScorer>.Instance);
@@ -229,7 +237,8 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
             users.Object,
             db,
             sourceManager,
-            recommendations);
+            recommendations,
+            libMgr.Object);
     }
 
     [Fact]
@@ -238,7 +247,7 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
         using var db = await NewDbAsync();
         var ctrl = BuildController(db, Array.Empty<MagnetCandidate>());
 
-        var result = await ctrl.Sources("not-a-channel-id", CancellationToken.None);
+        var result = await ctrl.Sources("not-a-channel-id", refresh: false, CancellationToken.None);
 
         Assert.IsType<NotFoundObjectResult>(result);
     }
@@ -296,6 +305,250 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
         Assert.NotNull(failure);
         Assert.Equal("operator_rejected", failure!.Reason);
         gostream.Verify(g => g.RemoveAsync("/stub/current.mkv", It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task RejectCurrent_ValidatesAlternatesInsteadOfOnlyTryingTopUnknownCandidate()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 42);
+        var current = Candidate("CURRENT", 100);
+        var sameHashAlternateMagnet = new MagnetCandidate(
+            "magnet:?xt=urn:btih:CURRENT-DIFFERENT-MAGNET",
+            current.InfoHash,
+            current.Size,
+            95,
+            current.Indexer);
+        var invalid = Candidate("INVALID", 90);
+        var valid = Candidate("VALID", 50);
+        await CacheCurrentAsync(db, 42, current, "/stub/current.mkv", "/fuse/current.mkv");
+        var added = new List<string>();
+        var fusePath = Path.Combine(_fuseRoot, "valid.mkv");
+        File.WriteAllText(fusePath, "x");
+        var cfg = new PluginConfiguration
+        {
+            SourcePickerPreset = "test",
+            MinSeeders = 1,
+            MinSizeGb1080p = 1,
+            MinSizeGb4K = 1,
+            FusePathWaitTimeoutSeconds = 2,
+            FusePathPollIntervalMilliseconds = 50,
+            MagnetCacheTtlHours = 24,
+            UnavailableRetryAfterHours = 24,
+            SourceValidationParallelism = 1,
+            SourceValidationWindowSize = 1,
+        };
+        var ctrl = BuildController(
+            db,
+            new[] { current, sameHashAlternateMagnet, invalid, valid },
+            gostreamSetup: g =>
+            {
+                g.Setup(x => x.ValidateAsync(It.IsAny<GostreamValidateRequest>(), It.IsAny<CancellationToken>()))
+                    .ReturnsAsync((GostreamValidateRequest req, CancellationToken _) => new GostreamValidateResult
+                    {
+                        Status = req.Magnet == invalid.Magnet ? "invalid" : "valid",
+                        Reason = req.Magnet == invalid.Magnet ? "no_valid_files" : null,
+                        Hash = req.Magnet == invalid.Magnet ? invalid.InfoHash : valid.InfoHash,
+                        SelectedFile = req.Magnet == invalid.Magnet ? null : new GostreamSelectedFile { Id = 1, Path = "valid.mkv", Size = 100 },
+                        ValidationSessionId = req.ValidationSessionId,
+                    });
+                g.Setup(x => x.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()))
+                    .ReturnsAsync((GostreamAddRequest req, CancellationToken _) =>
+                    {
+                        added.Add(req.Magnet);
+                        return new GostreamAddResult
+                        {
+                            StubPath = "/stub/valid.mkv",
+                            FusePath = fusePath,
+                            Hash = valid.InfoHash,
+                            Size = 100,
+                        };
+                    });
+            },
+            cfg: cfg);
+
+        var result = await ctrl.RejectCurrent("movie_42", CancellationToken.None);
+
+        var ok = Assert.IsType<OkObjectResult>(result);
+        var payload = Assert.IsType<PhantomSourceOperationResult>(ok.Value);
+        Assert.Equal(PhantomSourceOperationStatus.Success, payload.Status);
+        Assert.Equal(valid.Magnet, Assert.Single(added));
+        var sameHashFailure = await db.GetMagnetFailureByInfoHashAsync(
+            new MagnetCacheKey(42, "tt0000042", "movie", null, null, "test"),
+            sameHashAlternateMagnet.InfoHash,
+            cfg.SourceValidationPolicyVersion,
+            CancellationToken.None);
+        Assert.NotNull(sameHashFailure);
+        Assert.Equal("operator_rejected", sameHashFailure!.Reason);
+        var state = await db.GetMaterialisedStateAsync(42, "movie", -1, -1, CancellationToken.None);
+        Assert.NotNull(state);
+        Assert.Equal(fusePath, state!.FusePath);
+        var cached = await db.GetCachedMagnetAsync(new MagnetCacheKey(42, "tt0000042", "movie", null, null, "test"), CancellationToken.None);
+        Assert.NotNull(cached);
+        Assert.Equal(valid.Magnet, cached!.Magnet);
+    }
+
+    [Fact]
+    public async Task ResetCurrent_DeletesStateAndClearsUnavailableWithoutRejectingMagnet()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 42);
+        var current = Candidate("CURRENT", 100);
+        await CacheCurrentAsync(db, 42, current, "/stub/current.mkv", "/fuse/current.mkv");
+        await db.MarkUnavailableAsync(
+            new UnavailableKey(42, "tt0000042", "movie", null, null),
+            TimeSpan.FromHours(24),
+            CancellationToken.None);
+        await db.MarkMagnetFailedAsync(
+            new MagnetFailureKey(42, "tt0000042", "movie", null, null, "test", current.Magnet),
+            new MagnetFailureEntry
+            {
+                InfoHash = current.InfoHash,
+                Reason = "fuse_path_missing",
+                FailedAt = DateTimeOffset.UtcNow,
+                RetryAfter = DateTimeOffset.UtcNow.AddHours(24),
+            },
+            CancellationToken.None);
+        await db.UpsertSourceCandidatesAsync(
+            42,
+            "movie",
+            -1,
+            -1,
+            "test",
+            new[] { current },
+            "test",
+            TimeSpan.FromHours(1),
+            CancellationToken.None);
+        var validationTime = DateTimeOffset.FromUnixTimeSeconds(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        await db.UpdateSourceCandidateValidationAsync(new SourceCandidateValidationUpdate(
+            42,
+            "movie",
+            -1,
+            -1,
+            "test",
+            current.Magnet,
+            "invalid",
+            "fuse_path_missing",
+            validationTime,
+            validationTime.AddHours(1),
+            123,
+            "sv14-parser-audio-v1|containers:MKV",
+            1,
+            "Movie.mkv",
+            current.Size), CancellationToken.None);
+        var gostream = new Mock<IGostreamClient>(MockBehavior.Loose);
+        var ctrl = BuildController(db, new[] { current }, gostream);
+
+        var result = await ctrl.ResetCurrent("movie_42", CancellationToken.None);
+
+        var ok = Assert.IsType<OkObjectResult>(result);
+        var payload = Assert.IsType<PhantomSourceOperationResult>(ok.Value);
+        Assert.Equal(PhantomSourceOperationStatus.Success, payload.Status);
+        Assert.Equal("reset", payload.Code);
+        Assert.Null(await db.GetMaterialisedStateAsync(42, "movie", -1, -1, CancellationToken.None));
+        var availability = await db.GetAvailabilityItemAsync(42, "movie", -1, -1, CancellationToken.None);
+        Assert.NotNull(availability);
+        Assert.Equal("available", availability!.Status);
+        Assert.Null(await db.IsMarkedUnavailableAsync(new UnavailableKey(42, "tt0000042", "movie", null, null), CancellationToken.None));
+        Assert.Null(await db.GetMagnetFailureAsync(
+            new MagnetFailureKey(42, "tt0000042", "movie", null, null, "test", current.Magnet),
+            CancellationToken.None));
+        var resetCandidate = Assert.Single(await db.ListSourceCandidatesAsync(42, "movie", -1, -1, "test", includeExpired: true, CancellationToken.None));
+        Assert.Equal("unknown", resetCandidate.ValidationStatus);
+        Assert.Null(resetCandidate.ValidationReason);
+        Assert.Null(resetCandidate.ValidatedAt);
+        Assert.Equal("unknown", resetCandidate.ValidationPolicyVersion);
+        Assert.Null(resetCandidate.SelectedFilePath);
+        gostream.Verify(g => g.RemoveAsync("/stub/current.mkv", It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task ResetCurrent_UnmaterialisedItem_ClearsRejectedCandidateValidation()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 42);
+        var candidate = Candidate("BAD", 100);
+        await db.UpsertSourceCandidatesAsync(
+            42,
+            "movie",
+            -1,
+            -1,
+            "test",
+            new[] { candidate },
+            "test",
+            TimeSpan.FromHours(1),
+            CancellationToken.None);
+        var validationTime = DateTimeOffset.FromUnixTimeSeconds(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        await db.UpdateSourceCandidateValidationAsync(new SourceCandidateValidationUpdate(
+            42,
+            "movie",
+            -1,
+            -1,
+            "test",
+            candidate.Magnet,
+            "invalid",
+            "target_episode_not_found",
+            validationTime,
+            validationTime.AddDays(7),
+            123,
+            "sv14-parser-audio-v1|containers:MKV",
+            null,
+            null,
+            null), CancellationToken.None);
+        await db.MarkMagnetFailedAsync(
+            new MagnetFailureKey(42, "tt0000042", "movie", null, null, "test", candidate.Magnet),
+            new MagnetFailureEntry
+            {
+                InfoHash = candidate.InfoHash,
+                Reason = "target_episode_not_found",
+                FailedAt = validationTime,
+                RetryAfter = validationTime.AddDays(7),
+                ValidationPolicyVersion = "sv14-parser-audio-v1|containers:MKV",
+            },
+            CancellationToken.None);
+        var ctrl = BuildController(db, new[] { candidate });
+
+        var before = Assert.IsType<OkObjectResult>(await ctrl.Sources("movie_42", refresh: false, CancellationToken.None));
+        var beforeSources = Assert.IsType<PhantomSourcesResponse>(before.Value);
+        Assert.True(beforeSources.CanResetCurrent);
+        Assert.True(Assert.Single(beforeSources.Candidates).IsRejected);
+
+        var result = await ctrl.ResetCurrent("movie_42", CancellationToken.None);
+
+        var ok = Assert.IsType<OkObjectResult>(result);
+        var payload = Assert.IsType<PhantomSourceOperationResult>(ok.Value);
+        Assert.Equal(PhantomSourceOperationStatus.Success, payload.Status);
+        Assert.Null(await db.GetMagnetFailureAsync(
+            new MagnetFailureKey(42, "tt0000042", "movie", null, null, "test", candidate.Magnet),
+            CancellationToken.None));
+        var resetCandidate = Assert.Single(await db.ListSourceCandidatesAsync(42, "movie", -1, -1, "test", includeExpired: true, CancellationToken.None));
+        Assert.Equal("unknown", resetCandidate.ValidationStatus);
+        Assert.Null(resetCandidate.ValidationReason);
+        Assert.Null(resetCandidate.ValidationExpiresAt);
+
+        var after = Assert.IsType<OkObjectResult>(await ctrl.Sources("movie_42", refresh: false, CancellationToken.None));
+        var afterSources = Assert.IsType<PhantomSourcesResponse>(after.Value);
+        Assert.False(afterSources.CanResetCurrent);
+        Assert.False(Assert.Single(afterSources.Candidates).IsRejected);
+        Assert.True(afterSources.CanMaterialiseSelected);
+    }
+
+    [Fact]
+    public async Task ResetCurrent_InFlight_Returns409WithoutDeletingState()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 42);
+        var current = Candidate("CURRENT", 100);
+        await CacheCurrentAsync(db, 42, current, "/stub/current.mkv", "/fuse/current.mkv");
+        await db.UpsertMaterialiseInFlightAsync(42, "movie", -1, -1, CancellationToken.None);
+        var gostream = new Mock<IGostreamClient>(MockBehavior.Loose);
+        var ctrl = BuildController(db, new[] { current }, gostream);
+
+        var result = await ctrl.ResetCurrent("movie_42", CancellationToken.None);
+
+        Assert.IsType<ConflictObjectResult>(result);
+        Assert.NotNull(await db.GetMaterialisedStateAsync(42, "movie", -1, -1, CancellationToken.None));
+        gostream.Verify(g => g.RemoveAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
     [Fact]

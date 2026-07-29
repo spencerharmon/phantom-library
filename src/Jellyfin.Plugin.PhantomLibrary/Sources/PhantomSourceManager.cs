@@ -49,6 +49,7 @@ public sealed record PhantomSourcesResponse
     public required string Status { get; init; }
     public PhantomCurrentSourceDto? CurrentSource { get; init; }
     public IReadOnlyList<PhantomSourceCandidateDto> Candidates { get; init; } = Array.Empty<PhantomSourceCandidateDto>();
+    public required bool CanResetCurrent { get; init; }
     public required bool CanRejectCurrent { get; init; }
     public required bool CanMaterialiseSelected { get; init; }
     public required string Message { get; init; }
@@ -139,7 +140,7 @@ public sealed class PhantomSourceManager
         int EpisodeSentinel,
         string MetadataType);
 
-    private sealed record CandidateWithFailure(MagnetCandidate Candidate, MagnetFailureEntry? Failure, int Rank, bool IsCurrent);
+    private sealed record CandidateWithFailure(MagnetCandidate Candidate, MagnetFailureEntry? Failure, SourceCandidateRow? SourceRow, int Rank, bool IsCurrent);
 
     public PhantomSourceManager(
         PhantomDb db,
@@ -175,6 +176,9 @@ public sealed class PhantomSourceManager
     }
 
     public async Task<PhantomSourcesResponse?> GetSourcesAsync(string externalId, CancellationToken ct)
+        => await GetSourcesAsync(externalId, refreshCandidates: false, ct).ConfigureAwait(false);
+
+    public async Task<PhantomSourcesResponse?> GetSourcesAsync(string externalId, bool refreshCandidates, CancellationToken ct)
     {
         if (!TryResolveKey(externalId, out var key))
         {
@@ -188,12 +192,14 @@ public sealed class PhantomSourceManager
             return null;
         }
 
+        await ClearStaleInFlightAsync(key, ct).ConfigureAwait(false);
         var current = await GetCurrentAsync(key, imdb, ct).ConfigureAwait(false);
         var inFlight = await _db.IsMaterialiseInFlightAsync(
             key.TmdbId, key.Type, key.SeasonSentinel, key.EpisodeSentinel, ct).ConfigureAwait(false);
 
         var currentMagnet = current is null ? null : current.Value.Entry?.Magnet;
-        var (candidates, errorKind, errorMessage) = await GetRankedCandidatesAsync(key, imdb, meta, includeRejected: true, currentMagnet: currentMagnet, ct)
+        var cfg = _configProvider();
+        var (candidates, errorKind, errorMessage) = await GetRankedCandidatesAsync(key, imdb, meta, includeRejected: true, currentMagnet: currentMagnet, allowProbe: refreshCandidates, ct)
             .ConfigureAwait(false);
 
         var status = inFlight
@@ -203,8 +209,12 @@ public sealed class PhantomSourceManager
                 : errorKind is null && candidates.Count == 0
                     ? "unavailable"
                     : "unmaterialised";
+        var canReset = !inFlight
+            && (current is not null
+                || string.Equals(status, "unavailable", StringComparison.OrdinalIgnoreCase)
+                || candidates.Any(c => c.Failure is not null || IsValidationRejected(c.SourceRow, cfg)));
         var canReject = current is not null && current.Value.Entry is not null && !inFlight;
-        var canMaterialise = !inFlight && candidates.Any(c => c.Failure is null);
+        var canMaterialise = !inFlight && candidates.Any(c => c.Failure is null && !IsValidationRejected(c.SourceRow, cfg));
         var message = inFlight
             ? "Materialisation already in flight"
             : canReject || canMaterialise
@@ -221,12 +231,64 @@ public sealed class PhantomSourceManager
             Status = status,
             CurrentSource = current is null ? null : ToCurrentDto(current.Value.State, current.Value.Entry),
             Candidates = candidates.Select(ToCandidateDto).ToArray(),
+            CanResetCurrent = canReset,
             CanRejectCurrent = canReject,
             CanMaterialiseSelected = canMaterialise,
             Message = message,
             ProbeErrorKind = errorKind,
             ProbeErrorMessage = errorMessage,
         };
+    }
+
+    public async Task<PhantomSourceOperationResult> ResetCurrentAsync(string externalId, CancellationToken ct)
+    {
+        if (!TryResolveKey(externalId, out var key))
+        {
+            return Result(PhantomSourceOperationStatus.NotFound, "not_found", "Phantom movie or episode external id not found");
+        }
+
+        await ClearStaleInFlightAsync(key, ct).ConfigureAwait(false);
+        if (await _db.IsMaterialiseInFlightAsync(key.TmdbId, key.Type, key.SeasonSentinel, key.EpisodeSentinel, ct).ConfigureAwait(false))
+        {
+            return Result(PhantomSourceOperationStatus.InFlight, "in_flight", "Materialisation already in flight");
+        }
+
+        var imdb = await ResolveImdbAsync(key, ct).ConfigureAwait(false);
+        var current = await GetCurrentAsync(key, imdb, ct).ConfigureAwait(false);
+        if (current is not null)
+        {
+            await _db.MarkAvailabilityAvailableAsync(
+                key.TmdbId,
+                key.Type,
+                key.SeasonSentinel,
+                key.EpisodeSentinel,
+                current.Value.Entry,
+                ct).ConfigureAwait(false);
+            await DeleteCurrentStateAndMaybeRemoveAsync(key, current.Value.State, current.Value.Entry?.InfoHash, ct).ConfigureAwait(false);
+        }
+
+        var cfg = _configProvider();
+        await _db.DeleteMagnetFailuresAsync(
+            CacheKey(key, imdb, cfg.SourcePickerPreset),
+            ct).ConfigureAwait(false);
+        await _db.ClearSourceCandidateValidationAsync(
+            key.TmdbId,
+            key.Type,
+            key.SeasonSentinel,
+            key.EpisodeSentinel,
+            cfg.SourcePickerPreset,
+            ct).ConfigureAwait(false);
+        await _db.DeleteUnavailableAsync(
+            new UnavailableKey(key.TmdbId, imdb, key.Type, key.Season, key.Episode),
+            ct).ConfigureAwait(false);
+        await RefreshItemAsync(key, forceProbe: false, ct).ConfigureAwait(false);
+
+        return Result(
+            PhantomSourceOperationStatus.Success,
+            "reset",
+            current is null
+                ? "Phantom item was already in base state; unavailable marker cleared"
+                : "Phantom materialisation state reset");
     }
 
     public async Task<PhantomSourceOperationResult> RejectCurrentAsync(string externalId, CancellationToken ct)
@@ -236,6 +298,7 @@ public sealed class PhantomSourceManager
             return Result(PhantomSourceOperationStatus.NotFound, "not_found", "Phantom movie or episode external id not found");
         }
 
+        await ClearStaleInFlightAsync(key, ct).ConfigureAwait(false);
         if (await _db.IsMaterialiseInFlightAsync(key.TmdbId, key.Type, key.SeasonSentinel, key.EpisodeSentinel, ct).ConfigureAwait(false))
         {
             return Result(PhantomSourceOperationStatus.InFlight, "in_flight", "Materialisation already in flight");
@@ -259,6 +322,7 @@ public sealed class PhantomSourceManager
                 Reason = "operator_rejected",
                 FailedAt = now,
                 RetryAfter = now.Add(OperatorRejectedRetry),
+                ValidationPolicyVersion = cfg.SourceValidationPolicyVersion,
             },
             ct).ConfigureAwait(false);
 
@@ -270,23 +334,28 @@ public sealed class PhantomSourceManager
             return Result(PhantomSourceOperationStatus.NoAlternate, "no_alternate", "No metadata is cached for this item, so no alternate source can be selected");
         }
 
-        var (ranked, _, _) = await GetRankedCandidatesAsync(key, imdb, meta, includeRejected: false, currentMagnet: current.Value.Entry.Magnet, ct).ConfigureAwait(false);
-        var next = ranked.FirstOrDefault(c => !string.Equals(c.Candidate.Magnet, current.Value.Entry.Magnet, StringComparison.Ordinal));
+        var (ranked, _, _) = await GetRankedCandidatesAsync(key, imdb, meta, includeRejected: false, currentMagnet: current.Value.Entry.Magnet, allowProbe: true, ct).ConfigureAwait(false);
+        var hasAlternate = ranked.Any(c => !string.Equals(c.Candidate.Magnet, current.Value.Entry.Magnet, StringComparison.Ordinal));
 
         await DeleteCurrentStateAndMaybeRemoveAsync(key, current.Value.State, current.Value.Entry.InfoHash, ct).ConfigureAwait(false);
+        await _db.DeleteUnavailableAsync(
+            new UnavailableKey(key.TmdbId, imdb, key.Type, key.Season, key.Episode),
+            ct).ConfigureAwait(false);
 
-        if (next is null)
+        if (!hasAlternate)
         {
             await RefreshItemAsync(key, forceProbe: false, ct).ConfigureAwait(false);
             return Result(PhantomSourceOperationStatus.NoAlternate, "no_alternate", "Current source rejected; no non-rejected alternate candidate is available");
         }
 
         var outcome = await _materialiser.MaterialiseAsync(
-            key.TmdbId, key.Type, key.Season, key.Episode,
-            next.Candidate,
+            key.TmdbId,
+            key.Type,
+            key.Season,
+            key.Episode,
             MaterialiseTrigger.Manual,
             ct).ConfigureAwait(false);
-        return PhantomSourceOperationResult.FromOutcome(outcome, ToCandidateDto(next));
+        return FromRejectMaterialisationOutcome(outcome);
     }
 
     public async Task<PhantomSourceOperationResult> MaterialiseCandidateAsync(
@@ -304,6 +373,7 @@ public sealed class PhantomSourceManager
             return Result(PhantomSourceOperationStatus.CandidateNotFound, "candidate_not_found", "Request must include a candidate magnet");
         }
 
+        await ClearStaleInFlightAsync(key, ct).ConfigureAwait(false);
         if (await _db.IsMaterialiseInFlightAsync(key.TmdbId, key.Type, key.SeasonSentinel, key.EpisodeSentinel, ct).ConfigureAwait(false))
         {
             return Result(PhantomSourceOperationStatus.InFlight, "in_flight", "Materialisation already in flight");
@@ -316,7 +386,7 @@ public sealed class PhantomSourceManager
             return Result(PhantomSourceOperationStatus.NotFound, "not_found", "Cached metadata for this item was not found");
         }
 
-        var (ranked, _, _) = await GetRankedCandidatesAsync(key, imdb, meta, includeRejected: request.OverrideRejected, currentMagnet: null, ct).ConfigureAwait(false);
+        var (ranked, _, _) = await GetRankedCandidatesAsync(key, imdb, meta, includeRejected: request.OverrideRejected, currentMagnet: null, allowProbe: true, ct).ConfigureAwait(false);
         var selected = ranked.FirstOrDefault(c => string.Equals(c.Candidate.Magnet, request.Magnet, StringComparison.Ordinal));
         if (selected is null)
         {
@@ -326,13 +396,12 @@ public sealed class PhantomSourceManager
                 return Result(PhantomSourceOperationStatus.CandidateNotFound, "candidate_not_found", "Selected candidate is not in the current list and request did not include exact candidate metadata");
             }
 
-            var failure = await _db.GetMagnetFailureAsync(
-                new MagnetFailureKey(key.TmdbId, imdb, key.Type, key.Season, key.Episode, _configProvider().SourcePickerPreset, requested.Magnet),
-                ct).ConfigureAwait(false);
-            selected = new CandidateWithFailure(requested, failure, 1, false);
+            var cfg = _configProvider();
+            var failure = await GetCandidateFailureAsync(CacheKey(key, imdb, cfg.SourcePickerPreset), requested, cfg, ct).ConfigureAwait(false);
+            selected = new CandidateWithFailure(requested, failure, null, 1, false);
         }
 
-        if (selected.Failure is not null && !request.OverrideRejected)
+        if ((selected.Failure is not null || IsValidationRejected(selected.SourceRow, _configProvider())) && !request.OverrideRejected)
         {
             return Result(PhantomSourceOperationStatus.CandidateNotFound, "candidate_not_found", "Selected candidate is currently rejected");
         }
@@ -361,6 +430,25 @@ public sealed class PhantomSourceManager
             MaterialiseTrigger.Manual,
             ct).ConfigureAwait(false);
         return PhantomSourceOperationResult.FromOutcome(outcome, ToCandidateDto(selected));
+    }
+
+    private async Task ClearStaleInFlightAsync(SourceKey key, CancellationToken ct)
+    {
+        var started = await _db.GetMaterialiseInFlightStartedAtAsync(
+            key.TmdbId, key.Type, key.SeasonSentinel, key.EpisodeSentinel, ct).ConfigureAwait(false);
+        if (!started.HasValue)
+        {
+            return;
+        }
+
+        var staleAfter = TimeSpan.FromMinutes(Math.Max(1, _configProvider().MaterialiseInFlightStaleMinutes));
+        if (DateTimeOffset.UtcNow - started.Value <= staleAfter)
+        {
+            return;
+        }
+
+        await _db.DeleteMaterialiseInFlightAsync(
+            key.TmdbId, key.Type, key.SeasonSentinel, key.EpisodeSentinel, ct).ConfigureAwait(false);
     }
 
     private static MagnetCandidate? TryBuildRequestedCandidate(PhantomMaterialiseCandidateRequest request)
@@ -423,18 +511,62 @@ public sealed class PhantomSourceManager
         TmdbMetadataRow meta,
         bool includeRejected,
         string? currentMagnet,
+        bool allowProbe,
         CancellationToken ct)
     {
-        var probe = await _magnetSelector.ProbeAsync(
-            key.TmdbId, imdb, key.Type, key.Season, key.Episode,
-            meta.Title, meta.Year,
-            ct).ConfigureAwait(false);
-
         var cfg = _configProvider();
         var cacheKey = CacheKey(key, imdb, cfg.SourcePickerPreset);
         var result = new List<CandidateWithFailure>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var rank = 0;
+
+        var cachedCandidates = await _db.ListSourceCandidatesAsync(
+            key.TmdbId,
+            key.Type,
+            key.SeasonSentinel,
+            key.EpisodeSentinel,
+            cfg.SourcePickerPreset,
+            includeExpired: false,
+            ct).ConfigureAwait(false);
+        foreach (var cached in cachedCandidates)
+        {
+            rank++;
+            var candidate = ToMagnetCandidate(cached);
+            var failure = await GetCandidateFailureAsync(cacheKey, candidate, cfg, ct).ConfigureAwait(false);
+            var validationRejected = IsValidationRejected(cached, cfg);
+            if ((failure is null && !validationRejected || includeRejected) && seen.Add(candidate.Magnet))
+            {
+                result.Add(new CandidateWithFailure(
+                    candidate,
+                    failure,
+                    cached,
+                    rank,
+                    string.Equals(candidate.Magnet, currentMagnet, StringComparison.Ordinal)));
+            }
+        }
+
+        MagnetProbeResult? probe = null;
+        if (allowProbe)
+        {
+            probe = await _magnetSelector.ProbeAsync(
+                key.TmdbId, imdb, key.Type, key.Season, key.Episode,
+                meta.Title, meta.Year,
+                ct).ConfigureAwait(false);
+
+            if (probe.Outcome == MagnetProbeOutcome.Available)
+            {
+                await _db.UpsertSourceCandidatesAsync(
+                    key.TmdbId,
+                    key.Type,
+                    key.SeasonSentinel,
+                    key.EpisodeSentinel,
+                    cfg.SourcePickerPreset,
+                    probe.Candidates,
+                    "details_probe",
+                    TimeSpan.FromHours(Math.Max(1, cfg.MagnetCacheTtlHours)),
+                    ct).ConfigureAwait(false);
+            }
+        }
 
         var availability = await _db.GetAvailabilityItemAsync(key.TmdbId, key.Type, key.SeasonSentinel, key.EpisodeSentinel, ct)
             .ConfigureAwait(false);
@@ -454,33 +586,31 @@ public sealed class PhantomSourceManager
             {
                 Title = meta.Title,
             };
-            var failure = await _db.GetMagnetFailureAsync(
-                new MagnetFailureKey(cacheKey.TmdbId, cacheKey.ImdbId, cacheKey.Type, cacheKey.Season, cacheKey.Episode, cacheKey.Preset, candidate.Magnet),
-                ct).ConfigureAwait(false);
+            var failure = await GetCandidateFailureAsync(cacheKey, candidate, cfg, ct).ConfigureAwait(false);
             if ((failure is null || includeRejected) && seen.Add(candidate.Magnet))
             {
                 result.Add(new CandidateWithFailure(
                     candidate,
                     failure,
+                    null,
                     rank,
                     string.Equals(candidate.Magnet, currentMagnet, StringComparison.Ordinal)));
             }
         }
 
-        if (probe.Outcome == MagnetProbeOutcome.Available)
+        if (probe?.Outcome == MagnetProbeOutcome.Available)
         {
             foreach (var candidate in probe.Candidates)
             {
                 ct.ThrowIfCancellationRequested();
                 rank++;
-                var failure = await _db.GetMagnetFailureAsync(
-                    new MagnetFailureKey(cacheKey.TmdbId, cacheKey.ImdbId, cacheKey.Type, cacheKey.Season, cacheKey.Episode, cacheKey.Preset, candidate.Magnet),
-                    ct).ConfigureAwait(false);
+                var failure = await GetCandidateFailureAsync(cacheKey, candidate, cfg, ct).ConfigureAwait(false);
                 if ((failure is null || includeRejected) && seen.Add(candidate.Magnet))
                 {
                     result.Add(new CandidateWithFailure(
                         candidate,
                         failure,
+                        null,
                         rank,
                         string.Equals(candidate.Magnet, currentMagnet, StringComparison.Ordinal)));
                 }
@@ -489,8 +619,37 @@ public sealed class PhantomSourceManager
 
         return result.Count > 0
             ? (result, null, null)
-            : (result, probe.ErrorKind, probe.ErrorMessage);
+            : (result, probe?.ErrorKind, probe?.ErrorMessage);
     }
+
+    private async Task<MagnetFailureEntry?> GetCandidateFailureAsync(
+        MagnetCacheKey cacheKey,
+        MagnetCandidate candidate,
+        PluginConfiguration cfg,
+        CancellationToken ct)
+    {
+        var byMagnet = await _db.GetMagnetFailureAsync(
+            new MagnetFailureKey(cacheKey.TmdbId, cacheKey.ImdbId, cacheKey.Type, cacheKey.Season, cacheKey.Episode, cacheKey.Preset, candidate.Magnet),
+            cfg.SourceValidationPolicyVersion,
+            ct).ConfigureAwait(false);
+        if (byMagnet is not null)
+        {
+            return byMagnet;
+        }
+
+        return await _db.GetMagnetFailureByInfoHashAsync(cacheKey, candidate.InfoHash, cfg.SourceValidationPolicyVersion, ct).ConfigureAwait(false);
+    }
+
+    private static MagnetCandidate ToMagnetCandidate(SourceCandidateRow row)
+        => new(
+            row.Magnet,
+            row.InfoHash,
+            row.Size ?? 0,
+            row.Seeders ?? 0,
+            row.Indexer)
+        {
+            Title = row.Title,
+        };
 
     private async Task<(MaterialisedStateRow State, MagnetCacheEntry? Entry)?> GetCurrentAsync(SourceKey key, string? imdb, CancellationToken ct)
     {
@@ -529,7 +688,9 @@ public sealed class PhantomSourceManager
         };
 
     private static PhantomSourceCandidateDto ToCandidateDto(CandidateWithFailure candidate)
-        => new()
+    {
+        var validationRejected = IsValidationRejected(candidate.SourceRow, null);
+        return new()
         {
             Magnet = candidate.Candidate.Magnet,
             InfoHash = candidate.Candidate.InfoHash,
@@ -539,9 +700,45 @@ public sealed class PhantomSourceManager
             Title = candidate.Candidate.Title,
             Rank = candidate.Rank,
             IsCurrent = candidate.IsCurrent,
-            IsRejected = candidate.Failure is not null,
-            FailureReason = candidate.Failure?.Reason,
-            RetryAfter = candidate.Failure?.RetryAfter,
+            IsRejected = candidate.Failure is not null || validationRejected,
+            FailureReason = candidate.Failure?.Reason ?? (validationRejected ? candidate.SourceRow?.ValidationReason ?? candidate.SourceRow?.ValidationStatus : null),
+            RetryAfter = candidate.Failure?.RetryAfter ?? (validationRejected ? candidate.SourceRow?.ValidationExpiresAt : null),
+        };
+    }
+
+    private static bool IsValidationRejected(SourceCandidateRow? row, PluginConfiguration? cfg)
+    {
+        if (row?.ValidationExpiresAt is null || row.ValidationExpiresAt.Value < DateTimeOffset.UtcNow)
+        {
+            return false;
+        }
+
+        if (cfg is not null && !string.Equals(row.ValidationPolicyVersion, cfg.SourceValidationPolicyVersion, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return string.Equals(row.ValidationStatus, "invalid", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static PhantomSourceOperationResult FromRejectMaterialisationOutcome(MaterialisationOutcome outcome)
+        => outcome.Status switch
+        {
+            MaterialisationStatus.Success or MaterialisationStatus.Duplicate => Result(
+                PhantomSourceOperationStatus.Success,
+                "materialised",
+                "Current source rejected; alternate source materialised"),
+            MaterialisationStatus.AlreadyInProgress => Result(
+                PhantomSourceOperationStatus.InFlight,
+                "in_flight",
+                "Current source rejected; materialisation already in flight"),
+            _ => Result(
+                PhantomSourceOperationStatus.Error,
+                "materialise_failed",
+                outcome.Error ?? "Current source rejected; alternate materialisation failed"),
+        } with
+        {
+            Outcome = outcome,
         };
 
     private static PhantomSourceOperationResult Result(PhantomSourceOperationStatus status, string code, string message)
