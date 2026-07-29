@@ -8,7 +8,7 @@ description: >-
 type: application
 # Chart version — MUST be bumped on every change (flux GitRepository/HelmRelease revs off it and,
 # if ever OCI-published, Helm requires the pushed tag to equal this).
-version: 0.3.1
+version: 0.3.2
 # Tracks the app milestone, not a container tag (images are digest-pinned in values).
 appVersion: "m14"
 keywords:
