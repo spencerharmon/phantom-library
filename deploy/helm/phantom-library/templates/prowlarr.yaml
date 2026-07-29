@@ -1,0 +1,138 @@
+{{- if .Values.prowlarr.enabled }}
+{{/*
+Prowlarr — standalone indexer aggregator (NOT a Jellyfin sidecar), ONE shared instance for all
+colors. The Phantom Library plugin's source search authenticates to it with an API key; we seed
+config.xml with the SAME key the migrated plugin config carries so they match without operator
+action. Indexers themselves are host-local operator data (never part of the migration import) — add
+them via the Prowlarr UI (`kubectl -n phantom-library port-forward svc/prowlarr 9696:9696`).
+
+Auth: External + DisabledForLocalAddresses — in-cluster callers (the Jellyfin pods, RFC1918 pod IPs)
+and port-forward (127.0.0.1) reach the API/UI without a login wall; the API key is honoured
+regardless. Not exposed via Ingress on purpose (no public auth in front of it yet).
+*/}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prowlarr-config
+  labels:
+    {{- include "phantom-library.labels" . | nindent 4 }}
+    app.kubernetes.io/component: prowlarr
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: {{ .Values.persistence.storageClassName }}
+  resources:
+    requests:
+      storage: {{ .Values.prowlarr.storage.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prowlarr
+  labels:
+    {{- include "phantom-library.labels" . | nindent 4 }}
+    app.kubernetes.io/component: prowlarr
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: phantom-library
+    app.kubernetes.io/component: prowlarr
+  ports:
+    - name: http
+      port: {{ .Values.prowlarr.port }}
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prowlarr
+  labels:
+    {{- include "phantom-library.labels" . | nindent 4 }}
+    app.kubernetes.io/component: prowlarr
+spec:
+  replicas: 1
+  # Single-writer config PVC (RWO); never run two replicas against one /config.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: phantom-library
+      app.kubernetes.io/component: prowlarr
+  template:
+    metadata:
+      labels:
+        {{- include "phantom-library.labels" . | nindent 8 }}
+        app.kubernetes.io/component: prowlarr
+    spec:
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      imagePullSecrets:
+        - name: {{ .Values.imagePullSecret }}
+      initContainers:
+        # Seed config.xml with the plugin's API key on FIRST boot only (never clobber operator edits
+        # or an indexer DB Prowlarr wrote later). Idempotent: skips if config.xml already exists.
+        - name: seed-config
+          image: docker.io/library/busybox:1.36
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              cfg=/config/config.xml
+              if [ -f "$cfg" ]; then
+                echo "config.xml present — leaving as-is"
+                exit 0
+              fi
+              cat > "$cfg" <<'EOF'
+              <Config>
+                <BindAddress>*</BindAddress>
+                <Port>{{ .Values.prowlarr.port }}</Port>
+                <SslPort>6969</SslPort>
+                <EnableSsl>False</EnableSsl>
+                <LaunchBrowser>False</LaunchBrowser>
+                <ApiKey>{{ .Values.prowlarr.apiKey }}</ApiKey>
+                <AuthenticationMethod>External</AuthenticationMethod>
+                <AuthenticationRequired>DisabledForLocalAddresses</AuthenticationRequired>
+                <Branch>master</Branch>
+                <LogLevel>info</LogLevel>
+                <SslCertPath></SslCertPath>
+                <SslCertPassword></SslCertPassword>
+                <UrlBase></UrlBase>
+                <InstanceName>Prowlarr</InstanceName>
+                <UpdateMechanism>Docker</UpdateMechanism>
+                <AnalyticsEnabled>False</AnalyticsEnabled>
+              </Config>
+              EOF
+              chown {{ .Values.prowlarr.env.PUID }}:{{ .Values.prowlarr.env.PGID }} "$cfg" || true
+              echo "seeded config.xml with plugin API key"
+          volumeMounts:
+            - name: config
+              mountPath: /config
+      containers:
+        - name: prowlarr
+          image: "{{ .Values.prowlarr.image.repository }}@{{ .Values.prowlarr.image.digest }}"
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          env:
+            {{- range $k, $v := .Values.prowlarr.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.prowlarr.port }}
+          readinessProbe:
+            httpGet: { path: /ping, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /ping, port: http }
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.prowlarr.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /config
+      volumes:
+        - name: config
+          persistentVolumeClaim:
+            claimName: prowlarr-config
+{{- end }}
