@@ -6,6 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **P4 Stage A: `scripts/phantom-migrate-jellyfindb-to-mysql.sh`** — offline,
+  operator-run migration of Jellyfin's authoritative library/user database off
+  the per-color SQLite `jellyfin.db` onto a shared MySQL/MariaDB served through
+  `jellyfin-plugin-mysql`, enabling N replicas to share one authoritative store.
+  Follows the P3 five-stage staging-validation methodology (clone → predicted
+  counts → staging validation on the inactive color → operator hand-validation →
+  prod write); dry-run by default, stage-gated, count-verified, idempotent,
+  backs up the prod target first. Regression-tested by
+  `scripts/tests/phantom-migrate-jellyfindb-to-mysql.test.sh`. See
+  `docs/tasks/p4-mysql-migration-impl.md`. No operator action until the operator
+  chooses to run the migration.
+
 ### Changed
 
 - **BREAKING: requires wipe.** Phantom DB schema bumped v14→v15: adds
