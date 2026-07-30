@@ -1,8 +1,12 @@
 {{/*
-Per-color Deployment: co-located gostream (FUSE producer, privileged, Bidirectional) + patched
-Jellyfin (FUSE consumer, unprivileged, HostToContainer RO) in ONE Pod. Rendered once per color.
-Strategy Recreate: a color must not double-bind its FUSE hostPath or the shared RWO state PVC with
-itself mid-redeploy (cross-color overlap is fine — different hostPaths/selectors).
+Per-color Deployment: gostream (virtual-MKV FUSE producer) + patched Jellyfin (FUSE consumer) run
+in ONE CONTAINER, replicating the host's original single-mount-namespace layout. Kubernetes cannot
+share a mount namespace between two containers, so a FUSE mounted by a separate gostream container
+is invisible (content-wise) to Jellyfin — which is what broke materialise ("FUSE path did not
+appear"). The combined image (jellyfin-phantom, which bakes in the gostream binary + fuse3) runs a
+supervisor entrypoint: gostream mounts the FUSE at /var/gostream/gostream-mkv-virtual (the plugin's
+own GostreamMoviesRoot/ShowsRoot), then Jellyfin reads it in the same namespace. Rendered once per
+color. Strategy Recreate: a color must not double-bind its RWO state PVC with itself mid-redeploy.
 */}}
 {{- range $color := .Values.colorList }}
 {{- $c := index $.Values.colors $color }}
@@ -34,39 +38,44 @@ spec:
       imagePullSecrets:
         - name: {{ $.Values.imagePullSecret }}
       containers:
-        # ----- gostream: FUSE producer, privileged, Bidirectional -----------------------
-        - name: gostream
-          image: {{ include "phantom-library.image" (dict "which" "gostream" "color" $color "root" $) }}
+        # ----- combined gostream + Jellyfin (one mount namespace; FUSE producer + consumer) -----
+        - name: jellyfin
+          image: {{ include "phantom-library.image" (dict "which" "jellyfin" "color" $color "root" $) }}
           imagePullPolicy: {{ $.Values.images.pullPolicy }}
           securityContext:
-            privileged: true # REQUIRED for Bidirectional mountPropagation + /dev/fuse + CAP_SYS_ADMIN
+            # REQUIRED: gostream mounts a FUSE inside this container (/dev/fuse + CAP_SYS_ADMIN).
+            # This matches the host, which ran gostream as root with --device /dev/fuse --cap-add SYS_ADMIN.
+            privileged: true
           env:
             {{- range $k, $v := $.Values.gostream.env }}
             - name: {{ $k }}
               value: {{ $v | quote }}
             {{- end }}
           ports:
+            - { name: http, containerPort: {{ $.Values.jellyfin.httpPort }} }
             - { name: proxy, containerPort: {{ $.Values.gostream.ports.proxy }} }
             - { name: metrics, containerPort: {{ $.Values.gostream.ports.metrics }} }
             - { name: gostorm, containerPort: {{ $.Values.gostream.ports.gostorm }} }
-          livenessProbe:
-            httpGet: { path: /healthz, port: {{ $.Values.gostream.ports.metrics }} }
-            initialDelaySeconds: 10
-            periodSeconds: 15
-            timeoutSeconds: 3
-            failureThreshold: 4
+          # Readiness gates the Service to Jellyfin being up; liveness restarts a hung Jellyfin.
+          # gostream death is caught by the supervisor entrypoint (it exits, restarting the pod).
           readinessProbe:
-            httpGet: { path: /readyz, port: {{ $.Values.gostream.ports.metrics }} }
-            initialDelaySeconds: 15
-            periodSeconds: 10
-            timeoutSeconds: 3
-            failureThreshold: 3
+            httpGet: { path: /health, port: {{ $.Values.jellyfin.httpPort }} }
+            initialDelaySeconds: 25
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet: { path: /health, port: {{ $.Values.jellyfin.httpPort }} }
+            initialDelaySeconds: 90
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
           resources:
-            {{- toYaml $.Values.gostream.resources | nindent 12 }}
+            {{- toYaml $.Values.jellyfin.resources | nindent 12 }}
           volumeMounts:
-            - name: virtual-mkv
-              mountPath: /mnt/gostream-mkv-virtual
-              mountPropagation: Bidirectional
+            # gostream side
+            - name: gostream-virtual
+              mountPath: /var/gostream
             - name: real-mkv
               mountPath: /mnt/gostream-mkv-real
             - name: state
@@ -83,28 +92,7 @@ spec:
             - name: config-secret
               mountPath: /config-src/secret
               readOnly: true
-        # ----- jellyfin: FUSE consumer, unprivileged, HostToContainer RO ------------------
-        - name: jellyfin
-          image: {{ include "phantom-library.image" (dict "which" "jellyfin" "color" $color "root" $) }}
-          imagePullPolicy: {{ $.Values.images.pullPolicy }}
-          securityContext:
-            privileged: false
-            allowPrivilegeEscalation: false
-          ports:
-            - { name: http, containerPort: {{ $.Values.jellyfin.httpPort }} }
-          readinessProbe:
-            httpGet: { path: /health, port: {{ $.Values.jellyfin.httpPort }} }
-            initialDelaySeconds: 20
-            periodSeconds: 15
-            timeoutSeconds: 5
-            failureThreshold: 6
-          resources:
-            {{- toYaml $.Values.jellyfin.resources | nindent 12 }}
-          volumeMounts:
-            - name: virtual-mkv
-              mountPath: /media/gostream
-              mountPropagation: HostToContainer
-              readOnly: true
+            # jellyfin side
             - name: jellyfin-var-lib
               mountPath: /var/lib/jellyfin
             - name: jellyfin-etc
@@ -114,10 +102,10 @@ spec:
             - name: plugin-preload
               mountPath: /opt/jellyfin/plugins-preload
       volumes:
-        - name: virtual-mkv
-          hostPath:
-            path: {{ $c.virtualMkvHostPath }}
-            type: DirectoryOrCreate
+        # FUSE mount point. Ephemeral (the virtual-MKV files are streamed on demand); each color's
+        # container has its own mount namespace, so no per-color hostPath is needed anymore.
+        - name: gostream-virtual
+          emptyDir: {}
         - name: real-mkv
           emptyDir: {}
         - name: state

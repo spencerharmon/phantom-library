@@ -41,13 +41,13 @@ colorList:
   - blue
   - green
 
-# Per-color settings. virtualMkvHostPath MUST differ per color: two FUSE servers cannot both mount
-# the same host path concurrently on the one node (the in-container mount path stays identical, so
-# config/library folders need no per-color patch). Optional per-color `images:` overrides the
-# shared digests below to repin ONE color at a time (blue/green independent image pinning).
+# Per-color settings. Single-container consolidation: gostream mounts the virtual-MKV FUSE INSIDE
+# each color's Jellyfin container (own mount namespace), so no per-color host FUSE path is needed —
+# `virtualMkvHostPath` is retained only for reference/rollback and is no longer mounted. Optional
+# per-color `images:` overrides the shared digests below to repin ONE color at a time.
 colors:
   blue:
-    virtualMkvHostPath: /var/gostream/gostream-mkv-virtual-blue
+    virtualMkvHostPath: /var/gostream/gostream-mkv-virtual-blue  # unused (single-container); see note above
     # images:
     #   gostream: { repository: ..., digest: sha256:... }
     #   jellyfin: { repository: ..., digest: sha256:... }
@@ -87,7 +87,7 @@ gostream:
   exposeUi: true
   env:
     GOSTREAM_ROOT_PATH: /usr/local/state
-    GOSTREAM_MOUNT_PATH: /mnt/gostream-mkv-virtual
+    GOSTREAM_MOUNT_PATH: /var/gostream/gostream-mkv-virtual
     GOSTREAM_SOURCE_PATH: /mnt/gostream-mkv-real
     MKV_PROXY_CONFIG_PATH: /etc/gostream/config.json
     MKV_PROXY_CONFIG_TUNING_PATH: /config-src/tuning/config.tuning.json
@@ -188,7 +188,7 @@ config:
   metrics_port: 9080
   blocklist_url: "https://github.com/Naunter/BT_BlockLists/raw/master/bt_blocklists.gz"
   physical_source_path: "/mnt/gostream-mkv-real"
-  fuse_mount_path: "/mnt/gostream-mkv-virtual"
+  fuse_mount_path: "/var/gostream/gostream-mkv-virtual"
   warmup_head_size_mb: 64
   natpmp:
     enabled: false
