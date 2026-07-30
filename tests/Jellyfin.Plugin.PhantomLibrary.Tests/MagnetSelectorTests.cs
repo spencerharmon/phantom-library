@@ -66,6 +66,32 @@ public class MagnetSelectorTests
     }
 
     [Fact]
+    public async Task EpisodeProbe_PrioritisesExactEpisodeOverSeasonPacks()
+    {
+        var exact = MakeCandidate("Avatar The Last Airbender S02E01 The Avatar State 1080p FLAC 2 0 AVC REMUX", 5, 24);
+        var pack = MakeCandidate("Avatar: The Last Airbender - S01 to S03 - 1080p - Bluray AAC5.1 - X264-Rapta", 5, 562);
+        var ix = new Mock<IIndexerClient>(MockBehavior.Strict);
+        ix.SetupGet(i => i.IsEnabled).Returns(true);
+        ix.SetupGet(i => i.Name).Returns("ix");
+        ix.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { pack, exact });
+
+        var cfg = TestConfig();
+        cfg.QualityPreset = QualityPreset.ResolutionSeeders;
+        cfg.PreferredResolution = "1080p";
+        cfg.ResolutionFallbackOrder = "1080p,720p,480p,unknown";
+        var sel = new MagnetSelector(
+            new[] { ix.Object },
+            new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance),
+            NullLogger<MagnetSelector>.Instance,
+            () => cfg);
+
+        var ranked = await sel.SelectRankedAsync(246, "tt0417299", "episode", 2, 1, "Avatar The Last Airbender", 2005, CancellationToken.None);
+
+        Assert.Equal(exact.Magnet, ranked[0].Magnet);
+    }
+
+    [Fact]
     public async Task NoCandidates_ReturnsNull()
     {
         var ix = new Mock<IIndexerClient>(MockBehavior.Strict);

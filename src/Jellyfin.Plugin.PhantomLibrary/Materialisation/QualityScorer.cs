@@ -98,8 +98,8 @@ public sealed class QualityScorer
             if (c.Seeders < minSeeders) return false;
             var is4K = Re4K.IsMatch(c.Title);
             var is1080 = Re1080p.IsMatch(c.Title);
-            if (is4K && c.Size > 0 && c.Size < min4K) return false;
-            if (!is4K && is1080 && c.Size > 0 && c.Size < min1080p) return false;
+            if (effective != QualityPreset.ResolutionSeeders && is4K && c.Size > 0 && c.Size < min4K) return false;
+            if (effective != QualityPreset.ResolutionSeeders && !is4K && is1080 && c.Size > 0 && c.Size < min1080p) return false;
             // gostream's library.FilterVideoFiles only accepts the 1080p
             // (4-20 GB) or 4K (10-60 GB) size bands. A release with no
             // 1080p/4K tag whose size is below the 1080p floor is

@@ -26,7 +26,7 @@
 # *** OPERATOR-RUN-ONLY ***
 #
 # Like scenario 30, this requires the patched Jellyfin build from
-# scripts/jellyfin-patches/0001..0003. The shared /tmp/jf-test/ rig
+# scripts/jellyfin-patches/0001..0003. The shared /var/tmp/jf-test/ rig
 # ships unmodified Jellyfin; the channel-arch materialise path
 # depends on the patched IChannelItemRefreshManager and won't
 # exercise correctly there. Phase 7.2 wires "build patched Jellyfin
@@ -63,12 +63,14 @@
 # The rig scenario below is a step-by-step scaffold the operator
 # can drive manually or that the Stage 7.x rig harness can lift
 # into a fully automated bash flow once the patched Jellyfin is
-# bootstrapped into /tmp/jf-test/.
+# bootstrapped into /var/tmp/jf-test/.
 
 set -euo pipefail
 
-PHANTOM_DB=${PHANTOM_DB:-/var/lib/jellyfin/plugins/configurations/PhantomLibrary/phantom.db}
-JELLYFIN_DB=${JELLYFIN_DB:-/var/lib/jellyfin/data/jellyfin.db}
+PHANTOM_DB=${PHANTOM_DB:-/var/tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db}
+JELLYFIN_DB=${JELLYFIN_DB:-/var/tmp/jf-test/data/data/jellyfin.db}
+# Default DB paths point at the existing rig clone. Override only with another
+# sandbox clone; never point scenario tests at production DBs.
 TMDB_ID=${TMDB_ID:-872585}   # default: a recent movie expected in trending
 API=${API:-http://127.0.0.1:18096}
 TOKEN=${TOKEN:-}   # operator-supplied API key
@@ -147,5 +149,5 @@ echo "          we backdated 1 hour so it's well past.)"
 
 echo ""
 echo "Stage 4.4 scaffold complete. Once Phase 7.2 wires the patched"
-echo "Jellyfin into /tmp/jf-test/, the above steps lift directly into"
+echo "Jellyfin into /var/tmp/jf-test/, the above steps lift directly into"
 echo "an automated bash flow with assertions."

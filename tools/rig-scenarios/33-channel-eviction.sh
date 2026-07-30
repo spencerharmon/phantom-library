@@ -25,7 +25,7 @@
 # *** OPERATOR-RUN-ONLY ***
 #
 # Like scenarios 30 / 31 / 32, this requires the patched Jellyfin
-# build from scripts/jellyfin-patches/. The shared /tmp/jf-test/ rig
+# build from scripts/jellyfin-patches/. The shared /var/tmp/jf-test/ rig
 # ships unmodified Jellyfin; EvictionSweeper's post-evict refresh
 # depends on the patched IChannelItemRefreshManager and won't exercise
 # correctly there. Phase 7.2 wires "build patched Jellyfin into the
@@ -59,12 +59,14 @@
 #
 # The rig steps below are the operator-runnable scaffold the Phase 7.x
 # patched-Jellyfin rig will lift into an automated bash flow once the
-# patched build is bootstrapped into /tmp/jf-test/.
+# patched build is bootstrapped into /var/tmp/jf-test/.
 
 set -euo pipefail
 
-PHANTOM_DB=${PHANTOM_DB:-/var/lib/jellyfin/plugins/configurations/PhantomLibrary/phantom.db}
-JELLYFIN_DB=${JELLYFIN_DB:-/var/lib/jellyfin/data/jellyfin.db}
+PHANTOM_DB=${PHANTOM_DB:-/var/tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db}
+JELLYFIN_DB=${JELLYFIN_DB:-/var/tmp/jf-test/data/data/jellyfin.db}
+# Default DB paths point at the existing rig clone. Override only with another
+# sandbox clone; never point scenario tests at production DBs.
 PLUGIN_CFG=${PLUGIN_CFG:-/var/lib/jellyfin/plugins/configurations/Jellyfin.Plugin.PhantomLibrary.xml}
 # Default to TMDB id 603 (The Matrix) for the idle-eviction movie target.
 MOVIE_TMDB=${MOVIE_TMDB:-603}
@@ -177,5 +179,5 @@ echo "      Expect log: '[Eviction] orphan materialised_state row; no BaseItem f
 echo "      Assert: state row STILL present (orphans are NOT silently swept)."
 echo ""
 echo "Stage 6.2 scaffold complete. Once Phase 7.2 wires the patched"
-echo "Jellyfin into /tmp/jf-test/, the above steps lift directly into"
+echo "Jellyfin into /var/tmp/jf-test/, the above steps lift directly into"
 echo "an automated bash flow with assertions."

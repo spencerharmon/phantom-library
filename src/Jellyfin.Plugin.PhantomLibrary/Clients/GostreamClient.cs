@@ -27,20 +27,31 @@ public sealed class GostreamClient : IGostreamClient
     private readonly HttpClient _http;
     private readonly ILogger<GostreamClient> _logger;
     private readonly Func<string> _baseUrlProvider;
+    private readonly Func<string> _tokenProvider;
     private Lazy<Task<bool>>? _vaultModeProbe;
     private readonly object _vaultProbeLock = new();
 
     public GostreamClient(HttpClient http, ILogger<GostreamClient> logger)
-        : this(http, logger, () => Plugin.Instance?.Configuration.GostreamBaseUrl ?? string.Empty)
+        : this(
+            http,
+            logger,
+            () => Plugin.Instance?.Configuration.GostreamBaseUrl ?? string.Empty,
+            () => Plugin.Instance?.Configuration.GostreamApiToken ?? string.Empty)
     {
     }
 
     // Test-friendly ctor: internal so ActivatorUtilities ignores it during DI resolution.
     internal GostreamClient(HttpClient http, ILogger<GostreamClient> logger, Func<string> baseUrlProvider)
+        : this(http, logger, baseUrlProvider, () => string.Empty)
+    {
+    }
+
+    internal GostreamClient(HttpClient http, ILogger<GostreamClient> logger, Func<string> baseUrlProvider, Func<string> tokenProvider)
     {
         _http = http;
         _logger = logger;
         _baseUrlProvider = baseUrlProvider;
+        _tokenProvider = tokenProvider;
     }
 
     public async Task<GostreamAddResult> AddAsync(GostreamAddRequest request, CancellationToken ct)
@@ -90,6 +101,77 @@ public sealed class GostreamClient : IGostreamClient
         }
     }
 
+    public async Task<GostreamValidateResult> ValidateAsync(GostreamValidateRequest request, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        var url = BuildUrl("/api/library/validate");
+
+        using var response = await PostJsonAsync(url, request, ct).ConfigureAwait(false);
+        var status = (int)response.StatusCode;
+        if (status == 200)
+        {
+            var body = await response.Content.ReadFromJsonAsync<ValidateResponseDto>(JsonOpts, ct).ConfigureAwait(false)
+                ?? throw new GostreamServerException(status, "gostream /api/library/validate returned empty body");
+            return ToValidateResult(body);
+        }
+
+        var errText = await SafeReadErrorAsync(response, ct).ConfigureAwait(false);
+        switch (status)
+        {
+            case 400:
+            case 401:
+            case 403:
+            case 404:
+            case 405:
+            case 415:
+                throw new GostreamBadRequestException($"gostream validate {status}: {errText}");
+            case 504:
+                return new GostreamValidateResult
+                {
+                    Status = "transient",
+                    Reason = "metadata_timeout",
+                    ValidationSessionId = request.ValidationSessionId,
+                };
+            default:
+                if (status >= 500)
+                {
+                    return new GostreamValidateResult
+                    {
+                        Status = "transient",
+                        Reason = "gostream_server_error",
+                        ValidationSessionId = request.ValidationSessionId,
+                    };
+                }
+
+                throw new GostreamServerException(status, $"gostream validate {status}: {errText}");
+        }
+    }
+
+    public async Task ReleaseValidationAsync(GostreamValidationReleaseRequest request, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        if (string.IsNullOrWhiteSpace(request.Hash))
+        {
+            return;
+        }
+
+        var url = BuildUrl("/api/library/validate/release");
+        using var response = await PostJsonAsync(url, request, ct).ConfigureAwait(false);
+        var status = (int)response.StatusCode;
+        if (status >= 200 && status < 300)
+        {
+            return;
+        }
+
+        var err = await SafeReadErrorAsync(response, ct).ConfigureAwait(false);
+        if (status >= 500)
+        {
+            throw new GostreamServerException(status, $"gostream validation release {status}: {err}");
+        }
+
+        throw new GostreamBadRequestException($"gostream validation release {status}: {err}");
+    }
+
     public async Task RemoveAsync(string stubPath, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(stubPath))
@@ -98,8 +180,7 @@ public sealed class GostreamClient : IGostreamClient
         }
 
         var url = BuildUrl("/api/library/remove");
-        using var content = JsonContent.Create(new { stub_path = stubPath });
-        using var response = await _http.PostAsync(url, content, ct).ConfigureAwait(false);
+        using var response = await PostJsonAsync(url, new { stub_path = stubPath }, ct).ConfigureAwait(false);
         var status = (int)response.StatusCode;
         if (status == 204 || status == 200)
         {
@@ -292,10 +373,23 @@ public sealed class GostreamClient : IGostreamClient
         return response;
     }
 
-    private Task<HttpResponseMessage> PostJsonAsync(string url, GostreamAddRequest request, CancellationToken ct)
+    private async Task<HttpResponseMessage> PostJsonAsync(string url, object request, CancellationToken ct)
     {
-        var content = JsonContent.Create(request, options: JsonOpts);
-        return _http.PostAsync(url, content, ct);
+        using var message = new HttpRequestMessage(HttpMethod.Post, url)
+        {
+            Content = JsonContent.Create(request, options: JsonOpts),
+        };
+        AddLibraryAuthHeader(message);
+        return await _http.SendAsync(message, ct).ConfigureAwait(false);
+    }
+
+    private void AddLibraryAuthHeader(HttpRequestMessage message)
+    {
+        var token = _tokenProvider();
+        if (!string.IsNullOrWhiteSpace(token))
+        {
+            message.Headers.TryAddWithoutValidation("X-Gostream-Token", token);
+        }
     }
 
     private static async Task<string> SafeReadErrorAsync(HttpResponseMessage response, CancellationToken ct)
@@ -326,6 +420,35 @@ public sealed class GostreamClient : IGostreamClient
         {
             return string.Empty;
         }
+    }
+
+    private static GostreamValidateResult ToValidateResult(ValidateResponseDto body)
+    {
+        if (string.IsNullOrWhiteSpace(body.Status))
+        {
+            throw new GostreamServerException("gostream /api/library/validate returned incomplete response (missing status)");
+        }
+
+        return new GostreamValidateResult
+        {
+            Status = body.Status!,
+            Reason = body.Reason,
+            Hash = body.Hash,
+            SelectedFile = body.SelectedFile is null
+                ? null
+                : new GostreamSelectedFile
+                {
+                    Id = body.SelectedFile.Id,
+                    Path = body.SelectedFile.Path,
+                    Size = body.SelectedFile.Size,
+                    Container = body.SelectedFile.Container,
+                },
+            AudioTracks = body.AudioTracks ?? Array.Empty<GostreamAudioTrack>(),
+            SelectedAudioIndex = body.SelectedAudioIndex,
+            SelectedAudioLanguage = body.SelectedAudioLanguage,
+            ValidationSessionId = body.ValidationSessionId,
+            ValidationLeaseExpiresAt = body.ValidationLeaseExpiresAt,
+        };
     }
 
     private static void ValidateAddResponse(AddResponseDto body)
@@ -362,5 +485,26 @@ public sealed class GostreamClient : IGostreamClient
         [JsonPropertyName("fuse_path")] public string? FusePath { get; init; }
         [JsonPropertyName("hash")] public string? Hash { get; init; }
         [JsonPropertyName("size")] public long Size { get; init; }
+    }
+
+    private sealed class ValidateResponseDto
+    {
+        [JsonPropertyName("status")] public string? Status { get; init; }
+        [JsonPropertyName("reason")] public string? Reason { get; init; }
+        [JsonPropertyName("hash")] public string? Hash { get; init; }
+        [JsonPropertyName("selected_file")] public SelectedFileDto? SelectedFile { get; init; }
+        [JsonPropertyName("audio_tracks")] public GostreamAudioTrack[]? AudioTracks { get; init; }
+        [JsonPropertyName("selected_audio_index")] public int? SelectedAudioIndex { get; init; }
+        [JsonPropertyName("selected_audio_language")] public string? SelectedAudioLanguage { get; init; }
+        [JsonPropertyName("validation_session_id")] public string? ValidationSessionId { get; init; }
+        [JsonPropertyName("validation_lease_expires_at")] public DateTimeOffset? ValidationLeaseExpiresAt { get; init; }
+    }
+
+    private sealed class SelectedFileDto
+    {
+        [JsonPropertyName("id")] public int? Id { get; init; }
+        [JsonPropertyName("path")] public string? Path { get; init; }
+        [JsonPropertyName("size")] public long? Size { get; init; }
+        [JsonPropertyName("container")] public string? Container { get; init; }
     }
 }

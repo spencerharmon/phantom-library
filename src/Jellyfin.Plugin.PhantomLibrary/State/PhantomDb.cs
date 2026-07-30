@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Data.Sqlite;
@@ -32,7 +34,81 @@ public sealed record MagnetFailureEntry
     public required string Reason { get; init; }
     public required DateTimeOffset FailedAt { get; init; }
     public required DateTimeOffset RetryAfter { get; init; }
+    public string ValidationPolicyVersion { get; init; } = "legacy";
 }
+
+public sealed record SourceCandidateRow(
+    int TmdbId,
+    string Type,
+    int Season,
+    int Episode,
+    string Preset,
+    string Magnet,
+    string InfoHash,
+    string Indexer,
+    string Title,
+    int? Seeders,
+    long? Size,
+    int Rank,
+    string Source,
+    DateTimeOffset FetchedAt,
+    DateTimeOffset ExpiresAt,
+    string ValidationStatus = "unknown",
+    string? ValidationReason = null,
+    DateTimeOffset? ValidatedAt = null,
+    DateTimeOffset? ValidationExpiresAt = null,
+    long? ValidationDurationMs = null,
+    string ValidationPolicyVersion = "unknown",
+    long? SelectedFileId = null,
+    string? SelectedFilePath = null,
+    long? SelectedFileSize = null);
+
+
+public sealed record SourceCandidateValidationUpdate(
+    int TmdbId,
+    string Type,
+    int Season,
+    int Episode,
+    string Preset,
+    string Magnet,
+    string ValidationStatus,
+    string? ValidationReason,
+    DateTimeOffset? ValidatedAt,
+    DateTimeOffset? ValidationExpiresAt,
+    long? ValidationDurationMs,
+    string ValidationPolicyVersion,
+    long? SelectedFileId,
+    string? SelectedFilePath,
+    long? SelectedFileSize);
+
+public sealed record BulkMaterialiseRequestRow(
+    string RequestId,
+    string UserId,
+    string ParentExternalId,
+    string ParentKind,
+    int TmdbId,
+    int Season,
+    string Trigger,
+    string Status,
+    DateTimeOffset RequestedAt,
+    DateTimeOffset UpdatedAt,
+    string? LastError,
+    DateTimeOffset? LastUnfavoritedAt,
+    int Generation);
+
+public sealed record BulkMaterialiseItemRow(
+    string RequestId,
+    int TmdbId,
+    string Type,
+    int Season,
+    int Episode,
+    string Status,
+    int Generation,
+    string? ClaimToken,
+    int Attempts,
+    DateTimeOffset NextRunAt,
+    DateTimeOffset UpdatedAt,
+    string? LastError);
 
 /// <summary>
 /// Row of the <c>discovery_cache</c> table. Movies and series only;
@@ -120,7 +196,8 @@ public sealed record TmdbMetadataRow(
     string? OfficialRating,
     double? CommunityRating,
     string? OriginalTitle,
-    DateTimeOffset FetchedAt);
+    DateTimeOffset FetchedAt,
+    int? RuntimeMinutes = null);
 
 /// <summary>
 /// Row of the <c>tmdb_episode_cache</c> table. Per-(series_tmdb_id,
@@ -176,33 +253,30 @@ public sealed record HiddenItemRow(int TmdbId, string Type, DateTimeOffset Hidde
 
 /// <summary>
 /// SQLite-backed persistence for the plugin's private state under the
-/// channel architecture (schema v12). Single writer, serialised via a
+/// channel architecture (schema v16). Single writer, serialised via a
 /// process-wide <see cref="SemaphoreSlim"/>; concurrent readers
 /// permitted via separate short-lived connections.
 ///
-/// Schema v11 is a clean break from the v5 file-on-disk schema (v6/v7/v8
+/// Schema v14 is a clean break from the v5 file-on-disk schema (v6/v7/v8
 /// were intermediate channel-arch revisions that never reached prod;
 /// v9 adds the <c>tmdb_episode_cache</c> table the shows channel needs
 /// for per-episode display metadata at refresh time; v10 adds
 /// <c>magnet_failure_cache</c> so rejected pack candidates do not
 /// block viable alternatives; v11 adds append-only catalogue and
-/// availability scheduler state; v12 adds the two <b>additive</b>
+/// availability scheduler state; v12 adds ranked source candidates;
+/// v13 persists movie runtime minutes for resume eligibility; v14 adds source validation state, failure policy versions, and a durable bulk materialise queue; v15 adds the persistent gostream path→tmdb resolution cache; v16 adds the two <b>additive</b>
 /// per-user preference tables <c>user_prefs</c> (one row per Jellyfin
 /// user carrying the per-user toggles) and <c>user_hidden_items</c>
 /// (a user's per-item hidden set) — the foundation for REQ-M14-PER-USER
 /// (branch B). Favourite state is <b>not</b> stored here; it is read
-/// live from Jellyfin's own <c>UserData</c>. The v12 tables touch no
-/// existing table, but per AGENTS.md "No database migrations until v1.0"
-/// this class still ships no runtime migration: existing databases at
-/// any pre-v12 user_version are HARD-REFUSED and the operator must run
-/// <c>scripts/phantom-wipe.sh</c> before restart. A no-wipe upgrade path
-/// is deliberately out of scope here and tracked separately as
-/// <c>db-migration-script</c>, gated by the project's v1.0 migration
-/// policy; until then, schema evolution means wipe-and-rebuild.
+/// live from Jellyfin's own <c>UserData</c>. Per
+/// AGENTS.md "No database migrations until v1.0", existing databases
+/// at any pre-v16 user_version are HARD-REFUSED and the operator must
+/// wipe (<c>scripts/phantom-wipe.sh --commit</c>) before restart.
 /// </summary>
 public sealed class PhantomDb : IDisposable
 {
-    private const int CurrentSchemaVersion = 12;
+    public const int CurrentSchemaVersion = 16;
 
     private readonly string _connectionString;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
@@ -281,13 +355,11 @@ public sealed class PhantomDb : IDisposable
 
         if (version > 0 && version < CurrentSchemaVersion)
         {
-            // HARD-REFUSE: pre-v1.0 the plugin does not ship migrations.
-            // Operator must wipe and rebuild. Per AGENTS.md
-            // "No database migrations until v1.0" + critic v2 BLOCKER 2.
+            // HARD-REFUSE: pre-v1.0 = wipe-and-rebuild, no migrations.
             throw new InvalidOperationException(
                 $"Phantom Library schema is at version {version}; this build requires" + Environment.NewLine
-                + $"version {CurrentSchemaVersion}. Pre-v1.0 the plugin does not ship migrations — see" + Environment.NewLine
-                + "AGENTS.md \"No database migrations until v1.0\". Stop Jellyfin, run" + Environment.NewLine
+                + $"version {CurrentSchemaVersion}. Pre-v1.0 has no migrations." + Environment.NewLine
+                + "Stop Jellyfin, run" + Environment.NewLine
                 + "`sudo bash scripts/phantom-wipe.sh --commit`, then restart.");
         }
 
@@ -299,7 +371,7 @@ public sealed class PhantomDb : IDisposable
                 + $" version {CurrentSchemaVersion}. Downgrade is not supported. Wipe and rebuild.");
         }
 
-        // version == 0: fresh / never-initialised DB. Create the v12 schema.
+        // version == 0: fresh / never-initialised DB. Create the current schema.
         using var tx = conn.BeginTransaction();
         using (var cmd = conn.CreateCommand())
         {
@@ -503,10 +575,51 @@ CREATE TABLE IF NOT EXISTS magnet_failure_cache (
     reason      TEXT NOT NULL,
     failed_at   INTEGER NOT NULL,
     retry_after INTEGER NOT NULL,
+    validation_policy_version TEXT NOT NULL DEFAULT 'legacy',
     PRIMARY KEY (tmdb_id, imdb_id, type, season, episode, preset, magnet)
 );
 CREATE INDEX IF NOT EXISTS idx_magnet_failure_cache_retry_after
     ON magnet_failure_cache(retry_after);
+
+-- Ranked source candidates cached from availability probes and source
+-- details page probes. No FK by operator-approved design (2026-06-23):
+-- candidates are keyed by the same stable item tuple as availability /
+-- materialised state and may exist before/after either row.
+CREATE TABLE IF NOT EXISTS source_candidates (
+    tmdb_id    INTEGER NOT NULL,
+    type       TEXT NOT NULL,
+    season     INTEGER NOT NULL DEFAULT -1,
+    episode    INTEGER NOT NULL DEFAULT -1,
+    preset     TEXT NOT NULL DEFAULT '',
+    magnet     TEXT NOT NULL,
+    info_hash  TEXT NOT NULL,
+    indexer    TEXT NOT NULL,
+    title      TEXT NOT NULL,
+    seeders    INTEGER,
+    size       INTEGER,
+    rank       INTEGER NOT NULL,
+    source     TEXT NOT NULL,
+    fetched_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    validation_status TEXT NOT NULL DEFAULT 'unknown',
+    validation_reason TEXT,
+    validated_at INTEGER,
+    validation_expires_at INTEGER,
+    validation_duration_ms INTEGER,
+    validation_policy_version TEXT NOT NULL DEFAULT 'unknown',
+    selected_file_id INTEGER,
+    selected_file_path TEXT,
+    selected_file_size INTEGER,
+    PRIMARY KEY (tmdb_id, type, season, episode, preset, magnet)
+);
+CREATE INDEX IF NOT EXISTS idx_source_candidates_item_rank
+    ON source_candidates(tmdb_id, type, season, episode, preset, rank);
+CREATE INDEX IF NOT EXISTS idx_source_candidates_validation
+    ON source_candidates(tmdb_id, type, season, episode, preset, validation_status, rank);
+CREATE INDEX IF NOT EXISTS idx_source_candidates_expiry
+    ON source_candidates(expires_at);
+CREATE INDEX IF NOT EXISTS idx_source_candidates_hash
+    ON source_candidates(info_hash);
 
 -- Surviving table from v1: indexers returned nothing for a key; back
 -- off until retry_after.
@@ -520,6 +633,50 @@ CREATE TABLE IF NOT EXISTS unavailable_marker (
     retry_after INTEGER NOT NULL,
     PRIMARY KEY (tmdb_id, imdb_id, type, season, episode)
 );
+
+-- Durable bulk favourite materialisation requests. No FK to item table by
+-- operator-approved no-FK schema design; request/item relationship is
+-- enforced by composite keys in code.
+CREATE TABLE IF NOT EXISTS bulk_materialise_requests (
+    request_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    parent_external_id TEXT NOT NULL,
+    parent_kind TEXT NOT NULL,
+    tmdb_id INTEGER NOT NULL,
+    season INTEGER NOT NULL DEFAULT -1,
+    trigger TEXT NOT NULL,
+    status TEXT NOT NULL,
+    requested_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    last_error TEXT,
+    last_unfavorited_at INTEGER,
+    generation INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_bulk_materialise_requests_status
+    ON bulk_materialise_requests(status, updated_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bulk_materialise_requests_active_parent
+    ON bulk_materialise_requests(user_id, parent_external_id)
+    WHERE status IN ('pending','running');
+
+CREATE TABLE IF NOT EXISTS bulk_materialise_items (
+    request_id TEXT NOT NULL,
+    tmdb_id INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    season INTEGER NOT NULL,
+    episode INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 0,
+    claim_token TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_run_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    last_error TEXT,
+    PRIMARY KEY (request_id, tmdb_id, type, season, episode)
+);
+CREATE INDEX IF NOT EXISTS idx_bulk_materialise_items_due
+    ON bulk_materialise_items(status, next_run_at);
+CREATE INDEX IF NOT EXISTS idx_bulk_materialise_items_episode
+    ON bulk_materialise_items(tmdb_id, type, season, episode);
 
 -- Surviving table from v5: key/value store for one-shot migration
 -- markers and similar small metadata that needs to outlive plugin
@@ -547,6 +704,7 @@ CREATE TABLE IF NOT EXISTS tmdb_metadata (
     official_rating  TEXT,
     community_rating REAL,
     original_title   TEXT,
+    runtime_minutes  INTEGER,
     fetched_at       INTEGER NOT NULL,
     PRIMARY KEY (tmdb_id, type)
 );
@@ -573,7 +731,17 @@ CREATE TABLE IF NOT EXISTS tmdb_episode_cache (
 CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
     ON tmdb_episode_cache(fetched_at);
 
--- v12 per-user preferences (additive; REQ-M14-PER-USER branch B). One row
+-- v15 persistent gostream FUSE-path -> tmdb_id resolution cache. Without
+-- this, channel cold-browse re-runs TMDB search per orphan file every
+-- restart (movies ~40s, shows ~5.3s). 'kind' is 'movie' or 'series'.
+CREATE TABLE IF NOT EXISTS gostream_path_tmdb (
+    path        TEXT PRIMARY KEY,
+    kind        TEXT NOT NULL,
+    tmdb_id     INTEGER NOT NULL,
+    resolved_at INTEGER NOT NULL
+);
+
+-- v16 per-user preferences (additive; REQ-M14-PER-USER branch B). One row
 -- per Jellyfin user holding that user's Phantom toggles. Favourites are NOT
 -- stored here — favourite state is read live from Jellyfin's own UserData;
 -- this table only persists the explicit per-user toggle choices. A user with
@@ -714,7 +882,7 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
         ArgumentNullException.ThrowIfNull(key);
         await using var conn = await OpenAsync(ct).ConfigureAwait(false);
         await using var cmd = conn.CreateCommand();
-        cmd.CommandText = @"SELECT info_hash, reason, failed_at, retry_after
+        cmd.CommandText = @"SELECT info_hash, reason, failed_at, retry_after, validation_policy_version
             FROM magnet_failure_cache
             WHERE tmdb_id=$tmdb
               AND imdb_id=$imdb
@@ -746,7 +914,72 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
             Reason = r.GetString(1),
             FailedAt = DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(2)),
             RetryAfter = retryAfter,
+            ValidationPolicyVersion = r.GetString(4),
         };
+    }
+
+    public async Task<MagnetFailureEntry?> GetMagnetFailureAsync(
+        MagnetFailureKey key,
+        string currentValidationPolicyVersion,
+        CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(currentValidationPolicyVersion);
+        var failure = await GetMagnetFailureAsync(key, ct).ConfigureAwait(false);
+        return IsCurrentFailure(failure, currentValidationPolicyVersion) ? failure : null;
+    }
+
+    public async Task<MagnetFailureEntry?> GetMagnetFailureByInfoHashAsync(
+        MagnetCacheKey key,
+        string infoHash,
+        string currentValidationPolicyVersion,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+        ArgumentException.ThrowIfNullOrWhiteSpace(infoHash);
+        ArgumentException.ThrowIfNullOrWhiteSpace(currentValidationPolicyVersion);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT info_hash, reason, failed_at, retry_after, validation_policy_version
+            FROM magnet_failure_cache
+            WHERE tmdb_id=$tmdb
+              AND imdb_id=$imdb
+              AND type=$type
+              AND season=$season
+              AND episode=$episode
+              AND preset=$preset
+              AND lower(info_hash)=lower($hash)
+            ORDER BY retry_after DESC
+            LIMIT 1;";
+        BindKey(cmd, key);
+        cmd.Parameters.AddWithValue("$preset", key.Preset);
+        cmd.Parameters.AddWithValue("$hash", infoHash);
+
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (!await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            return null;
+        }
+
+        var failure = new MagnetFailureEntry
+        {
+            InfoHash = r.GetString(0),
+            Reason = r.GetString(1),
+            FailedAt = DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(2)),
+            RetryAfter = DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(3)),
+            ValidationPolicyVersion = r.GetString(4),
+        };
+        return IsCurrentFailure(failure, currentValidationPolicyVersion) ? failure : null;
+    }
+
+    private static bool IsCurrentFailure(MagnetFailureEntry? failure, string currentValidationPolicyVersion)
+    {
+        if (failure is null || DateTimeOffset.UtcNow >= failure.RetryAfter)
+        {
+            return false;
+        }
+
+        return !IsPolicySensitiveFailureReason(failure.Reason)
+            || string.Equals(failure.ValidationPolicyVersion, currentValidationPolicyVersion, StringComparison.Ordinal);
     }
 
     public async Task MarkMagnetFailedAsync(MagnetFailureKey key, MagnetFailureEntry entry, CancellationToken ct)
@@ -759,8 +992,8 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
             await using var conn = await OpenAsync(ct).ConfigureAwait(false);
             await using var cmd = conn.CreateCommand();
             cmd.CommandText = @"INSERT OR REPLACE INTO magnet_failure_cache
-                (tmdb_id, imdb_id, type, season, episode, preset, magnet, info_hash, reason, failed_at, retry_after)
-                VALUES ($tmdb,$imdb,$type,$season,$episode,$preset,$magnet,$hash,$reason,$failed,$retry);";
+                (tmdb_id, imdb_id, type, season, episode, preset, magnet, info_hash, reason, failed_at, retry_after, validation_policy_version)
+                VALUES ($tmdb,$imdb,$type,$season,$episode,$preset,$magnet,$hash,$reason,$failed,$retry,$policy);";
             BindKey(cmd, new MagnetCacheKey(key.TmdbId, key.ImdbId, key.Type, key.Season, key.Episode, key.Preset));
             cmd.Parameters.AddWithValue("$preset", key.Preset);
             cmd.Parameters.AddWithValue("$magnet", key.Magnet);
@@ -768,7 +1001,33 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
             cmd.Parameters.AddWithValue("$reason", entry.Reason);
             cmd.Parameters.AddWithValue("$failed", entry.FailedAt.ToUnixTimeSeconds());
             cmd.Parameters.AddWithValue("$retry", entry.RetryAfter.ToUnixTimeSeconds());
+            cmd.Parameters.AddWithValue("$policy", entry.ValidationPolicyVersion);
             await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<int> DeleteMagnetFailuresAsync(MagnetCacheKey key, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"DELETE FROM magnet_failure_cache
+                WHERE tmdb_id=$tmdb
+                  AND imdb_id=$imdb
+                  AND type=$type
+                  AND season=$season
+                  AND episode=$episode
+                  AND preset=$preset;";
+            BindKey(cmd, key);
+            cmd.Parameters.AddWithValue("$preset", key.Preset);
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
         finally
         {
@@ -792,6 +1051,248 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
             _writeLock.Release();
         }
     }
+
+    private static bool IsPolicySensitiveFailureReason(string reason)
+        => string.Equals(reason, "target_episode_not_found", StringComparison.Ordinal)
+           || string.Equals(reason, "no_valid_files", StringComparison.Ordinal)
+           || string.Equals(reason, "fuse_path_missing", StringComparison.Ordinal)
+           || string.Equals(reason, "no_english_audio", StringComparison.Ordinal)
+           || string.Equals(reason, "no_main_english_audio", StringComparison.Ordinal)
+           || string.Equals(reason, "audio_probe_unsupported_format", StringComparison.Ordinal);
+
+    // ---- source_candidates ----
+
+    public async Task<IReadOnlyList<SourceCandidateRow>> ListSourceCandidatesAsync(
+        int tmdbId,
+        string type,
+        int season,
+        int episode,
+        string preset,
+        bool includeExpired,
+        CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        ArgumentNullException.ThrowIfNull(preset);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT tmdb_id,type,season,episode,preset,magnet,info_hash,indexer,title,seeders,size,rank,source,fetched_at,expires_at,
+                   validation_status,validation_reason,validated_at,validation_expires_at,validation_duration_ms,validation_policy_version,
+                   selected_file_id,selected_file_path,selected_file_size
+            FROM source_candidates
+            WHERE tmdb_id=$tmdb AND type=$type AND season=$season AND episode=$episode AND preset=$preset
+              AND ($includeExpired=1 OR expires_at >= $now)
+            ORDER BY rank ASC, seeders DESC, size DESC;";
+        cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+        cmd.Parameters.AddWithValue("$type", type);
+        cmd.Parameters.AddWithValue("$season", season);
+        cmd.Parameters.AddWithValue("$episode", episode);
+        cmd.Parameters.AddWithValue("$preset", preset);
+        cmd.Parameters.AddWithValue("$includeExpired", includeExpired ? 1 : 0);
+        cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        var list = new List<SourceCandidateRow>();
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            list.Add(ReadSourceCandidate(r));
+        }
+
+        return list;
+    }
+
+    public async Task UpsertSourceCandidatesAsync(
+        int tmdbId,
+        string type,
+        int season,
+        int episode,
+        string preset,
+        IReadOnlyList<Jellyfin.Plugin.PhantomLibrary.Sources.MagnetCandidate> candidates,
+        string source,
+        TimeSpan ttl,
+        CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        ArgumentNullException.ThrowIfNull(preset);
+        ArgumentNullException.ThrowIfNull(candidates);
+        ArgumentException.ThrowIfNullOrWhiteSpace(source);
+        if (candidates.Count == 0)
+        {
+            return;
+        }
+
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var tx = await conn.BeginTransactionAsync(ct).ConfigureAwait(false);
+            var now = DateTimeOffset.UtcNow;
+            var expires = now.Add(ttl <= TimeSpan.Zero ? TimeSpan.FromHours(1) : ttl);
+            var rank = 0;
+            foreach (var candidate in candidates)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (string.IsNullOrWhiteSpace(candidate.Magnet) || string.IsNullOrWhiteSpace(candidate.InfoHash))
+                {
+                    continue;
+                }
+
+                rank++;
+                await using var cmd = conn.CreateCommand();
+                cmd.Transaction = (SqliteTransaction)tx;
+                cmd.CommandText = @"INSERT INTO source_candidates
+                    (tmdb_id,type,season,episode,preset,magnet,info_hash,indexer,title,seeders,size,rank,source,fetched_at,expires_at)
+                    VALUES ($tmdb,$type,$season,$episode,$preset,$magnet,$hash,$indexer,$title,$seeders,$size,$rank,$source,$fetched,$expires)
+                    ON CONFLICT(tmdb_id,type,season,episode,preset,magnet) DO UPDATE SET
+                        info_hash=excluded.info_hash,
+                        indexer=excluded.indexer,
+                        title=excluded.title,
+                        seeders=excluded.seeders,
+                        size=excluded.size,
+                        rank=excluded.rank,
+                        source=excluded.source,
+                        fetched_at=excluded.fetched_at,
+                        expires_at=excluded.expires_at;";
+                cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+                cmd.Parameters.AddWithValue("$type", type);
+                cmd.Parameters.AddWithValue("$season", season);
+                cmd.Parameters.AddWithValue("$episode", episode);
+                cmd.Parameters.AddWithValue("$preset", preset);
+                cmd.Parameters.AddWithValue("$magnet", candidate.Magnet);
+                cmd.Parameters.AddWithValue("$hash", candidate.InfoHash);
+                cmd.Parameters.AddWithValue("$indexer", candidate.Indexer);
+                cmd.Parameters.AddWithValue("$title", candidate.Title ?? string.Empty);
+                cmd.Parameters.AddWithValue("$seeders", candidate.Seeders);
+                cmd.Parameters.AddWithValue("$size", candidate.Size);
+                cmd.Parameters.AddWithValue("$rank", rank);
+                cmd.Parameters.AddWithValue("$source", source);
+                cmd.Parameters.AddWithValue("$fetched", now.ToUnixTimeSeconds());
+                cmd.Parameters.AddWithValue("$expires", expires.ToUnixTimeSeconds());
+                await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            }
+
+            await tx.CommitAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task UpdateSourceCandidateValidationAsync(SourceCandidateValidationUpdate update, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(update);
+        ArgumentException.ThrowIfNullOrWhiteSpace(update.Type);
+        ArgumentNullException.ThrowIfNull(update.Preset);
+        ArgumentException.ThrowIfNullOrWhiteSpace(update.Magnet);
+        ArgumentException.ThrowIfNullOrWhiteSpace(update.ValidationStatus);
+        ArgumentException.ThrowIfNullOrWhiteSpace(update.ValidationPolicyVersion);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"UPDATE source_candidates
+                SET validation_status=$status,
+                    validation_reason=$reason,
+                    validated_at=$validated,
+                    validation_expires_at=$validationExpires,
+                    validation_duration_ms=$duration,
+                    validation_policy_version=$policy,
+                    selected_file_id=$fileId,
+                    selected_file_path=$filePath,
+                    selected_file_size=$fileSize
+                WHERE tmdb_id=$tmdb AND type=$type AND season=$season AND episode=$episode AND preset=$preset AND magnet=$magnet;";
+            cmd.Parameters.AddWithValue("$tmdb", update.TmdbId);
+            cmd.Parameters.AddWithValue("$type", update.Type);
+            cmd.Parameters.AddWithValue("$season", update.Season);
+            cmd.Parameters.AddWithValue("$episode", update.Episode);
+            cmd.Parameters.AddWithValue("$preset", update.Preset);
+            cmd.Parameters.AddWithValue("$magnet", update.Magnet);
+            cmd.Parameters.AddWithValue("$status", update.ValidationStatus);
+            cmd.Parameters.AddWithValue("$reason", (object?)update.ValidationReason ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$validated", update.ValidatedAt.HasValue ? update.ValidatedAt.Value.ToUnixTimeSeconds() : DBNull.Value);
+            cmd.Parameters.AddWithValue("$validationExpires", update.ValidationExpiresAt.HasValue ? update.ValidationExpiresAt.Value.ToUnixTimeSeconds() : DBNull.Value);
+            cmd.Parameters.AddWithValue("$duration", (object?)update.ValidationDurationMs ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$policy", update.ValidationPolicyVersion);
+            cmd.Parameters.AddWithValue("$fileId", (object?)update.SelectedFileId ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$filePath", (object?)update.SelectedFilePath ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$fileSize", (object?)update.SelectedFileSize ?? DBNull.Value);
+            var affected = await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            if (affected != 1)
+            {
+                throw new InvalidOperationException("source_candidates validation update matched no row");
+            }
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<int> ClearSourceCandidateValidationAsync(
+        int tmdbId,
+        string type,
+        int season,
+        int episode,
+        string preset,
+        CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        ArgumentNullException.ThrowIfNull(preset);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"UPDATE source_candidates
+                SET validation_status='unknown',
+                    validation_reason=NULL,
+                    validated_at=NULL,
+                    validation_expires_at=NULL,
+                    validation_duration_ms=NULL,
+                    validation_policy_version='unknown',
+                    selected_file_id=NULL,
+                    selected_file_path=NULL,
+                    selected_file_size=NULL
+                WHERE tmdb_id=$tmdb AND type=$type AND season=$season AND episode=$episode AND preset=$preset;";
+            cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+            cmd.Parameters.AddWithValue("$type", type);
+            cmd.Parameters.AddWithValue("$season", season);
+            cmd.Parameters.AddWithValue("$episode", episode);
+            cmd.Parameters.AddWithValue("$preset", preset);
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    private static SourceCandidateRow ReadSourceCandidate(SqliteDataReader r)
+        => new(
+            r.GetInt32(0),
+            r.GetString(1),
+            r.GetInt32(2),
+            r.GetInt32(3),
+            r.GetString(4),
+            r.GetString(5),
+            r.GetString(6),
+            r.GetString(7),
+            r.GetString(8),
+            r.IsDBNull(9) ? null : r.GetInt32(9),
+            r.IsDBNull(10) ? null : r.GetInt64(10),
+            r.GetInt32(11),
+            r.GetString(12),
+            DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(13)),
+            DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(14)),
+            r.GetString(15),
+            r.IsDBNull(16) ? null : r.GetString(16),
+            r.IsDBNull(17) ? null : DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(17)),
+            r.IsDBNull(18) ? null : DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(18)),
+            r.IsDBNull(19) ? null : r.GetInt64(19),
+            r.GetString(20),
+            r.IsDBNull(21) ? null : r.GetInt64(21),
+            r.IsDBNull(22) ? null : r.GetString(22),
+            r.IsDBNull(23) ? null : r.GetInt64(23));
 
     // ---- unavailable_marker ----
 
@@ -1189,11 +1690,22 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
                 await using (var cmd = conn.CreateCommand())
                 {
                     cmd.Transaction = (SqliteTransaction)tx;
-                    cmd.CommandText = @"INSERT OR IGNORE INTO tmdb_metadata
+                    cmd.CommandText = @"INSERT INTO tmdb_metadata
                         (tmdb_id, type, title, year, overview, poster_url, backdrop_url,
-                         genres_json, official_rating, community_rating, original_title, fetched_at)
+                         genres_json, official_rating, community_rating, original_title, runtime_minutes, fetched_at)
                         VALUES ($tmdb,$type,$title,$year,$overview,$poster,$backdrop,
-                                $genres,$rating,$community,$origtitle,$fetched);";
+                                $genres,$rating,$community,$origtitle,$runtime,$fetched)
+                        ON CONFLICT(tmdb_id, type) DO UPDATE SET
+                            runtime_minutes=excluded.runtime_minutes,
+                            genres_json=COALESCE(tmdb_metadata.genres_json, excluded.genres_json),
+                            official_rating=COALESCE(tmdb_metadata.official_rating, excluded.official_rating),
+                            community_rating=COALESCE(tmdb_metadata.community_rating, excluded.community_rating),
+                            original_title=COALESCE(tmdb_metadata.original_title, excluded.original_title),
+                            overview=COALESCE(tmdb_metadata.overview, excluded.overview),
+                            poster_url=COALESCE(tmdb_metadata.poster_url, excluded.poster_url),
+                            backdrop_url=COALESCE(tmdb_metadata.backdrop_url, excluded.backdrop_url)
+                        WHERE tmdb_metadata.runtime_minutes IS NULL
+                          AND excluded.runtime_minutes IS NOT NULL;";
                     BindMetadata(cmd, row);
                     metaChange = await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
                 }
@@ -1252,6 +1764,7 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
         cmd.Parameters.AddWithValue("$rating", (object?)row.OfficialRating ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$community", (object?)row.CommunityRating ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$origtitle", (object?)row.OriginalTitle ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$runtime", (object?)row.RuntimeMinutes ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$fetched", row.FetchedAt.ToUnixTimeSeconds());
     }
 
@@ -1468,6 +1981,56 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
             cmd.Parameters.AddWithValue("$owner", lease.LeaseOwner ?? string.Empty);
             cmd.Parameters.AddWithValue("$generation", lease.ProbeGeneration);
             return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) == 1;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task MarkAvailabilityAvailableAsync(int tmdbId, string type, int season, int episode, MagnetCacheEntry? candidate, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        var now = DateTimeOffset.UtcNow;
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"INSERT INTO availability_items
+                    (tmdb_id, type, season, episode, status, checked_at, next_check_at,
+                     candidate_magnet, candidate_info_hash, candidate_size, candidate_seeders,
+                     candidate_indexer, candidate_source, last_error_kind, last_error_message,
+                     lease_owner, lease_until)
+                VALUES ($tmdb,$type,$season,$episode,'available',$checked,$next,
+                    $magnet,$hash,$size,$seeders,$indexer,$source,NULL,NULL,NULL,NULL)
+                ON CONFLICT(tmdb_id, type, season, episode) DO UPDATE SET
+                    status='available',
+                    checked_at=excluded.checked_at,
+                    next_check_at=excluded.next_check_at,
+                    candidate_magnet=COALESCE(excluded.candidate_magnet, availability_items.candidate_magnet),
+                    candidate_info_hash=COALESCE(excluded.candidate_info_hash, availability_items.candidate_info_hash),
+                    candidate_size=COALESCE(excluded.candidate_size, availability_items.candidate_size),
+                    candidate_seeders=COALESCE(excluded.candidate_seeders, availability_items.candidate_seeders),
+                    candidate_indexer=COALESCE(excluded.candidate_indexer, availability_items.candidate_indexer),
+                    candidate_source=COALESCE(excluded.candidate_source, availability_items.candidate_source),
+                    last_error_kind=NULL,
+                    last_error_message=NULL,
+                    lease_owner=NULL,
+                    lease_until=NULL;";
+            cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+            cmd.Parameters.AddWithValue("$type", type);
+            cmd.Parameters.AddWithValue("$season", season);
+            cmd.Parameters.AddWithValue("$episode", episode);
+            cmd.Parameters.AddWithValue("$checked", now.ToUnixTimeSeconds());
+            cmd.Parameters.AddWithValue("$next", now.ToUnixTimeSeconds());
+            cmd.Parameters.AddWithValue("$magnet", (object?)candidate?.Magnet ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$hash", (object?)candidate?.InfoHash ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$size", (object?)candidate?.Size ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$seeders", (object?)candidate?.Seeders ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$indexer", (object?)candidate?.Indexer ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$source", (object?)candidate?.Source ?? DBNull.Value);
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
         finally
         {
@@ -1730,7 +2293,7 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
         await using var conn = await OpenAsync(ct).ConfigureAwait(false);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = @"SELECT m.tmdb_id,m.type,m.title,m.year,m.overview,m.poster_url,m.backdrop_url,
-                   m.genres_json,m.official_rating,m.community_rating,m.original_title,m.fetched_at,
+                   m.genres_json,m.official_rating,m.community_rating,m.original_title,m.fetched_at,m.runtime_minutes,
                    ms.tmdb_id,ms.type,ms.season,ms.episode,ms.stub_path,ms.fuse_path,ms.materialised_at,
                    a.tmdb_id,a.type,a.season,a.episode,a.status,a.checked_at,a.next_check_at,
                    a.candidate_magnet,a.candidate_info_hash,a.candidate_size,a.candidate_seeders,
@@ -1745,9 +2308,9 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
         while (await r.ReadAsync(ct).ConfigureAwait(false))
         {
             var meta = ReadTmdbMetadata(r, 0);
-            MaterialisedStateRow? mat = r.IsDBNull(12) ? null : new MaterialisedStateRow(
-                r.GetInt32(12), r.GetString(13), r.GetInt32(14), r.GetInt32(15), r.GetString(16), r.GetString(17), DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(18)));
-            AvailabilityItemRow? av = r.IsDBNull(19) ? null : ReadAvailability(r, 19);
+            MaterialisedStateRow? mat = r.IsDBNull(13) ? null : new MaterialisedStateRow(
+                r.GetInt32(13), r.GetString(14), r.GetInt32(15), r.GetInt32(16), r.GetString(17), r.GetString(18), DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(19)));
+            AvailabilityItemRow? av = r.IsDBNull(20) ? null : ReadAvailability(r, 20);
             list.Add(new VisibleMovieRow(meta, mat, av));
         }
 
@@ -1760,7 +2323,7 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
         await using var conn = await OpenAsync(ct).ConfigureAwait(false);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = @"SELECT m.tmdb_id,m.type,m.title,m.year,m.overview,m.poster_url,m.backdrop_url,
-                   m.genres_json,m.official_rating,m.community_rating,m.original_title,m.fetched_at,
+                   m.genres_json,m.official_rating,m.community_rating,m.original_title,m.fetched_at,m.runtime_minutes,
                    COALESCE(av.available_count,0), COALESCE(mat.materialised_count,0)
             FROM tmdb_metadata m
             LEFT JOIN (
@@ -1791,8 +2354,8 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
         {
             list.Add(new VisibleSeriesRow(
                 ReadTmdbMetadata(r, 0),
-                Convert.ToInt32(r.GetInt64(12)),
-                Convert.ToInt32(r.GetInt64(13))));
+                Convert.ToInt32(r.GetInt64(13)),
+                Convert.ToInt32(r.GetInt64(14))));
         }
 
         return list;
@@ -2283,7 +2846,8 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
             r.IsDBNull(offset + 8) ? null : r.GetString(offset + 8),
             r.IsDBNull(offset + 9) ? null : r.GetDouble(offset + 9),
             r.IsDBNull(offset + 10) ? null : r.GetString(offset + 10),
-            DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(offset + 11)));
+            DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(offset + 11)),
+            r.IsDBNull(offset + 12) ? null : r.GetInt32(offset + 12));
     }
 
     private static AvailabilityItemRow ReadAvailability(SqliteDataReader r, int offset = 0)
@@ -2359,10 +2923,16 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
 
     public async Task<bool> IsMaterialiseInFlightAsync(int tmdbId, string type, int season, int episode, CancellationToken ct)
     {
+        var started = await GetMaterialiseInFlightStartedAtAsync(tmdbId, type, season, episode, ct).ConfigureAwait(false);
+        return started.HasValue;
+    }
+
+    public async Task<DateTimeOffset?> GetMaterialiseInFlightStartedAtAsync(int tmdbId, string type, int season, int episode, CancellationToken ct)
+    {
         ArgumentException.ThrowIfNullOrWhiteSpace(type);
         await using var conn = await OpenAsync(ct).ConfigureAwait(false);
         await using var cmd = conn.CreateCommand();
-        cmd.CommandText = @"SELECT 1 FROM materialise_in_flight
+        cmd.CommandText = @"SELECT started_at FROM materialise_in_flight
             WHERE tmdb_id=$tmdb AND type=$type AND season=$season AND episode=$episode
             LIMIT 1;";
         cmd.Parameters.AddWithValue("$tmdb", tmdbId);
@@ -2370,7 +2940,12 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
         cmd.Parameters.AddWithValue("$season", season);
         cmd.Parameters.AddWithValue("$episode", episode);
         var v = await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
-        return v is not null and not DBNull;
+        if (v is null || v is DBNull)
+        {
+            return null;
+        }
+
+        return DateTimeOffset.FromUnixTimeSeconds(Convert.ToInt64(v, CultureInfo.InvariantCulture));
     }
 
     /// <summary>
@@ -2551,6 +3126,303 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
         return Convert.ToInt32(count, CultureInfo.InvariantCulture);
     }
 
+    // ---- bulk_materialise_* ----
+
+    public static string ComputeBulkMaterialiseRequestId(string userId, string parentExternalId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(userId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(parentExternalId);
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(userId + ":" + parentExternalId));
+        return Convert.ToHexStringLower(bytes);
+    }
+
+    public async Task UpsertBulkMaterialiseRequestAsync(BulkMaterialiseRequestRow row, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(row);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"INSERT INTO bulk_materialise_requests
+                (request_id,user_id,parent_external_id,parent_kind,tmdb_id,season,trigger,status,requested_at,updated_at,last_error,last_unfavorited_at,generation)
+                VALUES ($request,$user,$parent,$kind,$tmdb,$season,$trigger,$status,$requested,$updated,$error,$unfav,$generation)
+                ON CONFLICT(request_id) DO UPDATE SET
+                    user_id=excluded.user_id,
+                    parent_external_id=excluded.parent_external_id,
+                    parent_kind=excluded.parent_kind,
+                    tmdb_id=excluded.tmdb_id,
+                    season=excluded.season,
+                    trigger=excluded.trigger,
+                    status=excluded.status,
+                    updated_at=excluded.updated_at,
+                    last_error=excluded.last_error,
+                    last_unfavorited_at=excluded.last_unfavorited_at,
+                    generation=excluded.generation;";
+            BindBulkRequest(cmd, row);
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<BulkMaterialiseRequestRow?> GetBulkMaterialiseRequestAsync(string requestId, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(requestId);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT request_id,user_id,parent_external_id,parent_kind,tmdb_id,season,trigger,status,requested_at,updated_at,last_error,last_unfavorited_at,generation
+            FROM bulk_materialise_requests WHERE request_id=$request LIMIT 1;";
+        cmd.Parameters.AddWithValue("$request", requestId);
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        return await r.ReadAsync(ct).ConfigureAwait(false) ? ReadBulkRequest(r) : null;
+    }
+
+    public async Task UpsertBulkMaterialiseItemAsync(BulkMaterialiseItemRow row, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(row);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"INSERT INTO bulk_materialise_items
+                (request_id,tmdb_id,type,season,episode,status,generation,claim_token,attempts,next_run_at,updated_at,last_error)
+                VALUES ($request,$tmdb,$type,$season,$episode,$status,$generation,$claim,$attempts,$next,$updated,$error)
+                ON CONFLICT(request_id,tmdb_id,type,season,episode) DO UPDATE SET
+                    status=excluded.status,
+                    generation=excluded.generation,
+                    claim_token=excluded.claim_token,
+                    attempts=excluded.attempts,
+                    next_run_at=excluded.next_run_at,
+                    updated_at=excluded.updated_at,
+                    last_error=excluded.last_error;";
+            BindBulkItem(cmd, row);
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<IReadOnlyList<BulkMaterialiseItemRow>> ListBulkMaterialiseItemsAsync(string requestId, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(requestId);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT request_id,tmdb_id,type,season,episode,status,generation,claim_token,attempts,next_run_at,updated_at,last_error
+            FROM bulk_materialise_items WHERE request_id=$request ORDER BY season, episode;";
+        cmd.Parameters.AddWithValue("$request", requestId);
+        var list = new List<BulkMaterialiseItemRow>();
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            list.Add(ReadBulkItem(r));
+        }
+
+        return list;
+    }
+
+    public async Task<IReadOnlyList<BulkMaterialiseItemRow>> PeekDueBulkMaterialiseItemsAsync(DateTimeOffset now, int limit, CancellationToken ct)
+    {
+        if (limit <= 0)
+        {
+            return Array.Empty<BulkMaterialiseItemRow>();
+        }
+
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT request_id,tmdb_id,type,season,episode,status,generation,claim_token,attempts,next_run_at,updated_at,last_error
+            FROM bulk_materialise_items
+            WHERE status IN ('pending','retry') AND next_run_at <= $now
+            ORDER BY next_run_at ASC, updated_at ASC
+            LIMIT $limit;";
+        cmd.Parameters.AddWithValue("$now", now.ToUnixTimeSeconds());
+        cmd.Parameters.AddWithValue("$limit", limit);
+        var list = new List<BulkMaterialiseItemRow>();
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            list.Add(ReadBulkItem(r));
+        }
+
+        return list;
+    }
+
+    public async Task<bool> TryClaimBulkMaterialiseItemAsync(
+        string requestId,
+        int tmdbId,
+        string type,
+        int season,
+        int episode,
+        int generation,
+        string claimToken,
+        DateTimeOffset now,
+        CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(requestId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        ArgumentException.ThrowIfNullOrWhiteSpace(claimToken);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"UPDATE bulk_materialise_items
+                SET status='running', claim_token=$claim, attempts=attempts+1, updated_at=$now
+                WHERE request_id=$request AND tmdb_id=$tmdb AND type=$type
+                  AND season=$season AND episode=$episode AND generation=$generation
+                  AND status IN ('pending','retry') AND next_run_at <= $now;";
+            cmd.Parameters.AddWithValue("$request", requestId);
+            cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+            cmd.Parameters.AddWithValue("$type", type);
+            cmd.Parameters.AddWithValue("$season", season);
+            cmd.Parameters.AddWithValue("$episode", episode);
+            cmd.Parameters.AddWithValue("$generation", generation);
+            cmd.Parameters.AddWithValue("$claim", claimToken);
+            cmd.Parameters.AddWithValue("$now", now.ToUnixTimeSeconds());
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) == 1;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<bool> CompleteBulkMaterialiseItemAsync(
+        string requestId,
+        int tmdbId,
+        string type,
+        int season,
+        int episode,
+        int generation,
+        string claimToken,
+        string status,
+        DateTimeOffset nextRunAt,
+        string? lastError,
+        DateTimeOffset now,
+        CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(requestId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        ArgumentException.ThrowIfNullOrWhiteSpace(claimToken);
+        ArgumentException.ThrowIfNullOrWhiteSpace(status);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"UPDATE bulk_materialise_items
+                SET status=$status, claim_token=NULL, next_run_at=$next, updated_at=$now, last_error=$error
+                WHERE request_id=$request AND tmdb_id=$tmdb AND type=$type
+                  AND season=$season AND episode=$episode AND generation=$generation
+                  AND claim_token=$claim;";
+            cmd.Parameters.AddWithValue("$request", requestId);
+            cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+            cmd.Parameters.AddWithValue("$type", type);
+            cmd.Parameters.AddWithValue("$season", season);
+            cmd.Parameters.AddWithValue("$episode", episode);
+            cmd.Parameters.AddWithValue("$generation", generation);
+            cmd.Parameters.AddWithValue("$claim", claimToken);
+            cmd.Parameters.AddWithValue("$status", status);
+            cmd.Parameters.AddWithValue("$next", nextRunAt.ToUnixTimeSeconds());
+            cmd.Parameters.AddWithValue("$now", now.ToUnixTimeSeconds());
+            cmd.Parameters.AddWithValue("$error", (object?)lastError ?? DBNull.Value);
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) == 1;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<int> ResetStaleBulkMaterialiseItemsAsync(TimeSpan staleAge, DateTimeOffset now, CancellationToken ct)
+    {
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"UPDATE bulk_materialise_items
+                SET status='retry', claim_token=NULL, next_run_at=$now, updated_at=$now, last_error='stale_running_reset'
+                WHERE status='running' AND updated_at < $cutoff;";
+            cmd.Parameters.AddWithValue("$now", now.ToUnixTimeSeconds());
+            cmd.Parameters.AddWithValue("$cutoff", now.Subtract(staleAge).ToUnixTimeSeconds());
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    private static void BindBulkRequest(SqliteCommand cmd, BulkMaterialiseRequestRow row)
+    {
+        cmd.Parameters.AddWithValue("$request", row.RequestId);
+        cmd.Parameters.AddWithValue("$user", row.UserId);
+        cmd.Parameters.AddWithValue("$parent", row.ParentExternalId);
+        cmd.Parameters.AddWithValue("$kind", row.ParentKind);
+        cmd.Parameters.AddWithValue("$tmdb", row.TmdbId);
+        cmd.Parameters.AddWithValue("$season", row.Season);
+        cmd.Parameters.AddWithValue("$trigger", row.Trigger);
+        cmd.Parameters.AddWithValue("$status", row.Status);
+        cmd.Parameters.AddWithValue("$requested", row.RequestedAt.ToUnixTimeSeconds());
+        cmd.Parameters.AddWithValue("$updated", row.UpdatedAt.ToUnixTimeSeconds());
+        cmd.Parameters.AddWithValue("$error", (object?)row.LastError ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$unfav", row.LastUnfavoritedAt.HasValue ? row.LastUnfavoritedAt.Value.ToUnixTimeSeconds() : DBNull.Value);
+        cmd.Parameters.AddWithValue("$generation", row.Generation);
+    }
+
+    private static BulkMaterialiseRequestRow ReadBulkRequest(SqliteDataReader r)
+        => new(
+            r.GetString(0),
+            r.GetString(1),
+            r.GetString(2),
+            r.GetString(3),
+            r.GetInt32(4),
+            r.GetInt32(5),
+            r.GetString(6),
+            r.GetString(7),
+            DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(8)),
+            DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(9)),
+            r.IsDBNull(10) ? null : r.GetString(10),
+            r.IsDBNull(11) ? null : DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(11)),
+            r.GetInt32(12));
+
+    private static void BindBulkItem(SqliteCommand cmd, BulkMaterialiseItemRow row)
+    {
+        cmd.Parameters.AddWithValue("$request", row.RequestId);
+        cmd.Parameters.AddWithValue("$tmdb", row.TmdbId);
+        cmd.Parameters.AddWithValue("$type", row.Type);
+        cmd.Parameters.AddWithValue("$season", row.Season);
+        cmd.Parameters.AddWithValue("$episode", row.Episode);
+        cmd.Parameters.AddWithValue("$status", row.Status);
+        cmd.Parameters.AddWithValue("$generation", row.Generation);
+        cmd.Parameters.AddWithValue("$claim", (object?)row.ClaimToken ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$attempts", row.Attempts);
+        cmd.Parameters.AddWithValue("$next", row.NextRunAt.ToUnixTimeSeconds());
+        cmd.Parameters.AddWithValue("$updated", row.UpdatedAt.ToUnixTimeSeconds());
+        cmd.Parameters.AddWithValue("$error", (object?)row.LastError ?? DBNull.Value);
+    }
+
+    private static BulkMaterialiseItemRow ReadBulkItem(SqliteDataReader r)
+        => new(
+            r.GetString(0),
+            r.GetInt32(1),
+            r.GetString(2),
+            r.GetInt32(3),
+            r.GetInt32(4),
+            r.GetString(5),
+            r.GetInt32(6),
+            r.IsDBNull(7) ? null : r.GetString(7),
+            r.GetInt32(8),
+            DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(9)),
+            DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(10)),
+            r.IsDBNull(11) ? null : r.GetString(11));
+
     // ---- tmdb_external_ids ----
 
     /// <summary>
@@ -2629,9 +3501,9 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
             await using var cmd = conn.CreateCommand();
             cmd.CommandText = @"INSERT OR REPLACE INTO tmdb_metadata
                 (tmdb_id, type, title, year, overview, poster_url, backdrop_url,
-                 genres_json, official_rating, community_rating, original_title, fetched_at)
+                 genres_json, official_rating, community_rating, original_title, runtime_minutes, fetched_at)
                 VALUES ($tmdb,$type,$title,$year,$overview,$poster,$backdrop,
-                        $genres,$rating,$community,$origtitle,$fetched);";
+                        $genres,$rating,$community,$origtitle,$runtime,$fetched);";
             cmd.Parameters.AddWithValue("$tmdb", row.TmdbId);
             cmd.Parameters.AddWithValue("$type", row.Type);
             cmd.Parameters.AddWithValue("$title", row.Title);
@@ -2646,6 +3518,7 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
             cmd.Parameters.AddWithValue("$rating", (object?)row.OfficialRating ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$community", (object?)row.CommunityRating ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$origtitle", (object?)row.OriginalTitle ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$runtime", (object?)row.RuntimeMinutes ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$fetched", row.FetchedAt.ToUnixTimeSeconds());
             await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
@@ -2662,7 +3535,7 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
         await using var conn = await OpenAsync(ct).ConfigureAwait(false);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = @"SELECT tmdb_id, type, title, year, overview, poster_url, backdrop_url,
-                   genres_json, official_rating, community_rating, original_title, fetched_at
+                   genres_json, official_rating, community_rating, original_title, fetched_at, runtime_minutes
             FROM tmdb_metadata
             WHERE type=$type AND ($year IS NULL OR year=$year)
             ORDER BY fetched_at DESC;";
@@ -2689,7 +3562,7 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
         await using var conn = await OpenAsync(ct).ConfigureAwait(false);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = @"SELECT tmdb_id, type, title, year, overview, poster_url, backdrop_url,
-                   genres_json, official_rating, community_rating, original_title, fetched_at
+                   genres_json, official_rating, community_rating, original_title, fetched_at, runtime_minutes
             FROM tmdb_metadata WHERE tmdb_id=$tmdb AND type=$type LIMIT 1;";
         cmd.Parameters.AddWithValue("$tmdb", tmdbId);
         cmd.Parameters.AddWithValue("$type", type);
@@ -2700,6 +3573,47 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
         }
 
         return ReadTmdbMetadata(r);
+    }
+
+    public async Task<int?> GetGostreamPathTmdbAsync(string path, string kind, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        ArgumentException.ThrowIfNullOrWhiteSpace(kind);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT tmdb_id FROM gostream_path_tmdb WHERE path=$path AND kind=$kind LIMIT 1;";
+        cmd.Parameters.AddWithValue("$path", path);
+        cmd.Parameters.AddWithValue("$kind", kind);
+        var v = await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
+        if (v is null || v is DBNull)
+        {
+            return null;
+        }
+
+        return Convert.ToInt32(v, System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    public async Task UpsertGostreamPathTmdbAsync(string path, string kind, int tmdbId, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        ArgumentException.ThrowIfNullOrWhiteSpace(kind);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"INSERT OR REPLACE INTO gostream_path_tmdb (path, kind, tmdb_id, resolved_at)
+                VALUES ($path,$kind,$tmdb,$at);";
+            cmd.Parameters.AddWithValue("$path", path);
+            cmd.Parameters.AddWithValue("$kind", kind);
+            cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+            cmd.Parameters.AddWithValue("$at", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     private static TmdbMetadataRow ReadTmdbMetadata(SqliteDataReader r)
@@ -2729,7 +3643,8 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
             r.IsDBNull(8) ? null : r.GetString(8),
             r.IsDBNull(9) ? null : r.GetDouble(9),
             r.IsDBNull(10) ? null : r.GetString(10),
-            DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(11)));
+            DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(11)),
+            r.IsDBNull(12) ? null : r.GetInt32(12));
     }
 
     private static string NormalizeTitle(string? title)

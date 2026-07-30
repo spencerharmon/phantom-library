@@ -50,6 +50,7 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         });
 
         // Gostream
+        serviceCollection.AddSingleton<GostreamHeavyLimiter>();
         serviceCollection.AddHttpClient<IGostreamClient, GostreamClient>(c =>
         {
             c.Timeout = TimeSpan.FromSeconds(60);
@@ -60,6 +61,10 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         serviceCollection.AddHttpClient<ProwlarrClient>(c =>
         {
             c.Timeout = TimeSpan.FromSeconds(30);
+        })
+        .ConfigurePrimaryHttpMessageHandler(() => new System.Net.Http.HttpClientHandler
+        {
+            AllowAutoRedirect = false,
         });
         serviceCollection.AddHttpClient<TorrentioClient>(c =>
         {
@@ -76,6 +81,7 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         serviceCollection.AddSingleton<MagnetSelector>();
         serviceCollection.AddSingleton<TmdbExternalIdResolver>();
         serviceCollection.AddSingleton<PhantomSourceManager>();
+        serviceCollection.AddSingleton<IItemActionProvider, PhantomItemActionProvider>();
         serviceCollection.AddSingleton<IMaterialiser, Materialiser>();
         serviceCollection.AddHostedService<MaterialiseInFlightSweeper>();
         serviceCollection.AddSingleton<MaterialisationQueue>();

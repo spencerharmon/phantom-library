@@ -1,0 +1,38 @@
+diff --git a/Emby.Server.Implementations/Library/MediaStreamSelector.cs b/Emby.Server.Implementations/Library/MediaStreamSelector.cs
+index 631179ffcf..c1bbab334c 100644
+--- a/Emby.Server.Implementations/Library/MediaStreamSelector.cs
++++ b/Emby.Server.Implementations/Library/MediaStreamSelector.cs
+@@ -15,6 +15,16 @@ namespace Emby.Server.Implementations.Library
+         {
+             var sortedStreams = GetSortedStreams(streams, MediaStreamType.Audio, preferredLanguages).ToList();
+ 
++            if (preferredLanguages.Count > 0)
++            {
++                var preferredStream = sortedStreams.FirstOrDefault(i => MatchesPreferredLanguage(i.Language, preferredLanguages));
++
++                if (preferredStream is not null)
++                {
++                    return preferredStream.Index;
++                }
++            }
++
+             if (preferDefaultTrack)
+             {
+                 var defaultStream = sortedStreams.FirstOrDefault(i => i.IsDefault);
+diff --git a/tests/Jellyfin.Server.Implementations.Tests/Library/MediaStreamSelectorTests.cs b/tests/Jellyfin.Server.Implementations.Tests/Library/MediaStreamSelectorTests.cs
+index 07feae587b..7e19ca92fd 100644
+--- a/tests/Jellyfin.Server.Implementations.Tests/Library/MediaStreamSelectorTests.cs
++++ b/tests/Jellyfin.Server.Implementations.Tests/Library/MediaStreamSelectorTests.cs
+@@ -19,10 +19,10 @@ public class MediaStreamSelectorTests
+     [InlineData(new string[0], false, 1)]
+     [InlineData(new string[0], true, 1)]
+     [InlineData(new[] { "eng" }, false, 2)]
+-    [InlineData(new[] { "eng" }, true, 1)]
++    [InlineData(new[] { "eng" }, true, 2)]
+     [InlineData(new[] { "eng", "fre" }, false, 2)]
+     [InlineData(new[] { "fre", "eng" }, false, 1)]
+-    [InlineData(new[] { "eng", "fre" }, true, 1)]
++    [InlineData(new[] { "eng", "fre" }, true, 2)]
+     public void GetDefaultAudioStreamIndex_PreferredLanguage_SelectsCorrect(string[] preferredLanguages, bool preferDefaultTrack, int expectedIndex)
+     {
+         var streams = new MediaStream[]

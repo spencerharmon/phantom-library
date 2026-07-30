@@ -19,7 +19,9 @@ public class PhantomKebabScriptTests
 
         Assert.Contains("getPlayablePhantomItem", js);
         Assert.Contains("item.ExternalId", js);
-        Assert.Contains("fetchSources(ctx.externalId)", js);
+        Assert.Contains("fetchSources(ctx.externalId, refreshCandidates === true)", js);
+        Assert.Contains("resolveExternalId(currentItemId())", js);
+        Assert.Contains("Plugins/PhantomLibrary/Items/ResolveExternalId/", js);
         Assert.Contains("Plugins/PhantomLibrary/Items/", js);
         Assert.Contains("/Sources", js);
         Assert.Contains("encodeURIComponent(externalId)", js);
@@ -32,6 +34,7 @@ public class PhantomKebabScriptTests
 
         Assert.Contains("Phantom Source", js);
         Assert.Contains("phantom-source-section", js);
+        Assert.DoesNotContain("phantom-item-actions-section", js);
         Assert.Contains("phantom-source-candidates", js);
         Assert.Contains("Materialise selected source", js);
         Assert.Contains("Reject current source", js);
@@ -93,16 +96,70 @@ public class PhantomKebabScriptTests
     }
 
     [Fact]
-    public void ActionSheet_ShowsRejectForMaterialisedAndMaterialiseForUnmaterialised()
+    public void SourceControls_ExposeResetRejectAndCandidateMaterialiseControls()
     {
         var js = ReadScript();
 
-        Assert.Contains("isMaterialisedState(state) && canRejectState(state)", js);
-        Assert.Contains("REJECT_DATA_ID", js);
+        Assert.Contains("canRejectState(state)", js);
+        Assert.Contains("canResetState(state)", js);
         Assert.Contains("canMaterialiseState(state)", js);
-        Assert.Contains("MATERIALISE_DATA_ID", js);
         Assert.Contains("fireRejectCurrent(ctx.externalId)", js);
-        Assert.Contains("fireMaterialise(itemId)", js);
+        Assert.Contains("fireReset(ctx.externalId)", js);
+        Assert.Contains("fireMaterialiseCandidate(ctx.externalId, selected)", js);
+        Assert.Contains("Refresh sources", js);
+        Assert.Contains("refreshSourceSection(true)", js);
+        Assert.Contains("?refresh=true", js);
+    }
+
+    [Fact]
+    public void SourceControls_PollDetailStateAfterMaterialiseResetAndReject()
+    {
+        var js = ReadScript();
+
+        Assert.Contains("detailPoll", js);
+        Assert.Contains("startDetailPolling(ctx, 'materialise-candidate')", js);
+        Assert.Contains("startDetailPolling(ctx, 'reset')", js);
+        Assert.Contains("startDetailPolling(ctx, 'reject')", js);
+        Assert.Contains("startDetailPollingForCurrent(actionId)", js);
+        Assert.Contains("actionId === 'phantom.rejectCurrent'", js);
+        Assert.Contains("startDetailPollingForCurrent('item-action')", js);
+        Assert.Contains("setInterval(pollDetailState, 2000)", js);
+        Assert.Contains("fetchSources(externalId, false)", js);
+        Assert.Contains("refreshVisibleItemContainers()", js);
+        Assert.Contains("scanActionSheets()", js);
+        Assert.Contains("window.location.reload()", js);
+    }
+
+    [Fact]
+    public void ActionSheet_UsesServerAdvertisedItemActions()
+    {
+        var js = ReadScript();
+
+        Assert.Contains("fetchItemActions(itemId)", js);
+        Assert.Contains("currentUserQuery", js);
+        Assert.Contains("scanActionSheets", js);
+        Assert.Contains("setInterval(scanActionSheets", js);
+        Assert.Contains("patchApiClientForChannelItems", js);
+        Assert.Contains("cachedChannelItem(itemId)", js);
+        Assert.Contains("querySelector('.actionSheetScroller') || sheet.querySelector('.actionSheetContent')", js);
+        var injectStart = js.IndexOf("function injectIntoSheet", StringComparison.Ordinal);
+        var injectEnd = js.IndexOf("function scanActionSheets", StringComparison.Ordinal);
+        Assert.True(injectStart >= 0 && injectEnd > injectStart, "injectIntoSheet block not found");
+        var injectBlock = js[injectStart..injectEnd];
+        Assert.Contains("fetchItemActions(itemId)", injectBlock);
+        Assert.DoesNotContain("getPlayablePhantomItem", injectBlock);
+        Assert.Contains("Items/", js);
+        Assert.Contains("/Actions", js);
+        Assert.Contains("fireItemAction(itemId, actionId)", js);
+        Assert.Contains("refreshClientAfterAction", js);
+        Assert.Contains("isKebabAction", js);
+        Assert.Contains("phantom.reset", js);
+        Assert.Contains("phantom.rejectCurrent", js);
+        Assert.DoesNotContain("interceptDetailMoreButtonClick", js);
+        Assert.DoesNotContain("showPhantomActionMenu", js);
+        Assert.Contains("window.location.reload()", js);
+        Assert.Contains("ConfirmationText", js);
+        Assert.Contains("phantom-action-", js);
     }
 
     [Fact]

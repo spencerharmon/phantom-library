@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phantom Library — local operator installer.
+# Phantom Library - local operator installer.
 #
 # Installs the pre-built plugin DLL into Jellyfin's plugins dir under
 # the canonical versioned name, creates the writable phantom-stub
@@ -8,7 +8,7 @@
 # storage, and offers to restart Jellyfin via systemd.
 #
 # This is the operator's local installer; not for general users.
-# By default it does NOT rebuild — the agent builds during testing,
+# By default it does NOT rebuild - the agent builds during testing,
 # the operator runs this to install the already-built artefacts.
 #
 # Idempotent. Safe to re-run after a `git pull && ./install.sh`.
@@ -94,11 +94,44 @@ fi
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
 
+prepare_submodule_checkout() {
+  local path="$1"
+  if [ ! -f "$REPO_ROOT/.gitmodules" ]; then
+    die "$path/ source checkout missing and .gitmodules is absent; cannot initialise dependency."
+  fi
+
+  bold "Preparing submodule $path at recorded commit..."
+  git -C "$REPO_ROOT" submodule sync -- "$path" >/dev/null \
+    || die "Failed to sync submodule $path."
+
+  # A previous interrupted install may have left generated patch files,
+  # modified tracked files, or build detritus inside the submodule. Build
+  # reproducibility must come from the superproject's recorded gitlink, not
+  # from local filesystem state, so reset/clean before and after checkout.
+  if git -C "$REPO_ROOT/$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git -C "$REPO_ROOT/$path" reset --hard >/dev/null \
+      || die "Failed to reset submodule $path."
+    git -C "$REPO_ROOT/$path" clean -fd -e obj/ -e bin/ >/dev/null \
+      || die "Failed to clean submodule $path."
+  fi
+
+  git -C "$REPO_ROOT" submodule update --init --recursive --force "$path" \
+    || die "Failed to initialise submodule $path. Check network/credentials and retry."
+
+  git -C "$REPO_ROOT/$path" reset --hard >/dev/null \
+    || die "Failed to reset submodule $path after checkout."
+  git -C "$REPO_ROOT/$path" clean -fd -e obj/ -e bin/ >/dev/null \
+    || die "Failed to clean submodule $path after checkout."
+
+  git -C "$REPO_ROOT/$path" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die "$path/ submodule did not initialise to a git checkout."
+}
+
 # ---------------------------------------------------------------- detect
 # Read canonical plugin version + GUID from build.yaml so the install
 # layout matches what the manifest workflow publishes.
 if [ ! -f build.yaml ]; then
-  die "build.yaml missing in $REPO_ROOT — are you in the repo root?"
+  die "build.yaml missing in $REPO_ROOT - are you in the repo root?"
 fi
 
 PLUGIN_VERSION="$(awk -F'"' '/^version:/ {print $2; exit}' build.yaml)"
@@ -108,7 +141,7 @@ PLUGIN_NAME="Jellyfin.Plugin.PhantomLibrary"
 PLUGIN_DISPLAY_NAME="Phantom Library"
 PLUGIN_DIR_NAME="${PLUGIN_NAME}_${PLUGIN_VERSION}"
 DLL_OUT="src/${PLUGIN_NAME}/bin/Release/net9.0/${PLUGIN_NAME}.dll"
-EXPECTED_PHANTOM_SCHEMA="$(grep -R 'private const int CurrentSchemaVersion' -n src/${PLUGIN_NAME}/State/PhantomDb.cs 2>/dev/null | sed -E 's/.*= ([0-9]+);/\1/' | head -1)"
+EXPECTED_PHANTOM_SCHEMA="$(awk '/CurrentSchemaVersion/ { if (match($0, /[0-9]+/)) { print substr($0, RSTART, RLENGTH); exit } }' "src/${PLUGIN_NAME}/State/PhantomDb.cs" 2>/dev/null || true)"
 [ -n "$EXPECTED_PHANTOM_SCHEMA" ] || EXPECTED_PHANTOM_SCHEMA="unknown"
 
 # Detect Jellyfin data dir if not overridden. Order of preference:
@@ -165,6 +198,10 @@ echo "  Phantom stub root:  $PHANTOM_STUB_ROOT"
 echo "  Phantom DB:         $PHANTOM_DB_PATH"
 echo
 
+if [ "$DO_BUILD" -eq 1 ] && [ "$DEPLOY_JELLYFIN_DLLS" -eq 1 ] && systemctl is-active --quiet jellyfin 2>/dev/null; then
+  die "jellyfin.service is active; stop it before running ./install.sh --build, or pass --no-deploy-jellyfin-dlls to build without deploying patched Jellyfin DLLs"
+fi
+
 # Refuse to install over an incompatible phantom.db. The plugin will
 # HARD-REFUSE schema mismatches at runtime; catching it here gives the
 # operator a clear action before restarting Jellyfin.
@@ -179,6 +216,12 @@ if [ -f "$PHANTOM_DB_PATH" ] && command -v sqlite3 >/dev/null 2>&1; then
       ;;
     "$EXPECTED_PHANTOM_SCHEMA")
       :
+      ;;
+    13)
+      if [ "$EXPECTED_PHANTOM_SCHEMA" = "14" ]; then
+        die "phantom.db schema is v13 but Phantom Library $PLUGIN_VERSION requires v14. Stop Jellyfin and run: sudo bash scripts/migrate-source-validation-v14.sh, then re-run ./install.sh --build"
+      fi
+      die "phantom.db schema is v$PHANTOM_SCHEMA but Phantom Library $PLUGIN_VERSION requires v$EXPECTED_PHANTOM_SCHEMA. Stop Jellyfin and run: sudo bash scripts/phantom-wipe.sh --commit"
       ;;
     *)
       die "phantom.db schema is v$PHANTOM_SCHEMA but Phantom Library $PLUGIN_VERSION requires v$EXPECTED_PHANTOM_SCHEMA. Stop Jellyfin and run: sudo bash scripts/phantom-wipe.sh --commit"
@@ -230,9 +273,7 @@ if [ "$DO_BUILD" -eq 1 ]; then
   # assembly-load failures (MediaBrowser.Common version mismatch).
   patches_dir="$REPO_ROOT/scripts/jellyfin-patches"
   if [ -d "$patches_dir" ] && ls "$patches_dir"/*.patch >/dev/null 2>&1; then
-    if [ ! -d "$REPO_ROOT/jellyfin/.git" ]; then
-      die "jellyfin/ source clone missing or not a git checkout; cannot apply patches"
-    fi
+    prepare_submodule_checkout jellyfin
 
     installed_version="$(installed_jellyfin_version || true)"
     if [ -z "$installed_version" ]; then
@@ -271,8 +312,8 @@ if [ "$DO_BUILD" -eq 1 ]; then
   bold "Building plugin (Release)... [--build]"
   echo
   yellow "  NOTE: this plugin depends on PATCHED Jellyfin assemblies"
-  yellow "        (MediaBrowser.Controller + Jellyfin.LiveTv). The patches"
-  yellow "        add IChannelItemRefresh{,Manager} - used by the plugin"
+  yellow "        (MediaBrowser.Controller + MediaBrowser.Model + Jellyfin.Api + Jellyfin.LiveTv)."
+  yellow "        The patches add IChannelItemRefresh{,Manager} and item actions - used by the plugin"
   yellow "        at runtime. The plugin DLL alone is NOT sufficient;"
   yellow "        you must also deploy the patched Jellyfin DLLs to the"
   yellow "        Jellyfin install dir (default /usr/lib/jellyfin/)."
@@ -283,20 +324,31 @@ if [ "$DO_BUILD" -eq 1 ]; then
   if [ ${#dotnet_build_args[@]} -gt 0 ]; then
     yellow "  extra dotnet build args: ${dotnet_build_args[*]}"
   fi
-  dotnet build -c Release "${dotnet_build_args[@]}"
-
-  # Also build the patched Jellyfin assemblies the plugin links against
-  # at runtime. Building Jellyfin.Server pulls in MediaBrowser.Controller
-  # and Jellyfin.LiveTv transitively. Output ends up in each project's
-  # bin/Release/net*/ - we re-locate the two we care about at the end.
-  bold "Building patched Jellyfin assemblies (Release)..."
   jf_server_csproj="$REPO_ROOT/jellyfin/Jellyfin.Server/Jellyfin.Server.csproj"
   if [ ! -f "$jf_server_csproj" ]; then
     die "jellyfin/Jellyfin.Server/Jellyfin.Server.csproj missing; expected a v10.11.9 clone at $REPO_ROOT/jellyfin (base commit $(cat "$REPO_ROOT/scripts/jellyfin-patches/REBASE.md" 2>/dev/null | grep -oE '[0-9a-f]{10,}' | head -1 || echo e83a7e62f2))"
   fi
+
+  # Submodule reset/clean can remove stale generated files from earlier
+  # failed installs. Restore explicitly before any build so the install loop
+  # does not depend on preserved local obj/project.assets.json state, even if
+  # PHANTOM_DOTNET_BUILD_ARGS contains --no-restore for the build step.
+  bold "Restoring NuGet packages..."
+  dotnet restore
+  dotnet restore "$jf_server_csproj"
+
+  dotnet build -c Release "${dotnet_build_args[@]}"
+
+  # Also build the patched Jellyfin assemblies the plugin links against
+  # at runtime. Building Jellyfin.Server pulls in MediaBrowser.Controller,
+  # MediaBrowser.Model, Jellyfin.Api, and Jellyfin.LiveTv transitively.
+  # Output ends up in each project's bin/Release/net*/.
+  bold "Building patched Jellyfin assemblies (Release)..."
   dotnet build -c Release "$jf_server_csproj" "${dotnet_build_args[@]}"
 
   jf_controller_dll="$REPO_ROOT/jellyfin/MediaBrowser.Controller/bin/Release/net9.0/MediaBrowser.Controller.dll"
+  jf_model_dll="$REPO_ROOT/jellyfin/MediaBrowser.Model/bin/Release/net9.0/MediaBrowser.Model.dll"
+  jf_api_dll="$REPO_ROOT/jellyfin/Jellyfin.Api/bin/Release/net9.0/Jellyfin.Api.dll"
   jf_livetv_dll="$REPO_ROOT/jellyfin/src/Jellyfin.LiveTv/bin/Release/net9.0/Jellyfin.LiveTv.dll"
   if ! grep -a -q "Version=$installed_version" "$jf_controller_dll"; then
     die "Patched MediaBrowser.Controller.dll does not reference installed Jellyfin assembly version $installed_version. Refusing to deploy."
@@ -312,6 +364,40 @@ fi
 
 if [ ! -f "$DLL_OUT" ]; then
   die "Built DLL not found at $DLL_OUT. Re-run with --build, or build manually first."
+fi
+
+if [ "$DO_BUILD" -eq 1 ] && [ "$DEPLOY_JELLYFIN_DLLS" -eq 1 ]; then
+  runtime_dir=""
+  for cand in /usr/lib/jellyfin /usr/share/jellyfin/bin /opt/jellyfin; do
+    if [ -f "$cand/MediaBrowser.Controller.dll" ] && [ -f "$cand/MediaBrowser.Model.dll" ] && [ -f "$cand/Jellyfin.Api.dll" ] && [ -f "$cand/Jellyfin.LiveTv.dll" ]; then
+      runtime_dir="$cand"
+      break
+    fi
+  done
+  if [ -z "$runtime_dir" ]; then
+    die "Could not detect Jellyfin runtime install dir for patched DLL deploy; pass --no-deploy-jellyfin-dlls to build without installing plugin/runtime DLLs"
+  fi
+fi
+
+if [ "$DO_BUILD" -eq 0 ]; then
+  runtime_dir=""
+  for cand in /usr/lib/jellyfin /usr/share/jellyfin/bin /opt/jellyfin; do
+    if [ -f "$cand/MediaBrowser.Controller.dll" ] && [ -f "$cand/MediaBrowser.Model.dll" ] && [ -f "$cand/Jellyfin.Api.dll" ] && [ -f "$cand/Jellyfin.LiveTv.dll" ]; then
+      runtime_dir="$cand"
+      break
+    fi
+  done
+  if [ -z "$runtime_dir" ]; then
+    die "Could not verify patched Jellyfin runtime DLLs; run ./install.sh --build so patched assemblies are built/deployed"
+  fi
+  grep -a -q IChannelItemRefreshManager "$runtime_dir/MediaBrowser.Controller.dll" \
+    || die "Runtime MediaBrowser.Controller.dll lacks Phantom patches; run ./install.sh --build"
+  grep -a -q ItemActionInfo "$runtime_dir/MediaBrowser.Model.dll" \
+    || die "Runtime MediaBrowser.Model.dll lacks Phantom item-action patch; run ./install.sh --build"
+  grep -a -q ItemActionsController "$runtime_dir/Jellyfin.Api.dll" \
+    || die "Runtime Jellyfin.Api.dll lacks Phantom item-action patch; run ./install.sh --build"
+  grep -a -q RefreshChannelItemAsync "$runtime_dir/Jellyfin.LiveTv.dll" \
+    || die "Runtime Jellyfin.LiveTv.dll lacks Phantom channel-refresh patch; run ./install.sh --build"
 fi
 
 # ---------------------------------------------------------------- install dll
@@ -390,7 +476,7 @@ echo "  plugin built sha256:     $SRC_SHA256"
 echo "  plugin deployed sha256:  $DST_SHA256"
 VERIFY_JF_INSTALL_DIR=""
 for cand in /usr/lib/jellyfin /usr/share/jellyfin/bin /opt/jellyfin; do
-  if [ -f "$cand/MediaBrowser.Controller.dll" ] && [ -f "$cand/Jellyfin.LiveTv.dll" ]; then
+  if [ -f "$cand/MediaBrowser.Controller.dll" ] && [ -f "$cand/MediaBrowser.Model.dll" ] && [ -f "$cand/Jellyfin.Api.dll" ] && [ -f "$cand/Jellyfin.LiveTv.dll" ]; then
     VERIFY_JF_INSTALL_DIR="$cand"
     break
   fi
@@ -398,11 +484,13 @@ done
 if [ -n "$VERIFY_JF_INSTALL_DIR" ]; then
   echo "  Jellyfin install dir:    $VERIFY_JF_INSTALL_DIR"
   echo "  Controller sha256:       $(file_sha256 "$VERIFY_JF_INSTALL_DIR/MediaBrowser.Controller.dll")"
+  echo "  Model sha256:            $(file_sha256 "$VERIFY_JF_INSTALL_DIR/MediaBrowser.Model.dll")"
+  echo "  Api sha256:              $(file_sha256 "$VERIFY_JF_INSTALL_DIR/Jellyfin.Api.dll")"
   echo "  LiveTv sha256:           $(file_sha256 "$VERIFY_JF_INSTALL_DIR/Jellyfin.LiveTv.dll")"
 else
   echo "  Jellyfin install dir:    not detected"
 fi
-if [ -d "$REPO_ROOT/gostream/.git" ]; then
+if git -C "$REPO_ROOT/gostream" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "  gostream commit:         $(git -C "$REPO_ROOT/gostream" rev-parse HEAD 2>/dev/null || echo unknown)"
   echo "  gostream dirty files:"
   git -C "$REPO_ROOT/gostream" status --short 2>/dev/null | sed 's/^/    /' || true
@@ -425,19 +513,23 @@ fi
 # produced (when --build was passed).
 if [ "$DO_BUILD" -eq 1 ]; then
   jf_controller_dll="$REPO_ROOT/jellyfin/MediaBrowser.Controller/bin/Release/net9.0/MediaBrowser.Controller.dll"
+  jf_model_dll="$REPO_ROOT/jellyfin/MediaBrowser.Model/bin/Release/net9.0/MediaBrowser.Model.dll"
+  jf_api_dll="$REPO_ROOT/jellyfin/Jellyfin.Api/bin/Release/net9.0/Jellyfin.Api.dll"
   jf_livetv_dll="$REPO_ROOT/jellyfin/src/Jellyfin.LiveTv/bin/Release/net9.0/Jellyfin.LiveTv.dll"
   # Detect the operator's Jellyfin install dir. /usr/lib/jellyfin/ on
   # Arch + Debian distro packages. Skip the section quietly if neither
   # patched DLL exists yet (build failed earlier).
-  if [ ! -f "$jf_controller_dll" ] || [ ! -f "$jf_livetv_dll" ]; then
+  if [ ! -f "$jf_controller_dll" ] || [ ! -f "$jf_model_dll" ] || [ ! -f "$jf_api_dll" ] || [ ! -f "$jf_livetv_dll" ]; then
     yellow "Patched Jellyfin DLLs not found under jellyfin/.../bin/Release/net9.0/."
     yellow "  expected: $jf_controller_dll"
+    yellow "            $jf_model_dll"
+    yellow "            $jf_api_dll"
     yellow "            $jf_livetv_dll"
     yellow "  Did 'dotnet build -c Release jellyfin/Jellyfin.Server/Jellyfin.Server.csproj' succeed?"
   else
     jf_install_dir=""
     for cand in /usr/lib/jellyfin /usr/share/jellyfin/bin /opt/jellyfin; do
-      if [ -f "$cand/MediaBrowser.Controller.dll" ] && [ -f "$cand/Jellyfin.LiveTv.dll" ]; then
+      if [ -f "$cand/MediaBrowser.Controller.dll" ] && [ -f "$cand/MediaBrowser.Model.dll" ] && [ -f "$cand/Jellyfin.Api.dll" ] && [ -f "$cand/Jellyfin.LiveTv.dll" ]; then
         jf_install_dir="$cand"
         break
       fi
@@ -446,24 +538,34 @@ if [ "$DO_BUILD" -eq 1 ]; then
     bold "Patched Jellyfin assemblies ready for operator deploy:"
     echo "  built artefacts:"
     echo "    $jf_controller_dll"
+    echo "    $jf_model_dll"
+    echo "    $jf_api_dll"
     echo "    $jf_livetv_dll"
     if [ -n "$jf_install_dir" ]; then
       echo
       echo "  detected runtime Jellyfin install dir: $jf_install_dir"
       yellow "  the plugin DLL just installed REFERENCES types added by the patches;"
       yellow "  the plugin will fail to load against the unpatched DLLs currently"
-      yellow "  at $jf_install_dir/{MediaBrowser.Controller.dll,Jellyfin.LiveTv.dll}."
+      yellow "  at $jf_install_dir/{MediaBrowser.Controller.dll,MediaBrowser.Model.dll,Jellyfin.Api.dll,Jellyfin.LiveTv.dll}."
       echo
       bold "  Operator deploy procedure (run BEFORE restarting jellyfin):"
       echo "    sudo systemctl stop jellyfin"
       echo "    test -f $jf_install_dir/MediaBrowser.Controller.dll.pre-phantom-bak || sudo cp -p $jf_install_dir/MediaBrowser.Controller.dll \\"
       echo "            $jf_install_dir/MediaBrowser.Controller.dll.pre-phantom-bak"
+      echo "    test -f $jf_install_dir/MediaBrowser.Model.dll.pre-phantom-bak || sudo cp -p $jf_install_dir/MediaBrowser.Model.dll \\"
+      echo "            $jf_install_dir/MediaBrowser.Model.dll.pre-phantom-bak"
+      echo "    test -f $jf_install_dir/Jellyfin.Api.dll.pre-phantom-bak || sudo cp -p $jf_install_dir/Jellyfin.Api.dll \\"
+      echo "            $jf_install_dir/Jellyfin.Api.dll.pre-phantom-bak"
       echo "    test -f $jf_install_dir/Jellyfin.LiveTv.dll.pre-phantom-bak || sudo cp -p $jf_install_dir/Jellyfin.LiveTv.dll \\"
       echo "            $jf_install_dir/Jellyfin.LiveTv.dll.pre-phantom-bak"
       echo "    sudo install -m 644 $jf_controller_dll $jf_install_dir/"
+      echo "    sudo install -m 644 $jf_model_dll $jf_install_dir/"
+      echo "    sudo install -m 644 $jf_api_dll $jf_install_dir/"
       echo "    sudo install -m 644 $jf_livetv_dll $jf_install_dir/"
       echo "    grep -a -q 'Version=$installed_version' $jf_install_dir/MediaBrowser.Controller.dll && echo OK_VERSION_MATCH"
       echo "    grep -a -q IChannelItemRefreshManager $jf_install_dir/MediaBrowser.Controller.dll && echo OK_CONTROLLER_PATCHED"
+      echo "    grep -a -q ItemActionInfo $jf_install_dir/MediaBrowser.Model.dll && echo OK_MODEL_PATCHED"
+      echo "    grep -a -q ItemActionsController $jf_install_dir/Jellyfin.Api.dll && echo OK_API_PATCHED"
       echo "    grep -a -q RefreshChannelItemAsync $jf_install_dir/Jellyfin.LiveTv.dll && echo OK_LIVETV_PATCHED"
       echo "    sudo systemctl start jellyfin"
       echo
@@ -476,19 +578,33 @@ if [ "$DO_BUILD" -eq 1 ]; then
         if ! $SUDO test -f "$jf_install_dir/MediaBrowser.Controller.dll.pre-phantom-bak"; then
           $SUDO cp -p "$jf_install_dir/MediaBrowser.Controller.dll" "$jf_install_dir/MediaBrowser.Controller.dll.pre-phantom-bak"
         fi
+        if ! $SUDO test -f "$jf_install_dir/MediaBrowser.Model.dll.pre-phantom-bak"; then
+          $SUDO cp -p "$jf_install_dir/MediaBrowser.Model.dll" "$jf_install_dir/MediaBrowser.Model.dll.pre-phantom-bak"
+        fi
+        if ! $SUDO test -f "$jf_install_dir/Jellyfin.Api.dll.pre-phantom-bak"; then
+          $SUDO cp -p "$jf_install_dir/Jellyfin.Api.dll" "$jf_install_dir/Jellyfin.Api.dll.pre-phantom-bak"
+        fi
         if ! $SUDO test -f "$jf_install_dir/Jellyfin.LiveTv.dll.pre-phantom-bak"; then
           $SUDO cp -p "$jf_install_dir/Jellyfin.LiveTv.dll" "$jf_install_dir/Jellyfin.LiveTv.dll.pre-phantom-bak"
         fi
         $SUDO install -m 644 "$jf_controller_dll" "$jf_install_dir/"
+        $SUDO install -m 644 "$jf_model_dll" "$jf_install_dir/"
+        $SUDO install -m 644 "$jf_api_dll" "$jf_install_dir/"
         $SUDO install -m 644 "$jf_livetv_dll" "$jf_install_dir/"
         grep -a -q "Version=$installed_version" "$jf_install_dir/MediaBrowser.Controller.dll" \
           || die "deployed MediaBrowser.Controller.dll does not reference Version=$installed_version"
         grep -a -q IChannelItemRefreshManager "$jf_install_dir/MediaBrowser.Controller.dll" \
           || die "deployed MediaBrowser.Controller.dll lacks IChannelItemRefreshManager"
+        grep -a -q ItemActionInfo "$jf_install_dir/MediaBrowser.Model.dll" \
+          || die "deployed MediaBrowser.Model.dll lacks ItemActionInfo"
+        grep -a -q ItemActionsController "$jf_install_dir/Jellyfin.Api.dll" \
+          || die "deployed Jellyfin.Api.dll lacks ItemActionsController"
         grep -a -q RefreshChannelItemAsync "$jf_install_dir/Jellyfin.LiveTv.dll" \
           || die "deployed Jellyfin.LiveTv.dll lacks RefreshChannelItemAsync"
         green "  patched Jellyfin DLLs deployed + verified in $jf_install_dir"
         echo "  deployed Controller sha256: $(file_sha256 "$jf_install_dir/MediaBrowser.Controller.dll")"
+        echo "  deployed Model sha256:      $(file_sha256 "$jf_install_dir/MediaBrowser.Model.dll")"
+        echo "  deployed Api sha256:        $(file_sha256 "$jf_install_dir/Jellyfin.Api.dll")"
         echo "  deployed LiveTv sha256:     $(file_sha256 "$jf_install_dir/Jellyfin.LiveTv.dll")"
         echo
       fi
@@ -497,6 +613,8 @@ if [ "$DO_BUILD" -eq 1 ]; then
       yellow "        package will silently overwrite these DLLs and the plugin"
       yellow "        will fail to load on the next jellyfin restart. To detect:"
       echo   "          md5sum $jf_install_dir/MediaBrowser.Controller.dll \\"
+      echo   "                 $jf_install_dir/MediaBrowser.Model.dll \\"
+      echo   "                 $jf_install_dir/Jellyfin.Api.dll \\"
       echo   "                 $jf_install_dir/Jellyfin.LiveTv.dll"
       yellow "        Compare against the md5 of the .pre-phantom-bak files. If"
       yellow "        the live DLLs match the .pre-phantom-bak, the patch was clobbered;"
@@ -505,7 +623,7 @@ if [ "$DO_BUILD" -eq 1 ]; then
       yellow "        files are not overwritten by a bad patched build."
     else
       yellow "  Could not auto-detect a Jellyfin install dir with the unpatched DLLs."
-      yellow "  Deploy these two DLLs to your Jellyfin install dir (the one containing"
+      yellow "  Deploy these four DLLs to your Jellyfin install dir (the one containing"
       yellow "  jellyfin.dll), back up the originals first. See docs/operator-deploy.md."
     fi
     echo
@@ -526,16 +644,44 @@ yellow "        different path, also chown that path to $JELLYFIN_USER:$JELLYFIN
 # ---------------------------------------------------------------- gostream image
 if [ "$DO_GOSTREAM" -eq 1 ]; then
   echo
-  bold "Loading gostream image into root podman storage..."
+  bold "Preparing gostream image..."
+  GOSTREAM_LOAD=1
   if ! command -v podman >/dev/null 2>&1; then
-    yellow "  podman not in PATH — skipping. Install podman or pass --no-gostream."
-  elif [ ! -f "$GOSTREAM_TARBALL" ]; then
-    yellow "  $GOSTREAM_TARBALL not found."
-    yellow "  The agent produces this with:"
-    yellow "    cd gostream && podman build -f docker/Dockerfile -t $GOSTREAM_IMAGE ."
-    yellow "    podman save -o $GOSTREAM_TARBALL $GOSTREAM_IMAGE"
-    yellow "  Skipping image load."
+    if [ "$DO_BUILD" -eq 1 ]; then
+      die "podman not in PATH; cannot build gostream image. Install podman or pass --no-gostream."
+    fi
+    yellow "  podman not in PATH - skipping. Install podman or pass --no-gostream."
   else
+    if [ "$DO_BUILD" -eq 1 ]; then
+      prepare_submodule_checkout gostream
+      if [ ! -f "$REPO_ROOT/gostream/docker/Dockerfile" ]; then
+        die "gostream/docker/Dockerfile missing; cannot build $GOSTREAM_IMAGE."
+      fi
+
+      bold "  Building gostream image from $REPO_ROOT/gostream..."
+      (
+        cd "$REPO_ROOT/gostream"
+        podman build -f docker/Dockerfile -t "$GOSTREAM_IMAGE" .
+        # podman saves docker-archive output, which cannot be modified in
+        # place. Remove any stale tarball first so repeated installs do not
+        # fail with: docker-archive doesn't support modifying existing images.
+        rm -f "$GOSTREAM_TARBALL"
+        podman save -o "$GOSTREAM_TARBALL" "$GOSTREAM_IMAGE"
+      )
+      green "  built $GOSTREAM_IMAGE and wrote $GOSTREAM_TARBALL"
+      echo "  gostream commit:       $(git -C "$REPO_ROOT/gostream" rev-parse HEAD 2>/dev/null || echo unknown)"
+      echo "  gostream tar sha256:   $(file_sha256 "$GOSTREAM_TARBALL")"
+    elif [ ! -f "$GOSTREAM_TARBALL" ]; then
+      yellow "  $GOSTREAM_TARBALL not found."
+      yellow "  Re-run with --build to build gostream automatically, or create it with:"
+      yellow "    cd gostream && podman build -f docker/Dockerfile -t $GOSTREAM_IMAGE ."
+      yellow "    podman save -o $GOSTREAM_TARBALL $GOSTREAM_IMAGE"
+      yellow "  Skipping image load."
+      GOSTREAM_LOAD=0
+    fi
+
+    if [ "$GOSTREAM_LOAD" -eq 1 ]; then
+    bold "Loading gostream image into root podman storage..."
     # Capture the pre-load image id (if any) so we can detect whether
     # the load actually replaced anything new. Empty string if absent.
     OLD_IMG_ID="$($SUDO podman image inspect --format '{{.Id}}' "$GOSTREAM_IMAGE" 2>/dev/null || true)"
@@ -573,6 +719,7 @@ if [ "$DO_GOSTREAM" -eq 1 ]; then
       else
         yellow "  Image id unchanged; gostream.service not restarted."
       fi
+    fi
     fi
   fi
 else
@@ -648,7 +795,7 @@ esac
 # /usr/share/jellyfin/web/index.html directly. The patch is idempotent
 # (skips re-add if marker already present) and survives plugin
 # reinstalls. NOTE: a jellyfin-web package upgrade will overwrite
-# index.html and remove the patch — re-run install.sh after such an
+# index.html and remove the patch - re-run install.sh after such an
 # upgrade to reapply.
 # ---------------------------------------------------------------
 INDEX_CANDIDATES=(

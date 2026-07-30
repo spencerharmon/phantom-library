@@ -1,0 +1,8 @@
+[submodule "jellyfin"]
+	path = jellyfin
+	url = https://github.com/spencerharmon/jellyfin
+	branch = phantom-library/patch-base-10.11.9
+[submodule "gostream"]
+	path = gostream
+	url = git@github.com:spencerharmon/gostream.git
+	branch = phantom-library/testing

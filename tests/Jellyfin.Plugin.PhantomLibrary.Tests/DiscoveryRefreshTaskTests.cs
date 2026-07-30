@@ -120,6 +120,7 @@ public class DiscoveryRefreshTaskTests : IDisposable
         Assert.NotNull(m101);
         Assert.Equal("Movie 101", m101!.Title);
         Assert.Equal(1999, m101.Year);
+        Assert.Equal(120, m101.RuntimeMinutes);
         Assert.NotNull(m101.PosterUrl);
         Assert.StartsWith("https://image.tmdb.org/t/p/w500/", m101.PosterUrl, StringComparison.Ordinal);
 
@@ -170,6 +171,7 @@ public class DiscoveryRefreshTaskTests : IDisposable
 
         Assert.NotNull(movie);
         Assert.Equal("Movie 301", movie!.Title);
+        Assert.Equal(120, movie.RuntimeMinutes);
         Assert.NotNull(series);
         Assert.Equal("Series 401", series!.Title);
     }
@@ -222,7 +224,7 @@ public class DiscoveryRefreshTaskTests : IDisposable
 
         var movies = await ListCatalogueAsync("movie");
         Assert.Equal(new[] { 101, 102 }, movies.OrderBy(id => id));
-        Assert.Empty(tmdb.MovieDetailCalls);
+        Assert.Equal(new[] { 101, 102 }, tmdb.MovieDetailCalls);
         var meta101 = await _db.GetTmdbMetadataAsync(101, "movie", CancellationToken.None);
         var meta102 = await _db.GetTmdbMetadataAsync(102, "movie", CancellationToken.None);
         Assert.NotNull(meta101);

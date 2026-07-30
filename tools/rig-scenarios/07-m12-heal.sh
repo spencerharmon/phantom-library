@@ -15,8 +15,8 @@ set -u
 exec > /tmp/jf-rig/logs/scenario-07-m12-heal.log 2>&1
 BASE=http://localhost:18096
 TOK=testtoken00000000000000000000000
-JFDB=/tmp/jf-test/data/data/jellyfin.db
-PHDB=/tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db
+JFDB=/var/tmp/jf-test/data/data/jellyfin.db
+PHDB=/var/tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db
 
 echo "=== Scenario 07: M12 dedupe-gap heal ==="
 date
@@ -28,7 +28,7 @@ DELETE FROM BaseItemImageInfos WHERE ItemId IN (SELECT Id FROM BaseItems WHERE P
 DELETE FROM BaseItems WHERE Path LIKE '%__phantom_tmdb%' OR Name LIKE '%__phantom_tmdb%';
 SQL
 sqlite3 $PHDB "DELETE FROM phantom_items; DELETE FROM tmdb_cache;"
-find /tmp/jf-test/data/phantom-library -type l -delete 2>/dev/null
+find /var/tmp/jf-test/data/phantom-library -type l -delete 2>/dev/null
 echo "  state wiped"
 
 # Plant a broken-shape row: filename-stem Name, IsLocked=0, no providers,

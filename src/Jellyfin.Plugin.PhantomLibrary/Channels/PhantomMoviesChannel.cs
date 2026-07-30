@@ -10,6 +10,7 @@ using Jellyfin.Plugin.PhantomLibrary.Clients.Models;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Controller.Channels;
 using MediaBrowser.Controller.Drawing;
+using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Controller.Providers;
 using MediaBrowser.Model.Channels;
 using MediaBrowser.Model.Dto;
@@ -40,13 +41,14 @@ namespace Jellyfin.Plugin.PhantomLibrary.Channels;
 /// filtered result is never served to another.
 /// </summary>
 public sealed class PhantomMoviesChannel
-    : IChannel, ISupportsLatestMedia, IChannelItemRefresh, ISupportsMediaProbe, IHasCacheKey
+    : IChannel, IChannelItemRefresh, ISupportsMediaProbe, IHasCacheKey
 {
     private readonly PhantomDb _db;
     private readonly GostreamFilesystemEnumerator _enumerator;
     private readonly SplashSourceProvider _splashSource;
     private readonly ChannelStateProvider _state;
     private readonly ITmdbClient _tmdbClient;
+    private readonly IMediaEncoder? _mediaEncoder;
     private readonly ILogger<PhantomMoviesChannel> _logger;
     private readonly Dictionary<string, int> _gostreamMovieTmdbByPath = new(StringComparer.Ordinal);
 
@@ -57,12 +59,25 @@ public sealed class PhantomMoviesChannel
         ChannelStateProvider state,
         ITmdbClient tmdbClient,
         ILogger<PhantomMoviesChannel> logger)
+        : this(db, enumerator, splashSource, state, tmdbClient, null, logger)
+    {
+    }
+
+    public PhantomMoviesChannel(
+        PhantomDb db,
+        GostreamFilesystemEnumerator enumerator,
+        SplashSourceProvider splashSource,
+        ChannelStateProvider state,
+        ITmdbClient tmdbClient,
+        IMediaEncoder? mediaEncoder,
+        ILogger<PhantomMoviesChannel> logger)
     {
         _db = db ?? throw new ArgumentNullException(nameof(db));
         _enumerator = enumerator ?? throw new ArgumentNullException(nameof(enumerator));
         _splashSource = splashSource ?? throw new ArgumentNullException(nameof(splashSource));
         _state = state ?? throw new ArgumentNullException(nameof(state));
         _tmdbClient = tmdbClient ?? throw new ArgumentNullException(nameof(tmdbClient));
+        _mediaEncoder = mediaEncoder;
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
@@ -183,7 +198,7 @@ public sealed class PhantomMoviesChannel
                 var materialisedPath = GostreamPathResolver.ResolveMoviePath(row.Materialised.FusePath);
                 if (File.Exists(materialisedPath))
                 {
-                    sources.Add(FuseMediaSource(materialisedPath));
+                    sources.Add(await FuseMediaSourceAsync(materialisedPath, cancellationToken).ConfigureAwait(false));
                 }
                 else
                 {
@@ -233,7 +248,7 @@ public sealed class PhantomMoviesChannel
         foreach (var o in unresolvedOrphans)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            items.Add(BuildOrphanMovieItem(o));
+            items.Add(await BuildOrphanMovieItemAsync(o, cancellationToken).ConfigureAwait(false));
         }
 
         return new ChannelItemResult
@@ -263,7 +278,7 @@ public sealed class PhantomMoviesChannel
                         var path = GostreamPathResolver.ResolveMoviePath(state.FusePath);
                         if (File.Exists(path))
                         {
-                            return new[] { FuseMediaSource(path) };
+                            return new[] { await FuseMediaSourceAsync(path, cancellationToken, probe: true).ConfigureAwait(false) };
                         }
                     }
 
@@ -279,7 +294,7 @@ public sealed class PhantomMoviesChannel
                         return Array.Empty<MediaSourceInfo>();
                     }
 
-                    return new[] { FuseMediaSource(orphan.Path) };
+                    return new[] { await FuseMediaSourceAsync(orphan.Path, cancellationToken, probe: true).ConfigureAwait(false) };
                 }
 
             default:
@@ -288,36 +303,22 @@ public sealed class PhantomMoviesChannel
     }
 
     /// <inheritdoc />
-    public async Task<IEnumerable<ChannelItemInfo>> GetLatestMedia(ChannelLatestMediaSearch request, CancellationToken cancellationToken)
-    {
-        ArgumentNullException.ThrowIfNull(request);
-        // ChannelLatestMediaSearch (Jellyfin 10.11) carries UserId only;
-        // no Limit field. Default to 20 as the conventional "Latest" row size.
-        //
-        // Scope note (REQ-M14-PER-USER Surface 3): this "Latest" row is
-        // deliberately NOT filtered by request.UserId's hidden set. Every
-        // upstream citation of the per-user browse requirement (the backend
-        // task's doc, the eval, and the arbitration ruling) scopes "channel-
-        // browse wiring" to the main GetChannelItems query path; there is no
-        // per-user overload for ListMaterialisedStateAsync, and this method
-        // never took a userId before this task. Adding one here would be a
-        // speculative, uncited behaviour change beyond this rework's scope.
-        const int defaultLimit = 20;
-
-        var materialised = await _db.ListMaterialisedStateAsync("movie", cancellationToken).ConfigureAwait(false);
-        var items = new List<ChannelItemInfo>(Math.Min(materialised.Count, defaultLimit));
-        foreach (var row in materialised.OrderByDescending(r => r.MaterialisedAt).Take(defaultLimit))
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var built = await BuildMovieItemAsync(row.TmdbId, row, variants: null, cancellationToken).ConfigureAwait(false);
-            if (built is not null)
-            {
-                items.Add(built);
-            }
-        }
-
-        return items;
-    }
+    // ISupportsLatestMedia / GetLatestMedia deliberately removed (operator
+    // decision, 2026-06-28). Jellyfin core's RefreshLatestChannelItems ignores
+    // GetLatestMedia and instead deep-enumerates the whole channel via
+    // GetChannelItems (series -> season -> build) to populate the Home "Latest
+    // in Phantom Movies" row. On production-shaped data that enumeration runs
+    // for seconds-to-minutes on every Home load, on every client (the spinner
+    // never clears). Dropping ISupportsLatestMedia makes
+    // GetLatestChannelItemsInternal short-circuit to an empty result instantly
+    // (ChannelManager.cs: GetAllChannels().Where(i => i is ISupportsLatestMedia)).
+    //
+    // Tradeoff: the "Latest in Phantom Movies" Home row is gone for now.
+    // TODO(operator-approved): restore the Latest row cheaply (Option 2) by
+    // making the latest-refresh root enumeration O(latest) instead of
+    // O(catalogue) -- e.g. a cheap GetChannelItems fast-path for the
+    // refresh-root query backed by materialised_state -- then re-add
+    // ISupportsLatestMedia. Tracked in PLAN.md "Deferred".
 
     /// <inheritdoc />
     public Task<DynamicImageResponse> GetChannelImage(ImageType type, CancellationToken cancellationToken)
@@ -350,7 +351,7 @@ public sealed class PhantomMoviesChannel
                 {
                     var orphan = await _enumerator.LookupOrphanByHashAsync(
                         parsed.OrphanHash!, cancellationToken).ConfigureAwait(false);
-                    return orphan is null ? null! : BuildOrphanMovieItem(orphan);
+                    return orphan is null ? null! : await BuildOrphanMovieItemAsync(orphan, cancellationToken).ConfigureAwait(false);
                 }
 
             default:
@@ -393,7 +394,7 @@ public sealed class PhantomMoviesChannel
             var materialisedPath = GostreamPathResolver.ResolveMoviePath(materialised.FusePath);
             if (File.Exists(materialisedPath))
             {
-                sources.Add(FuseMediaSource(materialisedPath));
+                sources.Add(await FuseMediaSourceAsync(materialisedPath, ct).ConfigureAwait(false));
             }
             else
             {
@@ -432,6 +433,19 @@ public sealed class PhantomMoviesChannel
 
         if (tmdbId == 0)
         {
+            var persisted = await _db.GetGostreamPathTmdbAsync(path, "movie", ct).ConfigureAwait(false);
+            if (persisted is { } cached && cached != 0)
+            {
+                tmdbId = cached;
+                lock (_gostreamMovieTmdbByPath)
+                {
+                    _gostreamMovieTmdbByPath[path] = tmdbId;
+                }
+            }
+        }
+
+        if (tmdbId == 0)
+        {
             IReadOnlyList<TmdbSearchHit> hits;
             try
             {
@@ -449,6 +463,7 @@ public sealed class PhantomMoviesChannel
             }
 
             tmdbId = hits[0].Id;
+            await _db.UpsertGostreamPathTmdbAsync(path, "movie", tmdbId, ct).ConfigureAwait(false);
             lock (_gostreamMovieTmdbByPath)
             {
                 _gostreamMovieTmdbByPath[path] = tmdbId;
@@ -476,7 +491,7 @@ public sealed class PhantomMoviesChannel
             }
         }
 
-        return new EnrichedGostreamMovie(details.TmdbId, details, FuseMediaSource(path));
+        return new EnrichedGostreamMovie(details.TmdbId, details, await FuseMediaSourceAsync(path, ct).ConfigureAwait(false));
     }
 
     private static MediaSourceInfo SelectDefaultVariant(IReadOnlyList<MediaSourceInfo> sources)
@@ -524,6 +539,11 @@ public sealed class PhantomMoviesChannel
             item.Genres = meta.Genres.ToList();
         }
 
+        if (meta.RuntimeMinutes is { } rt && rt > 0)
+        {
+            item.RunTimeTicks = TimeSpan.FromMinutes(rt).Ticks;
+        }
+
         item.ProviderIds["Tmdb"] = meta.TmdbId.ToString(System.Globalization.CultureInfo.InvariantCulture);
         return item;
     }
@@ -544,7 +564,8 @@ public sealed class PhantomMoviesChannel
             null,
             movie.VoteAverage,
             movie.OriginalTitle,
-            DateTimeOffset.UtcNow);
+            DateTimeOffset.UtcNow,
+            movie.Runtime > 0 ? movie.Runtime : null);
     }
 
     private static bool TryParseGostreamMovieName(string path, out string title, out int? year)
@@ -573,7 +594,7 @@ public sealed class PhantomMoviesChannel
     private static string? BuildPosterUrl(string? path)
         => string.IsNullOrWhiteSpace(path) ? null : "https://image.tmdb.org/t/p/w500" + path;
 
-    private static ChannelItemInfo BuildOrphanMovieItem(GostreamFileEntry o)
+    private async Task<ChannelItemInfo> BuildOrphanMovieItemAsync(GostreamFileEntry o, CancellationToken ct)
     {
         var id = ChannelItemId.ForOrphanPath(o.Path).Encode();
         return new ChannelItemInfo
@@ -584,27 +605,12 @@ public sealed class PhantomMoviesChannel
             ContentType = ChannelMediaContentType.Movie,
             MediaType = ChannelMediaType.Video,
             Tags = new List<string> { "external" },
-            MediaSources = new List<MediaSourceInfo> { FuseMediaSource(o.Path) },
+            MediaSources = new List<MediaSourceInfo> { await FuseMediaSourceAsync(o.Path, ct).ConfigureAwait(false) },
         };
     }
 
-    private static MediaSourceInfo FuseMediaSource(string path)
-    {
-        var ext = Path.GetExtension(path).TrimStart('.');
-        // Container is a lowercased extension by Jellyfin convention.
-#pragma warning disable CA1308
-        var container = string.IsNullOrEmpty(ext) ? "mkv" : ext.ToLowerInvariant();
-#pragma warning restore CA1308
-        return new MediaSourceInfo
-        {
-            Id = MediaSourceIds.ForFilePath(path),
-            Path = path,
-            Container = container,
-            Protocol = MediaProtocol.File,
-            SupportsDirectPlay = true,
-            SupportsDirectStream = true,
-            IsRemote = false,
-            MediaStreams = new List<MediaStream>(),
-        };
-    }
+    private Task<MediaSourceInfo> FuseMediaSourceAsync(string path, CancellationToken ct, bool probe = false)
+        => probe
+            ? PhantomMediaSourceBuilder.CreateFileMediaSourceAsync(path, _mediaEncoder, _logger, ct)
+            : Task.FromResult(PhantomMediaSourceBuilder.CreateFileMediaSource(path));
 }

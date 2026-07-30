@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -65,6 +66,14 @@ public class MaterialiserTests : IDisposable
         File.WriteAllText(fusePath, "x"); // pre-create so WaitForFusePathAsync returns immediately
 
         var gostream = new Mock<IGostreamClient>(MockBehavior.Loose);
+        gostream.Setup(g => g.ValidateAsync(It.IsAny<GostreamValidateRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((GostreamValidateRequest req, CancellationToken _) => new GostreamValidateResult
+            {
+                Status = "valid",
+                Hash = "abc",
+                SelectedFile = new GostreamSelectedFile { Id = 0, Path = "movie.mkv", Size = 100 },
+                ValidationSessionId = req.ValidationSessionId,
+            });
         if (gostreamSetup is null)
         {
             gostream.Setup(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()))
@@ -173,7 +182,7 @@ public class MaterialiserTests : IDisposable
         {
             return Task.FromResult<System.Collections.Generic.IReadOnlyList<IndexerCandidate>>(_magnets.Select(m => new IndexerCandidate
             {
-                Title = "Test Movie 1080p",
+                Title = m.Title ?? "Test Movie 1080p",
                 Magnet = m.Magnet,
                 InfoHash = m.InfoHash,
                 Size = m.Size,
@@ -232,7 +241,16 @@ public class MaterialiserTests : IDisposable
             It.IsAny<Guid>(), It.IsAny<string>(),
             It.Is<ChannelItemRefreshOptions>(o => o.ForceUpdate && o.ForceProbe && o.InvalidateMediaInfoCache),
             It.IsAny<CancellationToken>()), Times.Once);
-        gostream.Verify(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()), Times.Once);
+        refresh.Verify(r => r.RefreshChannelItemAsync(
+            It.IsAny<Guid>(), It.IsAny<string>(),
+            It.Is<ChannelItemRefreshOptions>(o => !o.ForceUpdate && !o.ForceProbe && o.InvalidateMediaInfoCache),
+            It.IsAny<CancellationToken>()), Times.Once);
+        gostream.Verify(g => g.ValidateAsync(
+            It.Is<GostreamValidateRequest>(r => r.AllowedVideoContainers != null && r.AllowedVideoContainers.SequenceEqual(new[] { "MKV" })),
+            It.IsAny<CancellationToken>()), Times.Once);
+        gostream.Verify(g => g.AddAsync(
+            It.Is<GostreamAddRequest>(r => r.AllowedVideoContainers != null && r.AllowedVideoContainers.SequenceEqual(new[] { "MKV" })),
+            It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]
@@ -457,6 +475,74 @@ public class MaterialiserTests : IDisposable
     }
 
     [Fact]
+    public async Task EpisodeMaterialise_SkipsCandidatesWithWrongSeriesYear()
+    {
+        using var db = await NewDbAsync();
+        await SeedSeriesMetadataAsync(db, 200, "The Twilight Zone", 1959);
+        var wrong = new MagnetCandidate(
+            "magnet:?xt=urn:btih:BAD2019000000000000000000000000000000000",
+            "BAD2019000000000000000000000000000000000",
+            5L * 1024 * 1024 * 1024,
+            100,
+            "test")
+        {
+            Title = "The Twilight Zone 2019 S01E01 The Comedian 1080p WEB-DL",
+        };
+        var correct = new MagnetCandidate(
+            "magnet:?xt=urn:btih:ABC1959000000000000000000000000000000000",
+            "ABC1959000000000000000000000000000000000",
+            2L * 1024 * 1024 * 1024,
+            5,
+            "test")
+        {
+            Title = "The Twilight Zone S01E01 Where Is Everybody 720p WEB-DL",
+        };
+
+        GostreamAddRequest? added = null;
+        var (sut, gostream, _, _, _, cfg) = BuildSut(
+            db,
+            imdb: "tt0052520",
+            magnets: new[] { wrong, correct },
+            gostreamSetup: g =>
+            {
+                g.Setup(x => x.ValidateAsync(It.IsAny<GostreamValidateRequest>(), It.IsAny<CancellationToken>()))
+                    .ReturnsAsync((GostreamValidateRequest req, CancellationToken _) => new GostreamValidateResult
+                    {
+                        Status = "valid",
+                        Hash = req.Magnet.Contains("ABC1959", StringComparison.Ordinal) ? correct.InfoHash : wrong.InfoHash,
+                        SelectedFile = new GostreamSelectedFile { Id = 7, Path = "The Twilight Zone S01E01.mkv", Size = correct.Size },
+                        ValidationSessionId = req.ValidationSessionId,
+                    });
+                g.Setup(x => x.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()))
+                    .Returns<GostreamAddRequest, CancellationToken>((req, _) =>
+                    {
+                        added = req;
+                        var fuse = Path.Combine(_fuseMount, "twilight-zone-good.mkv");
+                        File.WriteAllText(fuse, "x");
+                        return Task.FromResult(new GostreamAddResult
+                        {
+                            StubPath = "/var/gostream/stubs/good.mkv",
+                            FusePath = fuse,
+                            Hash = correct.InfoHash,
+                            Size = correct.Size,
+                        });
+                    });
+            });
+
+        var outcome = await sut.MaterialiseAsync(200, "episode", 1, 1, MaterialiseTrigger.Manual, CancellationToken.None);
+
+        Assert.Equal(MaterialisationStatus.Success, outcome.Status);
+        Assert.NotNull(added);
+        Assert.Equal(correct.Magnet, added!.Magnet);
+        gostream.Verify(g => g.ValidateAsync(It.Is<GostreamValidateRequest>(r => r.Magnet == wrong.Magnet), It.IsAny<CancellationToken>()), Times.Never);
+        var failure = await db.GetMagnetFailureAsync(
+            new MagnetFailureKey(200, "tt0052520", "episode", 1, 1, cfg.SourcePickerPreset, wrong.Magnet),
+            CancellationToken.None);
+        Assert.NotNull(failure);
+        Assert.Equal("series_year_mismatch", failure!.Reason);
+    }
+
+    [Fact]
     public async Task PreFlightRefreshThrows_MaterialiseStillProceeds()
     {
         using var db = await NewDbAsync();
@@ -513,7 +599,7 @@ public class MaterialiserTests : IDisposable
         refresh.Verify(r => r.RefreshChannelItemAsync(
             It.IsAny<Guid>(), It.IsAny<string>(),
             It.Is<ChannelItemRefreshOptions>(o => !o.ForceUpdate && !o.ForceProbe && o.InvalidateMediaInfoCache),
-            It.IsAny<CancellationToken>()), Times.Once);
+            It.IsAny<CancellationToken>()), Times.Exactly(2));
     }
 
     [Fact]
@@ -531,6 +617,91 @@ public class MaterialiserTests : IDisposable
             CancellationToken.None);
         Assert.True(marker.HasValue);
         Assert.False(await db.IsMaterialiseInFlightAsync(90, "movie", -1, -1, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Materialise_ProbesFreshSourcesEvenWhenCachedCandidatesExist()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieMetadataAsync(db, 42);
+        var old = new MagnetCandidate("magnet:?xt=urn:btih:OLD", "OLD", 5L * 1024 * 1024 * 1024, 10, "old") { Title = "Old 1080p" };
+        var fresh = new MagnetCandidate("magnet:?xt=urn:btih:NEW", "NEW", 8L * 1024 * 1024 * 1024, 50, "fresh") { Title = "Fresh 1080p" };
+        await db.UpsertSourceCandidatesAsync(42, "movie", -1, -1, "test", new[] { old }, "details_probe", TimeSpan.FromHours(1), CancellationToken.None);
+        var validatedMagnets = new List<string>();
+        string? addedMagnet = null;
+        var (sut, _, _, indexer, _, cfg) = BuildSut(
+            db,
+            magnets: new[] { fresh },
+            gostreamSetup: g =>
+            {
+                g.Setup(x => x.ValidateAsync(It.IsAny<GostreamValidateRequest>(), It.IsAny<CancellationToken>()))
+                    .ReturnsAsync((GostreamValidateRequest req, CancellationToken _) =>
+                    {
+                        validatedMagnets.Add(req.Magnet);
+                        return new GostreamValidateResult
+                        {
+                            Status = "valid",
+                            Hash = req.Magnet.Contains("NEW", StringComparison.Ordinal) ? "NEW" : "OLD",
+                            SelectedFile = new GostreamSelectedFile { Id = 0, Path = "movie.mkv", Size = 100 },
+                            ValidationSessionId = req.ValidationSessionId,
+                        };
+                    });
+                g.Setup(x => x.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()))
+                    .ReturnsAsync((GostreamAddRequest req, CancellationToken _) =>
+                    {
+                        addedMagnet = req.Magnet;
+                        return new GostreamAddResult
+                        {
+                            StubPath = "/var/gostream/stubs/movie.mkv",
+                            FusePath = Path.Combine(_fuseMount, "movie.mkv"),
+                            Hash = req.Magnet.Contains("NEW", StringComparison.Ordinal) ? "NEW" : "OLD",
+                            Size = 100,
+                        };
+                    });
+            });
+        cfg.SourceValidationParallelism = 1;
+        cfg.SourceValidationWindowSize = 1;
+        File.WriteAllText(Path.Combine(_fuseMount, "movie.mkv"), "x");
+
+        var outcome = await sut.MaterialiseAsync(42, "movie", null, null, MaterialiseTrigger.Manual, CancellationToken.None);
+
+        Assert.Equal(MaterialisationStatus.Success, outcome.Status);
+        Assert.Contains(fresh.Magnet, validatedMagnets);
+        Assert.Equal(fresh.Magnet, addedMagnet);
+        var rows = await db.ListSourceCandidatesAsync(42, "movie", -1, -1, "test", includeExpired: false, CancellationToken.None);
+        Assert.Contains(rows, r => r.Magnet == old.Magnet);
+        Assert.Contains(rows, r => r.Magnet == fresh.Magnet);
+        Assert.IsType<FakeIndexer>(indexer);
+    }
+
+    [Fact]
+    public async Task TransientValidationFailure_UsesShortRetryMarker_NotUnavailableRetryWindow()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieMetadataAsync(db, 90);
+        var (sut, gostream, _, _, _, cfg) = BuildSut(db, gostreamSetup: g =>
+        {
+            g.Setup(x => x.ValidateAsync(It.IsAny<GostreamValidateRequest>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync((GostreamValidateRequest req, CancellationToken _) => new GostreamValidateResult
+                {
+                    Status = "transient",
+                    Reason = "validation_cancelled",
+                    ValidationSessionId = req.ValidationSessionId,
+                });
+        });
+        cfg.SourceValidationTransientRetryMinutes = 7;
+
+        var before = DateTimeOffset.UtcNow;
+        var outcome = await sut.MaterialiseAsync(90, "movie", null, null, MaterialiseTrigger.Manual, CancellationToken.None);
+
+        Assert.Equal(MaterialisationStatus.Error, outcome.Status);
+        Assert.Contains("transient validation failure", outcome.Error, StringComparison.OrdinalIgnoreCase);
+        var marker = await db.IsMarkedUnavailableAsync(
+            new UnavailableKey(TmdbId: 90, ImdbId: "tt0000042", Type: "movie", Season: null, Episode: null),
+            CancellationToken.None);
+        Assert.True(marker.HasValue);
+        Assert.InRange(marker.Value, before.AddMinutes(6), before.AddMinutes(9));
+        gostream.Verify(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
     // ---- type rejects ----
@@ -604,6 +775,14 @@ public class MaterialiserTests : IDisposable
         var gostream = new Mock<IGostreamClient>(MockBehavior.Loose);
         var fusePath = Path.Combine(_fuseMount, "legacy.mkv");
         File.WriteAllText(fusePath, "x");
+        gostream.Setup(g => g.ValidateAsync(It.IsAny<GostreamValidateRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((GostreamValidateRequest req, CancellationToken _) => new GostreamValidateResult
+            {
+                Status = "valid",
+                Hash = "h",
+                SelectedFile = new GostreamSelectedFile { Id = 0, Path = "legacy.mkv", Size = 1 },
+                ValidationSessionId = req.ValidationSessionId,
+            });
         gostream.Setup(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new GostreamAddResult { StubPath = "/stub", FusePath = fusePath, Hash = "h", Size = 1 });
         var refresh = new Mock<IChannelItemRefreshManager>(MockBehavior.Loose);

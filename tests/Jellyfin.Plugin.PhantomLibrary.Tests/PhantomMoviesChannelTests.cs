@@ -10,7 +10,10 @@ using Jellyfin.Plugin.PhantomLibrary.Clients.Models;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.Channels;
+using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Model.Dto;
+using MediaBrowser.Model.Entities;
+using MediaBrowser.Model.MediaInfo;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
@@ -58,6 +61,7 @@ public class PhantomMoviesChannelTests : IDisposable
 
     public void Dispose()
     {
+        GostreamFilesystemEnumerator.ResetForTests();
         _db.Dispose();
         SqliteConnection.ClearAllPools();
         try { if (File.Exists(_dbPath)) File.Delete(_dbPath); } catch { }
@@ -74,13 +78,13 @@ public class PhantomMoviesChannelTests : IDisposable
         Assert.True(Guid.TryParse(src.Id, out _));
     }
 
-    private async Task SeedMetaAsync(int tmdb, string title)
+    private async Task SeedMetaAsync(int tmdb, string title, int? runtimeMinutes = 95)
     {
         await _db.UpsertTmdbMetadataAsync(
             new TmdbMetadataRow(tmdb, "movie", title, 2020, "Overview " + tmdb,
                 "https://image.tmdb.org/t/p/w500/p.jpg",
                 "https://image.tmdb.org/t/p/w500/b.jpg",
-                new[] { "Drama" }, null, 7.5, title, DateTimeOffset.UtcNow),
+                new[] { "Drama" }, null, 7.5, title, DateTimeOffset.UtcNow, runtimeMinutes),
             CancellationToken.None);
     }
 
@@ -120,6 +124,7 @@ public class PhantomMoviesChannelTests : IDisposable
         var item = result.Items[0];
         Assert.Equal("movie_101", item.Id);
         Assert.Equal("Discovery Movie", item.Name);
+        Assert.Equal(TimeSpan.FromMinutes(95).Ticks, item.RunTimeTicks);
         Assert.Contains("phantom", item.Tags);
         var src = Assert.Single(item.MediaSources);
         AssertOpeningSource(src, "movie_101");
@@ -139,9 +144,41 @@ public class PhantomMoviesChannelTests : IDisposable
         var item = result.Items[0];
         Assert.Equal("movie_202", item.Id);
         Assert.DoesNotContain("phantom", item.Tags);
+        Assert.Equal(TimeSpan.FromMinutes(95).Ticks, item.RunTimeTicks);
         Assert.Equal(fusePath, item.MediaSources[0].Path);
         Assert.True(Guid.TryParse(item.MediaSources[0].Id, out _));
         Assert.Equal("202", item.ProviderIds["Tmdb"]);
+    }
+
+    [Fact]
+    public async Task GetChannelItems_RootBrowse_DoesNotProbeMaterialisedMovieFiles()
+    {
+        // Regression guard for 2026-06-25 root-list timeout: browse must
+        // not FFprobe every materialised file while building the channel
+        // root. Audio stream probing belongs to playback/media-info for the
+        // selected item only.
+        var expectedPaths = new List<string>();
+        for (var tmdb = 203; tmdb <= 205; tmdb++)
+        {
+            await SeedMetaAsync(tmdb, "Browse Movie " + tmdb);
+            var fusePath = Path.Combine(_moviesRoot, $"browse-{tmdb}.mkv");
+            File.WriteAllText(fusePath, string.Empty);
+            expectedPaths.Add(fusePath);
+            await _db.InsertMaterialisedStateAsync(tmdb, "movie", -1, -1, $"/stub/browse-{tmdb}.mkv", fusePath, CancellationToken.None);
+        }
+
+        var encoder = new Mock<IMediaEncoder>(MockBehavior.Strict);
+        var channel = new PhantomMoviesChannel(
+            _db, _enumerator, _splash, _state, _tmdb.Object, encoder.Object,
+            NullLogger<PhantomMoviesChannel>.Instance);
+
+        var result = await channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+
+        Assert.Equal(3, result.Items.Count);
+        Assert.Equal(
+            expectedPaths.OrderBy(p => p, StringComparer.Ordinal).ToArray(),
+            result.Items.Select(i => i.MediaSources[0].Path).OrderBy(p => p, StringComparer.Ordinal).ToArray());
+        encoder.Verify(e => e.GetMediaInfo(It.IsAny<MediaInfoRequest>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
     [Fact]
@@ -228,6 +265,7 @@ public class PhantomMoviesChannelTests : IDisposable
         Assert.Equal(path, item.MediaSources[0].Path);
         Assert.True(Guid.TryParse(item.MediaSources[0].Id, out _));
         Assert.Equal(2026, item.ProductionYear);
+        Assert.Equal(TimeSpan.FromMinutes(100).Ticks, item.RunTimeTicks);
     }
 
     [Fact]
@@ -319,6 +357,32 @@ public class PhantomMoviesChannelTests : IDisposable
         Assert.Contains("external", item.Tags);
         Assert.Equal(orphanPath, item.MediaSources[0].Path);
         Assert.True(Guid.TryParse(item.MediaSources[0].Id, out _));
+    }
+
+    [Fact]
+    public async Task GetChannelItems_GostreamPathTmdbPersisted_SecondColdChannel_DoesNotResearchTmdb()
+    {
+        var path = Path.Combine(_moviesRoot, "Apex_2026_2160p_DV_Atmos_7cf0a865.mkv");
+        File.WriteAllText(path, string.Empty);
+        _tmdb.Setup(t => t.SearchMoviesAsync("Apex", 2026, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { new TmdbSearchHit(1318447, "Apex", "Apex", "hit", null, null, "2026-01-01", 8.1, 10) });
+        _tmdb.Setup(t => t.GetMovieAsync(1318447, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new TmdbMovieDetails(1318447, "Apex", "Apex", "overview", "/poster.jpg", null,
+                "2026-01-01", 8.1, 10, 100, new[] { "Action" }, "Released", null, "tt1318447", null, null));
+
+        var first = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        Assert.Equal("movie_1318447", Assert.Single(first.Items).Id);
+        _tmdb.Verify(t => t.SearchMoviesAsync("Apex", 2026, It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Once);
+
+        // Cold restart: new channel + new in-memory dict; bust the enumerator's
+        // static walk cache. Resolution must come from the persisted path->tmdb
+        // cache, not a fresh TMDB search.
+        GostreamFilesystemEnumerator.ResetForTests();
+        var cold = new PhantomMoviesChannel(_db, _enumerator, _splash, _state, _tmdb.Object,
+            NullLogger<PhantomMoviesChannel>.Instance);
+        var second = await cold.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        Assert.Equal("movie_1318447", Assert.Single(second.Items).Id);
+        _tmdb.Verify(t => t.SearchMoviesAsync("Apex", 2026, It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]
@@ -435,6 +499,35 @@ public class PhantomMoviesChannelTests : IDisposable
     }
 
     [Fact]
+    public async Task GetChannelItemMediaInfo_Materialised_ProbesAudioStreams()
+    {
+        await SeedMetaAsync(51, "Fifty One");
+        var fusePath = Path.Combine(_moviesRoot, "51.mkv");
+        File.WriteAllText(fusePath, string.Empty);
+        await _db.InsertMaterialisedStateAsync(51, "movie", -1, -1, "/stub", fusePath, CancellationToken.None);
+        var encoder = new Mock<IMediaEncoder>(MockBehavior.Loose);
+        encoder.Setup(e => e.GetMediaInfo(It.IsAny<MediaInfoRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new MediaInfo
+            {
+                MediaStreams = new List<MediaStream>
+                {
+                    new() { Index = 0, Type = MediaStreamType.Video, IsDefault = true },
+                    new() { Index = 1, Type = MediaStreamType.Audio, Language = "pol", IsDefault = true },
+                    new() { Index = 2, Type = MediaStreamType.Audio, Language = "eng" },
+                },
+            });
+        var channel = new PhantomMoviesChannel(
+            _db, _enumerator, _splash, _state, _tmdb.Object, encoder.Object,
+            NullLogger<PhantomMoviesChannel>.Instance);
+
+        var got = await channel.GetChannelItemMediaInfo("movie_51", CancellationToken.None);
+
+        var src = Assert.Single(got);
+        Assert.Equal(new[] { 1, 2 }, src.MediaStreams.Where(s => s.Type == MediaStreamType.Audio).Select(s => s.Index));
+        Assert.Equal(1, src.DefaultAudioStreamIndex);
+    }
+
+    [Fact]
     public async Task GetChannelItemMediaInfo_MaterialisedWithMissingFile_ReturnsEmpty()
     {
         await SeedMetaAsync(50, "Fifty");
@@ -488,23 +581,16 @@ public class PhantomMoviesChannelTests : IDisposable
     }
 
     [Fact]
-    public async Task GetLatestMedia_ReturnsMaterialisedSortedByMaterialisedAtDesc()
+    public void Channel_DoesNotImplementISupportsLatestMedia()
     {
-        await SeedMetaAsync(1, "First");
-        var f1 = Path.Combine(_moviesRoot, "latest-1.mkv");
-        File.WriteAllText(f1, string.Empty);
-        await _db.InsertMaterialisedStateAsync(1, "movie", -1, -1, "/s1", f1, CancellationToken.None);
-        await Task.Delay(1100); // unix-seconds resolution
-        await SeedMetaAsync(2, "Second");
-        var f2 = Path.Combine(_moviesRoot, "latest-2.mkv");
-        File.WriteAllText(f2, string.Empty);
-        await _db.InsertMaterialisedStateAsync(2, "movie", -1, -1, "/s2", f2, CancellationToken.None);
-
-        var got = (await _channel.GetLatestMedia(new ChannelLatestMediaSearch(), CancellationToken.None)).ToList();
-
-        Assert.Equal(2, got.Count);
-        Assert.Equal("movie_2", got[0].Id); // most-recent first
-        Assert.Equal("movie_1", got[1].Id);
+        // Implementing ISupportsLatestMedia makes Jellyfin core's
+        // RefreshLatestChannelItems deep-enumerate the whole channel to
+        // populate the "Latest in Phantom Movies" Home row, hanging the Home
+        // screen on every client on production-shaped data. Keep it off until
+        // the O(latest) Option 2 fast-path exists.
+        Assert.DoesNotContain(
+            typeof(MediaBrowser.Controller.Channels.ISupportsLatestMedia),
+            _channel.GetType().GetInterfaces());
     }
 
     private static IApplicationPaths MockPaths(string root)

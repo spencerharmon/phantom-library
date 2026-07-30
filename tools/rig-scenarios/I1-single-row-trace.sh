@@ -9,8 +9,8 @@ set -u
 exec > /tmp/jf-rig/logs/I1-trace.log 2>&1
 BASE=http://localhost:18096
 TOK=testtoken00000000000000000000000
-JFDB=/tmp/jf-test/data/data/jellyfin.db
-PHDB=/tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db
+JFDB=/var/tmp/jf-test/data/data/jellyfin.db
+PHDB=/var/tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db
 SCAN_TASK=7738148ffcd07979c7ceb148e06b3aed
 
 # ID we expect (derived by plugin from "phantom_movie_99000001"). We don't
@@ -54,7 +54,7 @@ DELETE FROM BaseItemImageInfos WHERE ItemId IN (SELECT Id FROM BaseItems WHERE P
 DELETE FROM BaseItems WHERE Path LIKE '%phantom_tmdb%';
 SQL
 sqlite3 $PHDB "DELETE FROM phantom_items; DELETE FROM tmdb_cache;"
-find /tmp/jf-test/data/phantom-library -type l -delete 2>/dev/null
+find /var/tmp/jf-test/data/phantom-library -type l -delete 2>/dev/null
 
 snapshot "T0_initial_empty"
 

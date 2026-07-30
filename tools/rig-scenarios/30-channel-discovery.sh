@@ -11,7 +11,7 @@
 #
 # This scenario requires the patched Jellyfin server built from
 # scripts/jellyfin-patches/0001..0003 applied to release-10.11.z.
-# The shared rig at /tmp/jf-test/ ships unmodified Jellyfin and will
+# The shared rig at /var/tmp/jf-test/ ships unmodified Jellyfin and will
 # not exercise the per-item IChannelItemRefresh contract that the
 # channel arch depends on.
 #
@@ -40,7 +40,7 @@ exec > /tmp/jf-rig/logs/scenario-channel-discovery.log 2>&1
 
 BASE=${BASE:-http://localhost:18096}
 TOK=${TOK:-testtoken00000000000000000000000}
-PHDB=${PHDB:-/tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db}
+PHDB=${PHDB:-/var/tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db}
 DISCOVERY_TASK_ID=PhantomLibrary.DiscoveryRefresh
 
 echo "=== Scenario: channel-discovery (Stage 3.4) ==="

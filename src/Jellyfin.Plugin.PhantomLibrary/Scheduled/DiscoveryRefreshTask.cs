@@ -147,7 +147,7 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
         try
         {
             var (movies, fromCacheM) = await _tmdb.TrendingMoviesAsync("week", language, cancellationToken).ConfigureAwait(false);
-            var write = await UpsertHitsAsync(movies, "movie", SourceTrending, cancellationToken).ConfigureAwait(false);
+            var write = await UpsertHitsAsync(movies, "movie", SourceTrending, language, cancellationToken).ConfigureAwait(false);
             PhantomMetrics.DiscoveryRows("movie", write.Seen, write.Inserted, write.AvailabilityInserted, write.SeriesExpansionInserted);
             totalSeen += write.Seen;
             totalInserted += write.Inserted;
@@ -169,7 +169,7 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
         try
         {
             var (series, fromCacheS) = await _tmdb.TrendingSeriesAsync("week", language, cancellationToken).ConfigureAwait(false);
-            var write = await UpsertHitsAsync(series, "series", SourceTrending, cancellationToken).ConfigureAwait(false);
+            var write = await UpsertHitsAsync(series, "series", SourceTrending, language, cancellationToken).ConfigureAwait(false);
             PhantomMetrics.DiscoveryRows("series", write.Seen, write.Inserted, write.AvailabilityInserted, write.SeriesExpansionInserted);
             totalSeen += write.Seen;
             totalInserted += write.Inserted;
@@ -197,6 +197,7 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
             counters: result => { totalSeen += result.Seen; totalInserted += result.Inserted; totalAvailabilityInserted += result.AvailabilityInserted; totalSeriesExpansionInserted += result.SeriesExpansionInserted; },
             pagesPerRun: discoverPagesPerRun,
             pageDelay: discoverPageDelay,
+            language: language,
             cancellationToken: cancellationToken).ConfigureAwait(false);
         progress.Report(37.5);
 
@@ -207,6 +208,7 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
             counters: result => { totalSeen += result.Seen; totalInserted += result.Inserted; totalAvailabilityInserted += result.AvailabilityInserted; totalSeriesExpansionInserted += result.SeriesExpansionInserted; },
             pagesPerRun: discoverPagesPerRun,
             pageDelay: discoverPageDelay,
+            language: language,
             cancellationToken: cancellationToken).ConfigureAwait(false);
         progress.Report(45);
 
@@ -241,6 +243,7 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
         Action<CatalogueHitWriteResult> counters,
         int pagesPerRun,
         TimeSpan pageDelay,
+        string? language,
         CancellationToken cancellationToken)
     {
         if (maxItems <= 0)
@@ -306,7 +309,7 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
 
             var remaining = Math.Max(0, maxItems - processed);
             var pageHits = hits.Skip(offset).Take(remaining).ToList();
-            var write = await UpsertHitsAsync(pageHits, kind, SourceDiscover, cancellationToken).ConfigureAwait(false);
+            var write = await UpsertHitsAsync(pageHits, kind, SourceDiscover, language, cancellationToken).ConfigureAwait(false);
             PhantomMetrics.DiscoveryRows(kind, write.Seen, write.Inserted, write.AvailabilityInserted, write.SeriesExpansionInserted);
             counters(write);
             inserted += write.Inserted;
@@ -365,12 +368,12 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
         await _db.SetMetaAsync(offsetKey, offset.ToString(CultureInfo.InvariantCulture), ct).ConfigureAwait(false);
     }
 
-    private async Task<CatalogueHitWriteResult> UpsertHitsAsync(IReadOnlyList<TmdbSearchHit> hits, string type, int sourceMask, CancellationToken ct)
+    private async Task<CatalogueHitWriteResult> UpsertHitsAsync(IReadOnlyList<TmdbSearchHit> hits, string type, int sourceMask, string? language, CancellationToken ct)
     {
         var rows = new List<TmdbMetadataRow>(hits.Count);
         foreach (var hit in hits)
         {
-            var row = TmdbHitMapper.MapSearchHitToMetadata(hit, type);
+            var row = await BuildDiscoveryMetadataAsync(hit, type, language, ct).ConfigureAwait(false);
             if (string.IsNullOrWhiteSpace(row.Title))
             {
                 _logger.LogDebug("Skipping discovery hit {Type}:{Tmdb} because TMDB returned no title", type, hit.Id);
@@ -383,6 +386,76 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
         return await _db.UpsertCatalogueHitsAsync(rows, sourceMask, DateTimeOffset.UtcNow, ct).ConfigureAwait(false);
     }
 
+    private async Task<TmdbMetadataRow> BuildDiscoveryMetadataAsync(TmdbSearchHit hit, string type, string? language, CancellationToken ct)
+    {
+        if (type != "movie")
+        {
+            return MapSearchHitToMetadata(hit, type);
+        }
+
+        var existing = await _db.GetTmdbMetadataAsync(hit.Id, "movie", ct).ConfigureAwait(false);
+        if (existing?.RuntimeMinutes is { } existingRuntime && existingRuntime > 0)
+        {
+            return existing;
+        }
+
+        try
+        {
+            var details = await _tmdbClient.GetMovieAsync(hit.Id, language, ct).ConfigureAwait(false);
+            if (details is not null)
+            {
+                return MapMovieDetailsToMetadata(details);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Movie detail warm failed for tmdb={Tmdb}; falling back to discovery hit metadata without runtime", hit.Id);
+        }
+
+        return MapSearchHitToMetadata(hit, type);
+    }
+
+    private static TmdbMetadataRow MapSearchHitToMetadata(TmdbSearchHit hit, string type)
+    {
+        var title = !string.IsNullOrWhiteSpace(hit.Title) ? hit.Title! : (hit.OriginalTitle ?? string.Empty);
+        return new TmdbMetadataRow(
+            TmdbId: hit.Id,
+            Type: type,
+            Title: title,
+            Year: TmdbHitMapper.ParseYear(hit.ReleaseDate),
+            Overview: hit.Overview,
+            PosterUrl: TmdbHitMapper.BuildImageUrl(hit.PosterPath),
+            BackdropUrl: TmdbHitMapper.BuildImageUrl(hit.BackdropPath),
+            Genres: null,
+            OfficialRating: null,
+            CommunityRating: hit.VoteAverage,
+            OriginalTitle: hit.OriginalTitle,
+            FetchedAt: DateTimeOffset.UtcNow);
+    }
+
+    private static TmdbMetadataRow MapMovieDetailsToMetadata(TmdbMovieDetails details)
+    {
+        return new TmdbMetadataRow(
+            TmdbId: details.Id,
+            Type: "movie",
+            Title: !string.IsNullOrWhiteSpace(details.Title) ? details.Title!
+                   : (details.OriginalTitle ?? string.Empty),
+            Year: TmdbHitMapper.ParseYear(details.ReleaseDate),
+            Overview: details.Overview,
+            PosterUrl: TmdbHitMapper.BuildImageUrl(details.PosterPath),
+            BackdropUrl: TmdbHitMapper.BuildImageUrl(details.BackdropPath),
+            Genres: details.Genres is { Length: > 0 } ? details.Genres : null,
+            OfficialRating: null, // TMDB /movie/{id} does not expose certifications without /release_dates.
+            CommunityRating: details.VoteAverage,
+            OriginalTitle: details.OriginalTitle,
+            FetchedAt: DateTimeOffset.UtcNow,
+            RuntimeMinutes: details.Runtime > 0 ? details.Runtime : null);
+    }
+
     private async Task WarmMetadataAsync(int tmdb, string type, string? language, CancellationToken ct)
     {
         if (type == "movie")
@@ -393,20 +466,7 @@ public sealed class DiscoveryRefreshTask : IScheduledTask
                 return;
             }
 
-            var row = new TmdbMetadataRow(
-                TmdbId: details.Id,
-                Type: "movie",
-                Title: !string.IsNullOrWhiteSpace(details.Title) ? details.Title!
-                       : (details.OriginalTitle ?? string.Empty),
-                Year: TmdbHitMapper.ParseYear(details.ReleaseDate),
-                Overview: details.Overview,
-                PosterUrl: TmdbHitMapper.BuildImageUrl(details.PosterPath),
-                BackdropUrl: TmdbHitMapper.BuildImageUrl(details.BackdropPath),
-                Genres: details.Genres is { Length: > 0 } ? details.Genres : null,
-                OfficialRating: null, // TMDB /movie/{id} does not expose certifications without /release_dates.
-                CommunityRating: details.VoteAverage,
-                OriginalTitle: details.OriginalTitle,
-                FetchedAt: DateTimeOffset.UtcNow);
+            var row = MapMovieDetailsToMetadata(details);
 
             if (string.IsNullOrWhiteSpace(row.Title))
             {

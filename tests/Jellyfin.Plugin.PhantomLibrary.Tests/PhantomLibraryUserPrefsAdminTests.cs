@@ -72,7 +72,8 @@ public class PhantomLibraryUserPrefsAdminTests : IDisposable
             userManager: users,
             db: db,
             sourceManager: null!,
-            recommendationIngestor: null!);
+            recommendationIngestor: null!,
+            libraryManager: null!);
 
     private static User MakeUser(string name)
         => new(name, "auth-provider", "reset-provider") { Id = Guid.NewGuid() };

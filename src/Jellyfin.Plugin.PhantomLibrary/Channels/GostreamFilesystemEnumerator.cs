@@ -48,6 +48,27 @@ public sealed class GostreamFilesystemEnumerator
     private readonly PhantomDb _db;
     private readonly ILogger<GostreamFilesystemEnumerator> _logger;
 
+    private static readonly TimeSpan EnumerationTtl = TimeSpan.FromSeconds(30);
+    private static readonly SemaphoreSlim MoviesGate = new(1, 1);
+    private static readonly SemaphoreSlim SeriesGate = new(1, 1);
+    private static IReadOnlyList<GostreamFileEntry>? _moviesCache;
+    private static string? _moviesCacheVersion;
+    private static DateTimeOffset _moviesCacheAt = DateTimeOffset.MinValue;
+    private static IReadOnlyList<GostreamSeriesEntry>? _seriesCache;
+    private static string? _seriesCacheVersion;
+    private static DateTimeOffset _seriesCacheAt = DateTimeOffset.MinValue;
+
+    /// <summary>Test hook: drop cached enumeration results for a deterministic cold walk.</summary>
+    internal static void ResetForTests()
+    {
+        _moviesCache = null;
+        _moviesCacheVersion = null;
+        _moviesCacheAt = DateTimeOffset.MinValue;
+        _seriesCache = null;
+        _seriesCacheVersion = null;
+        _seriesCacheAt = DateTimeOffset.MinValue;
+    }
+
     public GostreamFilesystemEnumerator(PhantomDb db, ILogger<GostreamFilesystemEnumerator> logger)
     {
         _db = db ?? throw new ArgumentNullException(nameof(db));
@@ -120,6 +141,39 @@ public sealed class GostreamFilesystemEnumerator
         CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(knownTmdbs);
+        var version = MoviesVersion();
+        var cached = _moviesCache;
+        if (cached is not null && _moviesCacheVersion == version && DateTimeOffset.UtcNow - _moviesCacheAt < EnumerationTtl)
+        {
+            return cached;
+        }
+
+        await MoviesGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            cached = _moviesCache;
+            if (cached is not null && _moviesCacheVersion == version && DateTimeOffset.UtcNow - _moviesCacheAt < EnumerationTtl)
+            {
+                return cached;
+            }
+
+            var fresh = await WalkOrphanMoviesAsync(knownTmdbs, ct).ConfigureAwait(false);
+            _moviesCache = fresh;
+            _moviesCacheVersion = version;
+            _moviesCacheAt = DateTimeOffset.UtcNow;
+            return fresh;
+        }
+        finally
+        {
+            MoviesGate.Release();
+        }
+    }
+
+    private async Task<IReadOnlyList<GostreamFileEntry>> WalkOrphanMoviesAsync(
+        IReadOnlySet<int> knownTmdbs,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(knownTmdbs);
         var root = MoviesRoot;
         if (!Directory.Exists(root))
         {
@@ -178,6 +232,36 @@ public sealed class GostreamFilesystemEnumerator
     /// extends this to consult materialised_state for series-id resolution.
     /// </summary>
     public async Task<IReadOnlyList<GostreamSeriesEntry>> EnumerateSeriesAsync(CancellationToken ct)
+    {
+        var version = ShowsVersion();
+        var cached = _seriesCache;
+        if (cached is not null && _seriesCacheVersion == version && DateTimeOffset.UtcNow - _seriesCacheAt < EnumerationTtl)
+        {
+            return cached;
+        }
+
+        await SeriesGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            cached = _seriesCache;
+            if (cached is not null && _seriesCacheVersion == version && DateTimeOffset.UtcNow - _seriesCacheAt < EnumerationTtl)
+            {
+                return cached;
+            }
+
+            var fresh = await WalkSeriesAsync(ct).ConfigureAwait(false);
+            _seriesCache = fresh;
+            _seriesCacheVersion = version;
+            _seriesCacheAt = DateTimeOffset.UtcNow;
+            return fresh;
+        }
+        finally
+        {
+            SeriesGate.Release();
+        }
+    }
+
+    private async Task<IReadOnlyList<GostreamSeriesEntry>> WalkSeriesAsync(CancellationToken ct)
     {
         var root = ShowsRoot;
         if (!Directory.Exists(root))

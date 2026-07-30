@@ -24,8 +24,10 @@
 
     var TAG = '[PhantomLibrary]';
     var MATERIALISE_LABEL = 'Materialise (Phantom Library)';
+    var RESET_LABEL = 'Reset Phantom';
     var REJECT_LABEL = 'Reject current source (Phantom Library)';
     var MATERIALISE_DATA_ID = 'phantom-materialise';
+    var RESET_DATA_ID = 'phantom-reset';
     var REJECT_DATA_ID = 'phantom-reject-current-source';
     var HIDE_LABEL = 'Hide from my library (Phantom Library)';
     var UNHIDE_LABEL = 'Unhide from my library (Phantom Library)';
@@ -34,6 +36,16 @@
     var SECTION_ID = 'phantom-source-section';
     var VIS_SECTION_ID = 'phantom-visibility-section';
     var STYLE_ID = 'phantom-source-styles';
+    var cachedChannelItems = Object.create(null);
+    var detailPoll = {
+        timer: null,
+        itemId: null,
+        externalId: null,
+        deadline: 0,
+        busy: false,
+        lastStatus: null,
+        reloadTriggered: false
+    };
 
     function log() {
         // Quiet by default; uncomment for debugging.
@@ -62,6 +74,68 @@
             return window.connectionManager.currentApiClient();
         }
         return null;
+    }
+
+    function normaliseItemId(itemId) {
+        return typeof itemId === 'string' ? itemId.replace(/-/g, '').toLowerCase() : '';
+    }
+
+    function cacheChannelItem(item) {
+        if (!item || !item.Id || !item.ChannelId) { return; }
+        cachedChannelItems[normaliseItemId(item.Id)] = item;
+        var mediaSources = item.MediaSources || item.mediaSources || [];
+        for (var i = 0; i < mediaSources.length; i++) {
+            var sourceId = mediaSources[i] && (mediaSources[i].Id || mediaSources[i].id);
+            if (sourceId) {
+                cachedChannelItems[normaliseItemId(sourceId)] = item;
+            }
+        }
+    }
+
+    function cacheChannelItemsFromResponse(response) {
+        if (!response) { return; }
+        if (Array.isArray(response)) {
+            response.forEach(cacheChannelItemsFromResponse);
+            return;
+        }
+        if (Array.isArray(response.Items)) {
+            response.Items.forEach(cacheChannelItemsFromResponse);
+        }
+        cacheChannelItem(response);
+    }
+
+    function cachedChannelItem(itemId) {
+        return cachedChannelItems[normaliseItemId(itemId)] || null;
+    }
+
+    function patchApiClientForChannelItems() {
+        var api = getApiClient();
+        if (!api || api.__phantomChannelItemPatch === '1') { return; }
+        api.__phantomChannelItemPatch = '1';
+
+        if (typeof api.ajax === 'function') {
+            var originalAjax = api.ajax;
+            api.ajax = function () {
+                return originalAjax.apply(this, arguments).then(function (result) {
+                    cacheChannelItemsFromResponse(result);
+                    return result;
+                });
+            };
+        }
+
+        if (typeof api.getItem === 'function') {
+            var originalGetItem = api.getItem;
+            api.getItem = function (userId, itemId) {
+                var cached = cachedChannelItem(itemId);
+                if (cached) {
+                    return Promise.resolve(cached);
+                }
+                return originalGetItem.apply(this, arguments).then(function (item) {
+                    cacheChannelItem(item);
+                    return item;
+                });
+            };
+        }
     }
 
     function getCurrentItem() {
@@ -96,11 +170,17 @@
 
     function getPlayablePhantomItem() {
         return getCurrentItem().then(function (item) {
-            if (!item || !item.ExternalId) { return null; }
-            var parsed = parsePhantomExternalId(item.ExternalId);
-            if (!parsed) { return null; }
+            if (!item) { return null; }
             if (item.Type && item.Type !== 'Movie' && item.Type !== 'Episode') { return null; }
-            return { item: item, externalId: item.ExternalId, parsed: parsed };
+            var parsed = parsePhantomExternalId(item.ExternalId);
+            if (parsed) {
+                return { item: item, externalId: item.ExternalId, parsed: parsed };
+            }
+
+            return resolveExternalId(currentItemId()).then(function (externalId) {
+                parsed = parsePhantomExternalId(externalId);
+                return parsed ? { item: item, externalId: externalId, parsed: parsed } : null;
+            });
         });
     }
 
@@ -197,8 +277,69 @@
         return api.ajax(options);
     }
 
-    function fetchSources(externalId) {
-        var url = apiUrl('Plugins/PhantomLibrary/Items/' + encodeURIComponent(externalId) + '/Sources');
+    function resolveExternalId(itemId) {
+        if (!itemId) { return Promise.resolve(null); }
+        var url = apiUrl('Plugins/PhantomLibrary/Items/ResolveExternalId/' + encodeURIComponent(itemId));
+        if (!url) { return Promise.resolve(null); }
+        return ajaxJson({
+            type: 'GET',
+            url: url,
+            dataType: 'json'
+        }).then(function (result) {
+            return (result && (result.ExternalId || result.externalId)) || null;
+        }, function (err) {
+            warn('external id resolve failed', err);
+            return null;
+        });
+    }
+
+    function currentUserQuery() {
+        var api = getApiClient();
+        var userId = api && typeof api.getCurrentUserId === 'function' ? api.getCurrentUserId() : null;
+        return userId ? '?userId=' + encodeURIComponent(userId) : '';
+    }
+
+    function fetchItemActions(itemId) {
+        var url = apiUrl('Items/' + encodeURIComponent(itemId) + '/Actions' + currentUserQuery());
+        if (!url) { return Promise.resolve([]); }
+        return ajaxJson({
+            type: 'GET',
+            url: url,
+            dataType: 'json'
+        }).then(function (result) {
+            return Array.isArray(result) ? result : [];
+        }, function (err) {
+            warn('item actions lookup failed', err);
+            return [];
+        });
+    }
+
+    function fireItemAction(itemId, actionId) {
+        var url = apiUrl('Items/' + encodeURIComponent(itemId) + '/Actions/' + encodeURIComponent(actionId) + currentUserQuery());
+        if (!url) {
+            alert('Phantom Library: ApiClient not found. Reload page and try again.');
+            return Promise.reject(new Error('ApiClient not found'));
+        }
+        return ajaxJson({
+            type: 'POST',
+            url: url,
+            dataType: 'json',
+            contentType: 'application/json',
+            data: JSON.stringify({})
+        }).then(function (result) {
+            reportOutcome(actionId, result);
+            return result;
+        }, function (err) {
+            warn('item action failed', actionId, err);
+            alert('Phantom Library: action failed\n' + extractErrorMessage(err));
+            throw err;
+        });
+    }
+
+    function fetchSources(externalId, refresh) {
+        var path = 'Plugins/PhantomLibrary/Items/' + encodeURIComponent(externalId) + '/Sources';
+        if (refresh) { path += '?refresh=true'; }
+        var url = apiUrl(path);
         if (!url) { return Promise.resolve(null); }
         return ajaxJson({
             type: 'GET',
@@ -278,6 +419,27 @@
         }, function (err) {
             warn('materialise candidate failed', err);
             alert('Phantom Library: materialise selected source failed\n' + extractErrorMessage(err));
+            throw err;
+        });
+    }
+
+    function fireReset(externalId) {
+        var url = apiUrl('Plugins/PhantomLibrary/Items/' + encodeURIComponent(externalId) + '/Sources/Reset');
+        if (!url) {
+            alert('Phantom Library: ApiClient not found. Reload page and try again.');
+            return Promise.reject(new Error('ApiClient not found'));
+        }
+        return ajaxJson({
+            type: 'POST',
+            url: url,
+            dataType: 'json',
+            contentType: 'application/json'
+        }).then(function (result) {
+            reportOutcome('reset phantom', result);
+            return result;
+        }, function (err) {
+            warn('reset phantom failed', err);
+            alert('Phantom Library: reset phantom failed\n' + extractErrorMessage(err));
             throw err;
         });
     }
@@ -383,13 +545,30 @@
 
     function reportOutcome(action, result) {
         log(action, result);
-        var status = (result && (result.Status || result.status)) || 'Unknown';
+        var status = (result && (result.Status || result.status || result.Code || result.code)) || 'Unknown';
         var fuse = (result && (result.FusePath || result.fusePath)) || '';
-        var err = (result && (result.Error || result.error)) || '';
+        var err = (result && (result.Error || result.error || result.Message || result.message)) || '';
         var msg = 'Phantom Library: ' + action + ' — ' + status;
         if (err) { msg += '\n' + err; }
         if (fuse) { msg += '\n' + fuse; }
         alert(msg);
+    }
+
+    function shouldRefreshItem(result) {
+        if (!result) { return false; }
+        if (result.RefreshItem !== undefined) { return !!result.RefreshItem; }
+        if (result.refreshItem !== undefined) { return !!result.refreshItem; }
+        if (result.RefreshItemAfterInvoke !== undefined) { return !!result.RefreshItemAfterInvoke; }
+        if (result.refreshItemAfterInvoke !== undefined) { return !!result.refreshItemAfterInvoke; }
+        return false;
+    }
+
+    function refreshClientAfterAction(result) {
+        return refreshSourceSection().then(function () {
+            if (shouldRefreshItem(result)) {
+                startDetailPollingForCurrent('item-action');
+            }
+        });
     }
 
     function ensureStyles() {
@@ -459,6 +638,14 @@
         return !!(state && (state.CanRejectCurrent || state.canRejectCurrent || isMaterialisedState(state)));
     }
 
+    function canResetState(state) {
+        if (!state) { return false; }
+        if (state.CanResetCurrent !== undefined) { return !!state.CanResetCurrent; }
+        if (state.canResetCurrent !== undefined) { return !!state.canResetCurrent; }
+        var status = state.Status || state.status || '';
+        return isMaterialisedState(state) || status === 'materialised' || status === 'unavailable';
+    }
+
     function canMaterialiseState(state) {
         if (!state) { return false; }
         if (state.CanMaterialiseSelected !== undefined) { return !!state.CanMaterialiseSelected; }
@@ -471,6 +658,18 @@
     function candidateList(state) {
         var list = state && (state.Candidates || state.candidates);
         return Array.isArray(list) ? list : [];
+    }
+
+    function candidateRejected(candidate) {
+        return !!(candidate && (candidate.IsRejected || candidate.isRejected));
+    }
+
+    function selectableCandidates(candidates) {
+        return candidates.filter(function (candidate) { return !candidateRejected(candidate); });
+    }
+
+    function candidateFailureText(candidate) {
+        return (candidate && (candidate.FailureReason || candidate.failureReason || candidate.ValidationReason || candidate.validationReason)) || '';
     }
 
     function renderSourceSection(ctx, state) {
@@ -501,6 +700,7 @@
         section.appendChild(summary);
 
         var candidates = candidateList(state);
+        var selectable = selectableCandidates(candidates);
         var row = document.createElement('div');
         row.className = 'phantom-source-row';
 
@@ -512,17 +712,23 @@
         var select = document.createElement('select');
         select.id = 'phantom-source-candidates';
         select.className = 'phantom-source-select';
-        select.disabled = candidates.length === 0;
+        select.disabled = selectable.length === 0;
         if (candidates.length === 0) {
             var empty = document.createElement('option');
             empty.value = '';
             empty.textContent = 'No alternate candidates available';
             select.appendChild(empty);
         } else {
+            var firstSelectableSeen = false;
             candidates.forEach(function (candidate) {
                 var option = document.createElement('option');
                 option.value = candidateId(candidate);
-                option.textContent = candidateSummary(candidate);
+                option.textContent = candidateSummary(candidate) + (candidateRejected(candidate) ? ' — unavailable: ' + (candidateFailureText(candidate) || 'validation failed') : '');
+                option.disabled = candidateRejected(candidate);
+                if (!option.disabled && !firstSelectableSeen) {
+                    option.selected = true;
+                    firstSelectableSeen = true;
+                }
                 select.appendChild(option);
             });
         }
@@ -536,17 +742,55 @@
         materialise.type = 'button';
         materialise.className = 'raised button-submit phantom-source-button';
         materialise.textContent = 'Materialise selected source';
-        materialise.disabled = candidates.length === 0;
+        materialise.disabled = selectable.length === 0;
         materialise.addEventListener('click', function () {
             if (!select.value) { return; }
             var selected = candidates.filter(function (candidate) { return candidateId(candidate) === select.value; })[0];
             if (!selected) { return; }
+            if (candidateRejected(selected)) {
+                alert('Phantom Library: selected source is unavailable\n' + (candidateFailureText(selected) || 'validation failed'));
+                return;
+            }
             materialise.disabled = true;
-            fireMaterialiseCandidate(ctx.externalId, selected).then(refreshSourceSection, function () {
+            fireMaterialiseCandidate(ctx.externalId, selected).then(function () {
+                startDetailPolling(ctx, 'materialise-candidate');
+                return refreshSourceSection();
+            }, function () {
                 materialise.disabled = false;
             });
         });
         actions.appendChild(materialise);
+
+        var refresh = document.createElement('button');
+        refresh.type = 'button';
+        refresh.className = 'raised phantom-source-button';
+        refresh.textContent = 'Refresh sources';
+        refresh.addEventListener('click', function () {
+            refresh.disabled = true;
+            refreshSourceSection(true).then(function () {
+                refresh.disabled = false;
+            }, function () {
+                refresh.disabled = false;
+            });
+        });
+        actions.appendChild(refresh);
+
+        var reset = document.createElement('button');
+        reset.type = 'button';
+        reset.className = 'raised phantom-source-button';
+        reset.textContent = 'Reset Phantom';
+        reset.disabled = !canResetState(state);
+        reset.addEventListener('click', function () {
+            if (!window.confirm('Reset Phantom state for this item? This does not reject the current source.')) { return; }
+            reset.disabled = true;
+            fireReset(ctx.externalId).then(function () {
+                startDetailPolling(ctx, 'reset');
+                return refreshSourceSection();
+            }, function () {
+                reset.disabled = false;
+            });
+        });
+        actions.appendChild(reset);
 
         var reject = document.createElement('button');
         reject.type = 'button';
@@ -555,7 +799,10 @@
         reject.disabled = !canRejectState(state);
         reject.addEventListener('click', function () {
             reject.disabled = true;
-            fireRejectCurrent(ctx.externalId).then(refreshSourceSection, function () {
+            startDetailPolling(ctx, 'reject');
+            fireRejectCurrent(ctx.externalId).then(function () {
+                return refreshSourceSection();
+            }, function () {
                 reject.disabled = false;
             });
         });
@@ -592,20 +839,23 @@
         return !!(node.closest('#' + SECTION_ID) || node.closest('#' + VIS_SECTION_ID));
     }
 
-    function refreshSourceSection() {
+    function refreshSourceSection(refreshCandidates) {
         var seenItemId = currentItemId();
         if (!seenItemId) {
             removeSourceSection();
+            stopDetailPolling();
             return Promise.resolve();
         }
         return getPlayablePhantomItem().then(function (ctx) {
             if (!ctx || currentItemId() !== seenItemId) {
                 removeSourceSection();
+                stopDetailPolling();
                 return;
             }
-            return fetchSources(ctx.externalId).then(function (state) {
+            return fetchSources(ctx.externalId, refreshCandidates === true).then(function (state) {
                 if (currentItemId() !== seenItemId) { return; }
                 renderSourceSection(ctx, state);
+                observePhantomState(ctx, state, 'refresh');
             });
         });
     }
@@ -702,14 +952,106 @@
         });
     }
 
+    function sourceStatus(state) {
+        return (state && (state.Status || state.status)) || '';
+    }
+
+    function stopDetailPolling() {
+        if (detailPoll.timer) {
+            window.clearInterval(detailPoll.timer);
+        }
+        detailPoll.timer = null;
+        detailPoll.itemId = null;
+        detailPoll.externalId = null;
+        detailPoll.deadline = 0;
+        detailPoll.busy = false;
+        detailPoll.lastStatus = null;
+        detailPoll.reloadTriggered = false;
+    }
+
+    function startDetailPolling(ctx, reason) {
+        if (!ctx || !ctx.externalId) { return; }
+        var itemId = currentItemId();
+        if (!itemId) { return; }
+        if (detailPoll.itemId !== itemId || detailPoll.externalId !== ctx.externalId) {
+            stopDetailPolling();
+            detailPoll.itemId = itemId;
+            detailPoll.externalId = ctx.externalId;
+        }
+        detailPoll.deadline = Date.now() + 90000;
+        if (detailPoll.timer) { return; }
+        detailPoll.timer = window.setInterval(pollDetailState, 2000);
+        window.setTimeout(pollDetailState, reason === 'materialising' ? 500 : 1000);
+    }
+
+    function startDetailPollingForCurrent(reason) {
+        return getPlayablePhantomItem().then(function (ctx) {
+            if (ctx) { startDetailPolling(ctx, reason); }
+        });
+    }
+
+    function observePhantomState(ctx, state, reason) {
+        var status = sourceStatus(state);
+        if (!status) { return; }
+        if (status === 'materialising' || reason !== 'refresh') {
+            startDetailPolling(ctx, status || reason);
+        }
+        if (detailPoll.externalId === ctx.externalId) {
+            detailPoll.lastStatus = status;
+        }
+    }
+
+    function pollDetailState() {
+        if (!detailPoll.externalId || !detailPoll.itemId || currentItemId() !== detailPoll.itemId) {
+            stopDetailPolling();
+            return;
+        }
+        if (Date.now() > detailPoll.deadline) {
+            stopDetailPolling();
+            return;
+        }
+        if (detailPoll.busy) { return; }
+        detailPoll.busy = true;
+        var externalId = detailPoll.externalId;
+        fetchSources(externalId, false).then(function (state) {
+            if (!state || currentItemId() !== detailPoll.itemId || externalId !== detailPoll.externalId) { return; }
+            var ctx = { externalId: externalId };
+            renderSourceSection(ctx, state);
+            scanActionSheets();
+            refreshVisibleItemContainers();
+            var status = sourceStatus(state);
+            var prior = detailPoll.lastStatus;
+            detailPoll.lastStatus = status;
+            if (status === 'materialised' && prior && prior !== 'materialised' && !detailPoll.reloadTriggered) {
+                detailPoll.reloadTriggered = true;
+                window.setTimeout(function () {
+                    if (currentItemId() === detailPoll.itemId) {
+                        window.location.reload();
+                    }
+                }, 600);
+            }
+            if (status && status !== 'materialising' && status !== 'unmaterialised' && detailPoll.reloadTriggered) {
+                stopDetailPolling();
+            }
+        }, function (err) {
+            warn('detail poll failed', err);
+        }).then(function () {
+            detailPoll.busy = false;
+        });
+    }
+
     function closeSheet(sheet) {
-        var close = sheet.querySelector('.actionSheetCloseButton');
+        var close = sheet.querySelector('.btnCloseActionSheet') || sheet.querySelector('.actionSheetCloseButton');
         if (close) {
             close.click();
             return;
         }
         var bd = document.querySelector('.dialogBackdropOpened');
         if (bd) { bd.click(); }
+    }
+
+    function isKebabAction(actionId) {
+        return actionId === 'phantom.reset' || actionId === 'phantom.rejectCurrent';
     }
 
     /* Watch for the kebab action-sheet opening and inject source entries.
@@ -721,7 +1063,7 @@
         if (!sheet || sheet.dataset.phantomInjected === '1') {
             return;
         }
-        var content = sheet.querySelector('.actionSheetContent') || sheet.querySelector('.actionSheetScroller') || sheet;
+        var content = sheet.querySelector('.actionSheetScroller') || sheet.querySelector('.actionSheetContent') || sheet;
         if (!content) {
             return;
         }
@@ -731,29 +1073,29 @@
             return;
         }
 
-        getPlayablePhantomItem().then(function (ctx) {
-            if (!ctx) {
+        fetchItemActions(itemId).then(function (actions) {
+            if (!actions.length) {
                 sheet.dataset.phantomInjected = '1';
                 return;
             }
-            return fetchSources(ctx.externalId).then(function (state) {
-                if (!state) {
-                    sheet.dataset.phantomInjected = '1';
-                    return;
-                }
-                if (isMaterialisedState(state) && canRejectState(state)) {
-                    injectButton(sheet, content, REJECT_LABEL, REJECT_DATA_ID, 'block', function () {
-                        closeSheet(sheet);
-                        fireRejectCurrent(ctx.externalId).then(refreshSourceSection, function () { /* alert already shown */ });
-                    });
-                } else if (canMaterialiseState(state)) {
-                    injectButton(sheet, content, MATERIALISE_LABEL, MATERIALISE_DATA_ID, 'cloud_download', function () {
-                        closeSheet(sheet);
-                        fireMaterialise(itemId).then(refreshSourceSection, function () { /* alert already shown */ });
-                    });
-                }
-                sheet.dataset.phantomInjected = '1';
+            actions.forEach(function (action) {
+                var actionId = action.Id || action.id;
+                var label = action.Name || action.name || actionId;
+                var icon = action.Icon || action.icon || 'extension';
+                var enabled = action.IsEnabled !== false && action.isEnabled !== false;
+                var confirmText = action.ConfirmationText || action.confirmationText;
+                if (!actionId || !enabled || !isKebabAction(actionId)) { return; }
+                var requiresConfirmation = action.RequiresConfirmation === true || action.requiresConfirmation === true;
+                injectButton(sheet, content, label, 'phantom-action-' + actionId.replace(/[^a-zA-Z0-9_-]/g, '-'), icon, function () {
+                    closeSheet(sheet);
+                    if ((confirmText || requiresConfirmation) && !window.confirm(confirmText || ('Run ' + label + '?'))) { return; }
+                    if (actionId === 'phantom.rejectCurrent' || actionId === 'phantom.materialise') {
+                        startDetailPollingForCurrent(actionId);
+                    }
+                    fireItemAction(itemId, actionId).then(refreshClientAfterAction, function () { /* alert already shown */ });
+                });
             });
+            sheet.dataset.phantomInjected = '1';
         });
     }
 
@@ -801,6 +1143,13 @@
         });
     }
 
+    function scanActionSheets() {
+        var sheets = document.querySelectorAll('.actionSheet');
+        for (var i = 0; i < sheets.length; i++) {
+            injectIntoSheet(sheets[i]);
+        }
+    }
+
     function injectButton(sheet, content, label, dataId, iconText, onClick) {
         if (content.querySelector('[data-id="' + dataId + '"]')) { return; }
 
@@ -843,10 +1192,13 @@
      * SPA swaps detail-page DOM fragments. */
     function start() {
         ensureStyles();
+        patchApiClientForChannelItems();
         refreshSourceSection();
         refreshVisibilitySection();
         prehydratePhantomSeasonChildren();
         window.addEventListener('hashchange', function () {
+            stopDetailPolling();
+            patchApiClientForChannelItems();
             window.setTimeout(refreshSourceSection, 50);
             window.setTimeout(refreshVisibilitySection, 50);
             window.setTimeout(prehydratePhantomSeasonChildren, 50);
@@ -884,6 +1236,7 @@
                 scheduled = true;
                 window.setTimeout(function () {
                     scheduled = false;
+                    scanActionSheets();
                     refreshSourceSection();
                     refreshVisibilitySection();
                     prehydratePhantomSeasonChildren();
@@ -891,6 +1244,7 @@
             }
         });
         observer.observe(document.body, { childList: true, subtree: true });
+        window.setInterval(scanActionSheets, 500);
         log('observer started');
     }
 

@@ -10,8 +10,11 @@ using Jellyfin.Plugin.PhantomLibrary.Clients.Models;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.Channels;
+using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Model.Channels;
 using MediaBrowser.Model.Dto;
+using MediaBrowser.Model.Entities;
+using MediaBrowser.Model.MediaInfo;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
@@ -52,6 +55,7 @@ public class PhantomShowsChannelTests : IDisposable
 
     public void Dispose()
     {
+        GostreamFilesystemEnumerator.ResetForTests();
         _db.Dispose();
         SqliteConnection.ClearAllPools();
         try { if (File.Exists(_dbPath)) File.Delete(_dbPath); } catch { }
@@ -374,6 +378,39 @@ public class PhantomShowsChannelTests : IDisposable
         Assert.Contains("phantom", e1.Tags);
         Assert.DoesNotContain("phantom", e2.Tags);
         Assert.Equal(fusePath, e2.MediaSources[0].Path);
+    }
+
+    [Fact]
+    public async Task GetChannelItems_SeasonFolder_DoesNotProbeMaterialisedEpisodeFilesDuringBrowse()
+    {
+        // Regression guard for 2026-06-25 root/list timeout: browse must
+        // not FFprobe every materialised episode while building channel
+        // lists. Audio stream probing belongs to playback/media-info for
+        // the selected item only.
+        await SeedSeriesMetaAsync(1399, "Game of Thrones");
+        _tmdb.Setup(t => t.GetSeasonAsync(1399, 1, null, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MakeSeasonDetails(1399, 1, 3));
+        var expectedPaths = new List<string>();
+        for (var episode = 1; episode <= 3; episode++)
+        {
+            var fusePath = Path.Combine(_splashHome, $"browse_s01e{episode:D2}.mkv");
+            await File.WriteAllTextAsync(fusePath, "x", CancellationToken.None);
+            expectedPaths.Add(fusePath);
+            await _db.InsertMaterialisedStateAsync(1399, "episode", 1, episode, $"/stub/e{episode}", fusePath, CancellationToken.None);
+        }
+
+        var encoder = new Mock<IMediaEncoder>(MockBehavior.Strict);
+        var channel = new PhantomShowsChannel(
+            _db, _tmdb.Object, _splash, _state, _enumerator, encoder.Object,
+            NullLogger<PhantomShowsChannel>.Instance);
+
+        var result = await channel.GetChannelItems(new InternalChannelItemQuery { FolderId = "season_1399_s01" }, CancellationToken.None);
+
+        Assert.Equal(3, result.Items.Count);
+        Assert.Equal(
+            expectedPaths.OrderBy(p => p, StringComparer.Ordinal).ToArray(),
+            result.Items.Select(i => i.MediaSources[0].Path).OrderBy(p => p, StringComparer.Ordinal).ToArray());
+        encoder.Verify(e => e.GetMediaInfo(It.IsAny<MediaInfoRequest>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
     [Fact]
@@ -705,6 +742,34 @@ public class PhantomShowsChannelTests : IDisposable
     }
 
     [Fact]
+    public async Task GetChannelItemMediaInfo_MaterialisedEpisode_ProbesAudioStreams()
+    {
+        var fusePath = Path.Combine(_splashHome, "media-info-audio.mkv");
+        await File.WriteAllTextAsync(fusePath, "x", CancellationToken.None);
+        await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 2, "/stub", fusePath, CancellationToken.None);
+        var encoder = new Mock<IMediaEncoder>(MockBehavior.Loose);
+        encoder.Setup(e => e.GetMediaInfo(It.IsAny<MediaInfoRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new MediaInfo
+            {
+                MediaStreams = new List<MediaStream>
+                {
+                    new() { Index = 0, Type = MediaStreamType.Video, IsDefault = true },
+                    new() { Index = 1, Type = MediaStreamType.Audio, Language = "pol", IsDefault = true },
+                    new() { Index = 2, Type = MediaStreamType.Audio, Language = "eng" },
+                },
+            });
+        var channel = new PhantomShowsChannel(
+            _db, _tmdb.Object, _splash, _state, _enumerator, encoder.Object,
+            NullLogger<PhantomShowsChannel>.Instance);
+
+        var got = await channel.GetChannelItemMediaInfo("episode_1399_s01e02", CancellationToken.None);
+
+        var src = Assert.Single(got);
+        Assert.Equal(new[] { 1, 2 }, src.MediaStreams.Where(s => s.Type == MediaStreamType.Audio).Select(s => s.Index));
+        Assert.Equal(1, src.DefaultAudioStreamIndex);
+    }
+
+    [Fact]
     public async Task GetChannelItemMediaInfo_MaterialisedEpisodeWithMissingFile_ReturnsEmpty()
     {
         await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 1, "/stub", Path.Combine(_splashHome, "missing-media-info.mkv"), CancellationToken.None);
@@ -736,31 +801,21 @@ public class PhantomShowsChannelTests : IDisposable
     }
 
     // ----------------------------------------------------------------
-    // GetLatestMedia
+    // Latest media suppression (Option 3, operator decision 2026-06-28)
     // ----------------------------------------------------------------
 
     [Fact]
-    public async Task GetLatestMedia_ReturnsMaterialisedEpisodesNewestFirst()
+    public void Channel_DoesNotImplementISupportsLatestMedia()
     {
-        await SeedSeriesMetaAsync(1399, "Game of Thrones");
-        await _db.UpsertTmdbEpisodeAsync(
-            new TmdbEpisodeRow(1399, 1, 1, "Pilot", null, null, null, null, DateTimeOffset.UtcNow),
-            CancellationToken.None);
-        var f1 = Path.Combine(_splashHome, "latest-1.mkv");
-        await File.WriteAllTextAsync(f1, "x", CancellationToken.None);
-        await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 1, "/s1", f1, CancellationToken.None);
-        await Task.Delay(1100);
-        await _db.UpsertTmdbEpisodeAsync(
-            new TmdbEpisodeRow(1399, 1, 2, "Second", null, null, null, null, DateTimeOffset.UtcNow),
-            CancellationToken.None);
-        var f2 = Path.Combine(_splashHome, "latest-2.mkv");
-        await File.WriteAllTextAsync(f2, "x", CancellationToken.None);
-        await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 2, "/s2", f2, CancellationToken.None);
-
-        var got = (await _channel.GetLatestMedia(new ChannelLatestMediaSearch(), CancellationToken.None)).ToList();
-        Assert.Equal(2, got.Count);
-        Assert.Equal("episode_1399_s01e02", got[0].Id);
-        Assert.Equal("episode_1399_s01e01", got[1].Id);
+        // Implementing ISupportsLatestMedia makes Jellyfin core's
+        // RefreshLatestChannelItems deep-enumerate the whole channel
+        // (series -> season -> build) on every Home load to populate the
+        // "Latest in Phantom Shows" row, hanging the Home screen on every
+        // client. The interface must stay off until the O(latest) Option 2
+        // fast-path exists.
+        Assert.DoesNotContain(
+            typeof(MediaBrowser.Controller.Channels.ISupportsLatestMedia),
+            _channel.GetType().GetInterfaces());
     }
 
     [Fact]
@@ -818,6 +873,35 @@ public class PhantomShowsChannelTests : IDisposable
         Assert.Equal("https://image.tmdb.org/t/p/w500/poster.jpg", series.ImageUrl);
         Assert.Equal("99056001", series.ProviderIds["Tmdb"]);
         Assert.Contains("external", series.Tags);
+    }
+
+    [Fact]
+    public async Task GostreamOnlyTvFiles_PathTmdbPersisted_SecondColdChannel_UsesCacheNotTitleSearch()
+    {
+        var seasonDir = Path.Combine(_enumerator.ShowsRootOverride!, "56_Days (2026)", "Season.01");
+        Directory.CreateDirectory(seasonDir);
+        await File.WriteAllTextAsync(Path.Combine(seasonDir, "56_Days_S01E01_72a275d4.mkv"), "x", CancellationToken.None);
+        await _db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(99056001, "series", "56 Days From TMDB", 2026, "ov",
+                "https://img/p.jpg", "https://img/b.jpg", new[] { "Drama" }, null, 8.1, "56 Days", DateTimeOffset.UtcNow),
+            CancellationToken.None);
+
+        var first = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        Assert.Single(first.Items, i => i.Id == "series_99056001");
+        Assert.Equal(99056001, await _db.GetGostreamPathTmdbAsync(Path.Combine(_enumerator.ShowsRootOverride!, "56_Days (2026)"), "series", CancellationToken.None));
+
+        // Rename metadata so a title/year search would no longer match. Only the
+        // persisted path->tmdb cache + GetTmdbMetadataAsync(id) can still resolve.
+        await _db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(99056001, "series", "Renamed", null, "ov",
+                null, null, null, null, null, "Renamed", DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        GostreamFilesystemEnumerator.ResetForTests();
+        var cold = new PhantomShowsChannel(_db, _tmdb.Object, _splash, _state, _enumerator,
+            NullLogger<PhantomShowsChannel>.Instance, () => null);
+        var second = await cold.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var series = Assert.Single(second.Items, i => i.Id == "series_99056001");
+        Assert.Equal("Renamed", series.Name);
     }
 
     [Fact]
