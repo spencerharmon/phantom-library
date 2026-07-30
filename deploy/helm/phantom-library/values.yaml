@@ -62,7 +62,7 @@ images:
     digest: sha256:8fbd795c03f8f11d465e68e62fd39921fd810827993c83f6bdf5c478f3af6031
   jellyfin:
     repository: git.spencerharmon.com/zuul/jellyfin-phantom
-    digest: sha256:e182f6a5d46fab0b638b204aa41eaa354d259f8e1a36f43ab24013bf9914ef4e
+    digest: sha256:f26071fd81dc34e11dee0f9fb681e9e9abd6265f296aa6ec37657ec81f5effe3
   pullPolicy: IfNotPresent
 
 # Pull secret (kubernetes.io/dockerconfigjson) for the gitea OCI registry. Provisioned into the
