@@ -110,7 +110,9 @@ spec:
           emptyDir: {}
         - name: state
           persistentVolumeClaim:
-            claimName: gostream-state
+            # Per-color single-writer gostream STATE (STATE/gostream.db inode map + config.db BoltDB).
+            # Split from the old shared gostream-state PVC: exactly one gostream writer per embedded DB.
+            claimName: gostream-state-{{ $color }}
         - name: warmup
           persistentVolumeClaim:
             claimName: gostream-warmup

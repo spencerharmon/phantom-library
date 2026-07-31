@@ -1,26 +1,36 @@
 {{/*
-Shared gostream state + warmup PVCs (RWO, one node, co-resident across both colors).
-  gostream-state : GOSTREAM_ROOT_PATH — holds <root>/STATE/gostream.db (inode map, SACRED) and
-                   <root>/config.db (gostorm BoltDB: torrents + TorrentsSavePath + settings).
-  gostream-warmup: the warmup cache, mounted at gostorm's TorrentsSavePath (/usr/local/warmup).
-WARMUP-SIZING INVARIANT: the PVC capacity is DERIVED here as warmup.quotaGb + warmup.headroomGi, so it
-can never be smaller than the quota gostream enforces (quota = quotaGb * 1024^3). Both this size and the
-ConfigMap's disk_warmup_quota_gb come from .Values.warmup — the single source Helm gives us.
+Per-color gostream STATE PVCs + ONE shared warmup PVC (RWO, single node).
+  gostream-state-<color> : GOSTREAM_ROOT_PATH — holds <root>/STATE/gostream.db (inode map, SACRED)
+                   and <root>/config.db (gostorm BoltDB: torrents + TorrentsSavePath + settings). Both
+                   are SINGLE-WRITER embedded DBs (bbolt takes an exclusive file lock; SQLite is
+                   single-writer), so a SHARED state PVC means two gostream processes writing one
+                   file = corruption. Split per-color -> exactly one writer each. (Longer term these
+                   move to Postgres; per-color PVC is the correct fix until then.)
+  gostream-warmup: the infohash-addressed warmup cache at gostorm's TorrentsSavePath (/usr/local/warmup)
+                   — SHARED across colors ON PURPOSE. It is content-addressed (files keyed by the
+                   BitTorrent infohash), so both colors converge on identical filenames with no
+                   divergence; it is the external artifact both colors consume. Stays ONE PVC.
+WARMUP-SIZING INVARIANT: the warmup PVC capacity is DERIVED here as warmup.quotaGb + warmup.headroomGi,
+so it can never be smaller than the quota gostream enforces (quota = quotaGb * 1024^3). Both this size
+and the ConfigMap's disk_warmup_quota_gb come from .Values.warmup — the single source Helm gives us.
 */}}
+{{- range $color := $.Values.colorList }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: gostream-state
+  name: gostream-state-{{ $color }}
   labels:
-    {{- include "phantom-library.labels" . | nindent 4 }}
+    {{- include "phantom-library.labels" $ | nindent 4 }}
     app.kubernetes.io/component: state
+    color: {{ $color }}
 spec:
   accessModes: ["ReadWriteOnce"]
-  storageClassName: {{ .Values.persistence.storageClassName }}
+  storageClassName: {{ $.Values.persistence.storageClassName }}
   resources:
     requests:
-      storage: {{ .Values.persistence.state.size }}
+      storage: {{ $.Values.persistence.state.size }}
 ---
+{{- end }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
