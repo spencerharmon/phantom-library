@@ -8,17 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **P4 Stage A: `scripts/phantom-migrate-jellyfindb-to-mysql.sh`** — offline,
+- **P4 Stage A: `scripts/phantom-migrate-jellyfindb-to-postgres.sh`** — offline,
   operator-run migration of Jellyfin's authoritative library/user database off
-  the per-color SQLite `jellyfin.db` onto a shared MySQL/MariaDB served through
-  `jellyfin-plugin-mysql`, enabling N replicas to share one authoritative store.
-  Follows the P3 five-stage staging-validation methodology (clone → predicted
-  counts → staging validation on the inactive color → operator hand-validation →
-  prod write); dry-run by default, stage-gated, count-verified, idempotent,
-  backs up the prod target first. Regression-tested by
-  `scripts/tests/phantom-migrate-jellyfindb-to-mysql.test.sh`. See
+  the per-color SQLite `jellyfin.db` onto a shared **PostgreSQL** instance served
+  through the external [`Jellyfin.Pgsql`](https://github.com/JPVenson/Jellyfin.Pgsql)
+  provider, enabling N replicas to share one authoritative store. The same script
+  also moves phantom.db's own state to its own Postgres logical DB on the same
+  server (`--source phantom`), per the multi-writer audit. Follows the P3
+  five-stage staging-validation methodology (clone → predicted counts → staging
+  validation on the inactive color → operator hand-validation → prod write);
+  dry-run by default, stage-gated, count-verified, idempotent, additive
+  (expand/contract-compatible), backs up the prod target first. Regression-tested
+  by `scripts/tests/phantom-migrate-jellyfindb-to-postgres.test.sh`. See
   `docs/tasks/p4-mysql-migration-impl.md`. No operator action until the operator
-  chooses to run the migration.
+  chooses to run the migration. (Replaces the earlier MySQL-targeted variant,
+  now removed, after the 2026-07-31 ROI repointed Stage A to PostgreSQL.)
 
 ### Changed
 
