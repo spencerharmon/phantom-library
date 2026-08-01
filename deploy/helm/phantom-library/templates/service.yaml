@@ -1,8 +1,8 @@
 {{- if .Values.components.workload }}
 {{/*
-Single-environment Service. Fronts Jellyfin :8096 (the Ingress backend). When gostream.exposeUi, also
+Single-instance Service. Fronts Jellyfin :8096 (the Ingress backend). When gostream.exposeUi, also
 fronts the gostorm web UI :8090. Selector is instance+component-scoped so it never receives another
-release's traffic (blue/green) nor a Prowlarr Pod's.
+release's traffic nor a Prowlarr Pod's.
 */}}
 apiVersion: v1
 kind: Service
@@ -11,9 +11,6 @@ metadata:
   labels:
     {{- include "phantom-library.labels" . | nindent 4 }}
     app.kubernetes.io/component: jellyfin
-    {{- with (include "phantom-library.colorLabel" .) }}
-    color: {{ . }}
-    {{- end }}
 spec:
   type: ClusterIP
   selector:

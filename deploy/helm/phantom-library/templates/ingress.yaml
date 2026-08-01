@@ -1,9 +1,9 @@
 {{- if and .Values.components.workload .Values.ingress.enabled }}
 {{/*
-Single-environment Ingress.
-  Jellyfin (:8096):  .Values.hostname ALWAYS, plus any .Values.ingress.extraHosts (e.g. a shared apex
-                     placed on the ACTIVE color during a blue/green cutover — a bare CNAME does not
-                     rewrite the HTTP Host header, so a hostname that CNAMEs here must ALSO be a Host).
+Single-instance Ingress.
+  Jellyfin (:8096):  .Values.hostname ALWAYS, plus any .Values.ingress.extraHosts (a bare CNAME does
+                     not rewrite the HTTP Host header, so a hostname that CNAMEs here must ALSO be a
+                     Host). Exactly one instance may carry a given extra Host at a time.
   gostorm UI (:8090, when gostream.exposeUi): the gostorm host (default gostorm.<hostname>) plus any
                      .Values.ingress.extraGostormHosts.
 TLS: default OFF -> no tls: block, traefik's default TLSStore serves the site wildcard by SNI. When
@@ -21,9 +21,6 @@ metadata:
   name: {{ include "phantom-library.fullname" . }}
   labels:
     {{- include "phantom-library.labels" . | nindent 4 }}
-    {{- with (include "phantom-library.colorLabel" .) }}
-    color: {{ . }}
-    {{- end }}
   annotations:
     traefik.ingress.kubernetes.io/router.entrypoints: {{ .Values.ingress.entrypoint }}
 spec:

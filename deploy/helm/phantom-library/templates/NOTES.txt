@@ -1,9 +1,12 @@
 phantom-library deployed as release {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
 
 Components rendered by THIS release:
-  workload : {{ .Values.components.workload }}   (Deployment + Service + per-instance PVCs + Ingress{{ if and .Values.tls.enabled .Values.tls.issuerRef.name }} + Certificate{{ end }})
-  shared   : {{ .Values.components.shared }}   ({{ .Values.shared.warmupPvcName }} PVC + {{ .Values.shared.configMapName }} ConfigMap)
-  prowlarr : {{ .Values.components.prowlarr }}
+  workload        : {{ .Values.components.workload }}   (Deployment + Service + Ingress{{ if and .Values.tls.enabled .Values.tls.issuerRef.name }} + Certificate{{ end }})
+  jellyfinStorage : {{ .Values.components.jellyfinStorage }}   (jellyfin-var-lib{{ include "phantom-library.suffix" . }} + jellyfin-etc{{ include "phantom-library.suffix" . }} PVCs)
+  gostreamState   : {{ .Values.components.gostreamState }}   (gostream-state{{ include "phantom-library.suffix" . }} PVC)
+  warmupCache     : {{ .Values.components.warmupCache }}   ({{ .Values.warmup.pvcName }} PVC)
+  gostreamConfig  : {{ .Values.components.gostreamConfig }}   ({{ .Values.gostreamConfig.configMapName }} ConfigMap)
+  prowlarr        : {{ .Values.components.prowlarr }}   (prowlarr Deployment + Service + PVC)
 
 {{- if .Values.components.workload }}
 
@@ -19,6 +22,10 @@ URLs (served once external-dns + traefik reconcile):
   {{- end }}
   {{- end }}
 TLS: {{ if .Values.tls.enabled }}tls block emitted, secret {{ include "phantom-library.tlsSecret" . }}{{ if .Values.tls.issuerRef.name }} (cert-manager {{ .Values.tls.issuerRef.kind }} {{ .Values.tls.issuerRef.name }}){{ end }}{{ else }}none — traefik default TLSStore wildcard by SNI{{ end }}
+
+The workload mounts {{ .Values.warmup.pvcName }} (warmup) and {{ .Values.gostreamConfig.configMapName }}
+(tuning ConfigMap) BY NAME. If warmupCache / gostreamConfig are OFF in this release, another release
+in this namespace must render them under those exact names.
 {{- end }}
 
 PREREQUISITES in namespace {{ .Release.Namespace }} (NOT created by this chart — provisioned out of band):
@@ -26,9 +33,5 @@ PREREQUISITES in namespace {{ .Release.Namespace }} (NOT created by this chart �
   - config secret    {{ .Values.configSecretName }}  (Opaque, key config.secret.json)
 Without these the Pods stay ImagePullBackOff / fail to mount the gostream secret.
 
-Blue/green cutover is NOT this chart's concern — it lives in the consuming Flux/kustomize layer,
-which deploys two workload releases (blue/green) + one shared release and flips a CNAME between the
-color hosts. See infra-beehive INFRASTRUCTURE.md.
-
 Warmup sizing is single-source: warmup.quotaGb ({{ .Values.warmup.quotaGb }}) drives BOTH the ConfigMap
-disk_warmup_quota_gb and the {{ .Values.shared.warmupPvcName }} PVC size ({{ add (.Values.warmup.quotaGb | int) (.Values.warmup.headroomGi | int) }}Gi).
+disk_warmup_quota_gb and the {{ .Values.warmup.pvcName }} PVC size ({{ add (.Values.warmup.quotaGb | int) (.Values.warmup.headroomGi | int) }}Gi).

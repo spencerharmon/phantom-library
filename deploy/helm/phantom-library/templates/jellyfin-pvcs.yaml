@@ -1,8 +1,8 @@
-{{- if .Values.components.workload }}
+{{- if .Values.components.jellyfinStorage }}
 {{/*
 Per-instance Jellyfin persistence (var-lib = library DB/metadata/plugins; etc = network.xml +
-encoding config). Each workload instance owns its own so a bad rollout on one (e.g. the inactive
-blue/green color) can never touch the DB/config of the instance serving prod.
+encoding config). Each workload instance owns its own so a bad rollout on one instance can never
+touch the DB/config of another instance serving traffic.
 */}}
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -11,9 +11,6 @@ metadata:
   labels:
     {{- include "phantom-library.labels" . | nindent 4 }}
     app.kubernetes.io/component: jellyfin-var-lib
-    {{- with (include "phantom-library.colorLabel" .) }}
-    color: {{ . }}
-    {{- end }}
 spec:
   accessModes: ["ReadWriteOnce"]
   storageClassName: {{ .Values.persistence.storageClassName }}
@@ -28,9 +25,6 @@ metadata:
   labels:
     {{- include "phantom-library.labels" . | nindent 4 }}
     app.kubernetes.io/component: jellyfin-etc
-    {{- with (include "phantom-library.colorLabel" .) }}
-    color: {{ . }}
-    {{- end }}
 spec:
   accessModes: ["ReadWriteOnce"]
   storageClassName: {{ .Values.persistence.storageClassName }}

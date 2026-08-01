@@ -1,67 +1,61 @@
 # ============================================================================================
-# phantom-library Helm chart values — deploys exactly ONE environment (one gostream+Jellyfin Pod).
+# phantom-library Helm chart values — deploys ONE gostream+Jellyfin instance and/or its supporting
+# singletons. Every piece is an INDEPENDENT toggle under `components`, so one chart covers both the
+# simplest all-in-one deployment and any multi-release layout the consuming layer wants.
 #
 # SIMPLEST DEPLOYMENT (default): one release renders EVERYTHING — the workload, its per-instance
-# PVCs, the shared gostream warmup cache + tuning ConfigMap, Prowlarr, and an Ingress at `hostname`.
+# PVCs, the gostream warmup cache PVC + tuning ConfigMap, and Prowlarr, with an Ingress at `hostname`.
 # Set `hostname`, provide the two out-of-band secrets (imagePullSecret + configSecretName), done.
 #
-# BLUE/GREEN (operator layout, NOT the chart's concern): the consuming Flux/kustomize layer deploys
-# THREE releases of this chart into one namespace and flips a CNAME between them —
-#   * blue    workload only: nameSuffix=blue,  components.workload=true,  shared=false, prowlarr=false
-#   * green   workload only: nameSuffix=green, components.workload=true,  shared=false, prowlarr=false
-#   * shared  shared only:   nameSuffix="",    components.workload=false, shared=true,  prowlarr=true
-# The blue/green workload releases mount the SHARED warmup PVC + tuning ConfigMap by their fixed
-# names (see `shared.*` below). Cutover (which color the apex hostname points at) is owned entirely
-# by that outer layer — this chart has NO knowledge of colors, roles, or the cutover CNAME.
+# SPLIT DEPLOYMENTS: turn any component off in one release and on in another. The workload mounts the
+# warmup PVC (`warmup.pvcName`) and tuning ConfigMap (`gostreamConfig.configMapName`) BY NAME, so a
+# release that renders the workload without those singletons simply expects some other release in the
+# same namespace to have created them under those fixed names. This chart has NO knowledge of how the
+# consuming layer wires multiple releases together — that is entirely the consumer's concern.
 # ============================================================================================
 
 # Namespace the release deploys into (informational only; the flux HelmRelease sets
 # targetNamespace/createNamespace). Used for NOTES cross-references.
 namespace: phantom-library
 
-# Public hostname for THIS instance's Jellyfin. external-dns publishes it from the rendered Ingress
-# (standard ingress resource discovery — the chart emits no DNSEndpoint). For blue/green this is the
-# per-color host (e.g. blue.jellyfin.polyfam.studio); a shared apex host is added via
-# `ingress.extraHosts` on whichever color is currently active (managed by the outer flux layer).
+# Public hostname for this instance's Jellyfin. external-dns publishes it from the rendered Ingress
+# (standard ingress resource discovery — the chart emits no DNSEndpoint). Additional hostnames served
+# by this instance go in `ingress.extraHosts`.
 hostname: phantom-library.example.com
 
-# Resource suffix. Empty -> resources are `phantom-library`, `jellyfin-var-lib`, `gostream-state`,
-# etc. Set to e.g. "blue" -> `phantom-library-blue`, `jellyfin-var-lib-blue`, `gostream-state-blue`
-# so multiple workload releases coexist in one namespace without name collisions. The `color:` label
-# (used by the blue/green flip tooling) defaults to this value; override with `colorLabel`.
+# Resource-name suffix. Empty -> resources are `phantom-library`, `jellyfin-var-lib`, `gostream-state`,
+# etc. Set to e.g. "a" -> `phantom-library-a`, `jellyfin-var-lib-a`, `gostream-state-a` so multiple
+# workload releases coexist in one namespace without name collisions. The warmup PVC and tuning
+# ConfigMap are NOT suffixed (fixed names) so split releases can share them.
 nameSuffix: ""
-colorLabel: ""
 
-# Which parts of the stack THIS release renders. Defaults deploy a complete self-contained stack.
+# Which parts of the stack THIS release renders. Each is independent; defaults deploy a complete,
+# self-contained stack. Turn individual pieces off to split ownership across multiple releases.
 components:
-  # Deployment + Service + per-instance Jellyfin/gostream PVCs + Ingress (+ optional Certificate).
+  # Deployment + Service + Ingress (+ Certificate when tls.enabled and an issuer is named). The pod
+  # mounts jellyfin/gostream PVCs, the warmup PVC, and the tuning ConfigMap BY NAME — enable the
+  # matching storage/config components in this release, or expect another release to own them.
   workload: true
-  # Shared, single-owner resources: the gostream warmup cache PVC + the gostream tuning ConfigMap.
-  # In a blue/green layout exactly ONE release (the "shared" one) sets this true; the blue/green
-  # workload releases set it false and mount the shared names below.
-  shared: true
-  # Standalone Prowlarr indexer aggregator (own Deployment/Service/PVC). One instance is shared by
-  # every workload; in a blue/green layout only the shared release enables it.
+  # Per-instance Jellyfin PVCs: jellyfin-var-lib (library DB/metadata/plugins) + jellyfin-etc.
+  jellyfinStorage: true
+  # Per-instance gostream STATE PVC (gostream-state): STATE/gostream.db inode map + config.db BoltDB.
+  gostreamState: true
+  # gostream warmup cache PVC (`warmup.pvcName`, fixed/unsuffixed). Sized from warmup.quotaGb+headroomGi.
+  warmupCache: true
+  # gostream tuning ConfigMap (`gostreamConfig.configMapName`, fixed/unsuffixed).
+  gostreamConfig: true
+  # Standalone Prowlarr indexer aggregator (own Deployment/Service/PVC), reachable at svc `prowlarr`.
   prowlarr: true
-
-# Fixed names of the shared resources, referenced by workload Pods (warmup PVC mount + tuning
-# ConfigMap mount) AND created by whichever release sets components.shared=true. Keep these stable
-# and unsuffixed so blue + green workloads both mount the SAME shared cache/config.
-shared:
-  warmupPvcName: gostream-warmup
-  configMapName: gostream-config
 
 # ---------------------------------------------------------------------------- ingress --
 ingress:
   enabled: true
   # Traefik entrypoint. websecure = the 443 entrypoint fronted by the default TLSStore wildcard.
   entrypoint: websecure
-  # Extra Jellyfin Hosts served by this instance IN ADDITION to `hostname` — e.g. the shared apex
-  # (jellyfin.polyfam.studio) placed on the ACTIVE color during a blue/green cutover. A bare CNAME
-  # does not rewrite the HTTP Host header, so a hostname that only CNAMEs here must ALSO be listed
-  # as a Host on the serving Ingress. Exactly one instance may carry a given extra Host at a time.
+  # Extra Jellyfin Hosts served by this instance IN ADDITION to `hostname`. A bare CNAME does not
+  # rewrite the HTTP Host header, so a hostname that only CNAMEs here must ALSO be listed as a Host.
   extraHosts: []
-  # Extra gostorm-UI Hosts (same rationale, e.g. gostorm.jellyfin.polyfam.studio on the active color).
+  # Extra gostorm-UI Hosts (same rationale).
   extraGostormHosts: []
 
 # TLS. Default OFF: ingresses carry no tls: block and traefik's default TLSStore serves the site
@@ -79,7 +73,7 @@ tls:
 
 # Container images — pinned BY REGISTRY-SERVED DIGEST (never a floating tag). Built in-cluster by
 # Zuul/buildah, served from the gitea OCI registry. Pull secret below must exist in the namespace.
-# To repin one color independently, set `images` in that color's release values only.
+# To repin one instance independently, set `images` in that release's values only.
 images:
   gostream:
     repository: git.spencerharmon.com/zuul/gostream
@@ -108,7 +102,7 @@ gostream:
   # gostorm web UI exposure. When true the Service adds a gostorm port and the Ingress serves
   # gostorm.<hostname> (+ ingress.extraGostormHosts). gostorm has its own auth layer.
   exposeUi: true
-  # gostorm-UI hostname. Empty -> "gostorm." prepended to `hostname` (e.g. gostorm.blue.jelly...).
+  # gostorm-UI hostname. Empty -> "gostorm." prepended to `hostname`.
   hostname: ""
   env:
     GOSTREAM_ROOT_PATH: /usr/local/state
@@ -133,7 +127,7 @@ jellyfin:
     requests: { cpu: "500m", memory: 1Gi }
     limits: { cpu: "2", memory: 4Gi }
 
-# ------------------------------------------------------- prowlarr (standalone, shared) --
+# ---------------------------------------------------------------- prowlarr (standalone) --
 # Indexer aggregator the plugin's source search calls (ProwlarrBaseUrl / ProwlarrApiKey). Runs as
 # its OWN Deployment+Service (NOT a Jellyfin sidecar), reachable at the fixed DNS name `prowlarr`.
 # We seed Prowlarr's config.xml with the SAME API key the migrated plugin config carries so the two
@@ -163,9 +157,17 @@ prowlarr:
 # SINGLE SOURCE OF TRUTH for the warmup sizing. gostream enforces quotaGb as GiB (quota =
 # quotaGb * 1024^3) and evicts toward it; the warmup PVC is sized quotaGb + headroomGi so the quota
 # can never exceed the volume. Both the ConfigMap value and the warmup PVC storage derive from these.
+# pvcName is the fixed (unsuffixed) name the workload mounts and components.warmupCache creates.
 warmup:
+  pvcName: gostream-warmup
   quotaGb: 45
   headroomGi: 5   # PVC capacity = quotaGb + headroomGi (Gi)
+
+# --------------------------------------------------------------- gostream tuning config --
+# configMapName is the fixed (unsuffixed) name the workload mounts and components.gostreamConfig
+# creates. The data is rendered from `config` below (disk_warmup_quota_gb injected from warmup.quotaGb).
+gostreamConfig:
+  configMapName: gostream-config
 
 # ---------------------------------------------------------------------------- storage --
 persistence:

@@ -1,18 +1,18 @@
 {{/*
-Storage split:
-  * Per-INSTANCE gostream STATE PVC (gostream-state[-<suffix>]) — rendered with the workload. Holds
+Storage split (each an independent component toggle):
+  * gostreamState -> per-INSTANCE gostream STATE PVC (gostream-state[-<suffix>]). Holds
     <root>/STATE/gostream.db (inode map, SACRED) and <root>/config.db (gostorm BoltDB: torrents +
     TorrentsSavePath + settings). Both are SINGLE-WRITER embedded DBs (bbolt exclusive lock; SQLite
     single-writer), so each workload instance owns its own.
-  * The SHARED warmup PVC (.Values.shared.warmupPvcName) — rendered with components.shared. The
+  * warmupCache -> the gostream warmup PVC (.Values.warmup.pvcName, fixed/unsuffixed). The
     infohash-addressed warmup cache at gostorm's TorrentsSavePath (/usr/local/warmup) is
-    content-addressed, so both colors converge on identical filenames and share ONE RWO PVC
-    (co-resident on the one local-path node).
+    content-addressed, so instances that share a node converge on identical filenames and can share
+    ONE RWO PVC. Rendered by whichever release enables components.warmupCache.
 WARMUP-SIZING INVARIANT: capacity = warmup.quotaGb + warmup.headroomGi, so it can never be smaller
 than the quota gostream enforces (quota = quotaGb * 1024^3). Both this size and the ConfigMap's
 disk_warmup_quota_gb come from .Values.warmup — the single source Helm gives us.
 */}}
-{{- if .Values.components.workload }}
+{{- if .Values.components.gostreamState }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -20,9 +20,6 @@ metadata:
   labels:
     {{- include "phantom-library.labels" . | nindent 4 }}
     app.kubernetes.io/component: state
-    {{- with (include "phantom-library.colorLabel" .) }}
-    color: {{ . }}
-    {{- end }}
 spec:
   accessModes: ["ReadWriteOnce"]
   storageClassName: {{ .Values.persistence.storageClassName }}
@@ -30,14 +27,14 @@ spec:
     requests:
       storage: {{ .Values.persistence.state.size }}
 {{- end }}
-{{- if and .Values.components.workload .Values.components.shared }}
+{{- if and .Values.components.gostreamState .Values.components.warmupCache }}
 ---
 {{- end }}
-{{- if .Values.components.shared }}
+{{- if .Values.components.warmupCache }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ .Values.shared.warmupPvcName }}
+  name: {{ .Values.warmup.pvcName }}
   labels:
     {{- include "phantom-library.labels" . | nindent 4 }}
     app.kubernetes.io/component: warmup-cache

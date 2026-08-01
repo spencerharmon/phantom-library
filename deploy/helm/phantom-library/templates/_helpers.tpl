@@ -1,6 +1,4 @@
-{{/*
-Common helpers for the phantom-library chart (single-environment).
-*/}}
+{{/* Common helpers for the phantom-library chart. */}}
 
 {{/* Chart name (fixed). */}}
 {{- define "phantom-library.name" -}}
@@ -17,11 +15,6 @@ phantom-library
 phantom-library{{ include "phantom-library.suffix" . }}
 {{- end -}}
 
-{{/* Value of the `color:` label (blue/green flip tooling). Defaults to nameSuffix; may be empty. */}}
-{{- define "phantom-library.colorLabel" -}}
-{{- default .Values.nameSuffix .Values.colorLabel -}}
-{{- end -}}
-
 {{/* Common labels applied to every object. */}}
 {{- define "phantom-library.labels" -}}
 app.kubernetes.io/name: phantom-library
@@ -32,9 +25,9 @@ helm.sh/chart: phantom-library-{{ .Chart.Version }}
 {{- end -}}
 
 {{/*
-Workload selector labels — stable, minimal, and INSTANCE-scoped so two workload releases (blue +
-green) in one namespace never cross-select each other's Pods, and the workload Service never selects
-a Prowlarr Pod that shares the release (component discriminator).
+Workload selector labels — stable, minimal, and INSTANCE-scoped so multiple workload releases in one
+namespace never cross-select each other's Pods, and the workload Service never selects a Prowlarr Pod
+that shares the release (component discriminator).
 */}}
 {{- define "phantom-library.workloadSelector" -}}
 app.kubernetes.io/name: phantom-library

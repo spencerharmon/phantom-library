@@ -16,9 +16,6 @@ metadata:
   labels:
     {{- include "phantom-library.labels" . | nindent 4 }}
     app.kubernetes.io/component: jellyfin
-    {{- with (include "phantom-library.colorLabel" .) }}
-    color: {{ . }}
-    {{- end }}
 spec:
   replicas: 1
   strategy:
@@ -31,9 +28,6 @@ spec:
       labels:
         {{- include "phantom-library.workloadSelector" . | nindent 8 }}
         app.kubernetes.io/part-of: phantom-library
-        {{- with (include "phantom-library.colorLabel" .) }}
-        color: {{ . }}
-        {{- end }}
     spec:
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:
@@ -117,14 +111,14 @@ spec:
             claimName: gostream-state{{ include "phantom-library.suffix" . }}
         - name: warmup
           persistentVolumeClaim:
-            # SHARED warmup cache (content-addressed) — owned by the components.shared release.
-            claimName: {{ .Values.shared.warmupPvcName }}
+            # gostream warmup cache (content-addressed) — rendered by components.warmupCache.
+            claimName: {{ .Values.warmup.pvcName }}
         - name: config-merged
           emptyDir: {}
         - name: config-tuning
           configMap:
-            # SHARED gostream tuning ConfigMap — owned by the components.shared release.
-            name: {{ .Values.shared.configMapName }}
+            # gostream tuning ConfigMap — rendered by components.gostreamConfig.
+            name: {{ .Values.gostreamConfig.configMapName }}
         - name: config-secret
           secret:
             secretName: {{ .Values.configSecretName }}
