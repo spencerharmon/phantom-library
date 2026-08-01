@@ -1,4 +1,4 @@
-{{- if .Values.prowlarr.enabled }}
+{{- if .Values.components.prowlarr }}
 {{/*
 Prowlarr — standalone indexer aggregator (NOT a Jellyfin sidecar), ONE shared instance for all
 colors. The Phantom Library plugin's source search authenticates to it with an API key; we seed

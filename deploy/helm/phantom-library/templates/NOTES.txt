@@ -1,16 +1,24 @@
 phantom-library deployed as release {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
 
-Colors rendered: {{ join ", " .Values.colorList }}
-Roles:  prod -> {{ .Values.roles.prod }}   dev -> {{ .Values.roles.dev }}
+Components rendered by THIS release:
+  workload : {{ .Values.components.workload }}   (Deployment + Service + per-instance PVCs + Ingress{{ if and .Values.tls.enabled .Values.tls.issuerRef.name }} + Certificate{{ end }})
+  shared   : {{ .Values.components.shared }}   ({{ .Values.shared.warmupPvcName }} PVC + {{ .Values.shared.configMapName }} ConfigMap)
+  prowlarr : {{ .Values.components.prowlarr }}
 
-URLs (served once external-dns + traefik reconcile; TLS via the *.{{ .Values.domain }} wildcard):
-  prod   https://{{ .Values.domain }}            (-> {{ .Values.roles.prod }})
-  dev    https://dev.{{ .Values.domain }}        (-> {{ .Values.roles.dev }})
-  blue   https://blue.{{ .Values.domain }}
-  green  https://green.{{ .Values.domain }}
-{{- if .Values.gostream.exposeUi }}
-  gostorm (prod) https://gostorm.{{ .Values.domain }}      (-> gostorm-{{ .Values.roles.prod }})
-  gostorm (dev)  https://gostorm-dev.{{ .Values.domain }}  (-> gostorm-{{ .Values.roles.dev }})
+{{- if .Values.components.workload }}
+
+URLs (served once external-dns + traefik reconcile):
+  jellyfin  https://{{ .Values.hostname }}
+  {{- range .Values.ingress.extraHosts }}
+  jellyfin  https://{{ . }}   (extra host)
+  {{- end }}
+  {{- if .Values.gostream.exposeUi }}
+  gostorm   https://{{ include "phantom-library.gostormHost" . }}
+  {{- range .Values.ingress.extraGostormHosts }}
+  gostorm   https://{{ . }}   (extra host)
+  {{- end }}
+  {{- end }}
+TLS: {{ if .Values.tls.enabled }}tls block emitted, secret {{ include "phantom-library.tlsSecret" . }}{{ if .Values.tls.issuerRef.name }} (cert-manager {{ .Values.tls.issuerRef.kind }} {{ .Values.tls.issuerRef.name }}){{ end }}{{ else }}none — traefik default TLSStore wildcard by SNI{{ end }}
 {{- end }}
 
 PREREQUISITES in namespace {{ .Release.Namespace }} (NOT created by this chart — provisioned out of band):
@@ -18,23 +26,9 @@ PREREQUISITES in namespace {{ .Release.Namespace }} (NOT created by this chart �
   - config secret    {{ .Values.configSecretName }}  (Opaque, key config.secret.json)
 Without these the Pods stay ImagePullBackOff / fail to mount the gostream secret.
 
-Cutover (promote the staged color to prod): swap roles.prod<->roles.dev in the HelmRelease values and
-commit — the DNSEndpoint targets AND the role-host Ingress rules both follow, no pod restart.
-
-{{ if and .Values.expose.prod .Values.expose.dev -}}
-Exposure: prod+dev — this release owns ALL *.{{ .Values.domain }} role hostnames (apex + dev).
-{{- else if .Values.expose.dev -}}
-Exposure: DEV only — this release fronts dev.{{ .Values.domain }} (+ gostorm-dev) on its dev color for
-validation, while a predecessor still holds prod (apex). Reach prod's future color at the dev URL. Flip
-expose.prod=true at cutover (one commit that also retires the predecessor's prod side).
-{{- else if .Values.expose.prod -}}
-Exposure: PROD only — this release fronts the apex {{ .Values.domain }} (+ gostorm) on its prod color.
-{{- else -}}
-Exposure: OFF — NO Ingress/DNSEndpoint (staging alongside a live predecessor). Pods run healthy; reach
-them via `kubectl -n {{ .Release.Namespace }} port-forward svc/phantom-library-<color> 8096:8096` (or
-8090 for gostorm). Front a role by setting expose.dev / expose.prod true in a commit that also retires
-the predecessor owning that role's hostnames.
-{{- end }}
+Blue/green cutover is NOT this chart's concern — it lives in the consuming Flux/kustomize layer,
+which deploys two workload releases (blue/green) + one shared release and flips a CNAME between the
+color hosts. See infra-beehive INFRASTRUCTURE.md.
 
 Warmup sizing is single-source: warmup.quotaGb ({{ .Values.warmup.quotaGb }}) drives BOTH the ConfigMap
-disk_warmup_quota_gb and the gostream-warmup PVC size ({{ add (.Values.warmup.quotaGb | int) (.Values.warmup.headroomGi | int) }}Gi).
+disk_warmup_quota_gb and the {{ .Values.shared.warmupPvcName }} PVC size ({{ add (.Values.warmup.quotaGb | int) (.Values.warmup.headroomGi | int) }}Gi).

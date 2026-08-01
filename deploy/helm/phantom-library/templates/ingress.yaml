@@ -1,44 +1,41 @@
+{{- if and .Values.components.workload .Values.ingress.enabled }}
 {{/*
-Per-color Ingress. Hosts served by a color:
-  Jellyfin (:8096):  <color>.<domain>  ALWAYS, plus the ROLE host this color currently holds
-                     (prod -> <domain>, dev -> dev.<domain>). A bare CNAME does not rewrite the HTTP
-                     Host header, so the role hostname must appear in the ACTIVE color's Ingress to
-                     serve; cutover moves the role-host rule between colors in lockstep with the
-                     DNSEndpoint targets (both follow .Values.roles).
-  gostorm UI (:8090, when gostream.exposeUi): gostorm-<color>.<domain> ALWAYS, plus the gostorm ROLE
-                     host (prod -> gostorm.<domain>, dev -> gostorm-dev.<domain>).
-No tls: block — traefik's default TLSStore serves the *.<domain> wildcard by SNI.
-
-A color's Ingress renders ONLY when its ROLE is exposed (.Values.expose.<role>) — so a half-handover
-can front the dev color alone (expose.dev=true, expose.prod=false) while a predecessor still holds
-prod. Each rendered Ingress is preceded by its own `---` (a leading empty document is valid YAML).
+Single-environment Ingress.
+  Jellyfin (:8096):  .Values.hostname ALWAYS, plus any .Values.ingress.extraHosts (e.g. a shared apex
+                     placed on the ACTIVE color during a blue/green cutover — a bare CNAME does not
+                     rewrite the HTTP Host header, so a hostname that CNAMEs here must ALSO be a Host).
+  gostorm UI (:8090, when gostream.exposeUi): the gostorm host (default gostorm.<hostname>) plus any
+                     .Values.ingress.extraGostormHosts.
+TLS: default OFF -> no tls: block, traefik's default TLSStore serves the site wildcard by SNI. When
+.Values.tls.enabled the tls: block references the (optionally cert-manager-provisioned) secret.
+external-dns publishes A-records from the Host rules (standard ingress discovery — no DNSEndpoint).
 */}}
-{{- $domain := .Values.domain }}
-{{- range $color := .Values.colorList }}
-{{- $role := include "phantom-library.roleOf" (dict "color" $color "root" $) }}
-{{- $show := or (and (eq $role "prod") $.Values.expose.prod) (and (eq $role "dev") $.Values.expose.dev) }}
-{{- if $show }}
-{{- $jellyHosts := list (printf "%s.%s" $color $domain) }}
-{{- if eq $role "prod" }}{{ $jellyHosts = append $jellyHosts $domain }}{{ end }}
-{{- if eq $role "dev" }}{{ $jellyHosts = append $jellyHosts (printf "dev.%s" $domain) }}{{ end }}
+{{- $jellyHosts := concat (list .Values.hostname) .Values.ingress.extraHosts }}
 {{- $gostormHosts := list }}
-{{- if $.Values.gostream.exposeUi }}
-{{- $gostormHosts = append $gostormHosts (printf "gostorm-%s.%s" $color $domain) }}
-{{- if eq $role "prod" }}{{ $gostormHosts = append $gostormHosts (printf "gostorm.%s" $domain) }}{{ end }}
-{{- if eq $role "dev" }}{{ $gostormHosts = append $gostormHosts (printf "gostorm-dev.%s" $domain) }}{{ end }}
+{{- if .Values.gostream.exposeUi }}
+{{- $gostormHosts = concat (list (include "phantom-library.gostormHost" .)) .Values.ingress.extraGostormHosts }}
 {{- end }}
----
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: phantom-library-{{ $color }}
+  name: {{ include "phantom-library.fullname" . }}
   labels:
-    {{- include "phantom-library.labels" $ | nindent 4 }}
-    color: {{ $color }}
+    {{- include "phantom-library.labels" . | nindent 4 }}
+    {{- with (include "phantom-library.colorLabel" .) }}
+    color: {{ . }}
+    {{- end }}
   annotations:
-    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.entrypoints: {{ .Values.ingress.entrypoint }}
 spec:
   ingressClassName: traefik
+  {{- if .Values.tls.enabled }}
+  tls:
+    - hosts:
+        {{- range (concat $jellyHosts $gostormHosts) }}
+        - {{ . }}
+        {{- end }}
+      secretName: {{ include "phantom-library.tlsSecret" . }}
+  {{- end }}
   rules:
     {{- range $h := $jellyHosts }}
     - host: {{ $h }}
@@ -48,7 +45,7 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: phantom-library-{{ $color }}
+                name: {{ include "phantom-library.fullname" $ }}
                 port:
                   number: {{ $.Values.jellyfin.httpPort }}
     {{- end }}
@@ -60,9 +57,8 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: phantom-library-{{ $color }}
+                name: {{ include "phantom-library.fullname" $ }}
                 port:
                   number: {{ $.Values.gostream.ports.gostorm }}
     {{- end }}
-{{- end }}
 {{- end }}

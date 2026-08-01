@@ -1,39 +1,40 @@
+{{- if .Values.components.workload }}
 {{/*
-Independent per-color Jellyfin persistence (var-lib = library DB/metadata/plugins; etc = network.xml +
-encoding config). Blue and green NEVER share a library DB/config, so a bad rollout on the inactive color
-can never touch the color serving prod.
+Per-instance Jellyfin persistence (var-lib = library DB/metadata/plugins; etc = network.xml +
+encoding config). Each workload instance owns its own so a bad rollout on one (e.g. the inactive
+blue/green color) can never touch the DB/config of the instance serving prod.
 */}}
-{{- range $color := .Values.colorList }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: jellyfin-var-lib-{{ $color }}
+  name: jellyfin-var-lib{{ include "phantom-library.suffix" . }}
   labels:
-    {{- include "phantom-library.labels" $ | nindent 4 }}
+    {{- include "phantom-library.labels" . | nindent 4 }}
     app.kubernetes.io/component: jellyfin-var-lib
-    color: {{ $color }}
+    {{- with (include "phantom-library.colorLabel" .) }}
+    color: {{ . }}
+    {{- end }}
 spec:
   accessModes: ["ReadWriteOnce"]
-  storageClassName: {{ $.Values.persistence.storageClassName }}
+  storageClassName: {{ .Values.persistence.storageClassName }}
   resources:
     requests:
-      storage: {{ $.Values.persistence.jellyfinVarLib.size }}
+      storage: {{ .Values.persistence.jellyfinVarLib.size }}
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: jellyfin-etc-{{ $color }}
+  name: jellyfin-etc{{ include "phantom-library.suffix" . }}
   labels:
-    {{- include "phantom-library.labels" $ | nindent 4 }}
+    {{- include "phantom-library.labels" . | nindent 4 }}
     app.kubernetes.io/component: jellyfin-etc
-    color: {{ $color }}
+    {{- with (include "phantom-library.colorLabel" .) }}
+    color: {{ . }}
+    {{- end }}
 spec:
   accessModes: ["ReadWriteOnce"]
-  storageClassName: {{ $.Values.persistence.storageClassName }}
+  storageClassName: {{ .Values.persistence.storageClassName }}
   resources:
     requests:
-      storage: {{ $.Values.persistence.jellyfinEtc.size }}
-{{- if ne $color (last $.Values.colorList) }}
----
-{{- end }}
+      storage: {{ .Values.persistence.jellyfinEtc.size }}
 {{- end }}

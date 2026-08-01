@@ -1,15 +1,19 @@
+{{- if .Values.components.shared }}
 {{/*
-gostream non-secret tuning ConfigMap. config.tuning.json is rendered from .Values.config with
-disk_warmup_quota_gb injected from .Values.warmup.quotaGb (the single source of truth shared with the
-warmup PVC size — see state-pvcs.yaml). gostream deep-merges the out-of-band secret over this at start.
+gostream non-secret tuning ConfigMap (SHARED — owned by the components.shared release; blue/green
+workload Pods mount it by .Values.shared.configMapName). config.tuning.json is rendered from
+.Values.config with disk_warmup_quota_gb injected from .Values.warmup.quotaGb (the single source of
+truth shared with the warmup PVC size — see state-pvcs.yaml). gostream deep-merges the out-of-band
+secret over this at start.
 */}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: gostream-config
+  name: {{ .Values.shared.configMapName }}
   labels:
     {{- include "phantom-library.labels" . | nindent 4 }}
     app.kubernetes.io/component: config
 data:
   config.tuning.json: |
 {{ merge (dict "disk_warmup_quota_gb" (.Values.warmup.quotaGb | int)) .Values.config | toPrettyJson | indent 4 }}
+{{- end }}

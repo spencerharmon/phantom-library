@@ -1,19 +1,23 @@
 apiVersion: v2
 name: phantom-library
 description: >-
-  Co-located gostream (FUSE torrent producer) + patched Jellyfin (FUSE consumer) true blue/green
-  stack with CNAME role cutover. Renders BOTH colors, shared gostream state/warmup PVCs, per-color
-  Jellyfin PVCs, per-color Service/Ingress (Jellyfin :8096 + gostorm UI :8090), and the role-CNAME
-  DNSEndpoint (prod/dev/gostorm) from a single set of values. Consumed by flux as a HelmRelease.
+  Co-located gostream (FUSE torrent producer) + patched Jellyfin (FUSE consumer) deployment. Renders
+  exactly ONE environment: one Pod (jellyfin+gostream in a single mount namespace), its per-instance
+  PVCs, a Service, and an Ingress with a templated hostname + optional cert-manager issuer. Shared
+  resources (gostream warmup cache, gostream tuning ConfigMap, Prowlarr) and the workload are
+  independently toggleable so one chart covers both the simplest single deployment (all components in
+  one release) and an operator's blue/green layout (three releases: blue workload, green workload,
+  shared). Blue/green cutover is NOT the chart's concern — it lives in the consuming Flux/kustomize
+  layer (a CNAME between two instances). Consumed by flux as a HelmRelease.
 type: application
 # Chart version — MUST be bumped on every change (flux GitRepository/HelmRelease revs off it and,
-# if ever OCI-published, Helm requires the pushed tag to equal this).
-version: 0.5.0
+# if ever OCI-published, Helm requires the pushed tag to equal this). 1.0.0: single-env rewrite
+# (removed the built-in blue/green colorList/roles/expose machinery + role-CNAME DNSEndpoint).
+version: 1.0.0
 # Tracks the app milestone, not a container tag (images are digest-pinned in values).
 appVersion: "m14"
 keywords:
   - jellyfin
   - gostream
-  - blue-green
   - phantom-library
 home: https://github.com/spencerharmon/phantom-library

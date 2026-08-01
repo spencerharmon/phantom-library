@@ -1,0 +1,28 @@
+{{- if and .Values.components.workload .Values.ingress.enabled .Values.tls.enabled .Values.tls.issuerRef.name }}
+{{/*
+Optional per-instance cert-manager Certificate. Rendered only when TLS is enabled AND an issuer is
+named — otherwise the default TLSStore wildcard (SNI) covers the host and nothing is emitted here.
+Provisions .Values.tls.secretName (default <fullname>-tls), which the Ingress tls: block references.
+dnsNames cover the Jellyfin host(s) + gostorm host(s) this instance serves.
+*/}}
+{{- $jellyHosts := concat (list .Values.hostname) .Values.ingress.extraHosts }}
+{{- $gostormHosts := list }}
+{{- if .Values.gostream.exposeUi }}
+{{- $gostormHosts = concat (list (include "phantom-library.gostormHost" .)) .Values.ingress.extraGostormHosts }}
+{{- end }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "phantom-library.fullname" . }}-tls
+  labels:
+    {{- include "phantom-library.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "phantom-library.tlsSecret" . }}
+  issuerRef:
+    kind: {{ .Values.tls.issuerRef.kind }}
+    name: {{ .Values.tls.issuerRef.name }}
+  dnsNames:
+    {{- range (concat $jellyHosts $gostormHosts) }}
+    - {{ . }}
+    {{- end }}
+{{- end }}
