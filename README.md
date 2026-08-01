@@ -3,7 +3,7 @@
 A Jellyfin plugin that makes the entire TMDB catalogue appear to exist
 inside a Jellyfin library. Titles materialise on demand: a user
 favourites or plays an item, the plugin asks
-[gostream](https://github.com/MrRobotoGit/gostream) to register the
+[Tiramisu](https://github.com/MrRobotoGit/tiramisu) (formerly GoStream) to register the
 matching torrent, and the resulting FUSE-backed `.mkv` becomes a real
 streamable Jellyfin library item.
 
@@ -40,8 +40,8 @@ This is the architectural identity of the project.
 1. **Layer 1 — Phantom → Virtual → Materialised** (this plugin).
    Driven by user interactions inside Jellyfin: searches, favourites,
    play presses, suggestions surfacing.
-2. **Layer 2 — gostream FUSE byte-on-demand** (gostream).
-   Once an item is Materialised, gostream serves bytes from the swarm
+2. **Layer 2 — Tiramisu FUSE byte-on-demand** (Tiramisu).
+   Once an item is Materialised, Tiramisu serves bytes from the swarm
    on read, transparently to Jellyfin.
 
 Result: a Jellyfin library that *looks* the size of TMDB but only ever
@@ -53,14 +53,14 @@ holds bytes for content somebody actually interacts with.
 |-------|--------------------|------------------------|----------|
 | **Phantom** | nothing | TMDB metadata only, in plugin DB | no (fake button shows splash) |
 | **Virtual** | library row, no `Path`, "phantom" badge | TMDB metadata, persisted | no (fake button shows splash + status) |
-| **Materialised** | library row with `Path` to FUSE-backed `.mkv` | unchanged | yes (Jellyfin's real player + gostream FUSE) |
+| **Materialised** | library row with `Path` to FUSE-backed `.mkv` | unchanged | yes (Jellyfin's real player + Tiramisu FUSE) |
 | **Watched** | per-user data | unchanged | yes |
 | **Evicted** | demoted to Virtual (favourited items protected) | metadata preserved | no, until re-materialised |
 
 ## Requirements
 
 - Jellyfin **10.11.x** (current target — built against 10.11.9)
-- gostream with the `POST /api/library/add` patch applied (see
+- Tiramisu with the `POST /api/library/add` patch applied (see
   [primary patch](https://github.com/spencerharmon/gostream/tree/phantom-library/api-add))
 - TMDB v3 API key
 - Optional: Prowlarr (primary indexer); falls back to Torrentio
@@ -86,7 +86,7 @@ nothing to install. Once the tag exists, prefer the repository path.
 3. Restart Jellyfin.
 
 4. *Dashboard → Plugins → Phantom Library* → enter your TMDB key,
-   gostream URLs, indexer settings. Save.
+   Tiramisu URLs, indexer settings. Save.
 
 ### B. Build from source (current default)
 
@@ -147,8 +147,8 @@ episodes still use Phantom's channel-backed playback and badge state.
 All settings live in the admin dashboard. See PLAN.md §Configuration
 for the full list. Highlights:
 
-- **TMDB / gostream / indexer URLs and keys**
-- **Quality preset** (gostream-default mirror, biggest+most-seeded,
+- **TMDB / Tiramisu / indexer URLs and keys**
+- **Quality preset** (Tiramisu-default mirror, biggest+most-seeded,
   custom)
 - **Eviction policy** (default: 7 idle days; favourites protected
   per-user via a toggle in user preferences)
@@ -201,17 +201,17 @@ Real issues hit during M2 and M5 install / smoke testing. Check
   `10.11.0.0`, framework `net9.0`). A 10.10.x server will not load
   a 10.11-targeted plugin.
 
-- **Materialisation enqueues but never completes.** gostream is
+- **Materialisation enqueues but never completes.** Tiramisu is
   missing the `POST /api/library/add` endpoint. v0.1 hard-depends
-  on the patched gostream from branch
+  on the patched Tiramisu from branch
   [`phantom-library/api-add`](https://github.com/spencerharmon/gostream/tree/phantom-library/api-add)
-  on the fork. Build that branch, point the plugin's gostream URL
+  on the fork. Build that branch, point the plugin's Tiramisu URL
   at it, retry.
 
 - **The FUSE path appears on disk but Jellyfin can't see it.**
   Library scan / permissions problem. The FUSE mount must live
   under a directory that is (a) registered as a Jellyfin library
-  and (b) readable by the `jellyfin` user. If gostream runs as a
+  and (b) readable by the `jellyfin` user. If Tiramisu runs as a
   different user, fix the mount's permissions (e.g. `allow_other`
   in `fuse.conf` plus appropriate group membership) before
   blaming the plugin.
@@ -229,7 +229,7 @@ Real issues hit during M2 and M5 install / smoke testing. Check
   in the admin page. If you run many users, also consider lowering
   the suggestions refresh frequency.
 
-- **Vault Mode prestage appears to no-op.** The gostream
+- **Vault Mode prestage appears to no-op.** The Tiramisu
   [`phantom-library/vault-mode`](https://github.com/spencerharmon/gostream/tree/phantom-library/vault-mode)
   branch isn't deployed. This is harmless: the plugin detects the
   patch at runtime and silently skips `persist=true` when absent.
@@ -238,15 +238,15 @@ Real issues hit during M2 and M5 install / smoke testing. Check
 
 ## Auth & network model
 
-The plugin assumes it can reach gostream over a trusted network —
+The plugin assumes it can reach Tiramisu over a trusted network —
 loopback for single-host setups, private LAN otherwise. No auth is
-performed between the plugin and gostream. If you need to expose
+performed between the plugin and Tiramisu. If you need to expose
 either component to an untrusted network, terminate auth at a reverse
 proxy.
 
-## Companion gostream patches
+## Companion Tiramisu patches
 
-Phantom Library is designed against three patches to gostream, all
+Phantom Library is designed against three patches to Tiramisu, all
 optional but increasingly capable:
 
 | Patch | Purpose | Status |
