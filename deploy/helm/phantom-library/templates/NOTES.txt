@@ -4,6 +4,7 @@ Components rendered by THIS release:
   workload        : {{ .Values.components.workload }}   (Deployment + Service + Ingress{{ if and .Values.tls.enabled .Values.tls.issuerRef.name }} + Certificate{{ end }})
   jellyfinStorage : {{ .Values.components.jellyfinStorage }}   (jellyfin-var-lib{{ include "phantom-library.suffix" . }} + jellyfin-etc{{ include "phantom-library.suffix" . }} PVCs)
   gostreamState   : {{ .Values.components.gostreamState }}   (gostream-state{{ include "phantom-library.suffix" . }} PVC)
+  gostreamRealMkv : {{ .Values.components.gostreamRealMkv }}   (gostream-real-mkv{{ include "phantom-library.suffix" . }} PVC)
   warmupCache     : {{ .Values.components.warmupCache }}   ({{ .Values.warmup.pvcName }} PVC)
   gostreamConfig  : {{ .Values.components.gostreamConfig }}   ({{ .Values.gostreamConfig.configMapName }} ConfigMap)
   prowlarr        : {{ .Values.components.prowlarr }}   (prowlarr Deployment + Service + PVC{{ if .Values.prowlarr.ingress.enabled }} + Ingress{{ end }})

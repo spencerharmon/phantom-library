@@ -40,6 +40,9 @@ components:
   jellyfinStorage: true
   # Per-instance gostream STATE PVC (gostream-state): STATE/gostream.db inode map + config.db BoltDB.
   gostreamState: true
+  # Per-instance gostream PHYSICAL source PVC (gostream-real-mkv): the JSON stub descriptors gostream
+  # scans to build its virtual-MKV FS. Persist it or every materialised item vanishes on restart.
+  gostreamRealMkv: true
   # gostream warmup cache PVC (`warmup.pvcName`, fixed/unsuffixed). Sized from warmup.quotaGb+headroomGi.
   warmupCache: true
   # gostream tuning ConfigMap (`gostreamConfig.configMapName`, fixed/unsuffixed).
@@ -185,6 +188,9 @@ persistence:
   # Per-instance gostream STATE (STATE/gostream.db inode map + config.db BoltDB), single-writer.
   state:
     size: 5Gi
+  # gostream physical source (JSON stubs only — real media is streamed, never stored here); tiny.
+  realMkv:
+    size: 1Gi
   # warmup size is DERIVED from warmup.quotaGb + warmup.headroomGi (see state-pvcs.yaml) — not set here.
   # Per-instance Jellyfin persistence.
   jellyfinVarLib:

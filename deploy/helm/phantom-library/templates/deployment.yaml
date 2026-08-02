@@ -104,7 +104,13 @@ spec:
         - name: gostream-virtual
           emptyDir: {}
         - name: real-mkv
-          emptyDir: {}
+          persistentVolumeClaim:
+            # Per-instance PHYSICAL gostream source (/mnt/gostream-mkv-real): the tiny JSON stub
+            # descriptors (magnet/infohash/size/stream-url) gostream scans at startup to build the
+            # virtual-MKV FS. MUST persist — an empty source yields an empty virtual FS, so every
+            # materialised item (old catalog + new) would stop resolving on restart. Rendered by
+            # components.gostreamRealMkv.
+            claimName: gostream-real-mkv{{ include "phantom-library.suffix" . }}
         - name: state
           persistentVolumeClaim:
             # Per-instance single-writer gostream STATE (STATE/gostream.db inode map + config.db BoltDB).

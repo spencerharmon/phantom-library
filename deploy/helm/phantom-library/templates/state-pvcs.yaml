@@ -27,6 +27,22 @@ spec:
     requests:
       storage: {{ .Values.persistence.state.size }}
 {{- end }}
+{{- if .Values.components.gostreamRealMkv }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gostream-real-mkv{{ include "phantom-library.suffix" . }}
+  labels:
+    {{- include "phantom-library.labels" . | nindent 4 }}
+    app.kubernetes.io/component: real-mkv
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: {{ .Values.persistence.storageClassName }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.realMkv.size }}
+{{- end }}
 {{- if and .Values.components.gostreamState .Values.components.warmupCache }}
 ---
 {{- end }}
