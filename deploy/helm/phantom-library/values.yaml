@@ -100,11 +100,11 @@ terminationGracePeriodSeconds: 60
 # ------------------------------------------------------------------ gostream (per Pod) --
 gostream:
   # gostream Health Monitor dashboard exposure. When true the Service adds a `dashboard` port and the
-  # Ingress serves gostorm.<hostname> (+ ingress.extraGostormHosts), fronting the metrics port's
+  # Ingress serves tiramisu.<hostname> (+ ingress.extraGostormHosts), fronting the metrics port's
   # /dashboard UI. NOTE: the GoStorm engine port (:8090) is API-only with no browsable UI, so the
   # dashboard host targets :9080 (metrics), NOT :8090.
   exposeUi: true
-  # gostorm-UI hostname. Empty -> "gostorm." prepended to `hostname`.
+  # gostorm/tiramisu-UI hostname. Empty -> "tiramisu." prepended to `hostname`.
   hostname: ""
   env:
     GOSTREAM_ROOT_PATH: /usr/local/state

@@ -16,9 +16,9 @@ URLs (served once external-dns + traefik reconcile):
   jellyfin  https://{{ . }}   (extra host)
   {{- end }}
   {{- if .Values.gostream.exposeUi }}
-  gostream dashboard  https://{{ include "phantom-library.gostormHost" . }}/dashboard
+  tiramisu dashboard  https://{{ include "phantom-library.gostormHost" . }}/dashboard
   {{- range .Values.ingress.extraGostormHosts }}
-  gostream dashboard  https://{{ . }}/dashboard   (extra host)
+  tiramisu dashboard  https://{{ . }}/dashboard   (extra host)
   {{- end }}
   {{- end }}
 TLS: {{ if .Values.tls.enabled }}tls block emitted, secret {{ include "phantom-library.tlsSecret" . }}{{ if .Values.tls.issuerRef.name }} (cert-manager {{ .Values.tls.issuerRef.kind }} {{ .Values.tls.issuerRef.name }}){{ end }}{{ else }}none — traefik default TLSStore wildcard by SNI{{ end }}

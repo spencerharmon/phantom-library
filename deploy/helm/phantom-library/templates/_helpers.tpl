@@ -36,10 +36,11 @@ app.kubernetes.io/component: jellyfin
 {{- end -}}
 
 {{/*
-gostorm-UI hostname: explicit .Values.gostream.hostname, else "gostorm." prepended to .Values.hostname.
+gostorm-UI (Tiramisu dashboard) hostname: explicit .Values.gostream.hostname, else "tiramisu."
+prepended to .Values.hostname. ("tiramisu." is the rebranded gostream/GoStorm control-panel label.)
 */}}
 {{- define "phantom-library.gostormHost" -}}
-{{- default (printf "gostorm.%s" .Values.hostname) .Values.gostream.hostname -}}
+{{- default (printf "tiramisu.%s" .Values.hostname) .Values.gostream.hostname -}}
 {{- end -}}
 
 {{/* TLS secret name: explicit .Values.tls.secretName, else "<fullname>-tls". */}}

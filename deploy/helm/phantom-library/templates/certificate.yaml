@@ -3,7 +3,7 @@
 Optional per-instance cert-manager Certificate. Rendered only when TLS is enabled AND an issuer is
 named — otherwise the default TLSStore wildcard (SNI) covers the host and nothing is emitted here.
 Provisions .Values.tls.secretName (default <fullname>-tls), which the Ingress tls: block references.
-dnsNames cover the Jellyfin host(s) + gostorm host(s) this instance serves.
+dnsNames cover the Jellyfin host(s) + gostorm/tiramisu host(s) this instance serves.
 */}}
 {{- $jellyHosts := concat (list .Values.hostname) .Values.ingress.extraHosts }}
 {{- $gostormHosts := list }}

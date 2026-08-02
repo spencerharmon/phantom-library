@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Helm chart 2.1.1 — rename the gostream/GoStorm control-panel host default
+  label `gostorm.` -> `tiramisu.`** (`templates/_helpers.tpl`
+  `phantom-library.gostormHost`), matching the GoStream -> Tiramisu rebrand. A
+  plain chart consumer now reaches the dashboard at `tiramisu.<hostname>` (still
+  the `:9080` metrics `/dashboard` UI); `.Values.gostream.hostname` override and
+  the `ingress.extraGostormHosts` / `gostorm` value-key/port names are unchanged
+  (host label only, no values-schema break). Kept in lockstep with the flux
+  blue/green role CNAMEs + `extraGostormHosts` (submodule `flux`).
+
 ### Added
 
 - **P4 Stage A: `scripts/phantom-migrate-jellyfindb-to-postgres.sh`** — offline,

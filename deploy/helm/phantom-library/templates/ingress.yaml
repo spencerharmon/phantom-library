@@ -4,7 +4,7 @@ Single-instance Ingress.
   Jellyfin (:8096):  .Values.hostname ALWAYS, plus any .Values.ingress.extraHosts (a bare CNAME does
                      not rewrite the HTTP Host header, so a hostname that CNAMEs here must ALSO be a
                      Host). Exactly one instance may carry a given extra Host at a time.
-  gostream dashboard (:9080, when gostream.exposeUi): the gostorm host (default gostorm.<hostname>)
+  gostream dashboard (:9080, when gostream.exposeUi): the gostorm/tiramisu host (default tiramisu.<hostname>)
                      plus any .Values.ingress.extraGostormHosts. Fronts the metrics port's
                      /dashboard "GoStream Health Monitor" UI — the GoStorm engine port :8090 has no
                      browsable UI, so the dashboard host targets :9080, NOT :8090.
