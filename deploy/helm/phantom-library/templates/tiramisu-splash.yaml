@@ -1,0 +1,137 @@
+{{- if and .Values.components.workload .Values.gostream.exposeUi }}
+{{/*
+Tiramisu landing splash. gostream's :9080 server has NO handler for "/" (its UI lives at the absolute
+routes /dashboard and /control), so hitting the bare tiramisu host 404s. This tiny nginx serves a
+landing page at EXACTLY "/" and transparently reverse-proxies every other path to the workload's
+gostream dashboard port, so /dashboard, /control (and any data endpoints they poll) keep working on
+the same host with no path-priority tricks. Rendered by the workload release (per color); the tiramisu
+Ingress host points here instead of straight at :9080.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "phantom-library.fullname" . }}-splash
+  labels:
+    {{- include "phantom-library.labels" . | nindent 4 }}
+    app.kubernetes.io/component: tiramisu-splash
+data:
+  index.html: |
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Tiramisu</title>
+      <style>
+        :root { color-scheme: dark; }
+        body { margin:0; min-height:100vh; display:flex; flex-direction:column;
+               align-items:center; justify-content:center; gap:2rem;
+               font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+               background:#0f1115; color:#e8eaed; }
+        h1 { font-size:2.75rem; margin:0; letter-spacing:.02em; }
+        p.sub { margin:0; color:#9aa0a6; }
+        .links { display:flex; gap:1.25rem; flex-wrap:wrap; justify-content:center; }
+        a.card { display:block; padding:1.25rem 2.25rem; border-radius:.75rem; text-decoration:none;
+                 background:#1b1f27; color:#e8eaed; border:1px solid #2a2f3a; font-size:1.15rem;
+                 transition:background .15s, border-color .15s; }
+        a.card:hover { background:#232834; border-color:#3d76f0; }
+        a.card .d { display:block; margin-top:.35rem; font-size:.85rem; color:#9aa0a6; }
+      </style>
+    </head>
+    <body>
+      <div style="text-align:center">
+        <h1>&#127856; Tiramisu</h1>
+        <p class="sub">GoStream control surface</p>
+      </div>
+      <div class="links">
+        <a class="card" href="/dashboard">Dashboard<span class="d">health monitor</span></a>
+        <a class="card" href="/control">Control<span class="d">engine control panel</span></a>
+      </div>
+    </body>
+    </html>
+  default.conf: |
+    server {
+      listen 80;
+      server_name _;
+
+      # Landing page only for the exact root; everything else is the real gostream UI/API.
+      location = / {
+        root /usr/share/nginx/html;
+        try_files /index.html =404;
+      }
+
+      location / {
+        proxy_pass http://{{ include "phantom-library.fullname" . }}:{{ .Values.gostream.ports.metrics }};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $http_connection;
+        proxy_read_timeout 300s;
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "phantom-library.fullname" . }}-splash
+  labels:
+    {{- include "phantom-library.labels" . | nindent 4 }}
+    app.kubernetes.io/component: tiramisu-splash
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: phantom-library
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: tiramisu-splash
+  template:
+    metadata:
+      labels:
+        {{- include "phantom-library.labels" . | nindent 8 }}
+        app.kubernetes.io/component: tiramisu-splash
+    spec:
+      containers:
+        - name: splash
+          image: {{ .Values.gostream.splash.image }}
+          ports:
+            - name: http
+              containerPort: 80
+          volumeMounts:
+            - name: conf
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+            - name: conf
+              mountPath: /usr/share/nginx/html/index.html
+              subPath: index.html
+          readinessProbe:
+            httpGet: { path: /, port: http }
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 64Mi }
+      volumes:
+        - name: conf
+          configMap:
+            name: {{ include "phantom-library.fullname" . }}-splash
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "phantom-library.fullname" . }}-splash
+  labels:
+    {{- include "phantom-library.labels" . | nindent 4 }}
+    app.kubernetes.io/component: tiramisu-splash
+spec:
+  selector:
+    app.kubernetes.io/name: phantom-library
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: tiramisu-splash
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+{{- end }}
