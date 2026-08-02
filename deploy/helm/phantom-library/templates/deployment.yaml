@@ -39,6 +39,12 @@ spec:
         - name: jellyfin
           image: {{ include "phantom-library.image" (dict "which" "jellyfin" "root" $) }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
+          # gostream's settings store resolves config.db / settings.json RELATIVE TO CWD (the settings
+          # package's Path var is never set from --path), so it must run with CWD = the gostream root
+          # (GOSTREAM_ROOT_PATH). The reference podman unit did this with `--workdir /usr/local/state`;
+          # without it the gostorm BoltDB lands in an ephemeral /config.db and every /control settings
+          # change is lost on restart. Jellyfin uses absolute paths, so a shared CWD here is harmless.
+          workingDir: {{ .Values.gostream.env.GOSTREAM_ROOT_PATH | default "/usr/local/state" }}
           securityContext:
             # REQUIRED: gostream mounts a FUSE inside this container (/dev/fuse + CAP_SYS_ADMIN).
             # This matches the host, which ran gostream as root with --device /dev/fuse --cap-add SYS_ADMIN.
