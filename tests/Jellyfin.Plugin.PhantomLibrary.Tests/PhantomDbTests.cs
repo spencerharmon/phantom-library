@@ -694,6 +694,58 @@ public class PhantomDbTests : IDisposable
     }
 
     [Fact]
+    public async Task MaterialiseInFlight_TryInsert_StaleThreshold_ReclaimsLeakedRow()
+    {
+        // A row left over from a hard-killed materialise (no finally-block
+        // delete ever ran) must be reclaimable inline once it is older than
+        // the stale threshold — no startup-only sweeper required.
+        using var db = await NewDbAsync();
+
+        var first = await db.TryInsertMaterialiseInFlightAsync(42, "movie", -1, -1, CancellationToken.None);
+        Assert.True(first);
+
+        // Backdate the row to simulate a leaked claim older than the threshold.
+        var cs = new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString();
+        await using (var conn = new SqliteConnection(cs))
+        {
+            await conn.OpenAsync();
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE materialise_in_flight SET started_at = $t WHERE tmdb_id = 42;";
+            cmd.Parameters.AddWithValue("$t", DateTimeOffset.UtcNow.AddMinutes(-30).ToUnixTimeSeconds());
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        // Without a stale threshold, the leaked row still blocks (original behaviour).
+        var blockedRetry = await db.TryInsertMaterialiseInFlightAsync(42, "movie", -1, -1, CancellationToken.None);
+        Assert.False(blockedRetry);
+
+        // With an inline stale threshold, a retry past the threshold reclaims it —
+        // no startup/restart event required.
+        var reclaimed = await db.TryInsertMaterialiseInFlightAsync(42, "movie", -1, -1, CancellationToken.None, TimeSpan.FromMinutes(10));
+        Assert.True(reclaimed);
+
+        var startedAt = await db.GetMaterialiseInFlightStartedAtAsync(42, "movie", -1, -1, CancellationToken.None);
+        Assert.NotNull(startedAt);
+        Assert.True(startedAt!.Value > DateTimeOffset.UtcNow.AddMinutes(-1));
+    }
+
+    [Fact]
+    public async Task MaterialiseInFlight_TryInsert_StaleThreshold_FreshClaimStillBlocks()
+    {
+        // Safety case: a claim younger than the stale threshold must still
+        // block a concurrent duplicate materialise, even when the caller
+        // passes a stale threshold.
+        using var db = await NewDbAsync();
+
+        var first = await db.TryInsertMaterialiseInFlightAsync(42, "movie", -1, -1, CancellationToken.None);
+        Assert.True(first);
+
+        var second = await db.TryInsertMaterialiseInFlightAsync(42, "movie", -1, -1, CancellationToken.None, TimeSpan.FromMinutes(10));
+        Assert.False(second);
+        Assert.True(await db.IsMaterialiseInFlightAsync(42, "movie", -1, -1, CancellationToken.None));
+    }
+
+    [Fact]
     public async Task MaterialiseInFlight_PurgeWhenEmpty_ReturnsZero()
     {
         using var db = await NewDbAsync();

@@ -2870,22 +2870,55 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
 
     // ---- materialise_in_flight ----
 
-    public async Task<bool> TryInsertMaterialiseInFlightAsync(int tmdbId, string type, int season, int episode, CancellationToken ct)
+    /// <summary>
+    /// Attempts to claim the materialise_in_flight row for the given
+    /// tuple. If no row exists, inserts one and returns true. If a row
+    /// already exists, the claim is granted (the existing row is
+    /// stolen and its started_at bumped to now) only when that row's
+    /// started_at is OLDER than <paramref name="staleThreshold"/> —
+    /// i.e. it can only belong to a materialise that crashed mid-
+    /// flight and leaked the row (the process's own finally-block
+    /// delete never ran), never to a genuinely still-running
+    /// materialise, which by definition has a fresh started_at. This
+    /// makes the leaked-claim recovery inline and deterministic
+    /// (no reliance on <see cref="MaterialiseInFlightSweeper"/>'s
+    /// startup-only sweep, which a claim younger than the threshold
+    /// at sweep time would otherwise survive indefinitely). A fresh
+    /// (non-stale) existing row still blocks the caller, exactly as
+    /// before — this only widens the reclaim path for provably-leaked
+    /// rows.
+    /// </summary>
+    /// <param name="staleThreshold">
+    /// Age past which an existing row is presumed leaked and
+    /// reclaimable inline. Pass <see cref="TimeSpan.MaxValue"/> (or
+    /// omit) to disable inline reclaim and preserve the original
+    /// insert-or-ignore-only behaviour.
+    /// </param>
+    public async Task<bool> TryInsertMaterialiseInFlightAsync(int tmdbId, string type, int season, int episode, CancellationToken ct, TimeSpan? staleThreshold = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(type);
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            var now = DateTimeOffset.UtcNow;
+            var cutoff = staleThreshold.HasValue
+                ? now.Subtract(staleThreshold.Value).ToUnixTimeSeconds()
+                : long.MinValue;
+
             await using var conn = await OpenAsync(ct).ConfigureAwait(false);
             await using var cmd = conn.CreateCommand();
-            cmd.CommandText = @"INSERT OR IGNORE INTO materialise_in_flight
+            cmd.CommandText = @"INSERT INTO materialise_in_flight
                 (tmdb_id, type, season, episode, started_at)
-                VALUES ($tmdb, $type, $season, $episode, $now);";
+                VALUES ($tmdb, $type, $season, $episode, $now)
+                ON CONFLICT (tmdb_id, type, season, episode)
+                DO UPDATE SET started_at = excluded.started_at
+                WHERE materialise_in_flight.started_at < $cutoff;";
             cmd.Parameters.AddWithValue("$tmdb", tmdbId);
             cmd.Parameters.AddWithValue("$type", type);
             cmd.Parameters.AddWithValue("$season", season);
             cmd.Parameters.AddWithValue("$episode", episode);
-            cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            cmd.Parameters.AddWithValue("$now", now.ToUnixTimeSeconds());
+            cmd.Parameters.AddWithValue("$cutoff", cutoff);
             return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) == 1;
         }
         finally

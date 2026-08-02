@@ -243,7 +243,17 @@ public sealed class Materialiser : IMaterialiser
                 .ConfigureAwait(false);
         }
 
-        var claimed = await _db.TryInsertMaterialiseInFlightAsync(tmdbId, type, sSentinel, eSentinel, ct)
+        // Steal-if-stale: a claim older than MaterialiseInFlightStaleMinutes
+        // can only be a leaked row from a hard-killed materialise (its
+        // finally block never ran to delete it) — a genuinely still-
+        // running materialise always has a fresh started_at. Reclaiming
+        // it inline here means recovery no longer depends on the
+        // once-at-startup MaterialiseInFlightSweeper; a leaked row is
+        // unstuck on the very next retry past the threshold, without
+        // requiring an external process restart.
+        var cfg = _configProvider();
+        var staleThreshold = TimeSpan.FromMinutes(Math.Max(1, cfg.MaterialiseInFlightStaleMinutes));
+        var claimed = await _db.TryInsertMaterialiseInFlightAsync(tmdbId, type, sSentinel, eSentinel, ct, staleThreshold)
             .ConfigureAwait(false);
         if (!claimed)
         {

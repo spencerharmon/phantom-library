@@ -6,6 +6,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Materialise in-flight leak: deterministic inline reclaim, no restart
+  required.** A materialise hard-killed mid-flight (pod SIGKILL / warmup
+  restart) never runs its `finally` cleanup and leaks a
+  `materialise_in_flight` claim row; previously the only recovery was
+  `MaterialiseInFlightSweeper`, a startup-only sweep, so a claim younger than
+  `MaterialiseInFlightStaleMinutes` (default 10) at that single sweep survived
+  indefinitely — wedging the item at `AlreadyInProgress` until a *second*
+  restart happened to land after it aged out (observed on Rick and Morty
+  S08E02, 2026-08-02). `PhantomDb.TryInsertMaterialiseInFlightAsync` now
+  accepts an optional stale threshold and steals/reclaims an existing row
+  inline — atomically, via `INSERT ... ON CONFLICT ... DO UPDATE ... WHERE
+  started_at < cutoff` — the moment it is older than the threshold, with no
+  dependency on a startup event. A claim younger than the threshold still
+  blocks a concurrent duplicate exactly as before (safety case unchanged).
+  `Materialiser.MaterialiseAsync` passes `MaterialiseInFlightStaleMinutes` as
+  the reclaim threshold on every retry. `MaterialiseInFlightSweeper` is kept
+  unchanged as a startup belt-and-braces sweep.
+
 ### Changed
 
 - **Helm chart 2.1.1 — rename the gostream/GoStorm control-panel host default

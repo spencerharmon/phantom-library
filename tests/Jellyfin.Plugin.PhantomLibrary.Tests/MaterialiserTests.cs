@@ -319,6 +319,61 @@ public class MaterialiserTests : IDisposable
     }
 
     [Fact]
+    public async Task LeakedInFlightRow_OlderThanStaleThreshold_ReclaimedWithoutRestart()
+    {
+        // ROI regression: a materialise hard-killed mid-flight leaks its
+        // materialise_in_flight claim (the finally-block delete never ran).
+        // Before this fix, only a startup sweep (MaterialiseInFlightSweeper)
+        // could clear it, so a retry landing before the NEXT process restart
+        // returned AlreadyInProgress forever. Assert the retry alone —
+        // no restart, no sweeper invocation — now succeeds once the row is
+        // older than MaterialiseInFlightStaleMinutes.
+        using var db = await NewDbAsync();
+        await SeedMovieMetadataAsync(db, 60);
+
+        // Simulate the leaked row directly (as a hard-killed process would
+        // leave it): insert then backdate started_at past the threshold,
+        // WITHOUT ever calling DeleteMaterialiseInFlightAsync.
+        await db.UpsertMaterialiseInFlightAsync(60, "movie", -1, -1, CancellationToken.None);
+        var cs = new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString();
+        await using (var conn = new Microsoft.Data.Sqlite.SqliteConnection(cs))
+        {
+            await conn.OpenAsync();
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE materialise_in_flight SET started_at = $t WHERE tmdb_id = 60;";
+            cmd.Parameters.AddWithValue("$t", DateTimeOffset.UtcNow.AddMinutes(-30).ToUnixTimeSeconds());
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        var (sut, gostream, _, _, _, _) = BuildSut(db);
+
+        var outcome = await sut.MaterialiseAsync(60, "movie", null, null, MaterialiseTrigger.Manual, CancellationToken.None);
+
+        Assert.Equal(MaterialisationStatus.Success, outcome.Status);
+        gostream.Verify(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()), Times.Once);
+        var row = await db.GetMaterialisedStateAsync(60, "movie", -1, -1, CancellationToken.None);
+        Assert.NotNull(row);
+        Assert.False(await db.IsMaterialiseInFlightAsync(60, "movie", -1, -1, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task FreshInFlightRow_UnderStaleThreshold_StillBlocksConcurrentDuplicate()
+    {
+        // Safety case required by the ROI: a claim from a genuinely-running
+        // materialise (fresh started_at) must still block a concurrent
+        // duplicate — the reclaim only applies past the stale threshold.
+        using var db = await NewDbAsync();
+        await SeedMovieMetadataAsync(db, 60);
+        await db.UpsertMaterialiseInFlightAsync(60, "movie", -1, -1, CancellationToken.None);
+        var (sut, gostream, _, _, _, _) = BuildSut(db);
+
+        var outcome = await sut.MaterialiseAsync(60, "movie", null, null, MaterialiseTrigger.Manual, CancellationToken.None);
+
+        Assert.Equal(MaterialisationStatus.AlreadyInProgress, outcome.Status);
+        gostream.Verify(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
     public async Task ConcurrentMaterialise_SameTuple_OnlyOneGostreamAdd()
     {
         using var db = await NewDbAsync();
@@ -734,6 +789,35 @@ public class MaterialiserTests : IDisposable
         var (sut, _, _, _, _, _) = BuildSut(db);
         var outcome = await sut.MaterialiseAsync(1, "episode", null, null, MaterialiseTrigger.Manual, CancellationToken.None);
         Assert.Equal(MaterialisationStatus.Error, outcome.Status);
+    }
+
+    [Fact]
+    public async Task Episode_LeakedInFlightRow_OlderThanStaleThreshold_ReclaimedWithoutRestart()
+    {
+        // Movie/TV parity for LeakedInFlightRow_OlderThanStaleThreshold_ReclaimedWithoutRestart.
+        using var db = await NewDbAsync();
+        await SeedSeriesMetadataAsync(db, 200);
+
+        await db.UpsertMaterialiseInFlightAsync(200, "episode", 1, 1, CancellationToken.None);
+        var cs = new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString();
+        await using (var conn = new Microsoft.Data.Sqlite.SqliteConnection(cs))
+        {
+            await conn.OpenAsync();
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE materialise_in_flight SET started_at = $t WHERE tmdb_id = 200 AND type = 'episode';";
+            cmd.Parameters.AddWithValue("$t", DateTimeOffset.UtcNow.AddMinutes(-30).ToUnixTimeSeconds());
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        var (sut, gostream, _, _, _, _) = BuildSut(db);
+
+        var outcome = await sut.MaterialiseAsync(200, "episode", 1, 1, MaterialiseTrigger.Manual, CancellationToken.None);
+
+        Assert.Equal(MaterialisationStatus.Success, outcome.Status);
+        gostream.Verify(g => g.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()), Times.Once);
+        var row = await db.GetMaterialisedStateAsync(200, "episode", 1, 1, CancellationToken.None);
+        Assert.NotNull(row);
+        Assert.False(await db.IsMaterialiseInFlightAsync(200, "episode", 1, 1, CancellationToken.None));
     }
 
     [Fact]
