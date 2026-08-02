@@ -51,6 +51,12 @@ components:
   gostreamConfig: true
   # Standalone Prowlarr indexer aggregator (own Deployment/Service/PVC), reachable at svc `prowlarr`.
   prowlarr: true
+  # SHARED Jellyfin metadata PVC (`jellyfinMetadata.pvcName`, fixed/unsuffixed): the derived,
+  # color-independent artwork cache (posters/backdrops/people images) split out of jellyfin-var-lib
+  # so a blue/green flip never copies it (identical across colors) and the idle color does not
+  # duplicate ~78G on disk. Shared like warmup/real-mkv: owned by the release that enables it;
+  # workload releases mount it via extraVolumes/extraVolumeMounts at /var/lib/jellyfin/metadata.
+  jellyfinMetadata: false
 
 # ---------------------------------------------------------------------------- ingress --
 ingress:
@@ -190,11 +196,26 @@ warmup:
 realMkv:
   pvcName: gostream-real-mkv
 
+# ---------------------------------------------------------- shared Jellyfin metadata --
+# The /var/lib/jellyfin/metadata artwork cache, split into ONE shared RWO PVC both colors mount (by
+# fixed name) at /var/lib/jellyfin/metadata via extraVolumes/extraVolumeMounts. Derived + color-
+# independent, so it is never part of a flip's DB sync. Created by components.jellyfinMetadata.
+jellyfinMetadata:
+  pvcName: jellyfin-metadata
+
 # --------------------------------------------------------------- gostream tuning config --
 # configMapName is the fixed (unsuffixed) name the workload mounts and components.gostreamConfig
 # creates. The data is rendered from `config` below (disk_warmup_quota_gb injected from warmup.quotaGb).
 gostreamConfig:
   configMapName: gostream-config
+
+# ------------------------------------------------------------- extra pod volumes/mounts --
+# Escape hatch for attaching additional volumes to the single Deployment WITHOUT touching the happy
+# path (both default empty). Used by the blue/green topology to mount the SHARED jellyfin-metadata
+# PVC at /var/lib/jellyfin/metadata (see components.jellyfinMetadata). Standard pod volume /
+# volumeMount list syntax; appended verbatim after the built-in volumes/mounts.
+extraVolumes: []
+extraVolumeMounts: []
 
 # ---------------------------------------------------------------------------- storage --
 persistence:
@@ -211,6 +232,10 @@ persistence:
     size: 100Gi   # real library metadata ≈ 84G; local-path does not enforce, sized honestly
   jellyfinEtc:
     size: 256Mi
+  # SHARED Jellyfin metadata artwork cache (split out of jellyfinVarLib; ~78G today). Sized honestly;
+  # local-path does not enforce. Created by components.jellyfinMetadata.
+  jellyfinMetadata:
+    size: 100Gi
 
 # gostream non-secret tuning config (rendered verbatim to the ConfigMap's config.tuning.json). This
 # is the structured form of gostream's reference config; disk_warmup_quota_gb is injected from

@@ -32,3 +32,26 @@ spec:
     requests:
       storage: {{ .Values.persistence.jellyfinEtc.size }}
 {{- end }}
+{{- if .Values.components.jellyfinMetadata }}
+---
+{{/*
+SHARED, color-independent Jellyfin metadata (artwork) cache. Split out of jellyfin-var-lib so a
+blue/green flip never has to copy it (it is derived + identical across colors) and the idle color
+does not duplicate ~78G. Shared singleton like warmup/real-mkv: one RWO PVC (fixed name) both colors
+mount at /var/lib/jellyfin/metadata via extraVolumes/extraVolumeMounts. Owned by whichever release
+enables components.jellyfinMetadata (the `shared` release in the blue/green topology).
+*/}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Values.jellyfinMetadata.pvcName }}
+  labels:
+    {{- include "phantom-library.labels" . | nindent 4 }}
+    app.kubernetes.io/component: jellyfin-metadata
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: {{ .Values.persistence.storageClassName }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.jellyfinMetadata.size }}
+{{- end }}

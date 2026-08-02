@@ -104,6 +104,9 @@ spec:
             # stages a DLL here — Jellyfin runs fine with zero preload plugins).
             - name: plugin-preload
               mountPath: /opt/jellyfin/plugins-preload
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
       volumes:
         # FUSE mount point. Ephemeral (the virtual-MKV files are streamed on demand); the container
         # has its own mount namespace, so no per-instance hostPath is needed.
@@ -142,4 +145,7 @@ spec:
             claimName: jellyfin-etc{{ include "phantom-library.suffix" . }}
         - name: plugin-preload
           emptyDir: {}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
 {{- end }}
