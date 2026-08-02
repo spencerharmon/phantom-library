@@ -5,7 +5,7 @@ Single-instance Ingress.
                      not rewrite the HTTP Host header, so a hostname that CNAMEs here must ALSO be a
                      Host). Exactly one instance may carry a given extra Host at a time.
   gostream dashboard (:9080, when gostream.exposeUi): the gostorm/tiramisu host (default tiramisu.<hostname>)
-                     plus any .Values.ingress.extraGostormHosts. Fronts the metrics port's
+                     plus any .Values.ingress.extraGostormHosts. Fronts (via the per-color -splash nginx) the metrics port's
                      /dashboard "GoStream Health Monitor" UI — the GoStorm engine port :8090 has no
                      browsable UI, so the dashboard host targets :9080, NOT :8090.
 TLS: default OFF -> no tls: block, traefik's default TLSStore serves the site wildcard by SNI. When
@@ -56,8 +56,8 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: {{ include "phantom-library.fullname" $ }}
+                name: {{ include "phantom-library.fullname" $ }}-splash
                 port:
-                  number: {{ $.Values.gostream.ports.metrics }}
+                  number: 80
     {{- end }}
 {{- end }}

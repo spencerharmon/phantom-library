@@ -111,6 +111,11 @@ gostream:
   exposeUi: true
   # gostorm/tiramisu-UI hostname. Empty -> "tiramisu." prepended to `hostname`.
   hostname: ""
+  # Landing splash fronting the tiramisu host: nginx serves a link page at exactly "/" (gostream :9080
+  # has no root handler) and reverse-proxies every other path to the gostream dashboard port, so
+  # /dashboard and /control keep working on the same host. Rendered with the workload when exposeUi.
+  splash:
+    image: nginx:1.27-alpine
   env:
     GOSTREAM_ROOT_PATH: /usr/local/state
     GOSTREAM_MOUNT_PATH: /var/gostream/gostream-mkv-virtual
