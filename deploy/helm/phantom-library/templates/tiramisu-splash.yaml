@@ -60,9 +60,30 @@ data:
         try_files /index.html =404;
       }
 
+      # gostorm engine API (:8090, no ingress of its own) — same-origin target for the /control UI
+      # after the sub_filter rewrite below. Trailing slash on proxy_pass strips the /gostorm/ prefix
+      # (so /gostorm/settings -> :8090/settings).
+      location /gostorm/ {
+        proxy_pass http://{{ include "phantom-library.fullname" . }}:{{ .Values.gostream.ports.gostorm }}/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 300s;
+      }
+
       location / {
         proxy_pass http://{{ include "phantom-library.fullname" . }}:{{ .Values.gostream.ports.metrics }};
         proxy_http_version 1.1;
+        # The /control UI hardcodes an absolute gostorm-engine URL (http://<host>:8090/settings) for
+        # its Use-Warmup-Cache / engine settings. Over the https ingress that is BOTH mixed-content
+        # (http from https) AND an unexposed port, so every read/write silently fails (checkbox reads
+        # "off", saves never persist). Rewrite it to the same-origin /gostorm/ path proxied above.
+        # sub_filter needs the upstream HTML uncompressed, hence the empty Accept-Encoding.
+        proxy_set_header Accept-Encoding "";
+        sub_filter_once off;
+        sub_filter "'http://' + window.location.hostname + ':8090/settings'" "'/gostorm/settings'";
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;

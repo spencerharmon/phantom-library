@@ -25,5 +25,8 @@ spec:
     - name: dashboard
       port: {{ .Values.gostream.ports.metrics }}
       targetPort: metrics
+    - name: gostorm
+      port: {{ .Values.gostream.ports.gostorm }}
+      targetPort: gostorm
     {{- end }}
 {{- end }}
