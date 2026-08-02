@@ -40,8 +40,10 @@ components:
   jellyfinStorage: true
   # Per-instance gostream STATE PVC (gostream-state): STATE/gostream.db inode map + config.db BoltDB.
   gostreamState: true
-  # Per-instance gostream PHYSICAL source PVC (gostream-real-mkv): the JSON stub descriptors gostream
-  # scans to build its virtual-MKV FS. Persist it or every materialised item vanishes on restart.
+  # SHARED gostream physical-source PVC (`realMkv.pvcName`, fixed/unsuffixed): the infohash-named
+  # (content-addressed) JSON stub descriptors gostream scans to build its virtual-MKV FS. Shared like
+  # warmup so both colors see the same materialised catalogue (seamless flip). Owned by the release
+  # that enables it; workload releases mount it by fixed name.
   gostreamRealMkv: true
   # gostream warmup cache PVC (`warmup.pvcName`, fixed/unsuffixed). Sized from warmup.quotaGb+headroomGi.
   warmupCache: true
@@ -175,6 +177,13 @@ warmup:
   pvcName: gostream-warmup
   quotaGb: 45
   headroomGi: 5   # PVC capacity = quotaGb + headroomGi (Gi)
+
+# ---------------------------------------------------------- gostream physical source --
+# The /mnt/gostream-mkv-real stub pool. Stubs are infohash-named (content-addressed), so both colors
+# converge on identical files -> ONE shared RWO PVC (like warmup). pvcName is the fixed (unsuffixed)
+# name the workload mounts and components.gostreamRealMkv creates. Size lives under persistence.realMkv.
+realMkv:
+  pvcName: gostream-real-mkv
 
 # --------------------------------------------------------------- gostream tuning config --
 # configMapName is the fixed (unsuffixed) name the workload mounts and components.gostreamConfig

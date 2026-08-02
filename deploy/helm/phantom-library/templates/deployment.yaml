@@ -110,7 +110,7 @@ spec:
             # virtual-MKV FS. MUST persist — an empty source yields an empty virtual FS, so every
             # materialised item (old catalog + new) would stop resolving on restart. Rendered by
             # components.gostreamRealMkv.
-            claimName: gostream-real-mkv{{ include "phantom-library.suffix" . }}
+            claimName: {{ .Values.realMkv.pvcName }}
         - name: state
           persistentVolumeClaim:
             # Per-instance single-writer gostream STATE (STATE/gostream.db inode map + config.db BoltDB).

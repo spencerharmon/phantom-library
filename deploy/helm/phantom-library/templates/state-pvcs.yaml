@@ -4,15 +4,27 @@ Storage split (each an independent component toggle):
     <root>/STATE/gostream.db (inode map, SACRED) and <root>/config.db (gostorm BoltDB: torrents +
     TorrentsSavePath + settings). Both are SINGLE-WRITER embedded DBs (bbolt exclusive lock; SQLite
     single-writer), so each workload instance owns its own.
+  * gostreamRealMkv -> the gostream PHYSICAL-SOURCE PVC (.Values.realMkv.pvcName, fixed/unsuffixed).
+    /mnt/gostream-mkv-real holds the tiny JSON stub descriptors (magnet/infohash/size/stream-url)
+    gostream scans at startup to build its virtual-MKV FS. Each stub is named by its infohash
+    (<title>_<res>_<infohash8>.mkv), so it is CONTENT-ADDRESSED and immutable-by-hash exactly like
+    the warmup cache: any color materialising the same item writes a byte-identical stub at the
+    identical path. So it is a SHARED singleton (one RWO PVC both colors mount by fixed name) — NOT
+    per-instance. Sharing it makes a blue/green flip seamless: the inactive color already sees the
+    full materialised catalogue with no re-seed/re-materialise. (Real media is never stored here —
+    it is streamed from the torrent on read — so the PVC stays tiny.)
   * warmupCache -> the gostream warmup PVC (.Values.warmup.pvcName, fixed/unsuffixed). The
     infohash-addressed warmup cache at gostorm's TorrentsSavePath (/usr/local/warmup) is
     content-addressed, so instances that share a node converge on identical filenames and can share
     ONE RWO PVC. Rendered by whichever release enables components.warmupCache.
+Both shared singletons (real-mkv, warmup) are owned by whichever release enables their component
+(the `shared` release in the blue/green topology), and workload releases mount them by fixed name.
 WARMUP-SIZING INVARIANT: capacity = warmup.quotaGb + warmup.headroomGi, so it can never be smaller
 than the quota gostream enforces (quota = quotaGb * 1024^3). Both this size and the ConfigMap's
 disk_warmup_quota_gb come from .Values.warmup — the single source Helm gives us.
 */}}
 {{- if .Values.components.gostreamState }}
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -32,7 +44,7 @@ spec:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: gostream-real-mkv{{ include "phantom-library.suffix" . }}
+  name: {{ .Values.realMkv.pvcName }}
   labels:
     {{- include "phantom-library.labels" . | nindent 4 }}
     app.kubernetes.io/component: real-mkv
@@ -43,10 +55,8 @@ spec:
     requests:
       storage: {{ .Values.persistence.realMkv.size }}
 {{- end }}
-{{- if and .Values.components.gostreamState .Values.components.warmupCache }}
----
-{{- end }}
 {{- if .Values.components.warmupCache }}
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
