@@ -16,7 +16,7 @@ type: application
 # all blue/green language (composition of releases is the consumer's concern). BREAKING values schema.
 # 2.1.1: rename the gostorm control-panel host default label `gostorm.` -> `tiramisu.` (the rebranded
 # GoStream/GoStorm dashboard name); host label only, no schema/value-key change.
-version: 2.4.2
+version: 2.4.3
 # Tracks the app milestone, not a container tag (images are digest-pinned in values).
 appVersion: "m14"
 keywords:

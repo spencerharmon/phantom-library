@@ -257,3 +257,11 @@ config:
     library_id: 0
   library_add_timeout_sec: 45
   library_validation_lease_minutes: 10
+  # Prowlarr indexer for gostream's OWN source resolution. Non-secret half only: enabled +
+  # in-cluster URL. The api_key is supplied by the out-of-band gostream-config-secret
+  # (config.secret.json prowlarr.api_key), deep-merged OVER this at container start
+  # (jq '.[0] * .[1]'), so it never lands in the ConfigMap / git. tmdb_api_key is likewise
+  # secret-only. When enabled, gostream uses Prowlarr instead of torrentio_url.
+  prowlarr:
+    enabled: true
+    url: "http://prowlarr:9696/"
