@@ -99,8 +99,10 @@ terminationGracePeriodSeconds: 60
 
 # ------------------------------------------------------------------ gostream (per Pod) --
 gostream:
-  # gostorm web UI exposure. When true the Service adds a gostorm port and the Ingress serves
-  # gostorm.<hostname> (+ ingress.extraGostormHosts). gostorm has its own auth layer.
+  # gostream Health Monitor dashboard exposure. When true the Service adds a `dashboard` port and the
+  # Ingress serves gostorm.<hostname> (+ ingress.extraGostormHosts), fronting the metrics port's
+  # /dashboard UI. NOTE: the GoStorm engine port (:8090) is API-only with no browsable UI, so the
+  # dashboard host targets :9080 (metrics), NOT :8090.
   exposeUi: true
   # gostorm-UI hostname. Empty -> "gostorm." prepended to `hostname`.
   hostname: ""
@@ -131,9 +133,10 @@ jellyfin:
 # Indexer aggregator the plugin's source search calls (ProwlarrBaseUrl / ProwlarrApiKey). Runs as
 # its OWN Deployment+Service (NOT a Jellyfin sidecar), reachable at the fixed DNS name `prowlarr`.
 # We seed Prowlarr's config.xml with the SAME API key the migrated plugin config carries so the two
-# authenticate out of the box. INDEXERS are host-local operator data (NOT part of the migration
-# import) — add them in the Prowlarr UI after deploy
-# (`kubectl -n phantom-library port-forward svc/prowlarr 9696:9696`).
+# authenticate out of the box, and with Forms auth Required so the UI is login-gated (Prowlarr forces
+# admin-user creation on first visit). INDEXERS are host-local operator data (NOT part of the
+# migration import) — add them in the Prowlarr UI after deploy
+# (`kubectl -n phantom-library port-forward svc/prowlarr 9696:9696`, or via prowlarr.ingress).
 prowlarr:
   image:
     repository: ghcr.io/linuxserver/prowlarr
@@ -149,6 +152,13 @@ prowlarr:
     TZ: "Etc/UTC"
   storage:
     size: 2Gi
+  # Optional Ingress fronting the Prowlarr UI/API. Default OFF — the generic chart ships Prowlarr
+  # reachable only in-cluster / via port-forward. A consuming layer that wants browser access sets
+  # enabled=true and one or more hosts (Prowlarr's own Forms auth, seeded above, gates the UI; the
+  # plugin still authenticates with the API key). external-dns publishes A-records from the Host rules.
+  ingress:
+    enabled: false
+    hosts: []
   resources:
     requests: { cpu: "50m", memory: 128Mi }
     limits: { cpu: "1", memory: 512Mi }

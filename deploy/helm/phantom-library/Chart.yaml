@@ -14,7 +14,7 @@ type: application
 # independent per-piece toggles (workload / jellyfinStorage / gostreamState / warmupCache /
 # gostreamConfig / prowlarr); removed the `shared` grouping, the `color`/`colorLabel` machinery, and
 # all blue/green language (composition of releases is the consumer's concern). BREAKING values schema.
-version: 2.0.0
+version: 2.1.0
 # Tracks the app milestone, not a container tag (images are digest-pinned in values).
 appVersion: "m14"
 keywords:

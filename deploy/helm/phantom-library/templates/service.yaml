@@ -1,8 +1,10 @@
 {{- if .Values.components.workload }}
 {{/*
 Single-instance Service. Fronts Jellyfin :8096 (the Ingress backend). When gostream.exposeUi, also
-fronts the gostorm web UI :8090. Selector is instance+component-scoped so it never receives another
-release's traffic nor a Prowlarr Pod's.
+fronts the gostream Health Monitor dashboard. NOTE: the GoStorm engine port (:8090) is API-only with
+NO browsable UI (404 at /), so the dashboard is served from the metrics port (:9080) whose /dashboard
+route renders the "GoStream Health Monitor" web UI. Selector is instance+component-scoped so it never
+receives another release's traffic nor a Prowlarr Pod's.
 */}}
 apiVersion: v1
 kind: Service
@@ -20,8 +22,8 @@ spec:
       port: {{ .Values.jellyfin.httpPort }}
       targetPort: http
     {{- if .Values.gostream.exposeUi }}
-    - name: gostorm
-      port: {{ .Values.gostream.ports.gostorm }}
-      targetPort: gostorm
+    - name: dashboard
+      port: {{ .Values.gostream.ports.metrics }}
+      targetPort: metrics
     {{- end }}
 {{- end }}

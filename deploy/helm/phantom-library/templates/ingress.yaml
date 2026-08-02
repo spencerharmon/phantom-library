@@ -4,8 +4,10 @@ Single-instance Ingress.
   Jellyfin (:8096):  .Values.hostname ALWAYS, plus any .Values.ingress.extraHosts (a bare CNAME does
                      not rewrite the HTTP Host header, so a hostname that CNAMEs here must ALSO be a
                      Host). Exactly one instance may carry a given extra Host at a time.
-  gostorm UI (:8090, when gostream.exposeUi): the gostorm host (default gostorm.<hostname>) plus any
-                     .Values.ingress.extraGostormHosts.
+  gostream dashboard (:9080, when gostream.exposeUi): the gostorm host (default gostorm.<hostname>)
+                     plus any .Values.ingress.extraGostormHosts. Fronts the metrics port's
+                     /dashboard "GoStream Health Monitor" UI — the GoStorm engine port :8090 has no
+                     browsable UI, so the dashboard host targets :9080, NOT :8090.
 TLS: default OFF -> no tls: block, traefik's default TLSStore serves the site wildcard by SNI. When
 .Values.tls.enabled the tls: block references the (optionally cert-manager-provisioned) secret.
 external-dns publishes A-records from the Host rules (standard ingress discovery — no DNSEndpoint).
@@ -56,6 +58,6 @@ spec:
               service:
                 name: {{ include "phantom-library.fullname" $ }}
                 port:
-                  number: {{ $.Values.gostream.ports.gostorm }}
+                  number: {{ $.Values.gostream.ports.metrics }}
     {{- end }}
 {{- end }}

@@ -6,9 +6,10 @@ config.xml with the SAME key the migrated plugin config carries so they match wi
 action. Indexers themselves are host-local operator data (never part of the migration import) — add
 them via the Prowlarr UI (`kubectl -n phantom-library port-forward svc/prowlarr 9696:9696`).
 
-Auth: External + DisabledForLocalAddresses — in-cluster callers (the Jellyfin pods, RFC1918 pod IPs)
-and port-forward (127.0.0.1) reach the API/UI without a login wall; the API key is honoured
-regardless. Not exposed via Ingress on purpose (no public auth in front of it yet).
+Auth: Forms + Required — the UI is gated by a login (Prowlarr forces admin-user creation on first
+visit when no user exists yet); the API key is honoured regardless, so the in-cluster Jellyfin pods
+and port-forward callers authenticate with the key without a UI login. Exposed via Ingress only when
+.Values.prowlarr.ingress.enabled (the login gate makes that safe).
 */}}
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -89,8 +90,8 @@ spec:
                 <EnableSsl>False</EnableSsl>
                 <LaunchBrowser>False</LaunchBrowser>
                 <ApiKey>{{ .Values.prowlarr.apiKey }}</ApiKey>
-                <AuthenticationMethod>External</AuthenticationMethod>
-                <AuthenticationRequired>DisabledForLocalAddresses</AuthenticationRequired>
+                <AuthenticationMethod>Forms</AuthenticationMethod>
+                <AuthenticationRequired>Enabled</AuthenticationRequired>
                 <Branch>master</Branch>
                 <LogLevel>info</LogLevel>
                 <SslCertPath></SslCertPath>
@@ -135,4 +136,39 @@ spec:
         - name: config
           persistentVolumeClaim:
             claimName: prowlarr-config
+{{- if .Values.prowlarr.ingress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: prowlarr
+  labels:
+    {{- include "phantom-library.labels" . | nindent 4 }}
+    app.kubernetes.io/component: prowlarr
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: {{ .Values.ingress.entrypoint }}
+spec:
+  ingressClassName: traefik
+  {{- if .Values.tls.enabled }}
+  tls:
+    - hosts:
+        {{- range .Values.prowlarr.ingress.hosts }}
+        - {{ . }}
+        {{- end }}
+      secretName: {{ include "phantom-library.tlsSecret" . }}
+  {{- end }}
+  rules:
+    {{- range .Values.prowlarr.ingress.hosts }}
+    - host: {{ . }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: prowlarr
+                port:
+                  number: {{ $.Values.prowlarr.port }}
+    {{- end }}
+{{- end }}
 {{- end }}
