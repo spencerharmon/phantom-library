@@ -150,6 +150,45 @@ jellyfin:
     requests: { cpu: "500m", memory: 1Gi }
     limits: { cpu: "2", memory: 4Gi }
 
+# ---------------------------------------------------------------- shared PostgreSQL (P4 Stage A) --
+# Generic, OFF-by-default wiring for pointing this instance's Jellyfin (via the external
+# `Jellyfin.Pgsql` EF Core provider) and the plugin's own `phantom.db` logical DB at a SHARED
+# PostgreSQL server, instead of the default per-color SQLite files. This chart stays color-agnostic
+# per the bluegreen-topology-obfuscation skill: it has NO idea which instance is "active" or "idle" —
+# it only offers the toggle. The CONSUMING layer (the controller/HelmRelease composition) decides
+# which release(s) set `postgres.enabled: true` (e.g. only the inactive color's release, while the
+# migration in `scripts/phantom-migrate-jellyfindb-to-postgres.sh` runs and is hand-validated) and
+# supplies the connection details + the out-of-band Secret named by `*.passwordSecretName`.
+#
+# `jellyfin.*` follows the `Jellyfin.Pgsql` (JPVenson) image's own documented env-var contract
+# (POSTGRES_HOST/PORT/DB/USER/PASSWORD/SSLMODE/TRUSTSERVERCERTIFICATE/COMMAND_TIMEOUT) so the SAME
+# values drive that provider once the image bakes it in — no chart-invented naming for that half.
+# `phantom.*` is the plugin's OWN logical DB (a separate Postgres database on the same server): the
+# env var names here (PHANTOM_POSTGRES_*) are a forward-declared surface for `p4-phantomdb-postgres-
+# backend` (the plugin does not read Postgres config yet) so the wiring lands once, ahead of the
+# plugin-side implementation, per the task's Stage A step 1/2 split.
+postgres:
+  enabled: false
+  jellyfin:
+    host: ""
+    port: 5432
+    db: jellyfin_prod
+    user: jellyfin
+    # Secret (Opaque) holding the connection password, provisioned OUT OF BAND like
+    # `configSecretName` above. Referenced by name + key only; the chart never sees the value.
+    passwordSecretName: ""
+    passwordSecretKey: postgres-password
+    sslMode: ""              # e.g. "Require"; empty omits POSTGRES_SSLMODE
+    trustServerCertificate: false
+    commandTimeoutSeconds: 30
+  phantom:
+    host: ""
+    port: 5432
+    db: phantom_prod
+    user: jellyfin
+    passwordSecretName: ""
+    passwordSecretKey: postgres-password
+
 # ---------------------------------------------------------------- prowlarr (standalone) --
 # Indexer aggregator the plugin's source search calls (ProwlarrBaseUrl / ProwlarrApiKey). Runs as
 # its OWN Deployment+Service (NOT a Jellyfin sidecar), reachable at the fixed DNS name `prowlarr`.
