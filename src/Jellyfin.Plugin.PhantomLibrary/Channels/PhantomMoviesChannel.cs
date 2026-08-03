@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using System.Text.RegularExpressions;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
 using Jellyfin.Plugin.PhantomLibrary.Clients.Models;
+using Jellyfin.Plugin.PhantomLibrary.Diagnostics;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Controller.Channels;
 using MediaBrowser.Controller.Drawing;
@@ -137,6 +138,14 @@ public sealed class PhantomMoviesChannel
             };
         }
 
+        // P5 baseline: time the list-view load. Guid.Empty is the
+        // materialised-only enumeration path (system/refresh callers); a real
+        // user id is the interactive list-view load.
+        using var flowScope = PhantomFlowMetrics.Time(
+            query.UserId == Guid.Empty
+                ? PhantomFlowMetrics.FlowMaterialisedListing
+                : PhantomFlowMetrics.FlowListView);
+
         var items = new List<ChannelItemInfo>();
         var emittedTmdbs = new HashSet<int>();
 
@@ -251,6 +260,7 @@ public sealed class PhantomMoviesChannel
             items.Add(await BuildOrphanMovieItemAsync(o, cancellationToken).ConfigureAwait(false));
         }
 
+        flowScope.ItemCount = items.Count;
         return new ChannelItemResult
         {
             Items = items,

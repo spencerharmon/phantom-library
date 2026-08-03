@@ -6,6 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **OTLP flow-latency metrics for the five browse flows (pre-Postgres
+  baseline instrumentation).** A new `Phantom.Flows` meter
+  (`src/.../Diagnostics/PhantomFlowMetrics.cs`) records a
+  `phantom_flow_duration_ms` histogram and a `phantom_flow_items` counter,
+  tagged `flow` and `backend` (`sqlite`/`postgres`), around the five channel
+  browse flows: list view, sort/filter (badge States endpoint), season
+  listing, episode listing, and materialised listing. An opt-in OTLP exporter
+  (`PhantomMetricsExporter`, an `IHostedService`) ships these over
+  OTLP/gRPC or OTLP/HTTP. The exporter target is **configuration/env driven,
+  never a baked-in host**: `MetricsOtlpEndpoint` / `MetricsOtlpProtocol`
+  plugin config, falling back to the standard `OTEL_EXPORTER_OTLP_ENDPOINT` /
+  `OTEL_EXPORTER_OTLP_PROTOCOL` env vars; disabled by default
+  (`MetricsOtlpEnabled=false`). This establishes the SQLite baseline the
+  Postgres load-time comparison and the ratcheting regression guard measure
+  against.
+
 ### Fixed
 
 - **Materialise in-flight leak: deterministic inline reclaim, no restart

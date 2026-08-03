@@ -126,7 +126,38 @@ public class PluginConfiguration : BasePluginConfiguration
         SourceValidationPolicyVersion = "sv14-parser-audio-v1";
         GostreamHeavyConcurrency = 2;
         GostreamToken = string.Empty;
+
+        MetricsOtlpEnabled = false;
+        MetricsOtlpEndpoint = string.Empty;
+        MetricsOtlpProtocol = "grpc";
     }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the plugin pushes its
+    /// user-facing browse-flow latency histograms (P5 baseline instrumentation)
+    /// to an OTLP collector. Off by default; enabling it without a resolvable
+    /// endpoint is a no-op. The pull-based prometheus-net metrics on Jellyfin's
+    /// <c>/metrics</c> endpoint are unaffected by this toggle.
+    /// </summary>
+    public bool MetricsOtlpEnabled { get; set; }
+
+    /// <summary>
+    /// Gets or sets the OTLP collector endpoint the flow metrics exporter ships
+    /// to (for example <c>http://otel-collector.observability.svc:4317</c>).
+    /// Empty (default) falls back to the standard <c>OTEL_EXPORTER_OTLP_ENDPOINT</c>
+    /// environment variable. Never bake a deployment hostname into code — the
+    /// observability stack target is operator-configured and has changed
+    /// (OpenObserve retired in favour of the grafana-mimir-prometheus stack).
+    /// </summary>
+    public string MetricsOtlpEndpoint { get; set; }
+
+    /// <summary>
+    /// Gets or sets the OTLP transport protocol: <c>grpc</c> (default, port
+    /// 4317) or <c>http/protobuf</c> (port 4318). Empty falls back to the
+    /// standard <c>OTEL_EXPORTER_OTLP_PROTOCOL</c> environment variable, then
+    /// <c>grpc</c>.
+    /// </summary>
+    public string MetricsOtlpProtocol { get; set; }
 
     /// <summary>Gets or sets the TMDB v3 API key used by the plugin's TMDB client.</summary>
     public string TmdbApiKey { get; set; }

@@ -6,6 +6,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Channels;
 using Jellyfin.Plugin.PhantomLibrary.Configuration;
+using Jellyfin.Plugin.PhantomLibrary.Diagnostics;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Entities;
@@ -108,6 +109,12 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
         {
             return Ok(result);
         }
+
+        // P5 baseline: the badge-state batch re-resolve is the plugin-owned
+        // cost of a list-view sort/filter change (phantomBadges.js re-polls the
+        // freshly visible tile set on every reorder/filter).
+        using var flowScope = PhantomFlowMetrics.Time(PhantomFlowMetrics.FlowSortFilter);
+        flowScope.ItemCount = requests.Count;
 
         var resolved = new Dictionary<Guid, (BaseItem? Item, ChannelItemId Parsed)>();
         var unresolved = new HashSet<Guid>(requests.Select(r => r.Guid));

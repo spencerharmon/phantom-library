@@ -138,5 +138,9 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
 
         // Scheduled tasks.
         serviceCollection.AddSingleton<IScheduledTask, DiscoveryRefreshTask>();
+
+        // P5 baseline metrics: OTLP exporter for the user-facing browse-flow
+        // latency histograms. Endpoint resolved from config/env (never baked).
+        serviceCollection.AddHostedService<Diagnostics.PhantomMetricsExporter>();
     }
 }

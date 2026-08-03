@@ -8,6 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
 using Jellyfin.Plugin.PhantomLibrary.Clients.Models;
+using Jellyfin.Plugin.PhantomLibrary.Diagnostics;
 using Jellyfin.Plugin.PhantomLibrary.Configuration;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Controller.Channels;
@@ -351,6 +352,7 @@ public sealed partial class PhantomShowsChannel
 
     private async Task<ChannelItemResult> GetTopLevelSeriesAsync(Guid userId, CancellationToken ct)
     {
+        using var flowScope = PhantomFlowMetrics.Time(PhantomFlowMetrics.FlowListView);
         var seen = new HashSet<int>();
         var items = new List<ChannelItemInfo>();
 
@@ -426,6 +428,7 @@ public sealed partial class PhantomShowsChannel
 
     private async Task<ChannelItemResult> GetSeasonsForSeriesAsync(Guid userId, int seriesTmdb, CancellationToken ct)
     {
+        using var flowScope = PhantomFlowMetrics.Time(PhantomFlowMetrics.FlowSeasonListing);
         // Title-level hide short-circuits the whole seasons browse for this
         // series (REQ-M14-PER-USER Surface 3). This must happen BEFORE the
         // visible-seasons/external-seasons union below: unlike the top-level
@@ -496,6 +499,7 @@ public sealed partial class PhantomShowsChannel
 
     private async Task<ChannelItemResult> GetEpisodesForSeasonAsync(Guid userId, int seriesTmdb, int season, CancellationToken ct)
     {
+        using var flowScope = PhantomFlowMetrics.Time(PhantomFlowMetrics.FlowEpisodeListing);
         // Title-level hide short-circuits the whole episodes browse for this
         // series (REQ-M14-PER-USER Surface 3) — before any TMDB/cache work, for
         // the same completeness reason as GetSeasonsForSeriesAsync: the known-
