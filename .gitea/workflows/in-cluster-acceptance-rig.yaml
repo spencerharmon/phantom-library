@@ -1,0 +1,79 @@
+name: phantom-library in-cluster acceptance rig
+# .gitea/workflows/in-cluster-acceptance-rig.yaml
+#
+# P3 Stage 5 in-cluster acceptance gate (task in-cluster-acceptance-rig):
+# the ultimate ROI acceptance bar. Unlike live-rig.yaml (which proves the
+# PLUGIN against the rig's own throwaway Jellyfin built from freshly-pulled
+# images), this job proves the DEPLOY -- it drives the actual, already
+# running `phantom-library-bluegreen-deploy` HelmRelease on `spray` (the
+# current idle/dev color, its role host, its nested wildcard TLS, and its
+# co-located gostream-FUSE Pod) and is the precondition the operator's
+# host->cluster prod migration validates against before any prod CNAME
+# flip.
+#
+# Runs on the SELF-HOSTED Gitea Actions runner (already flux-deployed) --
+# NOT `ubuntu-latest` -- because it needs a live kubeconfig for the `spray`
+# cluster (in-cluster acceptance is meaningless from a hosted, cluster-less
+# runner).
+#
+# Everything substantive is delegated to
+# tools/ci/in-cluster-acceptance-run.sh (mirroring live-rig.yaml's
+# delegation to tools/ci/live-rig-run.sh) so this file stays a thin
+# trigger + toolchain declaration. No real hostnames, namespaces, or
+# credentials are hardcoded here (AGENTS.md "infrastructure identifiers"
+# rule) -- every one is supplied via the `secrets.*` / `vars.*` the
+# operator has already provisioned for this runner (kubeconfig context,
+# dev-color host, e2e service-account API key).
+#
+# Regression harness: scripts/tests/in-cluster-acceptance-rig.test.sh
+# verifies this file parses as YAML, runs on the self-hosted runner (never
+# ubuntu-latest), invokes tools/ci/in-cluster-acceptance-run.sh (never a
+# hand-rolled copy of its steps), and that a toolchain-agnostic dry run
+# (PHANTOM_CI_DRYRUN=1 tools/ci/in-cluster-acceptance-run.sh) exits 0 with
+# no kubectl/curl/openssl/network access.
+
+on:
+  push:
+    branches:
+      - main
+  # Manual trigger only by default -- this job dials the operator's real
+  # cluster, so it does not run on every PR the way the throwaway live-rig
+  # does. flux's own phantom-library-bluegreen-deploy pipeline (or an
+  # operator) triggers it once a color's deploy is ready to be proven.
+  workflow_dispatch:
+
+jobs:
+  in-cluster-acceptance:
+    name: in-cluster acceptance (real deployed dev/color stack)
+    runs-on: [self-hosted, gitea-actions-runner]
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install kubectl + curl + openssl + python3 (needed to resolve/assert the live deploy)
+        run: |
+          set -euo pipefail
+          apt-get update -y
+          apt-get install -y --no-install-recommends \
+            curl openssl python3 ca-certificates
+          if ! command -v kubectl >/dev/null 2>&1; then
+            curl -fsSLo /usr/local/bin/kubectl \
+              "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+            chmod +x /usr/local/bin/kubectl
+          fi
+          rm -rf /var/lib/apt/lists/*
+
+      - name: mark repo safe for git (container UID != checkout owner)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: in-cluster acceptance rig (shared script; drives the real deployed dev/color stack)
+        run: ./tools/ci/in-cluster-acceptance-run.sh
+        env:
+          # Fed from the runner's operator-provisioned CI secrets/vars --
+          # never hardcoded in this repo (AGENTS.md "infrastructure
+          # identifiers" rule).
+          KUBECONFIG: ${{ secrets.PHANTOM_INCLUSTER_KUBECONFIG_PATH }}
+          PHANTOM_INCLUSTER_NAMESPACE: ${{ vars.PHANTOM_INCLUSTER_NAMESPACE }}
+          PHANTOM_INCLUSTER_DEV_HOST: ${{ vars.PHANTOM_INCLUSTER_DEV_HOST }}
+          PHANTOM_INCLUSTER_PROD_HOST: ${{ vars.PHANTOM_INCLUSTER_PROD_HOST }}
+          PHANTOM_INCLUSTER_ADMIN_TOKEN: ${{ secrets.PHANTOM_INCLUSTER_ADMIN_TOKEN }}
