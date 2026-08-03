@@ -16,7 +16,6 @@ using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.Channels;
 using MediaBrowser.Controller.Library;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using Xunit;
@@ -39,7 +38,6 @@ public sealed class PhantomLibrarySourceControllerTests : IDisposable
     {
         try
         {
-            SqliteConnection.ClearAllPools();
             if (File.Exists(_dbPath)) File.Delete(_dbPath);
             if (Directory.Exists(_fuseRoot)) Directory.Delete(_fuseRoot, recursive: true);
         }

@@ -26,7 +26,6 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
 
     public void Dispose()
     {
-        SqliteConnection.ClearAllPools();
         if (File.Exists(_dbPath))
         {
             File.Delete(_dbPath);

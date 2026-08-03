@@ -34,7 +34,6 @@ public sealed class FavouriteRecommendationIngestorTests : IDisposable
     public void Dispose()
     {
         _db.Dispose();
-        SqliteConnection.ClearAllPools();
         try
         {
             if (File.Exists(_dbPath))

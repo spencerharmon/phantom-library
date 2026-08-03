@@ -39,7 +39,6 @@ public class PhantomLibraryBadgesControllerTests : IDisposable
     {
         try
         {
-            SqliteConnection.ClearAllPools();
             if (File.Exists(_dbPath)) File.Delete(_dbPath);
         }
         catch

@@ -8,7 +8,6 @@ using Jellyfin.Plugin.PhantomLibrary.Api;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Controller.Library;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Data.Sqlite;
 using Moq;
 using Xunit;
 
@@ -40,7 +39,6 @@ public class PhantomLibraryUserPrefsAdminTests : IDisposable
     {
         try
         {
-            SqliteConnection.ClearAllPools();
             if (File.Exists(_dbPath)) File.Delete(_dbPath);
         }
         catch
