@@ -32,6 +32,13 @@ spec:
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:
         fsGroup: {{ .Values.podSecurityContext.fsGroup }}
+        {{- with .Values.podSecurityContext.fsGroupChangePolicy }}
+        # OnRootMismatch: kubelet only recursively chowns the volume when its ROOT dir
+        # ownership/perms don't already match fsGroup. Once the tree is owned by fsGroup, every
+        # later (re)start skips the walk — avoids the multi-minute chown on the large-file-count
+        # metadata PVC that otherwise stalls every pod start. Empty value omits the field.
+        fsGroupChangePolicy: {{ . }}
+        {{- end }}
       imagePullSecrets:
         - name: {{ .Values.imagePullSecret }}
       containers:

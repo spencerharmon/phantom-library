@@ -105,6 +105,11 @@ configSecretName: gostream-config-secret
 # fsGroup so both apps' UIDs can write the local-path PVCs (jellyfin entrypoint mkdir -p's under them).
 podSecurityContext:
   fsGroup: 1000
+  # OnRootMismatch avoids kubelet's recursive volume chown on every pod (re)start: it walks the
+  # whole tree only when the volume ROOT doesn't already match fsGroup. The large metadata PVC
+  # (~2.7M files) otherwise re-chowns for many minutes on every restart, stalling container start
+  # and extending blue/green cutover outages. Set "" to omit the field (falls back to Always).
+  fsGroupChangePolicy: OnRootMismatch
 
 terminationGracePeriodSeconds: 60
 
