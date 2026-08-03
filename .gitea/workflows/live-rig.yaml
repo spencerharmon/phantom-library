@@ -1,0 +1,77 @@
+name: phantom-library live rig
+# .gitea/workflows/live-rig.yaml
+#
+# Gitea Actions live-rig gate: stands up the full Jellyfin channel/gostream
+# integration rig against the REAL patched-jellyfin + gostream images the
+# sibling pipelines publish to the Gitea OCI registry, and runs the
+# movie/TV/source-safety live scenarios end to end. This is the point of the
+# Gitea CI migration (gitea-live-rig-job): unlike the non-rig build/test gate
+# (nonrig-gate.yaml), this job exercises the real running server, not just
+# unit tests.
+#
+# Runs on the SELF-HOSTED Gitea Actions runner (already flux-deployed) —
+# NOT `ubuntu-latest` — because it needs podman (to pull/extract the
+# registry images) and a real filesystem the rig scripts can bind ports on.
+# It is NOT gated on any Zuul/Nodepool build-node: that provider never
+# existed for this tenant and is now retired outright, so unlike the
+# now-superseded Zuul rig-job design this job is not parked waiting on a
+# node label that will never appear — the Gitea runner already exists and
+# runs this job today.
+#
+# Everything substantive is delegated to tools/ci/live-rig-run.sh (mirroring
+# nonrig-gate.yaml's delegation to tools/ci/nonrig-build-test.sh) so the
+# workflow file itself stays a thin trigger + toolchain declaration.
+#
+# Regression harness: scripts/tests/gitea-live-rig-workflow.test.sh verifies
+# this file parses as YAML, runs on the self-hosted runner (never
+# ubuntu-latest), declares a container with a pinned .NET SDK image + podman
+# installed, invokes tools/ci/live-rig-run.sh (never a hand-rolled copy of
+# its steps), and that a toolchain-agnostic dry run
+# (PHANTOM_CI_DRYRUN=1 tools/ci/live-rig-run.sh) exits 0 with no podman,
+# dotnet SDK, or network access.
+#
+# GHA (.github/workflows/build.yml) is left in place until this path is
+# proven live end to end — see docs/tasks/gitea-live-rig-job.md.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  # Manual trigger: the live rig is heavier than the non-rig gate and an
+  # operator may want to run it on demand without a push/PR.
+  workflow_dispatch:
+
+jobs:
+  live-rig:
+    name: live rig (movie/TV/source-safety)
+    runs-on: [self-hosted, gitea-actions-runner]
+    # Pinned .NET SDK toolchain, matching nonrig-gate.yaml's pin. podman is
+    # installed explicitly (the base SDK image ships neither podman nor
+    # sqlite3/curl), since this job pulls/extracts the registry images and
+    # drives the rig over HTTP.
+    container:
+      image: mcr.microsoft.com/dotnet/sdk:9.0.305-noble
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install podman + git + sqlite3 + curl (needed by the rig + extract steps)
+        run: |
+          set -euo pipefail
+          apt-get update -y
+          apt-get install -y --no-install-recommends \
+            podman git sqlite3 curl ca-certificates jellyfin-ffmpeg
+          rm -rf /var/lib/apt/lists/*
+
+      - name: mark repo safe for git (container UID != checkout owner)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: live rig (shared script; pulls real gostream + patched-jellyfin images)
+        run: ./tools/ci/live-rig-run.sh
+        env:
+          # Sibling pipelines publish per-commit tags; default to `main` so
+          # a manual/dispatch run always has something pullable. Override
+          # per-run (workflow_dispatch input or a future `needs:` wiring to
+          # the gostream/jellyfin publish jobs) to pin an exact sha tag.
+          PHANTOM_RIG_TAG: main
