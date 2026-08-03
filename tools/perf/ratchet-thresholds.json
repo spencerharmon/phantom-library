@@ -1,0 +1,36 @@
+{
+  "improvement_margin_ratio": 0.1,
+  "ratchet_headroom_ratio": 0.05,
+  "scenarios": [
+    {
+      "flow": "list_view_load",
+      "backend": "sqlite",
+      "quantile": "p90",
+      "threshold_ms": 0
+    },
+    {
+      "flow": "sort_filter_change",
+      "backend": "sqlite",
+      "quantile": "p90",
+      "threshold_ms": 0
+    },
+    {
+      "flow": "season_listing",
+      "backend": "sqlite",
+      "quantile": "p90",
+      "threshold_ms": 0
+    },
+    {
+      "flow": "episode_listing",
+      "backend": "sqlite",
+      "quantile": "p90",
+      "threshold_ms": 0
+    },
+    {
+      "flow": "materialised_listing",
+      "backend": "sqlite",
+      "quantile": "p90",
+      "threshold_ms": 0
+    }
+  ]
+}

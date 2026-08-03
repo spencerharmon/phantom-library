@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-scenario ratcheting performance-regression guard.** A self-contained
+  .NET tool (`tools/perf/ratchet-guard/`, unit-tested via `dotnet test`) plus a
+  runner/auto-filer (`tools/perf/ratchet-guard.sh`) that guards the five browse
+  flows against per-scenario latency ceilings recorded in
+  `tools/perf/ratchet-thresholds.json`. A measurement over its ceiling is a
+  **breach** (fails the guard, and files a `beehive` performance-review task
+  blocking the guard rather than silently accepting the regression); a
+  measurement faster than the ceiling by the improvement margin **tightens** the
+  ceiling downward — the ratchet only ever tightens, never loosens (a breach
+  leaves the ceiling exactly where it was). Feeds off the `phantom_flow_duration_ms`
+  baseline instrumentation.
+
 - **OTLP flow-latency metrics for the five browse flows (pre-Postgres
   baseline instrumentation).** A new `Phantom.Flows` meter
   (`src/.../Diagnostics/PhantomFlowMetrics.cs`) records a

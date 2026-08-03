@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Per-scenario ratcheting performance-regression guard for the five browse
+    flows instrumented by p5-baseline-metrics-instrumentation.
+
+    Deliberately self-contained: it references NEITHER the plugin NOR the
+    jellyfin/ nested submodule, so the guard (and its unit tests) build and run
+    in any environment that has the .NET SDK — the ratcheting decision logic is
+    pure and does not depend on a live Jellyfin. The bash wrapper
+    (ratchet-guard.sh) turns a detected breach into a filed beehive task.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <RootNamespace>Phantom.Perf.RatchetGuard</RootNamespace>
+    <AssemblyName>phantom-ratchet-guard</AssemblyName>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="PhantomRatchetGuard.Tests" />
+  </ItemGroup>
+
+</Project>
