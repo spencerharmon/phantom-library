@@ -66,8 +66,10 @@ spec:
     spec:
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if .Values.prowlarr.imagePullSecret }}
       imagePullSecrets:
-        - name: {{ .Values.imagePullSecret }}
+        - name: {{ .Values.prowlarr.imagePullSecret }}
+      {{- end }}
       initContainers:
         # Seed config.xml with the plugin's API key on FIRST boot only (never clobber operator edits
         # or an indexer DB Prowlarr wrote later). Idempotent: skips if config.xml already exists.

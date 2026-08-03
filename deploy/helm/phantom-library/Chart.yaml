@@ -16,7 +16,10 @@ type: application
 # all blue/green language (composition of releases is the consumer's concern). BREAKING values schema.
 # 2.1.1: rename the gostorm control-panel host default label `gostorm.` -> `tiramisu.` (the rebranded
 # GoStream/GoStorm dashboard name); host label only, no schema/value-key change.
-version: 2.6.0
+# 2.6.1: Prowlarr's imagePullSecrets is now conditional on the new `prowlarr.imagePullSecret` value
+# (empty by default), since the standalone Prowlarr stack pulls its PUBLIC upstream image directly
+# and needs no pull secret; the workload Deployment's top-level `imagePullSecret` is unchanged.
+version: 2.6.1
 # Tracks the app milestone, not a container tag (images are digest-pinned in values).
 appVersion: "m14"
 keywords:

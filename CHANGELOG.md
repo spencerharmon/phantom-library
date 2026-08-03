@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Prowlarr no longer references the unused `gitea-oci-pull` imagePullSecret.**
+  The standalone Prowlarr Deployment (`deploy/helm/phantom-library/templates/prowlarr.yaml`)
+  pulls the PUBLIC `ghcr.io/linuxserver/prowlarr` image directly from upstream by
+  digest, so it never needed the gitea OCI registry pull secret the
+  gostream/jellyfin-phantom workload pod requires. Its `imagePullSecrets` block is
+  now conditional on a new `prowlarr.imagePullSecret` value (empty by default);
+  the workload Deployment's `imagePullSecret` reference is unchanged. Chart bumped
+  to 2.6.1.
+
 ### Added
 
 - **Migration + integration live rig (P3 Stage 3).** A new operator/CI rig

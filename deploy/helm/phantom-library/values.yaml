@@ -163,6 +163,13 @@ prowlarr:
     repository: ghcr.io/linuxserver/prowlarr
     # Immutable multi-arch index digest (linuxserver "latest" at pin time). Bump deliberately.
     digest: sha256:2f3d31307beba3ba2dd226d191f5f5c14ee3b4d8b49277c64683f5ed97083179
+  # Pull secret for the Prowlarr image, empty by default. Prowlarr pulls the PUBLIC
+  # ghcr.io/linuxserver/prowlarr image directly from upstream (never mirrored through the gitea OCI
+  # registry), so it needs NO pull secret — unlike the gostream/jellyfin-phantom workload pod, which
+  # pulls patched images from the private gitea registry via the top-level `imagePullSecret`. Leave
+  # empty to render the Prowlarr Deployment with no imagePullSecrets block; set it only if this
+  # release's Prowlarr image is ever repointed at a private registry.
+  imagePullSecret: ""
   port: 9696
   # API key the plugin sends. MUST match the migrated Jellyfin.Plugin.PhantomLibrary.xml ProwlarrApiKey.
   # TODO(operator): move to a SOPS-managed Secret; kept inline to match the already-plaintext plugin config.
