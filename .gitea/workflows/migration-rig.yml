@@ -1,0 +1,68 @@
+# Gitea Actions — migration + integration live rig (P3 Stage 3).
+#
+# Job `phantom-library-migration-rig` runs the P3 migration rig
+# (tools/rig-scenarios/44-migrate-v11-to-v12.sh) on the swarm's ALREADY-LIVE
+# self-hosted Gitea Actions runner. This is the CI home of the live migration
+# proof — there is NO Zuul/Nodepool cross-dependency (the historical
+# `flux-zuul-nodepool-ready` sentinel is dropped): the self-hosted runner is
+# already up, so the rig runs directly here.
+#
+# Synthetic fixture ONLY (the scenario seeds from scenario 41's zero-PII
+# discovery fixture, regenerating it if absent) — never a production clone.
+# The scenario owns a trap-based cleanup (rig-down + scratch removal) that
+# fires on ANY exit; the job adds an `if: always()` teardown step as belt +
+# braces so a runner-killed job never leaves the rig up.
+
+name: migration-rig
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  phantom-library-migration-rig:
+    name: phantom-library-migration-rig
+    # The self-hosted runner that already backs the swarm's Gitea Actions.
+    runs-on: self-hosted
+    timeout-minutes: 60
+    env:
+      # Point the rig scripts at THIS checkout (rig-up.sh / the scenarios read
+      # PHANTOM_REPO_ROOT and fall back to a hardcoded dev path otherwise).
+      PHANTOM_REPO_ROOT: ${{ gitea.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Build the plugin (Release)
+        run: |
+          dotnet build src/Jellyfin.Plugin.PhantomLibrary/Jellyfin.Plugin.PhantomLibrary.csproj \
+            -c Release
+
+      - name: Build the patched rig Jellyfin (Release)
+        run: |
+          dotnet build jellyfin/Jellyfin.Server/Jellyfin.Server.csproj -c Release
+
+      - name: Run the migration rig (v11 -> v12, synthetic fixture)
+        run: |
+          set -euo pipefail
+          chmod +x tools/rig-scenarios/*.sh
+          out="$(mktemp)"
+          # The scenario prints MIGRATION_RIG_OK on full success (structural
+          # migration + vM boot + full downstream e2e against the migrated DB).
+          bash tools/rig-scenarios/44-migrate-v11-to-v12.sh | tee "$out"
+          grep -q '^MIGRATION_RIG_OK$' "$out" \
+            || { echo 'migration rig did not reach MIGRATION_RIG_OK' >&2; exit 1; }
+
+      - name: Teardown rig (always)
+        if: always()
+        run: |
+          bash tools/rig-scenarios/rig-down.sh || true

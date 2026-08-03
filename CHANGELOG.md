@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Migration + integration live rig (P3 Stage 3).** A new operator/CI rig
+  scenario `tools/rig-scenarios/44-migrate-v11-to-v12.sh` that seeds a rig from
+  a **v11 synthetic** phantom.db (derived from scenario 41's zero-PII discovery
+  fixture), runs `scripts/phantom-migrate-v11-to-v12.sh --commit`, and asserts
+  the additive migration is correct (user_version 11→12; the two per-user tables
+  + index present and empty; every pre-existing table census-identical; schema
+  parity with a fresh v12 DB; the script's own predicted==actual verification) —
+  then boots the vM plugin on the migrated DB and runs the full downstream e2e
+  (35 + 36 + per-user 42) **against the migrated DB** (scenarios 35/36 gained a
+  default-preserving `RIG_NO_RESET=1` mode so they can drive an already-seeded
+  rig). The deterministic core is regression-covered in-repo by
+  `scripts/tests/migration-rig.test.sh` (bash + sqlite3 only, no live Jellyfin).
+  A **Gitea Actions** job `phantom-library-migration-rig`
+  (`.gitea/workflows/migration-rig.yml`) runs the rig on the already-live
+  self-hosted runner (no Zuul/Nodepool cross-dependency). The live boot + e2e
+  half is **honest-red** (never a silent green) while the in-repo additive
+  migration's target (v12) is behind the live plugin's `CurrentSchemaVersion`.
+
 - **Per-scenario ratcheting performance-regression guard.** A self-contained
   .NET tool (`tools/perf/ratchet-guard/`, unit-tested via `dotnet test`) plus a
   runner/auto-filer (`tools/perf/ratchet-guard.sh`) that guards the five browse
