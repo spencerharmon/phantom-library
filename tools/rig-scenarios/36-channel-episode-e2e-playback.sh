@@ -285,16 +285,27 @@ PY
 }
 
 echo '[0] build plugin + start reset rig'
-read -r -a BUILD_ARGS <<< "${PHANTOM_DOTNET_BUILD_ARGS:-}"
-dotnet build -c Release "${BUILD_ARGS[@]}" >/tmp/phantom-episode-e2e-build.log
-bash tools/rig-scenarios/rig-up.sh --reset
+# RIG_NO_RESET=1 lets a caller (e.g. the migration rig, scenario 44) drive this
+# scenario against an ALREADY-RUNNING rig seeded with a specific phantom.db —
+# instead of wiping it to a fresh DB — so the e2e runs against THAT DB. Default
+# (unset) preserves the historical build + `rig-up --reset` behaviour exactly.
+if [ "${RIG_NO_RESET:-0}" = "1" ]; then
+  echo '  RIG_NO_RESET=1: reusing the already-running rig + its existing phantom.db (no reset)'
+  [ -f "$PHDB" ] || fail "RIG_NO_RESET=1 but no phantom.db at $PHDB — the caller must seed + boot the rig first"
+  schema=$(sqlite3 "$PHDB" 'PRAGMA user_version;' 2>/dev/null || echo 0)
+  echo "  existing rig phantom.db schema: v${schema}"
+else
+  read -r -a BUILD_ARGS <<< "${PHANTOM_DOTNET_BUILD_ARGS:-}"
+  dotnet build -c Release "${BUILD_ARGS[@]}" >/tmp/phantom-episode-e2e-build.log
+  bash tools/rig-scenarios/rig-up.sh --reset
 
-for _ in $(seq 1 60); do
-  [ -f "$PHDB" ] && schema=$(sqlite3 "$PHDB" 'PRAGMA user_version;' 2>/dev/null || echo 0) || schema=0
-  [ "$schema" = "14" ] && break
-  sleep 1
-done
-[ "${schema:-0}" = "14" ] || fail "phantom schema not v14, got ${schema:-0}"
+  for _ in $(seq 1 60); do
+    [ -f "$PHDB" ] && schema=$(sqlite3 "$PHDB" 'PRAGMA user_version;' 2>/dev/null || echo 0) || schema=0
+    [ "$schema" = "14" ] && break
+    sleep 1
+  done
+  [ "${schema:-0}" = "14" ] || fail "phantom schema not v14, got ${schema:-0}"
+fi
 curl -sS --fail -X POST -H 'Content-Type: application/json' \
   -H 'X-Emby-Authorization: MediaBrowser Client="phantom-rig", Device="phantom-rig", DeviceId="phantom-rig-login", Version="1"' \
   -d '{"Username":"a","Pw":"a"}' "$API/Users/AuthenticateByName" -o /tmp/auth-user.json \
