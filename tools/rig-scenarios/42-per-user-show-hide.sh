@@ -52,8 +52,11 @@ set -u
 mkdir -p /tmp/jf-rig/logs
 exec > >(tee /tmp/jf-rig/logs/scenario-per-user-show-hide.log) 2>&1
 
-BASE=${BASE:-http://localhost:18096}
-TOK=${TOK:-testtoken00000000000000000000000}          # admin API key (rig-up)
+# Remote-target mode: the in-cluster acceptance rig
+# (tools/ci/in-cluster-acceptance-run.sh) sets PHANTOM_TARGET_API /
+# PHANTOM_TARGET_TOKEN to retarget this scenario at the DEPLOYED stack.
+BASE=${PHANTOM_TARGET_API:-${BASE:-http://localhost:18096}}
+TOK=${PHANTOM_TARGET_TOKEN:-${TOK:-testtoken00000000000000000000000}}          # admin API key (rig-up)
 PHDB=${PHDB:-/tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db}
 
 DISCOVERY_TASK_ID=PhantomLibrary.DiscoveryRefresh

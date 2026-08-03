@@ -11,8 +11,12 @@ set -euo pipefail
 
 ROOT=${PHANTOM_REPO_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}
 RIG=/tmp/jf-rig
-API=http://localhost:18096
-TOK=testtoken00000000000000000000000
+# Remote-target mode: the in-cluster acceptance rig
+# (tools/ci/in-cluster-acceptance-run.sh) sets PHANTOM_TARGET_API /
+# PHANTOM_TARGET_TOKEN to point this scenario at the DEPLOYED stack's ingress
+# instead of the local :18096 rig. Unset -> identical local-rig behaviour.
+API=${PHANTOM_TARGET_API:-http://localhost:18096}
+TOK=${PHANTOM_TARGET_TOKEN:-testtoken00000000000000000000000}
 PHDB=/var/tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db
 JDB=/var/tmp/jf-test/data/data/jellyfin.db
 LOG=$RIG/logs/scenario-channel-e2e-playback.log

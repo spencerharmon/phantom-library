@@ -1,0 +1,76 @@
+name: phantom-library in-cluster acceptance
+# .gitea/workflows/in-cluster-acceptance.yaml
+#
+# P3 Stage 5 — the in-cluster ACCEPTANCE gate (the ultimate ROI acceptance
+# bar). Unlike live-rig.yaml (gitea-live-rig-job), which stands up the rig's
+# OWN Jellyfin on :18096 against freshly-pulled images, THIS job drives the
+# assertions at the ACTUAL in-cluster phantom-library blue/green deployment
+# on `spray` — the dev host / color CNAMEs, the nested wildcard TLS, the
+# consolidated single-container image with its co-located gostream FUSE — and
+# asserts full e2e playback (movie/TV) plus the per-user show/hide scenario
+# AGAINST THE DEPLOYED STACK. It is both the deploy's acceptance proof and the
+# precondition the operator's host->cluster prod migration validates against
+# before any prod CNAME flip.
+#
+# Runs on the SELF-HOSTED Gitea Actions runner (already flux-deployed) — NOT
+# `ubuntu-latest` — because it needs in-cluster kubectl + curl to reach the
+# deployment on the cluster network. It is NOT gated on any Zuul/Nodepool
+# node label (that provider never existed for this tenant and is retired).
+#
+# Everything substantive is delegated to
+# tools/ci/in-cluster-acceptance-run.sh so the workflow stays a thin trigger
+# + toolchain declaration. Regression harness:
+# scripts/tests/in-cluster-acceptance-rig.test.sh.
+#
+# PROD SAFETY: the harness targets the dev host (the inactive/dev color) and
+# fails closed if the target's server Id equals the prod apex's — the rig
+# never drives production Jellyfin. PHANTOM_REQUIRE_AUTH=1 makes the missing
+# API key a hard failure so the acceptance bar cannot silently degrade to the
+# unauthenticated subset.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  in-cluster-acceptance:
+    name: in-cluster acceptance (deployed blue/green stack)
+    runs-on: [self-hosted, gitea-actions-runner]
+    container:
+      image: mcr.microsoft.com/dotnet/sdk:9.0.305-noble
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install kubectl + curl + git (needed to reach and drive the deployed stack)
+        run: |
+          set -euo pipefail
+          apt-get update -y
+          apt-get install -y --no-install-recommends \
+            curl git ca-certificates
+          curl -fsSL -o /usr/local/bin/kubectl \
+            "https://dl.k8s.io/release/v1.30.4/bin/linux/amd64/kubectl"
+          chmod +x /usr/local/bin/kubectl
+          rm -rf /var/lib/apt/lists/*
+
+      - name: mark repo safe for git (container UID != checkout owner)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: in-cluster acceptance (shared harness; drives the deployed blue/green stack)
+        run: ./tools/ci/in-cluster-acceptance-run.sh
+        env:
+          # Target the dev host (inactive/dev color), never the prod apex.
+          PHANTOM_INCLUSTER_BASE_URL: https://dev.jellyfin.polyfam.studio
+          PHANTOM_PROD_BASE_URL: https://jellyfin.polyfam.studio
+          PHANTOM_INCLUSTER_NAMESPACE: phantom-library
+          # The authenticated e2e phase is REQUIRED here (fail-closed): the
+          # acceptance bar is not met by the unauthenticated subset alone.
+          PHANTOM_REQUIRE_AUTH: "1"
+          # Operator-held Jellyfin API key for the deployed dev/color stack,
+          # injected as a Gitea Actions secret.
+          PHANTOM_INCLUSTER_APIKEY: ${{ secrets.PHANTOM_INCLUSTER_APIKEY }}
+          # In-cluster kubeconfig for the self-hosted runner (Phase B
+          # introspection: consolidated image + co-located FUSE + plugin).
+          KUBECONFIG: /var/run/secrets/kubernetes.io/kubeconfig

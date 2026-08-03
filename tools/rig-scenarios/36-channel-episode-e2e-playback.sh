@@ -10,8 +10,10 @@ set -euo pipefail
 
 ROOT=${PHANTOM_REPO_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}
 RIG=/tmp/jf-rig
-API=http://localhost:18096
-TOK=testtoken00000000000000000000000
+# Remote-target mode: see 35-channel-e2e-playback.sh. PHANTOM_TARGET_API /
+# PHANTOM_TARGET_TOKEN retarget this scenario at the deployed in-cluster stack.
+API=${PHANTOM_TARGET_API:-http://localhost:18096}
+TOK=${PHANTOM_TARGET_TOKEN:-testtoken00000000000000000000000}
 PHDB=/var/tmp/jf-test/data/plugins/configurations/PhantomLibrary/phantom.db
 JDB=/var/tmp/jf-test/data/data/jellyfin.db
 LOG=$RIG/logs/scenario-channel-episode-e2e-playback.log
