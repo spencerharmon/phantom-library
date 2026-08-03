@@ -1,6 +1,7 @@
 # JPRM-compatible plugin build manifest. Consumed by
 # `jprm plugin build` to produce the release zip + by the
-# GitHub Actions workflow to update the repository manifest.
+# Gitea Actions release workflow (.gitea/workflows/release.yaml) to
+# update the repository manifest.
 #
 # See: https://github.com/oddstr13/jellyfin-plugin-repository-manager
 name: "Phantom Library"

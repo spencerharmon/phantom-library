@@ -1,0 +1,151 @@
+name: release
+# .gitea/workflows/release.yaml
+#
+# Gitea Actions tag-driven release — the Gitea-native replacement for the
+# retired GitHub Actions release workflow (.github/workflows/release.yml).
+# This is the RELEASE half of the gitea-cutover: the non-rig gate
+# (nonrig-gate.yaml) already covers what GHA build.yml did (build + unit
+# test); this workflow covers what GHA release.yml did (jprm plugin
+# package + manifest.json update + published release with the zip attached).
+#
+# Runs on the SELF-HOSTED Gitea Actions runner already flux-deployed for
+# this tenant — NOT `ubuntu-latest` — inside a pinned .NET SDK container
+# (matching nonrig-gate.yaml / live-rig.yaml's pin) so the release build
+# does not depend on tools pre-installed on the runner host. Python + jprm
+# are installed into the container for packaging.
+#
+# NO deployment-specific identifier is hardcoded: the forge host and repo
+# come from the Actions context at run time (github.server_url /
+# github.repository, which Gitea Actions populates), so the download URL and
+# the manifest sourceUrl resolve to whatever forge this repo lives on.
+#
+# Regression harness: scripts/tests/gitea-cutover.test.sh asserts this file
+# exists, parses as YAML, is tag-driven, and invokes `jprm plugin build`
+# (the packaging step that produces the release zip + feeds the manifest).
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    name: package + publish release
+    runs-on: [self-hosted, gitea-actions-runner]
+    # Pinned .NET SDK toolchain — same concrete tag as the other gitea
+    # workflows so the release build cannot drift onto an untested SDK.
+    container:
+      image: mcr.microsoft.com/dotnet/sdk:9.0.305-noble
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: install git + python3 + jprm (base SDK image ships neither)
+        run: |
+          set -euo pipefail
+          apt-get update -y
+          apt-get install -y --no-install-recommends git python3 python3-pip ca-certificates
+          rm -rf /var/lib/apt/lists/*
+          pip install --no-cache-dir --break-system-packages jprm
+
+      - name: mark repo safe for git (container UID != checkout owner)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: resolve version
+        id: ver
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          V="${TAG#v}"
+          echo "tag=$TAG"     >> "$GITHUB_OUTPUT"
+          echo "version=$V"   >> "$GITHUB_OUTPUT"
+          # jprm wants a four-part version
+          if [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "asmver=${V}.0" >> "$GITHUB_OUTPUT"
+          else
+            echo "asmver=$V" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: build (Release, versioned)
+        run: |
+          set -euo pipefail
+          dotnet restore src/Jellyfin.Plugin.PhantomLibrary/Jellyfin.Plugin.PhantomLibrary.csproj
+          dotnet build src/Jellyfin.Plugin.PhantomLibrary/Jellyfin.Plugin.PhantomLibrary.csproj \
+            -c Release \
+            -p:Version=${{ steps.ver.outputs.version }} \
+            -p:AssemblyVersion=${{ steps.ver.outputs.asmver }} \
+            -p:FileVersion=${{ steps.ver.outputs.asmver }} \
+            --no-restore
+
+      - name: package with jprm
+        id: pkg
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          # jprm reads build.yaml; override version into it for the release.
+          sed "s/^version: .*/version: \"${{ steps.ver.outputs.asmver }}\"/" build.yaml > build.yaml.release
+          mv build.yaml.release build.yaml
+          jprm --verbosity=debug plugin build . \
+            --output=artifacts \
+            --dotnet-configuration=Release \
+            --dotnet-framework=net9.0
+          ZIP=$(ls artifacts/*.zip | head -n1)
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          echo "checksum=$(md5sum "$ZIP" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "filename=$(basename "$ZIP")" >> "$GITHUB_OUTPUT"
+
+      - name: update manifest.json
+        run: |
+          python3 - <<'PY'
+          import json, os, datetime
+          version   = os.environ["VERSION"]
+          checksum  = os.environ["CHECKSUM"]
+          filename  = os.environ["FILENAME"]
+          tag       = os.environ["TAG"]
+          repo      = os.environ["GITHUB_REPOSITORY"]
+          # Forge host from the Actions context — no hardcoded infra identifier.
+          server    = os.environ.get("GITHUB_SERVER_URL", "").rstrip("/")
+          download_url = f"{server}/{repo}/releases/download/{tag}/{filename}"
+          with open("manifest.json") as f:
+              data = json.load(f)
+          entry = {
+              "version": version,
+              "changelog": f"See {server}/{repo}/releases/tag/{tag}",
+              "targetAbi": "10.11.0.0",
+              "sourceUrl": download_url,
+              "checksum": checksum,
+              "timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+          }
+          data[0]["versions"] = [entry] + [v for v in data[0]["versions"] if v.get("version") != version]
+          with open("manifest.json", "w") as f:
+              json.dump(data, f, indent=2)
+              f.write("\n")
+          PY
+        env:
+          VERSION:  ${{ steps.ver.outputs.asmver }}
+          CHECKSUM: ${{ steps.pkg.outputs.checksum }}
+          FILENAME: ${{ steps.pkg.outputs.filename }}
+          TAG:      ${{ steps.ver.outputs.tag }}
+
+      - name: commit manifest.json to main
+        run: |
+          set -euo pipefail
+          git config user.name  "gitea-actions[bot]"
+          git config user.email "gitea-actions[bot]@noreply.local"
+          git checkout main
+          git pull --ff-only origin main
+          git add manifest.json
+          if git diff --cached --quiet; then
+            echo "manifest unchanged"
+          else
+            git commit -m "manifest: ${{ steps.ver.outputs.tag }}"
+            git push origin main
+          fi
+
+      - name: publish gitea release with the plugin zip
+        uses: akkuman/gitea-release-action@v1
+        with:
+          files: ${{ steps.pkg.outputs.zip }}
+          tag_name: ${{ steps.ver.outputs.tag }}

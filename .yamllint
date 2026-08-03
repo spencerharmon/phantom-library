@@ -1,7 +1,8 @@
 ---
-# yamllint config for the in-repo Zuul CI config (zuul.d/, playbooks/).
-# Run:  yamllint -c .yamllint zuul.d playbooks
-# Zuul/Ansible YAML idioms need a few relaxations vs yamllint defaults.
+# yamllint config for the in-repo Gitea Actions CI config (.gitea/workflows/).
+# Run:  yamllint -c .yamllint .gitea/workflows
+# Actions workflow YAML uses `on:` truthy idioms and long comment blocks;
+# keep those relaxations vs yamllint defaults.
 extends: default
 
 rules:

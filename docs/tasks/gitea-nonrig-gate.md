@@ -1,11 +1,11 @@
 # Gitea Actions non-rig gate
 
 Adds a **Gitea-native** non-rig build/unit-test gate, replacing the
-obsolete Zuul `zuul-nonrig-gate` for this repo's CI-migration effort. See
-`docs/ci-zuul.md` for the (now-superseded) Zuul-based version of this same
-gate; that doc remains accurate for the Zuul job definitions still present
-in `zuul.d/` — retiring those is the separate `gitea-cutover` task, not this
-one. GHA (`.github/workflows/`, if/when added) is likewise left untouched.
+obsolete Zuul `zuul-nonrig-gate` for this repo's CI-migration effort. The
+now-superseded Zuul job definitions (`zuul.d/`, `playbooks/`) and the GitHub
+Actions workflows (`.github/workflows/`) were removed by the separate
+`gitea-cutover` task once this Gitea path was proven live; see
+`docs/ci-gitea-actions.md` for the current CI overview.
 
 ## What lands in this repo
 
@@ -41,8 +41,9 @@ All of the actual logic — restoring the pinned/patched Jellyfin source tree,
 process-cleanup contract (`MSBUILDDISABLENODEREUSE=1`,
 `-p:UseSharedCompilation=false`, an `EXIT` trap that shuts down dotnet build
 servers and verifies no leftover `dotnet`/`testhost`/`VBCSCompiler`/`MSBuild`
-process survives) — is unchanged from the Zuul gate; see `docs/ci-zuul.md`
-for the full description. Nothing about that contract was re-implemented
+process survives) — is unchanged from the earlier gate; see
+`docs/ci-gitea-actions.md` for the full description. Nothing about that
+contract was re-implemented
 here, only re-invoked.
 
 ## Local reproduction / regression harness
@@ -74,7 +75,7 @@ It is also wired in as this task's definition-of-done `Check:`.
 
 ## Not in scope here
 
-- Retiring the Zuul `zuul.d/` job / GHA workflow — that is `gitea-cutover`.
+- Retiring the Zuul `zuul.d/` job / GHA workflow — done by `gitea-cutover`.
 - The live-Jellyfin **rig** job (integration scenarios) — out of scope for
   the non-rig gate on every CI backend, tracked separately (see
-  `docs/ci-zuul.md`'s own scope note for the Zuul equivalent).
+  `docs/ci-gitea-actions.md`'s own scope note).
