@@ -9,7 +9,6 @@ using Jellyfin.Plugin.PhantomLibrary.Channels;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Data.Sqlite;
 using Xunit;
 
 namespace Jellyfin.Plugin.PhantomLibrary.Tests;
@@ -37,7 +36,6 @@ public class PhantomLibraryUserControllerTests : IDisposable
     {
         try
         {
-            SqliteConnection.ClearAllPools();
             if (File.Exists(_dbPath)) File.Delete(_dbPath);
         }
         catch

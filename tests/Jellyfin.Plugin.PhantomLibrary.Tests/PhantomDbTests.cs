@@ -24,7 +24,6 @@ public class PhantomDbTests : IDisposable
     {
         try
         {
-            SqliteConnection.ClearAllPools();
             if (File.Exists(_dbPath))
             {
                 File.Delete(_dbPath);
@@ -185,7 +184,13 @@ public class PhantomDbTests : IDisposable
             await cmd.ExecuteNonQueryAsync();
         }
 
-        SqliteConnection.ClearAllPools();
+        // Scope the pool clear to THIS raw connection string so the seeded
+        // connection's handle is released before PhantomDb reopens the file,
+        // without tearing down other parallel test classes' pools.
+        using (var poolConn = new SqliteConnection(cs))
+        {
+            SqliteConnection.ClearPool(poolConn);
+        }
 
         using var db = new PhantomDb(_dbPath);
         await Assert.ThrowsAsync<InvalidOperationException>(
@@ -1363,7 +1368,13 @@ public class PhantomDbTests : IDisposable
             await cmd.ExecuteNonQueryAsync();
         }
 
-        SqliteConnection.ClearAllPools();
+        // Scope the pool clear to THIS raw connection string so the seeded
+        // connection's handle is released before PhantomDb reopens the file,
+        // without tearing down other parallel test classes' pools.
+        using (var poolConn = new SqliteConnection(cs))
+        {
+            SqliteConnection.ClearPool(poolConn);
+        }
     }
 
     private async Task CreateMinimalV13DbAsync()

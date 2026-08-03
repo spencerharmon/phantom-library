@@ -308,7 +308,23 @@ public sealed class PhantomDb : IDisposable
     public void Dispose()
     {
         _writeLock.Dispose();
-        SqliteConnection.ClearAllPools();
+
+        // Clear ONLY this database's connection pool, never the
+        // process-global pool. Microsoft.Data.Sqlite pools are keyed on the
+        // exact connection string, so ClearPool(conn) releases just the
+        // pooled sqlite3 handles for THIS instance's DataSource, letting the
+        // (unique, per-instance) file be deleted afterwards.
+        //
+        // The previous SqliteConnection.ClearAllPools() was process-global:
+        // disposing one PhantomDb tore down the pooled connections of EVERY
+        // other live PhantomDb. Under xUnit's default per-class parallelism
+        // this raced concurrent test classes — one class's teardown disposed
+        // the sqlite3 handle another class was mid-query on, surfacing as
+        // "System.ObjectDisposedException: Cannot access a disposed object.
+        // Object name: 'SQLitePCL.sqlite3'." Scoping the clear to this
+        // connection string removes the cross-instance race entirely.
+        using var conn = new SqliteConnection(_connectionString);
+        SqliteConnection.ClearPool(conn);
     }
 
     private async Task<SqliteConnection> OpenAsync(CancellationToken ct)

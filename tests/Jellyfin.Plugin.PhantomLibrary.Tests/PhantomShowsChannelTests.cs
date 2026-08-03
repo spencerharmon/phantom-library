@@ -57,7 +57,6 @@ public class PhantomShowsChannelTests : IDisposable
     {
         GostreamFilesystemEnumerator.ResetForTests();
         _db.Dispose();
-        SqliteConnection.ClearAllPools();
         try { if (File.Exists(_dbPath)) File.Delete(_dbPath); } catch { }
         try { if (Directory.Exists(_splashHome)) Directory.Delete(_splashHome, true); } catch { }
         try { if (_enumerator.ShowsRootOverride is not null && Directory.Exists(_enumerator.ShowsRootOverride)) Directory.Delete(_enumerator.ShowsRootOverride, true); } catch { }

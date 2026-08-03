@@ -35,7 +35,6 @@ public class MaterialiserTests : IDisposable
     {
         try
         {
-            SqliteConnection.ClearAllPools();
             if (File.Exists(_dbPath)) File.Delete(_dbPath);
             if (Directory.Exists(_fuseMount)) Directory.Delete(_fuseMount, recursive: true);
         }

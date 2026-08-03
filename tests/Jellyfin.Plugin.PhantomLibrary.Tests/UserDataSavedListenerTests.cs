@@ -32,7 +32,6 @@ public sealed class UserDataSavedListenerTests : IDisposable
         try
         {
             _db?.Dispose();
-            SqliteConnection.ClearAllPools();
             if (File.Exists(_dbPath))
             {
                 File.Delete(_dbPath);

@@ -11,7 +11,6 @@ using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.MediaInfo;
-using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using Xunit;
@@ -36,7 +35,6 @@ public class PhantomMaterialisingMediaSourceProviderTests : IDisposable
     public void Dispose()
     {
         _db.Dispose();
-        SqliteConnection.ClearAllPools();
         try { if (File.Exists(_dbPath)) File.Delete(_dbPath); } catch { }
         try { if (Directory.Exists(_root)) Directory.Delete(_root, true); } catch { }
     }

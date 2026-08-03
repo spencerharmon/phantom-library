@@ -6,7 +6,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Channels;
 using Jellyfin.Plugin.PhantomLibrary.State;
-using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -34,7 +33,6 @@ public class GostreamFilesystemEnumeratorTests : IDisposable
     {
         GostreamFilesystemEnumerator.ResetForTests();
         _db.Dispose();
-        SqliteConnection.ClearAllPools();
         try { if (File.Exists(_dbPath)) File.Delete(_dbPath); } catch { }
         try { if (Directory.Exists(_moviesRoot)) Directory.Delete(_moviesRoot, true); } catch { }
         try { if (Directory.Exists(_showsRoot)) Directory.Delete(_showsRoot, true); } catch { }

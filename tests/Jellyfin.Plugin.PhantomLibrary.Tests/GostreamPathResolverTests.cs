@@ -4,7 +4,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Channels;
 using Jellyfin.Plugin.PhantomLibrary.State;
-using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -17,7 +16,6 @@ public sealed class GostreamPathResolverTests : IDisposable
 
     public void Dispose()
     {
-        SqliteConnection.ClearAllPools();
         try { if (Directory.Exists(_root)) Directory.Delete(_root, true); } catch { }
         try { if (File.Exists(_dbPath)) File.Delete(_dbPath); } catch { }
     }
