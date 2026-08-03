@@ -1,0 +1,66 @@
+name: phantom-library non-rig gate
+# .gitea/workflows/nonrig-gate.yaml
+#
+# Non-rig build/unit-test gate on Gitea Actions, replacing the obsolete Zuul
+# `zuul-nonrig-gate` (zuul.d/jobs.yaml `phantom-library-nonrig-build-test`)
+# for this repo. Runs `dotnet build -c Release` then `dotnet test` against
+# the pinned, patched Jellyfin source tree, with the mandatory build/test
+# process cleanup (MSBUILDDISABLENODEREUSE=1,
+# -p:UseSharedCompilation=false, no reusable build servers, EXIT-trap
+# cleanup, verified-no-leftover-processes) — all delegated to the existing
+# tools/ci/nonrig-build-test.sh so the Zuul job and the Gitea job run
+# byte-for-byte identical logic.
+#
+# Runs INSIDE a container carrying a pinned .NET SDK toolchain (the
+# `mcr.microsoft.com/dotnet/sdk` image, tagged to the net9.0 target every
+# csproj in this repo declares) — no dependence on tools pre-installed on
+# the Gitea Actions runner host or on the retired Zuul/Nodepool build-node
+# image. sqlite3 and git are installed into the container explicitly since
+# the migration-regression pre-check and the Jellyfin clone step both need
+# them and the base SDK image ships neither.
+#
+# GHA (.github/workflows, if/when added) is left in place — retirement of
+# the old CI surface is a separate task (gitea-cutover). This workflow only
+# ADDS the Gitea-native gate; it does not touch or replace anything GitHub
+# Actions-side.
+#
+# Regression harness: scripts/tests/gitea-nonrig-workflow.test.sh verifies
+# this file parses as YAML, pins a concrete (non-`latest`) SDK image tag,
+# invokes tools/ci/nonrig-build-test.sh (never a hand-rolled copy of its
+# steps), carries the MSBUILDDISABLENODEREUSE/UseSharedCompilation cleanup
+# contract, and that the toolchain-agnostic dry run
+# (PHANTOM_CI_DRYRUN=1 tools/ci/nonrig-build-test.sh) exits 0 without a
+# dotnet SDK on PATH.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  nonrig-build-test:
+    name: nonrig build + test
+    runs-on: ubuntu-latest
+    # Pinned .NET SDK toolchain — matches the net9.0 TargetFramework every
+    # csproj in this repo declares (see Directory.Build.props /
+    # src/**/*.csproj). A concrete tag (not `:9.0`/`:latest`) so the gate
+    # cannot silently drift onto an untested SDK patch line.
+    container:
+      image: mcr.microsoft.com/dotnet/sdk:9.0.305-noble
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install git + sqlite3 (needed by the shared CI script)
+        run: |
+          set -euo pipefail
+          apt-get update -y
+          apt-get install -y --no-install-recommends git sqlite3 ca-certificates
+          rm -rf /var/lib/apt/lists/*
+
+      - name: mark repo safe for git (container UID != checkout owner)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: non-rig build + test (shared script; Zuul + Gitea identical)
+        run: ./tools/ci/nonrig-build-test.sh
