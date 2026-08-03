@@ -16,7 +16,11 @@ type: application
 # all blue/green language (composition of releases is the consumer's concern). BREAKING values schema.
 # 2.1.1: rename the gostorm control-panel host default label `gostorm.` -> `tiramisu.` (the rebranded
 # GoStream/GoStorm dashboard name); host label only, no schema/value-key change.
-version: 2.6.0
+# 2.6.0: fsGroupChangePolicy=OnRootMismatch (skip recursive volume chown on restart).
+# 2.7.0: generic, OFF-by-default `postgres.*` wiring (P4 Stage A step 1/2) — Jellyfin.Pgsql provider
+# env vars + a forward-declared phantom.db logical-DB env surface, gated behind
+# `postgres.enabled` so the chart stays color-agnostic (consumer picks which release enables it).
+version: 2.7.0
 # Tracks the app milestone, not a container tag (images are digest-pinned in values).
 appVersion: "m14"
 keywords:
