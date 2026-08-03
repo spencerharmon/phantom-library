@@ -209,7 +209,7 @@ for scenario in 35-channel-e2e-playback.sh 36-channel-episode-e2e-playback.sh; d
         bad "$scenario does not accept overridable TOK/PHDB/JDB (kubectl-exec env overrides would not take effect)"
     fi
 done
-if grep -qE '^BASE=\$\{BASE:-' "$REPO_ROOT/tools/rig-scenarios/42-per-user-show-hide.sh" \
+if grep -qE '^BASE=\$\{.*BASE:-' "$REPO_ROOT/tools/rig-scenarios/42-per-user-show-hide.sh" \
     && grep -qE '^PHDB=\$\{PHDB:-' "$REPO_ROOT/tools/rig-scenarios/42-per-user-show-hide.sh"; then
     ok "42-per-user-show-hide.sh accepts overridable BASE/PHDB"
 else
