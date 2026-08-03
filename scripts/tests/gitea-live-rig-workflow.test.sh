@@ -24,7 +24,7 @@
 #   - tools/ci/live-rig-run.sh itself: is syntactically valid bash, never
 #     targets the production Jellyfin port (:8096) or a production gostream
 #     port, references the real registry image coordinates
-#     (git.spencerharmon.com/zuul/{gostream,jellyfin-phantom}), runs the
+#     (git.spencerharmon.com/images/{gostream,jellyfin-phantom}), runs the
 #     movie/TV/source-safety scenario trio, and unconditionally tears the
 #     rig down via an EXIT trap (rig-down.sh) so a mid-run failure never
 #     strands rig processes.

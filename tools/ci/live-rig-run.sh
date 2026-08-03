@@ -15,9 +15,9 @@
 # depending on host-installed tooling.
 #
 #   1. Pull the pinned gostream + patched-jellyfin images from the registry
-#      (git.spencerharmon.com/zuul/{gostream,jellyfin-phantom}:<tag> — the
-#      `zuul` path segment is a legacy registry namespace only; a rename is
-#      flux's to make, not this repo's).
+#      (git.spencerharmon.com/images/{gostream,jellyfin-phantom}:<tag> —
+#      `images` is the current Gitea OCI registry namespace; the namespace
+#      is flux's to own, not this repo's).
 #   2. Extract the built artifacts each image carries (the gostream binary,
 #      the patched Jellyfin server + assemblies) onto the runner's
 #      filesystem at exactly the paths tools/rig-scenarios/rig-up.sh expects,
@@ -34,7 +34,7 @@
 #                                    them (toolchain-agnostic dry run; no
 #                                    podman/dotnet/network/systemd needed).
 #                                    Used by the in-repo regression check.
-#   PHANTOM_REGISTRY=<host/ns>      default git.spencerharmon.com/zuul
+#   PHANTOM_REGISTRY=<host/ns>      default git.spencerharmon.com/images
 #   PHANTOM_GOSTREAM_TAG=<tag>      default: value of PHANTOM_RIG_TAG, else
 #                                    "main"
 #   PHANTOM_JELLYFIN_IMAGE_TAG=<tag> default: value of PHANTOM_RIG_TAG, else
@@ -62,7 +62,7 @@ REPO_ROOT="${PHANTOM_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && p
 cd "$REPO_ROOT"
 
 DRYRUN="${PHANTOM_CI_DRYRUN:-0}"
-REGISTRY="${PHANTOM_REGISTRY:-git.spencerharmon.com/zuul}"
+REGISTRY="${PHANTOM_REGISTRY:-git.spencerharmon.com/images}"
 RIG_TAG_FALLBACK="${PHANTOM_RIG_TAG:-main}"
 GOSTREAM_TAG="${PHANTOM_GOSTREAM_TAG:-$RIG_TAG_FALLBACK}"
 JELLYFIN_IMAGE_TAG="${PHANTOM_JELLYFIN_IMAGE_TAG:-$RIG_TAG_FALLBACK}"
