@@ -8,6 +8,7 @@ using Jellyfin.Plugin.PhantomLibrary.Playback;
 using Jellyfin.Plugin.PhantomLibrary.Scheduled;
 using Jellyfin.Plugin.PhantomLibrary.Sources;
 using Jellyfin.Plugin.PhantomLibrary.State;
+using Jellyfin.Plugin.PhantomLibrary.State.Db;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Channels;
@@ -41,9 +42,18 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
             c.Timeout = TimeSpan.FromSeconds(15);
         });
 
-        // Phantom DB (singleton, lazily ensures schema on first use).
+        // Phantom DB (singleton, lazily ensures schema on first use). SQLite is
+        // the compiled-in default; PHANTOM_POSTGRES_HOST opts into the shared
+        // Postgres logical DB backend (p4-phantomdb-postgres-provider) — see
+        // PhantomDbOptions.
         serviceCollection.AddSingleton(sp =>
         {
+            var postgresConnectionString = PhantomDbOptions.TryBuildPostgresConnectionString();
+            if (postgresConnectionString is not null)
+            {
+                return PhantomDb.CreatePostgres(postgresConnectionString);
+            }
+
             var paths = sp.GetRequiredService<IApplicationPaths>();
             var dbPath = Path.Combine(paths.PluginConfigurationsPath, "PhantomLibrary", "phantom.db");
             return new PhantomDb(dbPath);

@@ -6,6 +6,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Config-gated PostgreSQL backend for PhantomDb (p4-phantomdb-postgres-provider).**
+  `PhantomDb`'s own state (discovery cache, catalogue, availability, materialised
+  state, magnet caches, bulk-materialise queue, user prefs/hidden-items, TMDB
+  metadata caches, `materialise_in_flight`, plugin meta) can now optionally run
+  against a shared `phantom_<role>` PostgreSQL logical database instead of a
+  per-color SQLite file, selected via the `PHANTOM_POSTGRES_HOST` env var (see
+  `p4-chart-postgres-wiring`). SQLite stays the compiled-in default and remains
+  off in prod unless explicitly configured; `EnsureSchema`'s hard-refuse on a
+  schema-version mismatch is unchanged for both backends. New
+  `Jellyfin.Plugin.PhantomLibrary.State.Db` provider abstraction
+  (`IPhantomDbProvider`, `SqliteDbProvider`, `PostgresDbProvider`) plus
+  `PhantomDb.CreatePostgres(connectionString)`. No data migration is included
+  here (see `p4-phantomdb-sqlite-to-postgres-migration`).
+
 ### Fixed
 
 - **Prowlarr no longer references the unused `gitea-oci-pull` imagePullSecret.**
