@@ -31,6 +31,36 @@
       "backend": "sqlite",
       "quantile": "p90",
       "threshold_ms": 0
+    },
+    {
+      "flow": "list_view_load",
+      "backend": "postgres",
+      "quantile": "p90",
+      "threshold_ms": 0
+    },
+    {
+      "flow": "sort_filter_change",
+      "backend": "postgres",
+      "quantile": "p90",
+      "threshold_ms": 0
+    },
+    {
+      "flow": "season_listing",
+      "backend": "postgres",
+      "quantile": "p90",
+      "threshold_ms": 0
+    },
+    {
+      "flow": "episode_listing",
+      "backend": "postgres",
+      "quantile": "p90",
+      "threshold_ms": 0
+    },
+    {
+      "flow": "materialised_listing",
+      "backend": "postgres",
+      "quantile": "p90",
+      "threshold_ms": 0
     }
   ]
 }

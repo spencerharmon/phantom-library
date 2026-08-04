@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Before/after browse-flow load-time comparison for p5-postgres-loadtime-comparison.
+
+    Re-runs of the five instrumented browse flows against the SQLite baseline and
+    the Postgres-backed (P4 Stage A) deployment produce two MeasurementSet JSON
+    files (backend=sqlite / backend=postgres). This tool computes the per-flow
+    before/after delta WITHOUT assuming a gain (a slower Postgres flow is reported
+    as a REGRESSION, not silently accepted) and feeds the measured Postgres "after"
+    numbers into the ratchet guard's threshold table so p5-ratcheting-regression-
+    guard can guard the Postgres backend too.
+
+    Deliberately self-contained like ratchet-guard: it references the ratchet-guard
+    library (to share the MeasurementSet / RatchetThresholds model and produce a
+    threshold feed) but NEITHER the plugin NOR the jellyfin/ nested submodule, so it
+    builds and runs in any environment that has the .NET SDK.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <RootNamespace>Phantom.Perf.LoadtimeCompare</RootNamespace>
+    <AssemblyName>phantom-loadtime-compare</AssemblyName>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="PhantomLoadtimeCompare.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ratchet-guard\PhantomRatchetGuard.csproj" />
+  </ItemGroup>
+
+</Project>
