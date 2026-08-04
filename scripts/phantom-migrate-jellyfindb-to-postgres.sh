@@ -113,6 +113,11 @@
 #     forces a partial load.
 #   - BACKS UP FIRST. A --commit prod write dumps the prod Postgres target's
 #     current contents to a timestamped pg_dump artifact before loading.
+#   - SCHEMA-VERSION GUARDED (--source phantom). Refuses to migrate a source
+#     phantom.db whose `PRAGMA user_version` does not match
+#     PhantomDb.CurrentSchemaVersion (default 16) — mirroring
+#     phantom-migrate-v11-to-v12.sh's own user_version guard, so a stale or
+#     wrong-version phantom.db is never silently copied into Postgres.
 #
 # NOT A GENERAL MIGRATOR. This is one specific, tested, offline store migration
 # (SQLite -> PostgreSQL), run with every replica's Jellyfin stopped. It does not
@@ -142,6 +147,12 @@
 #                              (default /var/lib/jellyfin/data/jellyfin.db)
 #     PHANTOM_DB               source SQLite path for --source phantom
 #                              (default /var/lib/jellyfin/plugins/configurations/PhantomLibrary/phantom.db)
+#     PHANTOM_EXPECTED_SCHEMA_VERSION
+#                              schema-version guard for --source phantom: the
+#                              PRAGMA user_version the source phantom.db MUST be
+#                              at (default 16, PhantomDb.CurrentSchemaVersion).
+#                              A mismatch refuses to migrate (see "SCHEMA-VERSION
+#                              GUARD" below).
 #   STAGING_DIR                working dir for the clone + load set + receipts
 #                              (default $TMPDIR/phantom-<source>-postgres.<ts>)
 #   Inactive color / dev logical DB (stage 3 rehearsal target):
@@ -307,6 +318,27 @@ info "  mode               : $MODE"
 info "  staging (dev) DB   : $PG_STAGING_DB"
 info "  prod DB            : $PG_PROD_DB"
 info "  staging dir        : $STAGING_DIR"
+
+# ---- schema-version guard (phantom source only) ----------------------------
+# phantom.db's schema is versioned via `PRAGMA user_version` (see
+# PhantomDb.CurrentSchemaVersion / EnsureSchemaAsync). Per AGENTS.md "No database
+# migrations until v1.0", this migration is a pure row-data COPY into an
+# already-created Postgres schema — it must NEVER run against a source phantom.db
+# whose on-disk schema does not match the version the running plugin build
+# expects, exactly like phantom-migrate-v11-to-v12.sh's own user_version guard.
+# A mismatch means the operator is migrating with the wrong plugin build staged,
+# or a stale/corrupt phantom.db — either way, guessing at the shape is unsafe;
+# refuse and tell the operator to align the plugin build/DB first.
+# jellyfin.db has no equivalent single-file gate here: its own schema is owned
+# and versioned by the Jellyfin.Pgsql provider's EF Core migrations, applied
+# independently on the Postgres side, not by this script.
+if [[ "$SOURCE" == "phantom" ]]; then
+    PHANTOM_EXPECTED_SCHEMA_VERSION="${PHANTOM_EXPECTED_SCHEMA_VERSION:-16}"
+    PHANTOM_ACTUAL_SCHEMA_VERSION="$("$SQLITE_CMD" "$SOURCE_DB" 'PRAGMA user_version;' 2>/dev/null || echo '?')"
+    [[ "$PHANTOM_ACTUAL_SCHEMA_VERSION" == "$PHANTOM_EXPECTED_SCHEMA_VERSION" ]] \
+        || die "phantom.db schema-version guard: source is at user_version=$PHANTOM_ACTUAL_SCHEMA_VERSION, expected $PHANTOM_EXPECTED_SCHEMA_VERSION (PhantomDb.CurrentSchemaVersion). Refusing to migrate a schema-mismatched phantom.db — align the plugin build (PhantomDb.CurrentSchemaVersion) and the source DB (or wipe/rebuild per AGENTS.md) before retrying. Override only for a deliberately pinned rehearsal via PHANTOM_EXPECTED_SCHEMA_VERSION=$PHANTOM_ACTUAL_SCHEMA_VERSION."
+    info "  phantom schema guard: user_version=$PHANTOM_ACTUAL_SCHEMA_VERSION (expected $PHANTOM_EXPECTED_SCHEMA_VERSION) ok"
+fi
 
 mkdir -p "$STAGING_DIR"
 
