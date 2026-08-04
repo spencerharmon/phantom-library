@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Staging validation + cutover runbook (staging-migration-cutover, P3 Stage 4,
+  operator-gated).** `docs/tasks/staging-migration-cutover.md`: the concrete
+  operator sequence for the REVISED shared-data blue/green topology (blue and
+  green share the SAME PVC(s) and the SAME PostgreSQL DB — no per-color CSI
+  `VolumeSnapshot` clone). Wires the already-shipped
+  `scripts/phantom-migrate-jellyfindb-to-postgres.sh` five-stage methodology
+  into: deploy vM on the inactive color -> migrate under expand/contract
+  discipline -> point `dev.jellyfin.polyfam.studio` at the inactive color ->
+  `NEEDS-HUMAN` for operator hand-validation -> operator (not the swarm) flips
+  the prod CNAME. No code change; documentation only (`check=none`).
+
 - **Config-gated PostgreSQL backend for PhantomDb (p4-phantomdb-postgres-provider).**
   `PhantomDb`'s own state (discovery cache, catalogue, availability, materialised
   state, magnet caches, bulk-materialise queue, user prefs/hidden-items, TMDB
