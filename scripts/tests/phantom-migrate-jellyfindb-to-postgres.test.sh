@@ -266,6 +266,7 @@ INSERT INTO "phantom_items" VALUES ('g-1',603,'/m/a'),('g-2',1437,'/m/b'),('g-3'
 CREATE TABLE "user_prefs" (user_id TEXT, pref TEXT, PRIMARY KEY(user_id,pref));
 INSERT INTO "user_prefs" VALUES ('u-1','dark'),('u-2','light');
 CREATE TABLE "user_hidden_items" (user_id TEXT, item_guid TEXT, PRIMARY KEY(user_id,item_guid));
+PRAGMA user_version = 16;
 SQL
 
 run_matrix jellyfin "$JF_SRC" jellyfin_inactive jellyfin_prod Users BaseItems UserData EmptyTable
@@ -287,6 +288,46 @@ got="$(sqlite3 "$SHIM_STORE/phantom_dev.sqlite" "SELECT Value FROM plugin_meta W
 gotnull="$(sqlite3 "$SHIM_STORE/phantom_dev.sqlite" "SELECT COUNT(*) FROM phantom_items WHERE stub_path IS NULL;")"
 [[ "$gotnull" == "1" ]] && ok "phantom NULLs preserved through the copy" \
     || bad "phantom NULL not preserved (got $gotnull)"
+
+# ===========================================================================
+# Schema-version guard (--source phantom only): refuses a mismatched
+# PRAGMA user_version, and an explicit override lets a pinned rehearsal
+# proceed anyway. Mirrors phantom-migrate-v11-to-v12.sh's own user_version gate.
+# ===========================================================================
+head_ "[phantom] schema-version guard"
+
+PH_SRC_OLD="$WORK/phantom-v11.db"
+sqlite3 "$PH_SRC_OLD" <<'SQL'
+CREATE TABLE "plugin_meta" (Key TEXT PRIMARY KEY, Value TEXT);
+INSERT INTO "plugin_meta" VALUES ('note','stale');
+PRAGMA user_version = 11;
+SQL
+
+STAGING_GUARD="$WORK/phantom-guard-mismatch"
+if PSQL_CMD="$SHIM" SHIM_STORE="$SHIM_STORE" \
+   PHANTOM_DB="$PH_SRC_OLD" STAGING_DIR="$STAGING_GUARD" \
+   PG_STAGING_DB="phantom_guard_dev" PG_PROD_DB="phantom_guard_prod" \
+   bash "$SCRIPT" --source phantom --skip-service-check >/dev/null 2>"$WORK/guard-mismatch.err"; then
+    bad "migration ran against a v11 phantom.db (expected v16) — schema-version guard did not refuse"
+else
+    grep -q 'schema-version guard' "$WORK/guard-mismatch.err" \
+        && ok "schema-version guard hard-refused a v11 source (expected v16)" \
+        || bad "refused for the wrong reason: $(cat "$WORK/guard-mismatch.err")"
+fi
+[[ -d "$STAGING_GUARD" ]] && ls "$STAGING_GUARD"/*.clone.db >/dev/null 2>&1 \
+    && bad "guard refusal still produced a clone (should refuse before stage 1)" \
+    || ok "guard refusal ran before any clone was produced"
+
+STAGING_GUARD_OK="$WORK/phantom-guard-override"
+if PSQL_CMD="$SHIM" SHIM_STORE="$SHIM_STORE" \
+   PHANTOM_DB="$PH_SRC_OLD" STAGING_DIR="$STAGING_GUARD_OK" \
+   PG_STAGING_DB="phantom_guard_dev2" PG_PROD_DB="phantom_guard_prod2" \
+   PHANTOM_EXPECTED_SCHEMA_VERSION=11 \
+   bash "$SCRIPT" --source phantom --skip-service-check >/dev/null 2>"$WORK/guard-override.err"; then
+    ok "PHANTOM_EXPECTED_SCHEMA_VERSION override lets a pinned-version rehearsal proceed"
+else
+    bad "override run unexpectedly refused: $(cat "$WORK/guard-override.err")"
+fi
 
 # ===========================================================================
 head_ "Summary"
