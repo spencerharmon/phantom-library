@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Standalone regression-test project for the P4 Stage A phantom.db to PostgreSQL
+    store-relocation script (scripts/phantom-migrate-jellyfindb-to-postgres.sh,
+    source=phantom). It deliberately references NEITHER the plugin project NOR
+    the patched jellyfin/ source tree, so it builds and runs hermetically with
+    `dotnet test tests/Phantom.Migration.Tests/Phantom.Migration.Tests.csproj`
+    even where the Jellyfin submodule is not checked out (the plugin csproj cannot
+    build without it). It drives the real migration script against a synthetic
+    SQLite phantom.db and a SQLite-backed Postgres stand-in (a psql-client shim),
+    asserting predicted per-table counts == post-migration counts and that the
+    schema-version guard hard-refuses a mismatched phantom.db.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <NoWarn>$(NoWarn);CA1707;CA2007</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+</Project>

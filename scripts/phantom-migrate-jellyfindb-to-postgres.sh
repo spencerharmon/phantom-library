@@ -321,6 +321,31 @@ CLONE="$STAGING_DIR/${SOURCE}.clone.db"
 [[ -f "$CLONE" ]] || die "clone failed: $CLONE not produced"
 info "  clone: $CLONE"
 
+# =====================================================================
+# STAGE 1b — SCHEMA-VERSION GUARD (phantom source only).
+# The phantom plugin stamps phantom.db's PRAGMA user_version with
+# PhantomDb.CurrentSchemaVersion. This offline store relocation copies rows
+# 1:1 into the provider/plugin-created Postgres schema of the SAME logical
+# version; relocating a DB at a DIFFERENT schema version would load rows that
+# do not match the destination schema. So, mirroring PhantomDb's own startup
+# hard-refuse (and the pre-v1.0 "no in-place schema migration" rule), REFUSE to
+# migrate a phantom.db whose user_version is not the expected version — the
+# operator brings the DB to that version first (wipe/rebuild, or the additive
+# vN->vM script) and re-runs. Expected version is PhantomDb.CurrentSchemaVersion
+# (16), overridable for a future bump via PHANTOM_EXPECTED_SCHEMA_VERSION.
+# =====================================================================
+if [[ "$SOURCE" == "phantom" ]]; then
+    PHANTOM_EXPECTED_SCHEMA_VERSION="${PHANTOM_EXPECTED_SCHEMA_VERSION:-16}"
+    ACTUAL_SCHEMA_VERSION="$("$SQLITE_CMD" "$CLONE" "PRAGMA user_version;" | tr -d '[:space:]')"
+    bold "==> Stage 1b: phantom schema-version guard"
+    info "  expected user_version: $PHANTOM_EXPECTED_SCHEMA_VERSION"
+    info "  source   user_version: $ACTUAL_SCHEMA_VERSION"
+    if [[ "$ACTUAL_SCHEMA_VERSION" != "$PHANTOM_EXPECTED_SCHEMA_VERSION" ]]; then
+        die "phantom.db schema version mismatch: source is user_version=$ACTUAL_SCHEMA_VERSION but this migration targets version $PHANTOM_EXPECTED_SCHEMA_VERSION. This store relocation never migrates schema in place (pre-v1.0 rule): bring phantom.db to version $PHANTOM_EXPECTED_SCHEMA_VERSION first (wipe/rebuild or the additive vN->vM operator script), then re-run."
+    fi
+    info "  schema-version guard: ok"
+fi
+
 # Resolve the table set to migrate.
 mapfile -t ALL_TABLES < <("$SQLITE_CMD" "$CLONE" \
     "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;")

@@ -259,6 +259,7 @@ SQL
 # ===========================================================================
 PH_SRC="$WORK/phantom.db"
 sqlite3 "$PH_SRC" <<'SQL'
+PRAGMA user_version=16;
 CREATE TABLE "plugin_meta" (Key TEXT PRIMARY KEY, Value TEXT);
 INSERT INTO "plugin_meta" VALUES ('schema_version','12'),('note','carol o''brien ran it');
 CREATE TABLE "phantom_items" (item_guid TEXT PRIMARY KEY, tmdb_id INTEGER, stub_path TEXT);
