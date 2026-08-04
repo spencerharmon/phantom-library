@@ -272,15 +272,37 @@ public sealed record HiddenItemRow(int TmdbId, string Type, DateTimeOffset Hidde
 /// live from Jellyfin's own <c>UserData</c>. Per
 /// AGENTS.md "No database migrations until v1.0", existing databases
 /// at any pre-v16 user_version are HARD-REFUSED and the operator must
-/// wipe (<c>scripts/phantom-wipe.sh --commit</c>) before restart.
+/// wipe (<c>scripts/phantom-wipe.sh --commit</c>) before restart. v17
+/// adds an <b>additive</b> nullable <c>owner</c> column to
+/// <c>materialise_in_flight</c> (p4-phantomdb-multiwriter-safety-fixes):
+/// per the multiwriter audit (docs/tasks/p4-phantomdb-multiwriter-audit.md),
+/// the table previously had no way to distinguish "my own leaked lock"
+/// from "another live replica's fresh lock" when purged, so a shared-DB
+/// startup sweeper on one host could silently steal another host's
+/// in-flight dedup guard. The column is populated with <see cref="HostId"/>
+/// on every claim/steal so <see cref="PurgeStaleMaterialiseInFlightAsync"/>
+/// can tell them apart. No existing table/column is touched.
 /// </summary>
 public sealed class PhantomDb : IDisposable
 {
-    public const int CurrentSchemaVersion = 16;
+    public const int CurrentSchemaVersion = 17;
 
     private readonly string _connectionString;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
     private int _schemaEnsured;
+
+    /// <summary>
+    /// A per-instance identity for THIS PhantomDb (i.e. this host/process),
+    /// used to stamp the <c>owner</c> column of <c>materialise_in_flight</c>
+    /// rows this instance claims. Regenerated on every process start (a new
+    /// <see cref="Guid"/> component), which is intentional: a row this same
+    /// physical host owned before a crash/restart is no longer distinguishable
+    /// from any other replica's row by identity alone, so it correctly falls
+    /// through to the hard crash-recovery TTL path in
+    /// <see cref="PurgeStaleMaterialiseInFlightAsync"/> rather than being
+    /// silently reclaimed as "mine" the moment the process restarts.
+    /// </summary>
+    public string HostId { get; } = $"{Environment.MachineName}-{Environment.ProcessId}-{Guid.NewGuid():N}";
 
     public PhantomDb(string dbPath)
     {
@@ -354,6 +376,22 @@ public sealed class PhantomDb : IDisposable
         {
             pragma.CommandText = "PRAGMA journal_mode=WAL;";
             pragma.ExecuteNonQuery();
+        }
+
+        // Cross-process writers (N Jellyfin replicas sharing one phantom.db,
+        // per the multiwriter audit) hit SQLITE_BUSY immediately without this
+        // — the original design assumed a single writing process and relied
+        // solely on the in-process _writeLock semaphore, which does nothing
+        // across separate replica processes. A busy_timeout makes a second
+        // writer wait/retry for a bounded window instead of failing outright
+        // on lock contention; it does not, by itself, make multi-host SQLite
+        // safe (see the audit's WAL/shared-memory caveat) but it is a cheap,
+        // strictly-additive robustness improvement for the in-process and
+        // same-host-multi-process cases this task's fixes target.
+        using (var busyPragma = conn.CreateCommand())
+        {
+            busyPragma.CommandText = "PRAGMA busy_timeout=5000;";
+            busyPragma.ExecuteNonQuery();
         }
 
         int version;
@@ -521,12 +559,19 @@ CREATE INDEX IF NOT EXISTS idx_materialised_state_materialised_at
 -- Materialiser's finally block; stale rows (process crashed mid-flight)
 -- are swept by Stage 4's startup sweep via
 -- PurgeStaleMaterialiseInFlightAsync.
+-- v17 (additive): owner records which PhantomDb.HostId (i.e. which
+-- replica process) currently holds this row, so a shared-DB purge can
+-- tell my own leaked lock apart from another live replica's fresh
+-- lock (docs/tasks/p4-phantomdb-multiwriter-audit.md). NULL for rows
+-- written before this column existed (no wipe required to add it,
+-- purely additive) or, defensively, any writer that predates the fix.
 CREATE TABLE IF NOT EXISTS materialise_in_flight (
     tmdb_id    INTEGER NOT NULL,
     type       TEXT NOT NULL,
     season     INTEGER NOT NULL DEFAULT -1,
     episode    INTEGER NOT NULL DEFAULT -1,
     started_at INTEGER NOT NULL,
+    owner      TEXT,
     PRIMARY KEY (tmdb_id, type, season, episode)
 );
 
@@ -2924,10 +2969,10 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
             await using var conn = await OpenAsync(ct).ConfigureAwait(false);
             await using var cmd = conn.CreateCommand();
             cmd.CommandText = @"INSERT INTO materialise_in_flight
-                (tmdb_id, type, season, episode, started_at)
-                VALUES ($tmdb, $type, $season, $episode, $now)
+                (tmdb_id, type, season, episode, started_at, owner)
+                VALUES ($tmdb, $type, $season, $episode, $now, $owner)
                 ON CONFLICT (tmdb_id, type, season, episode)
-                DO UPDATE SET started_at = excluded.started_at
+                DO UPDATE SET started_at = excluded.started_at, owner = excluded.owner
                 WHERE materialise_in_flight.started_at < $cutoff;";
             cmd.Parameters.AddWithValue("$tmdb", tmdbId);
             cmd.Parameters.AddWithValue("$type", type);
@@ -2935,6 +2980,7 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
             cmd.Parameters.AddWithValue("$episode", episode);
             cmd.Parameters.AddWithValue("$now", now.ToUnixTimeSeconds());
             cmd.Parameters.AddWithValue("$cutoff", cutoff);
+            cmd.Parameters.AddWithValue("$owner", HostId);
             return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) == 1;
         }
         finally
@@ -2998,20 +3044,67 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
     }
 
     /// <summary>
-    /// Purges materialise_in_flight rows older than
-    /// <paramref name="threshold"/>. Returns the count of rows deleted
-    /// so the Stage 4 startup sweeper can log it.
+    /// Purges stale <c>materialise_in_flight</c> rows, owner-aware.
+    ///
+    /// Per the multiwriter audit
+    /// (docs/tasks/p4-phantomdb-multiwriter-audit.md), a shared-DB startup
+    /// sweeper cannot assume every row younger than the normal stale
+    /// threshold belongs to an actively-running materialise "on this very
+    /// process" — with N replicas sharing the DB file, a fresh row may
+    /// belong to a DIFFERENT, still-live replica. So this purge treats
+    /// rows differently depending on whether they carry THIS instance's
+    /// <see cref="HostId"/> in their <c>owner</c> column:
+    ///
+    ///   * Rows owned by THIS host (<paramref name="threshold"/>): the
+    ///     original semantics — presumed leaked once older than the
+    ///     configured (short) stale window, because only this process
+    ///     could have written them.
+    ///   * Rows owned by ANY OTHER host, or with a NULL/legacy owner
+    ///     (<paramref name="foreignOwnerThreshold"/>): purged ONLY past a
+    ///     much longer hard crash-recovery TTL, since a fresh row here may
+    ///     be a genuinely in-flight materialise on a live sibling replica —
+    ///     never stolen out from under it just because it crossed the
+    ///     short single-process threshold.
+    ///
+    /// Returns the count of rows deleted so the Stage 4 startup sweeper can
+    /// log it.
     /// </summary>
-    public async Task<int> PurgeStaleMaterialiseInFlightAsync(TimeSpan threshold, CancellationToken ct)
+    /// <param name="threshold">
+    /// Age past which a row owned by THIS host is presumed leaked.
+    /// </param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <param name="foreignOwnerThreshold">
+    /// Age past which a row owned by a DIFFERENT host (or with a
+    /// NULL/legacy owner) is presumed leaked — a hard crash-recovery TTL,
+    /// intentionally much longer than <paramref name="threshold"/> so a
+    /// live sibling replica's fresh claim is never purged out from under
+    /// it. Defaults to <c>threshold</c> scaled by
+    /// <see cref="ForeignOwnerHardTtlMultiplier"/> when omitted.
+    /// </param>
+    public async Task<int> PurgeStaleMaterialiseInFlightAsync(TimeSpan threshold, CancellationToken ct, TimeSpan? foreignOwnerThreshold = null)
     {
+        var foreignThreshold = foreignOwnerThreshold ?? TimeSpan.FromTicks(threshold.Ticks * ForeignOwnerHardTtlMultiplier);
+        if (foreignThreshold < threshold)
+        {
+            // Never let the foreign-owner window be tighter than the
+            // same-host window — that would defeat the whole point of
+            // distinguishing them (a caller-supplied inversion is almost
+            // certainly a mistake, not intent).
+            foreignThreshold = threshold;
+        }
+
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             await using var conn = await OpenAsync(ct).ConfigureAwait(false);
             await using var cmd = conn.CreateCommand();
-            cmd.CommandText = "DELETE FROM materialise_in_flight WHERE started_at < $cutoff;";
-            cmd.Parameters.AddWithValue("$cutoff",
-                DateTimeOffset.UtcNow.Subtract(threshold).ToUnixTimeSeconds());
+            cmd.CommandText = @"DELETE FROM materialise_in_flight
+                WHERE (owner IS $self AND started_at < $ownCutoff)
+                   OR (owner IS NOT $self AND started_at < $foreignCutoff);";
+            var now = DateTimeOffset.UtcNow;
+            cmd.Parameters.AddWithValue("$self", HostId);
+            cmd.Parameters.AddWithValue("$ownCutoff", now.Subtract(threshold).ToUnixTimeSeconds());
+            cmd.Parameters.AddWithValue("$foreignCutoff", now.Subtract(foreignThreshold).ToUnixTimeSeconds());
             return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
         finally
@@ -3019,6 +3112,16 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
             _writeLock.Release();
         }
     }
+
+    /// <summary>
+    /// Default multiplier applied to a caller's own-host stale threshold to
+    /// derive the hard crash-recovery TTL for a foreign-owned (or legacy
+    /// NULL-owner) <c>materialise_in_flight</c> row when the caller does not
+    /// supply an explicit <see cref="TimeSpan"/>. Deliberately large: this
+    /// window only exists to reclaim a row from a replica that is actually
+    /// gone (crashed and never coming back for it), not to race a live one.
+    /// </summary>
+    public const int ForeignOwnerHardTtlMultiplier = 6;
 
     // ---- materialised_state ----
 
@@ -3029,7 +3132,16 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
     /// throwing — re-materialise IS the expected upsert path (e.g.
     /// gostream re-cached an evicted file under a new stub path).
     /// </summary>
-    public async Task InsertMaterialisedStateAsync(int tmdbId, string type, int season, int episode, string stubPath, string fusePath, CancellationToken ct)
+    /// <param name="materialisedAt">
+    /// Optional explicit <c>materialised_at</c> stamp. Omit (default: now)
+    /// for a genuine new materialise. A caller that must put a row BACK
+    /// after provisionally claiming/removing it (e.g.
+    /// <see cref="Materialisation.EvictionSweeper"/> re-inserting on a
+    /// failed gostream remove) should pass the ORIGINAL value through so
+    /// re-inserting a not-actually-evicted row does not reset its idle
+    /// clock and make it look freshly materialised.
+    /// </param>
+    public async Task InsertMaterialisedStateAsync(int tmdbId, string type, int season, int episode, string stubPath, string fusePath, CancellationToken ct, DateTimeOffset? materialisedAt = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(type);
         ArgumentException.ThrowIfNullOrWhiteSpace(stubPath);
@@ -3048,7 +3160,7 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
             cmd.Parameters.AddWithValue("$episode", episode);
             cmd.Parameters.AddWithValue("$stub", stubPath);
             cmd.Parameters.AddWithValue("$fuse", fusePath);
-            cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            cmd.Parameters.AddWithValue("$now", (materialisedAt ?? DateTimeOffset.UtcNow).ToUnixTimeSeconds());
             await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
         finally
@@ -3112,7 +3224,16 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
         return list;
     }
 
-    public async Task DeleteMaterialisedStateAsync(int tmdbId, string type, int season, int episode, CancellationToken ct)
+    /// <summary>
+    /// Deletes a <c>materialised_state</c> row. Returns the number of rows
+    /// actually deleted (0 or 1) so a caller can use this as an atomic
+    /// "claim" — under concurrent writers/sweepers racing the SAME row,
+    /// exactly one caller's delete affects a row; every other concurrent
+    /// caller sees 0 and knows another writer already claimed/evicted it,
+    /// rather than both proceeding to double-act on the same materialised
+    /// item (see <see cref="Materialisation.EvictionSweeper"/>).
+    /// </summary>
+    public async Task<int> DeleteMaterialisedStateAsync(int tmdbId, string type, int season, int episode, CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(type);
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
@@ -3126,7 +3247,7 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
             cmd.Parameters.AddWithValue("$type", type);
             cmd.Parameters.AddWithValue("$season", season);
             cmd.Parameters.AddWithValue("$episode", episode);
-            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
         finally
         {

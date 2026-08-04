@@ -445,4 +445,117 @@ public class EvictionSweeperTests : IDisposable
             It.Is<ChannelItemRefreshOptions>(o => o.ForceUpdate && !o.ForceProbe && o.InvalidateMediaInfoCache),
             It.IsAny<CancellationToken>()), Times.Once);
     }
+
+    // ---- multiwriter safety (p4-phantomdb-multiwriter-safety-fixes) ----
+
+    [Fact]
+    public async Task ConcurrentSweepers_SameRow_NeverDoubleRemoves()
+    {
+        // Two "replica" sweepers (or an overlapping manual + cron run in one
+        // process) racing RunOnceAsync against a DB with the SAME candidate
+        // row must never both call gostream.RemoveAsync for it — the
+        // atomic-claim-via-delete-first fix makes exactly one sweeper act.
+        // Fails without the fix (original delete-after-remove order lets
+        // both list the row before either deletes it); passes with it.
+        //
+        // A barrier inside gostream.RemoveAsync forces BOTH sweepers to
+        // actually reach the "act on this row" step concurrently (rather
+        // than trusting incidental Task scheduling), reproducing the
+        // hazard deterministically: without the claim-first fix, both
+        // sweepers list the row before either deletes it and both would
+        // proceed to call gostream.RemoveAsync.
+        using var db = await NewDbAsync();
+        await db.InsertMaterialisedStateAsync(60, "movie", -1, -1, "/stub/race.mkv", "/fuse/race.mkv", CancellationToken.None);
+        await BackdateMaterialisedAtAsync(60, "movie", -1, -1, DateTimeOffset.UtcNow.AddDays(-90));
+
+        var barrier = new Barrier(2);
+        var removeCallCount = 0;
+
+        // Deliberately share ONE gostream mock (and one refresh mock) across
+        // BOTH sweeper instances — this is the piece that makes the race
+        // observable: two replica sweepers sharing one DB also share the
+        // same downstream gostream/channel-refresh services, not
+        // per-instance fakes. Only ILibraryManager differs per instance
+        // (each replica resolves the channel BaseItem independently), which
+        // does not affect the hazard being tested.
+        var gostream = new Mock<IGostreamClient>(MockBehavior.Loose);
+        gostream.Setup(g => g.RemoveAsync("/stub/race.mkv", It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                Interlocked.Increment(ref removeCallCount);
+                // Block until a second concurrent caller also arrives (or
+                // time out if the fix means only one caller ever gets here —
+                // that IS the expected/passing outcome).
+                await Task.Run(() => barrier.SignalAndWait(TimeSpan.FromMilliseconds(500)));
+            });
+
+        var item = MakeChannelMovie(60);
+
+        var userMgr = new Mock<IUserManager>(MockBehavior.Loose);
+        userMgr.Setup(u => u.GetUsers()).Returns(new[] { MakeUser() });
+        var userData = new Mock<IUserDataManager>(MockBehavior.Loose);
+        userData.Setup(u => u.GetUserData(It.IsAny<User>(), It.IsAny<BaseItem>())).Returns((UserItemData?)null);
+        var refresh = new Mock<IChannelItemRefreshManager>(MockBehavior.Loose);
+        refresh.Setup(r => r.RefreshChannelItemAsync(
+                It.IsAny<Guid>(), It.IsAny<string>(),
+                It.IsAny<ChannelItemRefreshOptions>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        var state = new ChannelStateProvider(db);
+        var cfg = new PluginConfiguration
+        {
+            EvictionEnabled = true,
+            EvictionIdleDays = 30,
+            ProtectFavourites = true,
+            EvictionScheduleCron = "0 4 * * *",
+        };
+
+        var libA = new Mock<ILibraryManager>(MockBehavior.Loose);
+        SetupExternalIdLookup(libA, item.ExternalId, item);
+        var sutA = new EvictionSweeper(
+            db, gostream.Object, libA.Object, userMgr.Object, userData.Object,
+            refresh.Object, state, NullLogger<EvictionSweeper>.Instance, () => cfg);
+
+        var libB = new Mock<ILibraryManager>(MockBehavior.Loose);
+        SetupExternalIdLookup(libB, item.ExternalId, item);
+        var sutB = new EvictionSweeper(
+            db, gostream.Object, libB.Object, userMgr.Object, userData.Object,
+            refresh.Object, state, NullLogger<EvictionSweeper>.Instance, () => cfg);
+
+        await Task.WhenAll(
+            sutA.RunOnceAsync(CancellationToken.None),
+            sutB.RunOnceAsync(CancellationToken.None));
+
+        Assert.Equal(1, removeCallCount);
+        gostream.Verify(g => g.RemoveAsync("/stub/race.mkv", It.IsAny<CancellationToken>()), Times.Once);
+        Assert.Null(await db.GetMaterialisedStateAsync(60, "movie", -1, -1, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task GostreamRemoveFails_RestoresClaimedRow_ForRetryNextTick()
+    {
+        // The claim-first ordering must not lose a row when the subsequent
+        // gostream remove fails — the row is put back (with its ORIGINAL
+        // materialised_at) so the existing "retry next tick" contract holds.
+        using var db = await NewDbAsync();
+        var originalWhen = DateTimeOffset.UtcNow.AddDays(-90);
+        await db.InsertMaterialisedStateAsync(61, "movie", -1, -1, "/stub/fail.mkv", "/fuse/fail.mkv", CancellationToken.None);
+        await BackdateMaterialisedAtAsync(61, "movie", -1, -1, originalWhen);
+
+        var (sut, gostream, lib, _, _, refresh, _, _) = BuildSut(db);
+        var item = MakeChannelMovie(61);
+        SetupExternalIdLookup(lib, item.ExternalId, item);
+        gostream.Setup(g => g.RemoveAsync("/stub/fail.mkv", It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("gostream unreachable"));
+
+        await sut.RunOnceAsync(CancellationToken.None);
+
+        var restored = await db.GetMaterialisedStateAsync(61, "movie", -1, -1, CancellationToken.None);
+        Assert.NotNull(restored);
+        Assert.Equal("/stub/fail.mkv", restored!.StubPath);
+        Assert.Equal("/fuse/fail.mkv", restored.FusePath);
+        Assert.Equal(originalWhen.ToUnixTimeSeconds(), restored.MaterialisedAt.ToUnixTimeSeconds());
+        refresh.Verify(r => r.RefreshChannelItemAsync(
+            It.IsAny<Guid>(), It.IsAny<string>(),
+            It.IsAny<ChannelItemRefreshOptions>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
 }

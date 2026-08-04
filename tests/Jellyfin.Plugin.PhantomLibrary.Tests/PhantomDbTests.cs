@@ -48,7 +48,7 @@ public class PhantomDbTests : IDisposable
     // ----------------------------------------------------------------
 
     [Fact]
-    public async Task FreshDb_CreatesSchemaV16_WithAllExpectedTables()
+    public async Task FreshDb_CreatesSchemaV17_WithAllExpectedTables()
     {
         using var db = await NewDbAsync();
 
@@ -67,7 +67,7 @@ public class PhantomDbTests : IDisposable
             version = Convert.ToInt32(await v.ExecuteScalarAsync());
         }
 
-        Assert.Equal(16, version);
+        Assert.Equal(17, version);
 
         var expectedTables = new[]
         {
@@ -142,6 +142,7 @@ public class PhantomDbTests : IDisposable
     [InlineData(13)]
     [InlineData(14)]
     [InlineData(15)]
+    [InlineData(16)]
     public async Task HardRefuse_PreCurrentSchemaVersion_ThrowsWithWipePointer(int oldVersion)
     {
         await CreateDbWithUserVersionAsync(oldVersion);
@@ -150,7 +151,7 @@ public class PhantomDbTests : IDisposable
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => db.SetMetaAsync("test", "1", CancellationToken.None));
 
-        Assert.Contains("version 16", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("version 17", ex.Message, StringComparison.Ordinal);
         Assert.Contains("phantom-wipe.sh", ex.Message, StringComparison.Ordinal);
     }
 
@@ -756,6 +757,142 @@ public class PhantomDbTests : IDisposable
         using var db = await NewDbAsync();
         var purged = await db.PurgeStaleMaterialiseInFlightAsync(TimeSpan.FromMinutes(10), CancellationToken.None);
         Assert.Equal(0, purged);
+    }
+
+    // ----------------------------------------------------------------
+    // materialise_in_flight — multiwriter (p4-phantomdb-multiwriter-safety-fixes)
+    //
+    // Simulates N Jellyfin replicas sharing one phantom.db by opening
+    // TWO separate PhantomDb instances against the SAME _dbPath. Each
+    // PhantomDb instance gets its own HostId (regenerated per-instance,
+    // exactly like a separate replica process would), so these tests
+    // exercise the real cross-instance owner-column behaviour rather
+    // than a same-instance same-owner no-op.
+    // ----------------------------------------------------------------
+
+    [Fact]
+    public async Task MaterialiseInFlight_TwoReplicas_HaveDistinctHostIds()
+    {
+        using var replicaA = await NewDbAsync();
+        using var replicaB = new PhantomDb(_dbPath);
+
+        Assert.NotEqual(replicaA.HostId, replicaB.HostId);
+    }
+
+    [Fact]
+    public async Task MaterialiseInFlight_Purge_NeverStealsAnotherLiveReplicasFreshLock()
+    {
+        // THIS is the exact hazard the audit called out: a shared-DB startup
+        // sweeper on replica A must not purge replica B's genuinely-in-flight
+        // row just because it crosses replica A's own (short) stale minutes
+        // threshold. Fails without the owner-aware fix (the original
+        // single-column-by-age purge deletes ANY row past the threshold,
+        // regardless of who wrote it); passes with it.
+        using var replicaA = await NewDbAsync();
+        using var replicaB = new PhantomDb(_dbPath);
+
+        // Replica B claims a materialise. It is "fresh" from B's own
+        // perspective, but we backdate it past A's short own-host stale
+        // threshold to simulate the row simply having been claimed a while
+        // ago — while B's materialise is still genuinely running (B never
+        // deleted it).
+        var claimedByB = await replicaB.TryInsertMaterialiseInFlightAsync(7, "movie", -1, -1, CancellationToken.None);
+        Assert.True(claimedByB);
+
+        var cs = new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString();
+        await using (var conn = new SqliteConnection(cs))
+        {
+            await conn.OpenAsync();
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE materialise_in_flight SET started_at = $t WHERE tmdb_id = 7;";
+            cmd.Parameters.AddWithValue("$t", DateTimeOffset.UtcNow.AddMinutes(-30).ToUnixTimeSeconds());
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        // Replica A's startup sweeper runs with its normal short own-host
+        // threshold (10 min) and a foreign-owner hard TTL far longer than the
+        // 30-minute backdate (so B's row must NOT be reclaimed yet).
+        var purged = await replicaA.PurgeStaleMaterialiseInFlightAsync(
+            TimeSpan.FromMinutes(10), CancellationToken.None, TimeSpan.FromHours(6));
+
+        Assert.Equal(0, purged);
+        Assert.True(await replicaB.IsMaterialiseInFlightAsync(7, "movie", -1, -1, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task MaterialiseInFlight_Purge_ReclaimsForeignRow_PastHardCrashRecoveryTtl()
+    {
+        // The complementary safety case: a row genuinely leaked by a replica
+        // that crashed and is never coming back for it must still eventually
+        // be reclaimable — just via the much longer hard TTL, not the short
+        // own-host threshold.
+        using var replicaA = await NewDbAsync();
+        using var replicaB = new PhantomDb(_dbPath);
+
+        var claimedByB = await replicaB.TryInsertMaterialiseInFlightAsync(8, "movie", -1, -1, CancellationToken.None);
+        Assert.True(claimedByB);
+
+        var cs = new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString();
+        await using (var conn = new SqliteConnection(cs))
+        {
+            await conn.OpenAsync();
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE materialise_in_flight SET started_at = $t WHERE tmdb_id = 8;";
+            cmd.Parameters.AddWithValue("$t", DateTimeOffset.UtcNow.AddHours(-7).ToUnixTimeSeconds());
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        var purged = await replicaA.PurgeStaleMaterialiseInFlightAsync(
+            TimeSpan.FromMinutes(10), CancellationToken.None, TimeSpan.FromHours(6));
+
+        Assert.Equal(1, purged);
+        Assert.False(await replicaB.IsMaterialiseInFlightAsync(8, "movie", -1, -1, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task MaterialiseInFlight_Purge_OwnHostRow_UsesShortThreshold_EvenWhileAnotherReplicasRowSurvives()
+    {
+        // A host purges its OWN leaked rows at the normal short threshold
+        // while a sibling replica's row past that same age, but under the
+        // foreign hard TTL, survives in the SAME purge call.
+        using var replicaA = await NewDbAsync();
+        using var replicaB = new PhantomDb(_dbPath);
+
+        Assert.True(await replicaA.TryInsertMaterialiseInFlightAsync(10, "movie", -1, -1, CancellationToken.None));
+        Assert.True(await replicaB.TryInsertMaterialiseInFlightAsync(11, "movie", -1, -1, CancellationToken.None));
+
+        var cs = new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString();
+        await using (var conn = new SqliteConnection(cs))
+        {
+            await conn.OpenAsync();
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE materialise_in_flight SET started_at = $t;";
+            cmd.Parameters.AddWithValue("$t", DateTimeOffset.UtcNow.AddMinutes(-30).ToUnixTimeSeconds());
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        var purged = await replicaA.PurgeStaleMaterialiseInFlightAsync(
+            TimeSpan.FromMinutes(10), CancellationToken.None, TimeSpan.FromHours(6));
+
+        Assert.Equal(1, purged);
+        Assert.False(await replicaA.IsMaterialiseInFlightAsync(10, "movie", -1, -1, CancellationToken.None));
+        Assert.True(await replicaB.IsMaterialiseInFlightAsync(11, "movie", -1, -1, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task MaterialiseInFlight_TryInsert_StampsOwnHostId()
+    {
+        using var db = await NewDbAsync();
+        await db.TryInsertMaterialiseInFlightAsync(42, "movie", -1, -1, CancellationToken.None);
+
+        var cs = new SqliteConnectionStringBuilder { DataSource = _dbPath, Mode = SqliteOpenMode.ReadOnly }.ToString();
+        await using var conn = new SqliteConnection(cs);
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT owner FROM materialise_in_flight WHERE tmdb_id = 42;";
+        var owner = await cmd.ExecuteScalarAsync() as string;
+
+        Assert.Equal(db.HostId, owner);
     }
 
     // ----------------------------------------------------------------

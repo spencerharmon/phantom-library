@@ -28,13 +28,27 @@ namespace Jellyfin.Plugin.PhantomLibrary.Materialisation;
 ///     on — REQ-M14-PER-USER, Surface 2),
 ///   * skips if favourite-protected, recently played, or recently
 ///     materialised-but-never-played within the idle window,
-///   * otherwise calls <c>gostream.RemoveAsync</c>, deletes the state
-///     row, and re-refreshes the channel item so the channel re-emits
-///     it with the splash MediaSource + 'phantom' tag.
+///   * otherwise atomically CLAIMS the row by deleting it from
+///     <c>materialised_state</c> first, then calls
+///     <c>gostream.RemoveAsync</c>, and re-refreshes the channel item so
+///     the channel re-emits it with the splash MediaSource + 'phantom'
+///     tag.
+///
+/// Multi-writer safety (p4-phantomdb-multiwriter-safety-fixes,
+/// docs/tasks/p4-phantomdb-multiwriter-audit.md): the sweeper lists every
+/// candidate row up front, so two concurrent sweepers — a sibling replica
+/// sharing the DB, or an overlapping manual/cron run in this same process
+/// — can both see the SAME row before either acts on it. Deleting the row
+/// FIRST (an atomic single-statement DELETE) makes the row itself the
+/// claim: exactly one concurrent caller's delete affects a row and
+/// proceeds to call gostream; every other caller sees "0 rows affected"
+/// and skips, so <c>gostream.RemoveAsync</c> is never invoked twice for
+/// the same stub. A failed remove re-inserts the row (preserving its
+/// original <c>materialised_at</c>) so it is retried, unclaimed, next tick.
 ///
 /// Failure semantics:
-///   * gostream.RemoveAsync throws → log + skip the row (state row
-///     stays so the next tick retries; no refresh is fired so the
+///   * gostream.RemoveAsync throws → log, restore the claimed row (state
+///     row is back so the next tick retries; no refresh is fired so the
 ///     channel keeps presenting the materialised view until the
 ///     remove actually succeeds).
 ///   * BaseItem not found for a state row's external id → log + skip
@@ -349,26 +363,59 @@ public sealed class EvictionSweeper : IHostedService, IDisposable
                 continue;
             }
 
+            // Claim the row FIRST via an atomic delete, then act on it.
+            // Under concurrent writers — two replica sweepers racing the
+            // same shared DB, or a manual RunOnceAsync overlapping the cron
+            // loop within one process — every sweeper lists the SAME
+            // materialised_state row before any of them acts on it.
+            // Deleting first (rather than removing via gostream then
+            // deleting, the original order) makes the row itself the
+            // mutual-exclusion primitive: SQLite guarantees the DELETE is
+            // atomic, so exactly one concurrent caller's delete affects a
+            // row (returns 1) and every other caller sees 0 and skips —
+            // never double-calling gostream.RemoveAsync for the same
+            // stub_path. If the subsequent gostream remove fails, the row
+            // is re-inserted (preserving the ORIGINAL materialised_at so a
+            // failed-then-retried evict does not look freshly
+            // materialised) so the existing retry-next-tick behaviour is
+            // unchanged.
+            var claimed = await _db.DeleteMaterialisedStateAsync(row.TmdbId, row.Type, row.Season, row.Episode, ct)
+                .ConfigureAwait(false);
+            if (claimed == 0)
+            {
+                // Another concurrent sweeper (this process or a sibling
+                // replica sharing the DB) already claimed this row.
+                _logger.LogDebug(
+                    "[Eviction] row already claimed by a concurrent sweeper; skipping ExternalId={External}",
+                    externalId);
+                continue;
+            }
+
             try
             {
                 await _gostream.RemoveAsync(row.StubPath, ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
+                // Put the row back before propagating — we already claimed
+                // it, and cancellation must not silently drop it.
+                await _db.InsertMaterialisedStateAsync(
+                    row.TmdbId, row.Type, row.Season, row.Episode, row.StubPath, row.FusePath, CancellationToken.None, row.MaterialisedAt)
+                    .ConfigureAwait(false);
                 throw;
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(
                     ex,
-                    "[Eviction] gostream RemoveAsync failed for stub_path={Path}; leaving state row intact, will retry next tick",
+                    "[Eviction] gostream RemoveAsync failed for stub_path={Path}; restoring claimed row, will retry next tick",
                     row.StubPath);
+                await _db.InsertMaterialisedStateAsync(
+                    row.TmdbId, row.Type, row.Season, row.Episode, row.StubPath, row.FusePath, CancellationToken.None, row.MaterialisedAt)
+                    .ConfigureAwait(false);
                 removeFailed++;
                 continue;
             }
-
-            await _db.DeleteMaterialisedStateAsync(row.TmdbId, row.Type, row.Season, row.Episode, ct)
-                .ConfigureAwait(false);
 
             try
             {

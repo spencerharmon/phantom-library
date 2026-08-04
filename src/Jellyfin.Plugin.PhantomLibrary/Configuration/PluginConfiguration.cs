@@ -109,6 +109,7 @@ public class PluginConfiguration : BasePluginConfiguration
         UnavailableRetryAfterHours = 24;
         MagnetCacheTtlHours = 24 * 7;
         MaterialiseInFlightStaleMinutes = 10;
+        MaterialiseInFlightForeignOwnerHardTtlMinutes = 60;
         GostreamMinQuality = string.Empty;
         FusePathWaitTimeoutSeconds = 60;
         FusePathPollIntervalMilliseconds = 500;
@@ -458,6 +459,23 @@ public class PluginConfiguration : BasePluginConfiguration
     /// is not interrupted by the startup sweep racing it.
     /// </summary>
     public int MaterialiseInFlightStaleMinutes { get; set; }
+
+    /// <summary>
+    /// Hard crash-recovery age threshold (minutes) above which a
+    /// <c>materialise_in_flight</c> row owned by a DIFFERENT replica host
+    /// (or a legacy row with no recorded owner) is presumed leaked and
+    /// swept on startup. Deliberately much longer than
+    /// <see cref="MaterialiseInFlightStaleMinutes"/>: that shorter window
+    /// only ever applies to rows THIS host itself wrote, so it is safe to
+    /// treat as "presumably crashed materialise, on this very process."
+    /// A row belonging to a sibling replica sharing the same
+    /// <c>phantom.db</c> may still be a genuinely in-flight materialise
+    /// there, so it is only reclaimed once it is old enough that the
+    /// owning replica must itself have crashed
+    /// (p4-phantomdb-multiwriter-safety-fixes,
+    /// docs/tasks/p4-phantomdb-multiwriter-audit.md).
+    /// </summary>
+    public int MaterialiseInFlightForeignOwnerHardTtlMinutes { get; set; }
 
     /// <summary>
     /// Optional <c>min_quality</c> hint forwarded to gostream's
