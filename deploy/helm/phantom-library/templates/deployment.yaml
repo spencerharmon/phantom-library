@@ -61,6 +61,50 @@ spec:
             - name: {{ $k }}
               value: {{ $v | quote }}
             {{- end }}
+            {{- if .Values.postgres.enabled }}
+            # ----- Jellyfin.Pgsql provider (Jellyfin's own jellyfin.db -> shared PostgreSQL) -----
+            # Env-var contract owned by the Jellyfin.Pgsql (JPVenson) image/provider itself, not
+            # invented here. See values.yaml `postgres` block for the source-of-truth wiring.
+            - name: POSTGRES_HOST
+              value: {{ .Values.postgres.jellyfin.host | quote }}
+            - name: POSTGRES_PORT
+              value: {{ .Values.postgres.jellyfin.port | quote }}
+            - name: POSTGRES_DB
+              value: {{ .Values.postgres.jellyfin.db | quote }}
+            - name: POSTGRES_USER
+              value: {{ .Values.postgres.jellyfin.user | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.postgres.jellyfin.passwordSecretName | quote }}
+                  key: {{ .Values.postgres.jellyfin.passwordSecretKey | quote }}
+            {{- if .Values.postgres.jellyfin.sslMode }}
+            - name: POSTGRES_SSLMODE
+              value: {{ .Values.postgres.jellyfin.sslMode | quote }}
+            {{- end }}
+            {{- if .Values.postgres.jellyfin.trustServerCertificate }}
+            - name: POSTGRES_TRUSTSERVERCERTIFICATE
+              value: "true"
+            {{- end }}
+            - name: POSTGRES_COMMAND_TIMEOUT
+              value: {{ .Values.postgres.jellyfin.commandTimeoutSeconds | quote }}
+            # ----- plugin's own phantom.db logical DB -> shared PostgreSQL -----
+            # Forward-declared for `p4-phantomdb-postgres-backend`: the plugin does not read these
+            # yet, but the wiring lands once, generically, per the Stage A step 1/2 task split.
+            - name: PHANTOM_POSTGRES_HOST
+              value: {{ .Values.postgres.phantom.host | quote }}
+            - name: PHANTOM_POSTGRES_PORT
+              value: {{ .Values.postgres.phantom.port | quote }}
+            - name: PHANTOM_POSTGRES_DB
+              value: {{ .Values.postgres.phantom.db | quote }}
+            - name: PHANTOM_POSTGRES_USER
+              value: {{ .Values.postgres.phantom.user | quote }}
+            - name: PHANTOM_POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.postgres.phantom.passwordSecretName | quote }}
+                  key: {{ .Values.postgres.phantom.passwordSecretKey | quote }}
+            {{- end }}
           ports:
             - { name: http, containerPort: {{ .Values.jellyfin.httpPort }} }
             - { name: proxy, containerPort: {{ .Values.gostream.ports.proxy }} }
