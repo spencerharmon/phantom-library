@@ -4,7 +4,6 @@ using System.Diagnostics.Metrics;
 using System.Linq;
 using Jellyfin.Plugin.PhantomLibrary.Configuration;
 using Jellyfin.Plugin.PhantomLibrary.Diagnostics;
-using OpenTelemetry.Exporter;
 using Xunit;
 
 namespace Jellyfin.Plugin.PhantomLibrary.Tests;
@@ -166,11 +165,11 @@ public sealed class PhantomFlowMetricsTests
     }
 
     [Theory]
-    [InlineData("grpc", OtlpExportProtocol.Grpc)]
-    [InlineData("http/protobuf", OtlpExportProtocol.HttpProtobuf)]
-    [InlineData("", OtlpExportProtocol.Grpc)]
-    [InlineData("nonsense", OtlpExportProtocol.Grpc)]
-    public void ResolveProtocol_MapsTokens(string token, OtlpExportProtocol expected)
+    [InlineData("grpc", PhantomOtlpProtocol.Grpc)]
+    [InlineData("http/protobuf", PhantomOtlpProtocol.HttpProtobuf)]
+    [InlineData("", PhantomOtlpProtocol.Grpc)]
+    [InlineData("nonsense", PhantomOtlpProtocol.Grpc)]
+    public void ResolveProtocol_MapsTokens(string token, PhantomOtlpProtocol expected)
     {
         var config = new PluginConfiguration { MetricsOtlpProtocol = token };
         var key = "OTEL_EXPORTER_OTLP_PROTOCOL";

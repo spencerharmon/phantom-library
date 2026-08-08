@@ -59,8 +59,6 @@
     <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="9.0.0" />
     <PackageReference Include="NCrontab" Version="3.3.3" />
     <PackageReference Include="prometheus-net" Version="8.2.1" />
-    <PackageReference Include="OpenTelemetry" Version="1.10.0" />
-    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.10.0" />
   </ItemGroup>
 
   <ItemGroup>
