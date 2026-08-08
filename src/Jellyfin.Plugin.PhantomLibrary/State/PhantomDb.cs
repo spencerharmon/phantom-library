@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Data;
 using System.Data.Common;
 using System.Globalization;
 using System.IO;
@@ -357,6 +358,24 @@ public sealed class PhantomDb : IDisposable
         }
 
         return conn;
+    }
+
+    /// <summary>
+    /// Adds a named parameter carrying an EXPLICIT <see cref="DbType"/> so that a
+    /// NULL value still advertises a resolvable type. Npgsql otherwise sends a
+    /// NULL <c>AddWithValue</c> parameter with an unspecified type OID, which
+    /// makes PostgreSQL reject predicates like <c>@p IS NULL</c> with
+    /// <c>42P08: could not determine data type of parameter</c>; Microsoft.Data.Sqlite
+    /// honours the same <see cref="DbType"/>, so this stays provider-agnostic across
+    /// the shared SQL used by both backends.
+    /// </summary>
+    private static void AddNullableParam(DbCommand cmd, string name, object? value, DbType type)
+    {
+        var p = cmd.CreateParameter();
+        p.ParameterName = name;
+        p.DbType = type;
+        p.Value = value ?? DBNull.Value;
+        cmd.Parameters.Add(p);
     }
 
     private async Task EnsureSchemaAsync(DbConnection conn, CancellationToken ct)
@@ -1903,7 +1922,7 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
             LIMIT 1;";
         cmd.AddWithValue("@now", now.ToUnixTimeSeconds());
         cmd.AddWithValue("@policy", policyHash);
-        cmd.AddWithValue("@preferred", (object?)preferredType ?? DBNull.Value);
+        AddNullableParam(cmd, "@preferred", preferredType, DbType.String);
         await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
         return await r.ReadAsync(ct).ConfigureAwait(false) ? ReadAvailability(r) : null;
     }
@@ -1931,7 +1950,7 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
                      season ASC,
                      episode ASC
             LIMIT 1;";
-        cmd.AddWithValue("@cursor", (object?)cursor ?? DBNull.Value);
+        AddNullableParam(cmd, "@cursor", cursor, DbType.Int64);
         cmd.AddWithValue("@now", now.ToUnixTimeSeconds());
         cmd.AddWithValue("@policy", policyHash);
         await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
@@ -3693,7 +3712,7 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
             WHERE type=@type AND (@year IS NULL OR year=@year)
             ORDER BY fetched_at DESC;";
         cmd.AddWithValue("@type", type);
-        cmd.AddWithValue("@year", (object?)year ?? DBNull.Value);
+        AddNullableParam(cmd, "@year", year, DbType.Int32);
         var wanted = NormalizeTitle(title);
         await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
         while (await r.ReadAsync(ct).ConfigureAwait(false))
