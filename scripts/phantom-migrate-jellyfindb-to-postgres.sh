@@ -238,7 +238,7 @@ case "$SOURCE" in
         SOURCE_DB="${JELLYFIN_DB:-/var/lib/jellyfin/data/jellyfin.db}"
         # EF Core / provider-internal tables the provider owns and must NOT be
         # copied from the SQLite provider (migration history is provider-specific).
-        SKIP_TABLES_DEFAULT="__EFMigrationsHistory"
+        SKIP_TABLES_DEFAULT="__EFMigrationsHistory __EFMigrationsLock"
         PG_STAGING_DB="${PG_STAGING_DB:-jellyfin_inactive}"
         PG_PROD_DB="${PG_PROD_DB:-jellyfin_prod}"
         ;;
@@ -406,26 +406,85 @@ LOAD_FILE="$STAGING_DIR/postgres-load.sql"
     echo "BEGIN;"
     echo "SET session_replication_role = replica;"
 } > "$LOAD_FILE"
+# Fetch the destination column TYPE maps (booleans + arrays) so the generator emits
+# correctly-typed PostgreSQL literals. SQLite is dynamically typed and quote()/`.mode
+# insert` emit SQLite-flavoured literals PostgreSQL rejects for three column classes:
+#   * boolean  — SQLite stores 0/1 ints; PG has no int->bool assignment cast.
+#   * array    — SQLite stores a JSON '[..]' string; PG array input needs '{..}'.
+#   * bytea    — SQLite emits X'..'; PG parses that as a BIT STRING (handled by the
+#                post-pass below, since quote() still emits the blob as X'..').
+# We read the destination types from the target DB and transform per column. Column
+# NAMES bind the values (never position), so the EF schema ordering a table's columns
+# differently from the historical SQLite schema is irrelevant. Requires target
+# connectivity (always set for --stage/--commit); dry-run skips the typing (preview only).
+TYPE_SRC_COLOR="staging"; [[ "$MODE" == "commit" ]] && TYPE_SRC_COLOR="prod"
+# Strict canonical GUID shape (8-4-4-4-12 hex) used to gate uuid columns.
+_H='[0-9A-Fa-f]'
+GUIDGLOB="${_H}${_H}${_H}${_H}${_H}${_H}${_H}${_H}-${_H}${_H}${_H}${_H}-${_H}${_H}${_H}${_H}-${_H}${_H}${_H}${_H}-${_H}${_H}${_H}${_H}${_H}${_H}${_H}${_H}${_H}${_H}${_H}${_H}"
+declare -A BOOLCOL=() ARRCOL=() TSCOL=() BYTEACOL=() UUIDCOL=()
+if [[ "$MODE" != "dryrun" ]]; then
+    while IFS=$'\t' read -r _tbl _col; do [[ -n "$_tbl" ]] && BOOLCOL["$_tbl.$_col"]=1; done < <(
+        psql_run "$TYPE_SRC_COLOR" -tAF $'\t' -c \
+            "SELECT table_name,column_name FROM information_schema.columns WHERE table_schema='public' AND data_type='boolean'")
+    while IFS=$'\t' read -r _tbl _col; do [[ -n "$_tbl" ]] && ARRCOL["$_tbl.$_col"]=1; done < <(
+        psql_run "$TYPE_SRC_COLOR" -tAF $'\t' -c \
+            "SELECT table_name,column_name FROM information_schema.columns WHERE table_schema='public' AND data_type='ARRAY'")
+    while IFS=$'\t' read -r _tbl _col; do [[ -n "$_tbl" ]] && TSCOL["$_tbl.$_col"]=1; done < <(
+        psql_run "$TYPE_SRC_COLOR" -tAF $'\t' -c \
+            "SELECT table_name,column_name FROM information_schema.columns WHERE table_schema='public' AND data_type='timestamp with time zone'")
+    while IFS=$'\t' read -r _tbl _col; do [[ -n "$_tbl" ]] && BYTEACOL["$_tbl.$_col"]=1; done < <(
+        psql_run "$TYPE_SRC_COLOR" -tAF $'\t' -c \
+            "SELECT table_name,column_name FROM information_schema.columns WHERE table_schema='public' AND data_type='bytea'")
+    while IFS=$'\t' read -r _tbl _col; do [[ -n "$_tbl" ]] && UUIDCOL["$_tbl.$_col"]=1; done < <(
+        psql_run "$TYPE_SRC_COLOR" -tAF $'\t' -c \
+            "SELECT table_name,column_name FROM information_schema.columns WHERE table_schema='public' AND data_type='uuid'")
+    info "  destination types: ${#BOOLCOL[@]} boolean, ${#ARRCOL[@]} array, ${#TSCOL[@]} timestamp, ${#BYTEACOL[@]} bytea, ${#UUIDCOL[@]} uuid column(s)"
+fi
+
 for t in "${TABLES[@]}"; do
     printf 'DELETE FROM "%s";\n' "$t" >> "$LOAD_FILE"
-    # SQLite `.mode insert <t>` emits `INSERT INTO <t> VALUES(...);` per row with
-    # the table name UNQUOTED (SQLite ignores quoting on the .mode arg). Postgres
-    # folds an unquoted identifier to lower case, so we rewrite the emitted
-    # `INSERT INTO <t> VALUES` prefix to a double-quoted `INSERT INTO "<t>" VALUES`
-    # to preserve the case-sensitive name. Value quoting (single quotes) is
-    # standard SQL and loads into Postgres unchanged.
-    "$SQLITE_CMD" "$CLONE" <<SQL >> "$LOAD_FILE"
-.mode insert $t
-SELECT * FROM "$t";
+    # Column names in SQLite's own (cid) order.
+    mapfile -t _cols < <("$SQLITE_CMD" "$CLONE" "SELECT name FROM pragma_table_info('$t') ORDER BY cid;")
+    [[ ${#_cols[@]} -gt 0 ]] || die "could not resolve columns for table $t from the SQLite clone"
+    _collist=""; _exprlist=""
+    for c in "${_cols[@]}"; do
+        _collist+="${_collist:+,}\"$c\""
+        if [[ -n "${BOOLCOL[$t.$c]:-}" ]]; then
+            _e="CASE WHEN \"$c\" IS NULL THEN 'NULL' WHEN \"$c\"=0 THEN 'false' ELSE 'true' END"
+        elif [[ -n "${ARRCOL[$t.$c]:-}" ]]; then
+            # SQLite JSON '[a,b,c]' -> PostgreSQL array literal '{a,b,c}'::bigint[].
+            _e="CASE WHEN \"$c\" IS NULL THEN 'NULL' ELSE '''{' || substr(\"$c\",2,length(\"$c\")-2) || '}''::bigint[]' END"
+        elif [[ -n "${TSCOL[$t.$c]:-}" ]]; then
+            # PostgreSQL timestamptz is strict; SQLite (dynamically typed) can hold a
+            # non-timestamp value in a DATETIME column (observed: BaseItems.EndDate='101').
+            # Pass through anything shaped like a 'YYYY-MM-DD...' timestamp; coerce any
+            # other non-NULL value to NULL (it is not representable as a timestamp).
+            _e="CASE WHEN \"$c\" IS NULL THEN 'NULL' WHEN \"$c\" GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*' THEN quote(\"$c\") ELSE 'NULL' END"
+        elif [[ -n "${BYTEACOL[$t.$c]:-}" ]]; then
+            # SQLite BLOB -> PostgreSQL bytea hex literal '\xHEX'::bytea, built from
+            # SQLite hex(). Done HERE (per column) rather than by a post-pass regex so a
+            # text value that merely CONTAINS an X'..' substring is never mistaken for a
+            # blob literal and corrupted (that shifts every following column).
+            _e="CASE WHEN \"$c\" IS NULL THEN 'NULL' ELSE '''\x' || hex(\"$c\") || '''::bytea' END"
+        elif [[ -n "${UUIDCOL[$t.$c]:-}" ]]; then
+            # PostgreSQL uuid is strict; SQLite may hold a byte-shifted/corrupt GUID
+            # (observed: one BaseItems row with non-hex trailing chars in ParentId/
+            # SeasonId/SeriesId/TopParentId). Pass through canonical 8-4-4-4-12 GUIDs;
+            # coerce any other non-NULL value to NULL (unrepresentable as a uuid). All
+            # primary-key Id columns were verified clean, so this only NULLs bad FKs.
+            _e="CASE WHEN \"$c\" IS NULL THEN 'NULL' WHEN \"$c\" GLOB '$GUIDGLOB' THEN quote(\"$c\") ELSE 'NULL' END"
+        else
+            _e="quote(\"$c\")"
+        fi
+        _exprlist+="${_exprlist:+ || ',' || }$_e"
+    done
+    # One fully-typed, column-named INSERT per row.
+    "$SQLITE_CMD" "$CLONE" >> "$LOAD_FILE" <<SQL
+SELECT 'INSERT INTO "$t" ($_collist) VALUES(' || $_exprlist || ');' FROM "$t";
 SQL
 done
 echo "SET session_replication_role = DEFAULT;" >> "$LOAD_FILE"
 echo "COMMIT;" >> "$LOAD_FILE"
-# Rewrite unquoted `INSERT INTO <table> VALUES` prefixes to quoted identifiers.
-for t in "${TABLES[@]}"; do
-    # Anchor on the exact emitted prefix; table names are plain identifiers.
-    sed -i "s/^INSERT INTO ${t} VALUES/INSERT INTO \"${t}\" VALUES/" "$LOAD_FILE"
-done
 info "  load set: $LOAD_FILE"
 
 # ---- load + verify a color against the predicted counts -------------------
@@ -448,6 +507,32 @@ load_and_verify() {  # load_and_verify <color>
         die "count drift on ${color} — the load did not reproduce the clone. Refusing to proceed."
     fi
     info "  ${color}: all ${#TABLES[@]} tables match predicted counts (total $TOTAL rows)"
+
+    # Advance identity/serial sequences past the bulk-loaded explicit Ids. A pure
+    # row-data COPY inserts explicit primary keys without advancing the owning
+    # sequence, so the application's next INSERT would reuse a low value and collide
+    # with an existing key (observed on jellyfin: ApiKeys/Devices/Permissions/... use
+    # GENERATED-AS-IDENTITY int PKs). Reset each public sequence to MAX(owning col)+1.
+    # PostgreSQL-specific; a no-op when the destination has no owned sequences.
+    bold "==> Resetting ${color} identity sequences to MAX(id)+1"
+    psql_run "$color" <<'RESETSQL' >/dev/null \
+        || die "sequence reset on ${color} failed"
+DO $$
+DECLARE r RECORD; n bigint;
+BEGIN
+  FOR r IN SELECT s.relname AS seq, t.relname AS tbl, a.attname AS col
+           FROM pg_class s
+           JOIN pg_depend d ON d.objid=s.oid AND d.deptype IN ('a','i')
+           JOIN pg_class t ON t.oid=d.refobjid
+           JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=d.refobjsubid
+           WHERE s.relkind='S' AND t.relnamespace='public'::regnamespace
+  LOOP
+    EXECUTE format('SELECT COALESCE(MAX(%I),0)+1 FROM %I', r.col, r.tbl) INTO n;
+    EXECUTE format('SELECT setval(%L, %s, false)', quote_ident(r.seq), n);
+  END LOOP;
+END $$;
+RESETSQL
+    info "  ${color}: identity sequences reset"
 }
 
 STAGE_RECEIPT="$STAGING_DIR/.staging-validated"
