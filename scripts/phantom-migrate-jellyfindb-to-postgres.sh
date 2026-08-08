@@ -303,8 +303,26 @@ if [[ $SKIP_SERVICE_CHECK -eq 0 ]]; then
         die "jellyfin.service is active. Stop EVERY color's Jellyfin first: sudo systemctl stop jellyfin"
     fi
     if pgrep -fa '[j]ellyfin' >/dev/null 2>&1; then
-        warn "pgrep found a live jellyfin process:"; pgrep -fa '[j]ellyfin' >&2 || true
-        die "Refusing to migrate while any Jellyfin process is alive."
+        # pgrep -f matches a process's WHOLE command line, so this script self-matches
+        # whenever "jellyfin" appears in its own argv (e.g. `--source jellyfin`, the
+        # script path phantom-migrate-jellyfin*.sh, or the `env JELLYFIN_DB=… bash …`
+        # wrapper). Forked subshells ($(...) / pipes) inherit that same argv too, so
+        # excluding only the ancestry is not enough. Exclude EVERY process whose
+        # command line contains this script's own filename — a real foreign jellyfin
+        # server never does.
+        _selfscript="$(basename "$0")"
+        _others=""
+        for _pid in $(pgrep -f '[j]ellyfin' 2>/dev/null); do
+            _cl=$( { tr '\0' ' ' < "/proc/$_pid/cmdline"; } 2>/dev/null ) || continue
+            [[ -z "$_cl" ]] && continue   # pid vanished (race) or empty cmdline -> not a live server
+            case "$_cl" in *"$_selfscript"*) continue;; esac
+            _others="$_others $_pid"
+        done
+        if [[ -n "${_others// /}" ]]; then
+            warn "pgrep found a live jellyfin process:"
+            for _op in $_others; do ps -o pid= -o args= -p "$_op" 2>/dev/null >&2 || true; done
+            die "Refusing to migrate while any Jellyfin process is alive."
+        fi
     fi
     info "  jellyfin: stopped (ok)"
 else

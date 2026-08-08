@@ -446,6 +446,20 @@ public sealed class PhantomDb : IDisposable
         await tx.CommitAsync(ct).ConfigureAwait(false);
     }
 
+    // Integer column width convention (matters for the PostgreSQL backend; SQLite
+    // is affinity-based and treats INTEGER/BIGINT identically as 64-bit):
+    //   * BIGINT (int8) for every column read via a GetInt64 reader OR that can hold
+    //     a 64-bit value in practice — all unix-time (*_at, *_until, next_*_at,
+    //     retry_after, *refreshed, ttl_seconds) and byte-size (*size, *_size,
+    //     validation_duration_ms, selected_file_id) columns. SQLite INTEGER is 64-bit
+    //     so these routinely exceed int4 (file sizes >2GB, ms/s timestamps), and
+    //     Npgsql's GetInt64 is STRICT: it throws on an int4 column. Declaring them
+    //     INTEGER here (int4 on Postgres) both overflows on write and mismatches the
+    //     reader.
+    //   * INTEGER (int4) only for genuinely 32-bit id/count/enum columns read via
+    //     GetInt32 (tmdb_id, season, episode, seeders, rank, *generation, attempts,
+    //     year, runtime_minutes, the 0/1 toggles). Npgsql's GetInt32 throws on int8,
+    //     so these MUST stay int4.
     private const string SchemaV10Sql = @"
 -- Channel-arch discovery: trending + similar-of-favourited TMDB ids,
 -- one row per (tmdb_id, type). Synthesised into ChannelItemInfos by
@@ -453,8 +467,8 @@ public sealed class PhantomDb : IDisposable
 CREATE TABLE IF NOT EXISTS discovery_cache (
     tmdb_id        INTEGER NOT NULL,
     type           TEXT NOT NULL,        -- 'movie' or 'series'
-    discovered_at  INTEGER NOT NULL,
-    last_refreshed INTEGER NOT NULL,
+    discovered_at  BIGINT NOT NULL,
+    last_refreshed BIGINT NOT NULL,
     PRIMARY KEY (tmdb_id, type)
 );
 CREATE INDEX IF NOT EXISTS idx_discovery_cache_last_refreshed
@@ -465,8 +479,8 @@ CREATE INDEX IF NOT EXISTS idx_discovery_cache_last_refreshed
 CREATE TABLE IF NOT EXISTS catalogue_items (
     tmdb_id       INTEGER NOT NULL,
     type          TEXT NOT NULL CHECK(type IN ('movie','series')),
-    first_seen_at INTEGER NOT NULL,
-    last_seen_at  INTEGER NOT NULL,
+    first_seen_at BIGINT NOT NULL,
+    last_seen_at  BIGINT NOT NULL,
     source_mask   INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (tmdb_id, type)
 );
@@ -477,10 +491,10 @@ CREATE INDEX IF NOT EXISTS idx_catalogue_items_type_last_seen
 -- its own due/lease lifecycle.
 CREATE TABLE IF NOT EXISTS series_expansion_state (
     series_tmdb_id   INTEGER PRIMARY KEY,
-    last_expanded_at INTEGER,
-    next_expand_at   INTEGER NOT NULL,
+    last_expanded_at BIGINT,
+    next_expand_at   BIGINT NOT NULL,
     lease_owner      TEXT,
-    lease_until      INTEGER,
+    lease_until      BIGINT,
     probe_generation INTEGER NOT NULL DEFAULT 0,
     last_error_kind  TEXT,
     last_error_message TEXT
@@ -497,8 +511,8 @@ CREATE TABLE IF NOT EXISTS series_episode_catalogue (
     season INTEGER NOT NULL CHECK(season >= 0),
     episode INTEGER NOT NULL CHECK(episode > 0),
     air_date TEXT,
-    first_seen_at INTEGER NOT NULL,
-    last_seen_at INTEGER NOT NULL,
+    first_seen_at BIGINT NOT NULL,
+    last_seen_at BIGINT NOT NULL,
     PRIMARY KEY (series_tmdb_id, season, episode)
 );
 CREATE INDEX IF NOT EXISTS idx_series_episode_catalogue_episode_tmdb
@@ -513,11 +527,11 @@ CREATE TABLE IF NOT EXISTS availability_items (
     season INTEGER NOT NULL DEFAULT -1,
     episode INTEGER NOT NULL DEFAULT -1,
     status TEXT NOT NULL CHECK(status IN ('unknown','available','unavailable')),
-    checked_at INTEGER,
-    next_check_at INTEGER NOT NULL,
+    checked_at BIGINT,
+    next_check_at BIGINT NOT NULL,
     candidate_magnet TEXT,
     candidate_info_hash TEXT,
-    candidate_size INTEGER,
+    candidate_size BIGINT,
     candidate_seeders INTEGER,
     candidate_indexer TEXT,
     candidate_source TEXT,
@@ -525,7 +539,7 @@ CREATE TABLE IF NOT EXISTS availability_items (
     last_error_kind TEXT,
     last_error_message TEXT,
     lease_owner TEXT,
-    lease_until INTEGER,
+    lease_until BIGINT,
     probe_generation INTEGER NOT NULL DEFAULT 0,
     attempt_count INTEGER NOT NULL DEFAULT 0,
     CHECK ((type='movie' AND season=-1 AND episode=-1) OR (type='episode' AND season>=0 AND episode>0)),
@@ -547,7 +561,7 @@ CREATE TABLE IF NOT EXISTS materialised_state (
     episode         INTEGER NOT NULL DEFAULT -1,
     stub_path       TEXT NOT NULL,
     fuse_path       TEXT NOT NULL,
-    materialised_at INTEGER NOT NULL,
+    materialised_at BIGINT NOT NULL,
     PRIMARY KEY (tmdb_id, type, season, episode)
 );
 CREATE INDEX IF NOT EXISTS idx_materialised_state_type
@@ -572,7 +586,7 @@ CREATE TABLE IF NOT EXISTS materialise_in_flight (
     type       TEXT NOT NULL,
     season     INTEGER NOT NULL DEFAULT -1,
     episode    INTEGER NOT NULL DEFAULT -1,
-    started_at INTEGER NOT NULL,
+    started_at BIGINT NOT NULL,
     owner      TEXT,
     PRIMARY KEY (tmdb_id, type, season, episode)
 );
@@ -585,7 +599,7 @@ CREATE TABLE IF NOT EXISTS tmdb_external_ids (
     tmdb_id    INTEGER NOT NULL,
     type       TEXT NOT NULL,    -- 'movie' or 'series'
     imdb_id    TEXT,             -- NULL = negative-cache row
-    fetched_at INTEGER NOT NULL,
+    fetched_at BIGINT NOT NULL,
     PRIMARY KEY (tmdb_id, type)
 );
 
@@ -596,8 +610,8 @@ CREATE TABLE IF NOT EXISTS tmdb_cache (
     params_hash  TEXT NOT NULL,
     language     TEXT NOT NULL,
     response_json TEXT NOT NULL,
-    cached_at    INTEGER NOT NULL,
-    ttl_seconds  INTEGER NOT NULL,
+    cached_at    BIGINT NOT NULL,
+    ttl_seconds  BIGINT NOT NULL,
     PRIMARY KEY (endpoint, params_hash, language)
 );
 CREATE INDEX IF NOT EXISTS idx_tmdb_cache_expiry
@@ -613,11 +627,11 @@ CREATE TABLE IF NOT EXISTS magnet_cache (
     preset      TEXT NOT NULL DEFAULT '',
     magnet      TEXT NOT NULL,
     info_hash   TEXT NOT NULL,
-    size        INTEGER NOT NULL,
+    size        BIGINT NOT NULL,
     seeders     INTEGER NOT NULL,
     indexer     TEXT NOT NULL,
-    cached_at   INTEGER NOT NULL,
-    ttl_seconds INTEGER NOT NULL,
+    cached_at   BIGINT NOT NULL,
+    ttl_seconds BIGINT NOT NULL,
     source      TEXT NOT NULL,
     PRIMARY KEY (tmdb_id, imdb_id, type, season, episode, preset)
 );
@@ -636,8 +650,8 @@ CREATE TABLE IF NOT EXISTS magnet_failure_cache (
     magnet      TEXT NOT NULL,
     info_hash   TEXT NOT NULL,
     reason      TEXT NOT NULL,
-    failed_at   INTEGER NOT NULL,
-    retry_after INTEGER NOT NULL,
+    failed_at   BIGINT NOT NULL,
+    retry_after BIGINT NOT NULL,
     validation_policy_version TEXT NOT NULL DEFAULT 'legacy',
     PRIMARY KEY (tmdb_id, imdb_id, type, season, episode, preset, magnet)
 );
@@ -659,20 +673,20 @@ CREATE TABLE IF NOT EXISTS source_candidates (
     indexer    TEXT NOT NULL,
     title      TEXT NOT NULL,
     seeders    INTEGER,
-    size       INTEGER,
+    size       BIGINT,
     rank       INTEGER NOT NULL,
     source     TEXT NOT NULL,
-    fetched_at INTEGER NOT NULL,
-    expires_at INTEGER NOT NULL,
+    fetched_at BIGINT NOT NULL,
+    expires_at BIGINT NOT NULL,
     validation_status TEXT NOT NULL DEFAULT 'unknown',
     validation_reason TEXT,
-    validated_at INTEGER,
-    validation_expires_at INTEGER,
-    validation_duration_ms INTEGER,
+    validated_at BIGINT,
+    validation_expires_at BIGINT,
+    validation_duration_ms BIGINT,
     validation_policy_version TEXT NOT NULL DEFAULT 'unknown',
-    selected_file_id INTEGER,
+    selected_file_id BIGINT,
     selected_file_path TEXT,
-    selected_file_size INTEGER,
+    selected_file_size BIGINT,
     PRIMARY KEY (tmdb_id, type, season, episode, preset, magnet)
 );
 CREATE INDEX IF NOT EXISTS idx_source_candidates_item_rank
@@ -692,8 +706,8 @@ CREATE TABLE IF NOT EXISTS unavailable_marker (
     type        TEXT NOT NULL,
     season      INTEGER NOT NULL DEFAULT 0,
     episode     INTEGER NOT NULL DEFAULT 0,
-    marked_at   INTEGER NOT NULL,
-    retry_after INTEGER NOT NULL,
+    marked_at   BIGINT NOT NULL,
+    retry_after BIGINT NOT NULL,
     PRIMARY KEY (tmdb_id, imdb_id, type, season, episode)
 );
 
@@ -709,10 +723,10 @@ CREATE TABLE IF NOT EXISTS bulk_materialise_requests (
     season INTEGER NOT NULL DEFAULT -1,
     trigger TEXT NOT NULL,
     status TEXT NOT NULL,
-    requested_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
+    requested_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL,
     last_error TEXT,
-    last_unfavorited_at INTEGER,
+    last_unfavorited_at BIGINT,
     generation INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_bulk_materialise_requests_status
@@ -731,8 +745,8 @@ CREATE TABLE IF NOT EXISTS bulk_materialise_items (
     generation INTEGER NOT NULL DEFAULT 0,
     claim_token TEXT,
     attempts INTEGER NOT NULL DEFAULT 0,
-    next_run_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
+    next_run_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL,
     last_error TEXT,
     PRIMARY KEY (request_id, tmdb_id, type, season, episode)
 );
@@ -768,7 +782,7 @@ CREATE TABLE IF NOT EXISTS tmdb_metadata (
     community_rating REAL,
     original_title   TEXT,
     runtime_minutes  INTEGER,
-    fetched_at       INTEGER NOT NULL,
+    fetched_at       BIGINT NOT NULL,
     PRIMARY KEY (tmdb_id, type)
 );
 CREATE INDEX IF NOT EXISTS idx_tmdb_metadata_fetched_at
@@ -788,7 +802,7 @@ CREATE TABLE IF NOT EXISTS tmdb_episode_cache (
     still_url       TEXT,
     air_date        TEXT,
     runtime_minutes INTEGER,
-    fetched_at      INTEGER NOT NULL,
+    fetched_at      BIGINT NOT NULL,
     PRIMARY KEY (series_tmdb_id, season, episode)
 );
 CREATE INDEX IF NOT EXISTS idx_tmdb_episode_cache_fetched_at
@@ -801,7 +815,7 @@ CREATE TABLE IF NOT EXISTS gostream_path_tmdb (
     path        TEXT PRIMARY KEY,
     kind        TEXT NOT NULL,
     tmdb_id     INTEGER NOT NULL,
-    resolved_at INTEGER NOT NULL
+    resolved_at BIGINT NOT NULL
 );
 
 -- v16 per-user preferences (additive; REQ-M14-PER-USER branch B). One row
@@ -817,7 +831,7 @@ CREATE TABLE IF NOT EXISTS user_prefs (
     protect_favourites INTEGER NOT NULL DEFAULT 1 CHECK(protect_favourites IN (0,1)),
     show_phantoms      INTEGER NOT NULL DEFAULT 1 CHECK(show_phantoms IN (0,1)),
     allow_eager        INTEGER NOT NULL DEFAULT 1 CHECK(allow_eager IN (0,1)),
-    updated_at         INTEGER NOT NULL
+    updated_at         BIGINT NOT NULL
 );
 
 -- v12 per-user hidden set (additive; REQ-M14-PER-USER branch B, Surface 3).
@@ -831,7 +845,7 @@ CREATE TABLE IF NOT EXISTS user_hidden_items (
     user_id   TEXT NOT NULL,
     tmdb_id   INTEGER NOT NULL,
     type      TEXT NOT NULL CHECK(type IN ('movie','series')),
-    hidden_at INTEGER NOT NULL,
+    hidden_at BIGINT NOT NULL,
     PRIMARY KEY (user_id, tmdb_id, type)
 );
 CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
