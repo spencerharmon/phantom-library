@@ -58,6 +58,18 @@ public sealed class GostreamFilesystemEnumerator
     private static string? _seriesCacheVersion;
     private static DateTimeOffset _seriesCacheAt = DateTimeOffset.MinValue;
 
+    // Memoization for the (expensive, recursive) filesystem-version walk. This value is a
+    // component of each channel's IChannel.DataVersion (Jellyfin's channel-item cache key);
+    // recomputing it per browse both cost a full FUSE-tree walk and made the cache key churn
+    // continuously as content materialised, defeating the channel cache -- catastrophic on the
+    // PostgreSQL backend where a cache miss forces a full folder re-sync (~13k queries/page).
+    private static readonly TimeSpan FilesystemVersionTtl = TimeSpan.FromSeconds(30);
+    private static readonly object FsVersionGate = new();
+    private static string? _moviesFsVersion;
+    private static DateTimeOffset _moviesFsVersionAt = DateTimeOffset.MinValue;
+    private static string? _showsFsVersion;
+    private static DateTimeOffset _showsFsVersionAt = DateTimeOffset.MinValue;
+
     /// <summary>Test hook: drop cached enumeration results for a deterministic cold walk.</summary>
     internal static void ResetForTests()
     {
@@ -67,6 +79,10 @@ public sealed class GostreamFilesystemEnumerator
         _seriesCache = null;
         _seriesCacheVersion = null;
         _seriesCacheAt = DateTimeOffset.MinValue;
+        _moviesFsVersion = null;
+        _moviesFsVersionAt = DateTimeOffset.MinValue;
+        _showsFsVersion = null;
+        _showsFsVersionAt = DateTimeOffset.MinValue;
     }
 
     public GostreamFilesystemEnumerator(PhantomDb db, ILogger<GostreamFilesystemEnumerator> logger)
@@ -85,9 +101,54 @@ public sealed class GostreamFilesystemEnumerator
     /// <summary>Test-only override for the shows root path.</summary>
     internal string? ShowsRootOverride { get; set; }
 
-    public string MoviesVersion() => FilesystemVersion(MoviesRoot);
+    public string MoviesVersion() => CachedFilesystemVersion(MoviesRoot, movies: true);
 
-    public string ShowsVersion() => FilesystemVersion(ShowsRoot);
+    public string ShowsVersion() => CachedFilesystemVersion(ShowsRoot, movies: false);
+
+    /// <summary>
+    /// Returns <see cref="FilesystemVersion"/> for <paramref name="root"/>, memoized for
+    /// <see cref="FilesystemVersionTtl"/>. The raw computation is a full recursive walk of the
+    /// FUSE-mounted tree and was previously run on every browse (it feeds the channel DataVersion
+    /// cache key). Memoizing bounds the walk frequency and holds the key stable within the window;
+    /// newly-materialised files become visible up to the TTL later. The walk itself runs outside
+    /// the lock so a slow FUSE stat never serialises unrelated callers.
+    /// </summary>
+    private string CachedFilesystemVersion(string root, bool movies)
+    {
+        var now = DateTimeOffset.UtcNow;
+        lock (FsVersionGate)
+        {
+            if (movies)
+            {
+                if (_moviesFsVersion is not null && now - _moviesFsVersionAt < FilesystemVersionTtl)
+                {
+                    return _moviesFsVersion;
+                }
+            }
+            else if (_showsFsVersion is not null && now - _showsFsVersionAt < FilesystemVersionTtl)
+            {
+                return _showsFsVersion;
+            }
+        }
+
+        var computed = FilesystemVersion(root);
+
+        lock (FsVersionGate)
+        {
+            if (movies)
+            {
+                _moviesFsVersion = computed;
+                _moviesFsVersionAt = now;
+            }
+            else
+            {
+                _showsFsVersion = computed;
+                _showsFsVersionAt = now;
+            }
+        }
+
+        return computed;
+    }
 
     private static string FilesystemVersion(string root)
     {
