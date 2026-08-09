@@ -63,7 +63,7 @@ public sealed class GostreamFilesystemEnumerator
     // recomputing it per browse both cost a full FUSE-tree walk and made the cache key churn
     // continuously as content materialised, defeating the channel cache -- catastrophic on the
     // PostgreSQL backend where a cache miss forces a full folder re-sync (~13k queries/page).
-    private static readonly TimeSpan FilesystemVersionTtl = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan FilesystemVersionTtl = TimeSpan.FromSeconds(60);
     private static readonly object FsVersionGate = new();
     private static string? _moviesFsVersion;
     private static DateTimeOffset _moviesFsVersionAt = DateTimeOffset.MinValue;

@@ -34,9 +34,11 @@ public sealed class ChannelStateProvider
     // once per window instead of on every change. This bounds how often Jellyfin invalidates its
     // channel-item disk cache (keyed on DataVersion) -- on the PostgreSQL backend a cache miss
     // forces a full ~13k-query re-sync of the whole channel folder per page, so unbounded
-    // invalidation is the difference between a sub-second cached browse and a 17-60s one. Trade-off:
-    // newly-changed content becomes visible up to this window later.
-    private static readonly TimeSpan CoalesceWindow = TimeSpan.FromSeconds(30);
+    // invalidation is the difference between a sub-second cached browse and a 17-60s one. The window
+    // must exceed the worst-case cold re-sync time (the Movies channel measured ~47s) or
+    // back-to-back browses each land after the window and re-publish, never benefiting from the
+    // cache. Trade-off: newly-changed content becomes visible up to this window later.
+    private static readonly TimeSpan CoalesceWindow = TimeSpan.FromSeconds(60);
 
     private static readonly string[] AllKinds = { KindMovies, KindShows };
 
