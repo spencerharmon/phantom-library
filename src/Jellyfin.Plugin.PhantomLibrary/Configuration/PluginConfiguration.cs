@@ -92,6 +92,7 @@ public class PluginConfiguration : BasePluginConfiguration
         FavouriteRecommendationsMaxPerFavourite = 40;
 
         AvailabilityProbeEnabled = true;
+        ChannelPrewarmEnabled = true;
         AvailabilityProbeMinIntervalSeconds = 4;
         AvailabilityProbeMaxIntervalSeconds = 28;
         AvailabilityAvailableTtlDays = 7;
@@ -364,6 +365,13 @@ public class PluginConfiguration : BasePluginConfiguration
 
     /// <summary>Enables bounded background source availability probing.</summary>
     public bool AvailabilityProbeEnabled { get; set; }
+
+    /// <summary>
+    /// Enables the background channel-prewarm worker, which keeps Jellyfin's per-user channel-item
+    /// disk cache warm so the one-time full channel-folder re-sync (expensive on the PostgreSQL
+    /// backend) happens off the interactive path instead of on a user's first browse.
+    /// </summary>
+    public bool ChannelPrewarmEnabled { get; set; }
 
     /// <summary>Fastest availability scheduler cadence during backlog catch-up.</summary>
     public int AvailabilityProbeMinIntervalSeconds { get; set; }

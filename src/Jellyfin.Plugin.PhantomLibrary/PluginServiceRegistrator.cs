@@ -105,6 +105,7 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         serviceCollection.AddHostedService<PlaybackTriggerListener>();
         serviceCollection.AddHostedService<EvictionSweeper>();
         serviceCollection.AddHostedService<AvailabilityProbeWorker>();
+        serviceCollection.AddHostedService<ChannelPrewarmWorker>();
 
         // SeriesAutopilot (stage-2.1 stub; rewritten in Stage 5.2).
         serviceCollection.AddSingleton<SeriesAutopilot>();
