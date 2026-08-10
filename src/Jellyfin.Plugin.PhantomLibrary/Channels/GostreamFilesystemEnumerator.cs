@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Jellyfin.Plugin.PhantomLibrary.Configuration;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using Microsoft.Extensions.Logging;
 
@@ -63,7 +64,15 @@ public sealed class GostreamFilesystemEnumerator
     // recomputing it per browse both cost a full FUSE-tree walk and made the cache key churn
     // continuously as content materialised, defeating the channel cache -- catastrophic on the
     // PostgreSQL backend where a cache miss forces a full folder re-sync (~13k queries/page).
-    private static readonly TimeSpan FilesystemVersionTtl = TimeSpan.FromSeconds(60);
+    // Memoization TTL for the (expensive, recursive) filesystem-version walk, tied to the same
+    // per-kind coalescing window as the channel DataVersion so the combined cache key stays stable
+    // across a browse session. See PluginConfiguration.ChannelCoalesceWindowSeconds{Shows,Movies}.
+    private static TimeSpan FilesystemVersionTtl(bool movies)
+    {
+        var cfg = Plugin.Instance?.Configuration ?? new PluginConfiguration();
+        var seconds = movies ? cfg.ChannelCoalesceWindowSecondsMovies : cfg.ChannelCoalesceWindowSecondsShows;
+        return TimeSpan.FromSeconds(Math.Max(1, seconds));
+    }
     private static readonly object FsVersionGate = new();
     private static string? _moviesFsVersion;
     private static DateTimeOffset _moviesFsVersionAt = DateTimeOffset.MinValue;
@@ -116,16 +125,17 @@ public sealed class GostreamFilesystemEnumerator
     private string CachedFilesystemVersion(string root, bool movies)
     {
         var now = DateTimeOffset.UtcNow;
+        var ttl = FilesystemVersionTtl(movies);
         lock (FsVersionGate)
         {
             if (movies)
             {
-                if (_moviesFsVersion is not null && now - _moviesFsVersionAt < FilesystemVersionTtl)
+                if (_moviesFsVersion is not null && now - _moviesFsVersionAt < ttl)
                 {
                     return _moviesFsVersion;
                 }
             }
-            else if (_showsFsVersion is not null && now - _showsFsVersionAt < FilesystemVersionTtl)
+            else if (_showsFsVersion is not null && now - _showsFsVersionAt < ttl)
             {
                 return _showsFsVersion;
             }

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Threading;
@@ -113,9 +114,16 @@ public sealed class ChannelPrewarmWorker : IHostedService, IDisposable
             }
 
             var users = _userManager.GetUsers();
-            var warmed = 0;
             var swAll = Stopwatch.StartNew();
 
+            // Collect every (user, channel) pair, then warm them concurrently. The channel cache is
+            // per-user and each channel's cold re-sync is independent; warming serially would make a
+            // fast channel (Shows, ~6s) wait behind a slow one (Movies, ~50s) and multiply by the
+            // user count, so a full cycle could exceed the coalescing window and never keep up. Run
+            // in parallel so a cycle takes about as long as the single slowest warm instead of their
+            // sum. Each warm streams its own sequential queries, so parallelism here adds only a
+            // handful of concurrent DB connections, not a query storm.
+            var warmTasks = new List<Task<bool>>();
             foreach (var user in users)
             {
                 if (ct.IsCancellationRequested)
@@ -138,42 +146,17 @@ public sealed class ChannelPrewarmWorker : IHostedService, IDisposable
 
                 foreach (var channel in channels.Items)
                 {
-                    if (ct.IsCancellationRequested)
-                    {
-                        return;
-                    }
-
                     if (!IsPhantomChannel(channel.Name))
                     {
                         continue;
                     }
 
-                    try
-                    {
-                        var query = new InternalItemsQuery(user)
-                        {
-                            ChannelIds = new[] { channel.Id },
-                            StartIndex = 0,
-                            Limit = 1,
-                            DtoOptions = new DtoOptions(false)
-                        };
-
-                        var sw = Stopwatch.StartNew();
-                        await _channelManager.GetChannelItems(query, ct).ConfigureAwait(false);
-                        sw.Stop();
-                        warmed++;
-                        _logger.LogDebug(
-                            "Channel prewarm: warmed '{Channel}' for user {User} in {Ms}ms",
-                            channel.Name,
-                            user.Username,
-                            sw.ElapsedMilliseconds);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogDebug(ex, "Channel prewarm: warming '{Channel}' for user {User} failed", channel.Name, user.Username);
-                    }
+                    warmTasks.Add(WarmOneAsync(user, channel, ct));
                 }
             }
+
+            var results = await Task.WhenAll(warmTasks).ConfigureAwait(false);
+            var warmed = results.Count(ok => ok);
 
             if (!_loggedFirstWarm && warmed > 0)
             {
@@ -191,6 +174,40 @@ public sealed class ChannelPrewarmWorker : IHostedService, IDisposable
         finally
         {
             Interlocked.Exchange(ref _running, 0);
+        }
+    }
+
+    private async Task<bool> WarmOneAsync(Jellyfin.Database.Implementations.Entities.User user, Channel channel, CancellationToken ct)
+    {
+        if (ct.IsCancellationRequested)
+        {
+            return false;
+        }
+
+        try
+        {
+            var query = new InternalItemsQuery(user)
+            {
+                ChannelIds = new[] { channel.Id },
+                StartIndex = 0,
+                Limit = 1,
+                DtoOptions = new DtoOptions(false)
+            };
+
+            var sw = Stopwatch.StartNew();
+            await _channelManager.GetChannelItems(query, ct).ConfigureAwait(false);
+            sw.Stop();
+            _logger.LogDebug(
+                "Channel prewarm: warmed '{Channel}' for user {User} in {Ms}ms",
+                channel.Name,
+                user.Username,
+                sw.ElapsedMilliseconds);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Channel prewarm: warming '{Channel}' for user {User} failed", channel.Name, user.Username);
+            return false;
         }
     }
 

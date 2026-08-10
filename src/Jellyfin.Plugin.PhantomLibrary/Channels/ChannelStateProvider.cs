@@ -1,6 +1,7 @@
 using System;
 using System.Globalization;
 using System.Threading;
+using Jellyfin.Plugin.PhantomLibrary.Configuration;
 using Jellyfin.Plugin.PhantomLibrary.State;
 
 namespace Jellyfin.Plugin.PhantomLibrary.Channels;
@@ -38,7 +39,24 @@ public sealed class ChannelStateProvider
     // must exceed the worst-case cold re-sync time (the Movies channel measured ~47s) or
     // back-to-back browses each land after the window and re-publish, never benefiting from the
     // cache. Trade-off: newly-changed content becomes visible up to this window later.
-    private static readonly TimeSpan CoalesceWindow = TimeSpan.FromSeconds(60);
+    // Per-kind coalescing window (from PluginConfiguration; see WindowFor). Rapid successive
+    // availability transitions (the probe worker fires many per minute across a multi-million-row
+    // catalogue) advance the published DataVersion at most once per window instead of on every
+    // change. This bounds how often Jellyfin invalidates its channel-item disk cache (keyed on
+    // DataVersion) -- on the PostgreSQL backend a cache miss forces a full ~13k-query re-sync of the
+    // whole channel folder per page, so unbounded invalidation is the difference between a sub-second
+    // cached browse and a 17-60s one. The window must exceed the worst-case cold re-sync time (the
+    // Movies channel measured ~50s, hence its larger default) or back-to-back browses each land after
+    // the window and re-publish, never benefiting from the cache. Trade-off: newly-changed content
+    // becomes visible up to the window later.
+    private static TimeSpan WindowFor(string kind)
+    {
+        var cfg = Plugin.Instance?.Configuration ?? new PluginConfiguration();
+        var seconds = string.Equals(kind, KindMovies, StringComparison.Ordinal)
+            ? cfg.ChannelCoalesceWindowSecondsMovies
+            : cfg.ChannelCoalesceWindowSecondsShows;
+        return TimeSpan.FromSeconds(Math.Max(1, seconds));
+    }
 
     private static readonly string[] AllKinds = { KindMovies, KindShows };
 
@@ -79,7 +97,7 @@ public sealed class ChannelStateProvider
     ///
     /// The advance is COALESCED: a bump only marks the kind dirty; the
     /// published version actually changes at most once per
-    /// <see cref="CoalesceWindow"/> (see <see cref="MaybePublishLocked"/>).
+    /// the per-kind coalescing window (see <see cref="MaybePublishLocked"/>).
     /// A read (<see cref="DataVersion"/>) also flushes a due pending bump,
     /// so the version still advances promptly on the next browse after the
     /// window elapses even if no further bump arrives.
@@ -97,7 +115,7 @@ public sealed class ChannelStateProvider
 
     /// <summary>
     /// Publishes a pending DataVersion advance for <paramref name="kind"/> only when at least
-    /// <see cref="CoalesceWindow"/> has elapsed since the previous publish. Must be called while
+    /// the per-kind coalescing window has elapsed since the previous publish. Must be called while
     /// holding <see cref="_gate"/>. The first pending bump after process start publishes
     /// immediately (last-published defaults to <see cref="DateTimeOffset.MinValue"/>), then
     /// subsequent bumps within a window are coalesced into a single advance.
@@ -110,7 +128,7 @@ public sealed class ChannelStateProvider
         }
 
         var last = _lastPublishedAt.TryGetValue(kind, out var t) ? t : DateTimeOffset.MinValue;
-        if (now - last < CoalesceWindow)
+        if (now - last < WindowFor(kind))
         {
             return;
         }

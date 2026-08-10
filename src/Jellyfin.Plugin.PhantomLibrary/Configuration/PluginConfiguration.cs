@@ -93,12 +93,14 @@ public class PluginConfiguration : BasePluginConfiguration
 
         AvailabilityProbeEnabled = true;
         ChannelPrewarmEnabled = true;
+        ChannelCoalesceWindowSecondsShows = 60;
+        ChannelCoalesceWindowSecondsMovies = 300;
         AvailabilityProbeMinIntervalSeconds = 4;
         AvailabilityProbeMaxIntervalSeconds = 28;
         AvailabilityAvailableTtlDays = 7;
         AvailabilityUnavailableTtlDays = 7;
         AvailabilityTransientRetryMinutes = 30;
-        AvailabilityMaxBatchSize = 1;
+        AvailabilityMaxBatchSize = 25;
         AvailabilityLeaseMinutes = 15;
         SeriesExpansionTtlDays = 7;
         SeriesExpansionTransientRetryMinutes = 60;
@@ -372,6 +374,22 @@ public class PluginConfiguration : BasePluginConfiguration
     /// backend) happens off the interactive path instead of on a user's first browse.
     /// </summary>
     public bool ChannelPrewarmEnabled { get; set; }
+
+    /// <summary>
+    /// Coalescing window (seconds) for the Shows channel's DataVersion. The channel-item cache is
+    /// held for at least this long between DataVersion advances, so browses hit the cache instead of
+    /// re-syncing the folder. Larger = fewer cold re-syncs / better browse speed under churn, at the
+    /// cost of newly-available Shows content taking up to this long to appear in the channel listing.
+    /// </summary>
+    public int ChannelCoalesceWindowSecondsShows { get; set; }
+
+    /// <summary>
+    /// Coalescing window (seconds) for the Movies channel's DataVersion. Defaults higher than Shows
+    /// because the Movies folder is larger and its cold re-sync is slower (~50s on PostgreSQL), so a
+    /// wider window is needed for the background prewarm to reliably keep it warm during heavy probe
+    /// churn. Trade-off: newly-available movies take up to this long to appear in the channel listing.
+    /// </summary>
+    public int ChannelCoalesceWindowSecondsMovies { get; set; }
 
     /// <summary>Fastest availability scheduler cadence during backlog catch-up.</summary>
     public int AvailabilityProbeMinIntervalSeconds { get; set; }
