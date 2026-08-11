@@ -93,6 +93,7 @@ public class PluginConfiguration : BasePluginConfiguration
 
         AvailabilityProbeEnabled = true;
         ChannelPrewarmEnabled = true;
+        MaterialisedPathReconcileEnabled = true;
         ChannelCoalesceWindowSecondsShows = 60;
         ChannelCoalesceWindowSecondsMovies = 300;
         AvailabilityProbeMinIntervalSeconds = 4;
@@ -374,6 +375,16 @@ public class PluginConfiguration : BasePluginConfiguration
     /// backend) happens off the interactive path instead of on a user's first browse.
     /// </summary>
     public bool ChannelPrewarmEnabled { get; set; }
+
+    /// <summary>
+    /// When true (default), a background worker periodically heals
+    /// <c>materialised_state</c> rows whose recorded gostream FUSE path no longer
+    /// exists (a gostream restart can rebuild the virtual tree with a different
+    /// directory scheme / per-episode hash for the same content, which would
+    /// otherwise make a previously-materialised item show as unavailable). The
+    /// worker re-homes each drifted row to the current tmdb-scoped path.
+    /// </summary>
+    public bool MaterialisedPathReconcileEnabled { get; set; }
 
     /// <summary>
     /// Coalescing window (seconds) for the Shows channel's DataVersion. The channel-item cache is

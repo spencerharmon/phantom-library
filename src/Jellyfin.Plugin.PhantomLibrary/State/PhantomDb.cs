@@ -3241,6 +3241,37 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
     }
 
     /// <summary>
+    /// Repoints a <c>materialised_state</c> row's <c>fuse_path</c> to a new
+    /// location, healing a row whose recorded FUSE path drifted (a gostream
+    /// restart can rebuild the virtual tree with a different directory scheme /
+    /// per-episode hash for the same content). Returns rows affected (0 or 1).
+    /// See <see cref="Scheduled.MaterialisedPathReconcileWorker"/>.
+    /// </summary>
+    public async Task<int> UpdateMaterialisedFusePathAsync(int tmdbId, string type, int season, int episode, string newFusePath, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        ArgumentException.ThrowIfNullOrWhiteSpace(newFusePath);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"UPDATE materialised_state SET fuse_path=@fuse
+                WHERE tmdb_id=@tmdb AND type=@type AND season=@season AND episode=@episode;";
+            cmd.AddWithValue("@fuse", newFusePath);
+            cmd.AddWithValue("@tmdb", tmdbId);
+            cmd.AddWithValue("@type", type);
+            cmd.AddWithValue("@season", season);
+            cmd.AddWithValue("@episode", episode);
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    /// <summary>
     /// Deletes a <c>materialised_state</c> row. Returns the number of rows
     /// actually deleted (0 or 1) so a caller can use this as an atomic
     /// "claim" — under concurrent writers/sweepers racing the SAME row,
@@ -3777,6 +3808,26 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
         }
 
         return Convert.ToInt32(v, System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>
+    /// Reverse of <see cref="GetGostreamPathTmdbAsync"/>: the current gostream
+    /// FUSE path most recently resolved for a (tmdb, kind) pair, or null. This is
+    /// the authoritative, tmdb-scoped mapping the reconcile worker uses to re-home
+    /// a materialised row whose recorded fuse_path drifted — keying on tmdb (not a
+    /// filename) avoids collapsing two same-named series (e.g. Avatar 2005 vs 2024)
+    /// onto one directory.
+    /// </summary>
+    public async Task<string?> GetGostreamPathByTmdbAsync(int tmdbId, string kind, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(kind);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT path FROM gostream_path_tmdb WHERE tmdb_id=@tmdb AND kind=@kind ORDER BY resolved_at DESC LIMIT 1;";
+        cmd.AddWithValue("@tmdb", tmdbId);
+        cmd.AddWithValue("@kind", kind);
+        var v = await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
+        return v is null || v is DBNull ? null : Convert.ToString(v, System.Globalization.CultureInfo.InvariantCulture);
     }
 
     public async Task UpsertGostreamPathTmdbAsync(string path, string kind, int tmdbId, CancellationToken ct)
