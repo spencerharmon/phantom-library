@@ -61,6 +61,21 @@ spec:
             - name: {{ $k }}
               value: {{ $v | quote }}
             {{- end }}
+            # ----- jellyfin-metadata generation caps (cut cache growth at the source) -----
+            # Read by the patched jellyfin-phantom entrypoint at startup to bound trickplay/
+            # person-image/artwork generation — see values.yaml `jellyfin.metadataGeneration` (the
+            # single source of truth) and jellyfin-metadata-quota-reaper.md for the incident this
+            # addresses. Chart-valued, never a baked config file.
+            - name: PHANTOM_JELLYFIN_TRICKPLAY_ENABLED
+              value: {{ .Values.jellyfin.metadataGeneration.trickplayEnabled | quote }}
+            - name: PHANTOM_JELLYFIN_TRICKPLAY_INTERVAL_SECONDS
+              value: {{ .Values.jellyfin.metadataGeneration.trickplayIntervalSeconds | quote }}
+            - name: PHANTOM_JELLYFIN_TRICKPLAY_QUALITY_PERCENT
+              value: {{ .Values.jellyfin.metadataGeneration.trickplayQualityPercent | quote }}
+            - name: PHANTOM_JELLYFIN_PERSON_IMAGE_MAX_DOWNLOADS_PER_REFRESH
+              value: {{ .Values.jellyfin.metadataGeneration.personImageMaxDownloadsPerRefresh | quote }}
+            - name: PHANTOM_JELLYFIN_ARTWORK_MAX_RESOLUTION_PX
+              value: {{ .Values.jellyfin.metadataGeneration.artworkMaxResolutionPx | quote }}
             {{- if .Values.postgres.enabled }}
             # ----- Jellyfin.Pgsql provider (Jellyfin's own jellyfin.db -> shared PostgreSQL) -----
             # Env-var contract owned by the Jellyfin.Pgsql (JPVenson) image/provider itself, not

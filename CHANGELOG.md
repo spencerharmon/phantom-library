@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Enforcing LRU reaper for the shared jellyfin-metadata cache (jellyfin-metadata-quota-reaper).**
+  The shared `jellyfin-metadata` PVC reached 78G on `spray` (library 50G / People 18G / channels 9G)
+  with no enforced upper bound (`persistence.jellyfinMetadata.size` was documentation only — local-path
+  ignores it). Mirroring the existing gostream warmup pattern: `jellyfinMetadata.quotaGb` +
+  `jellyfinMetadata.headroomGi` are now the single source of truth for the PVC's size (DERIVED, not
+  hand-set); a new `jellyfin-metadata-reaper` CronJob (`jellyfinMetadataReaper.*`, hourly by default)
+  measures usage and, once it exceeds quota, evicts the least-recently-accessed files first, restricted
+  to the regenerable `library/`, `People/`, `channels/` subtrees (never touches anything a library scan
+  cannot rebuild), and is a no-op below quota. It writes a Prometheus textfile-collector metrics file
+  (`jellyfin_metadata_cache_usage_bytes` / `jellyfin_metadata_cache_quota_bytes` /
+  `jellyfin_metadata_reaper_last_run_reclaimed_bytes`) so the existing monitoring stack can alert before
+  the volume actually fills (e.g. at 80% of quota). New `jellyfin.metadataGeneration.*` chart values
+  (`trickplayEnabled`/`trickplayIntervalSeconds`/`trickplayQualityPercent`/
+  `personImageMaxDownloadsPerRefresh`/`artworkMaxResolutionPx`, wired to `PHANTOM_JELLYFIN_*` env vars
+  on the workload container) cut generation at the source, which is cheaper than reaping after the
+  fact. Reaper script: `scripts/jellyfin-metadata-reaper.sh` (embedded byte-identical in the chart at
+  `deploy/helm/phantom-library/files/` since Helm's `.Files.Get` cannot read outside the chart
+  directory); tested by `scripts/tests/jellyfin-metadata-quota-reaper.test.sh` against synthetic
+  over-/under-quota fixtures plus a `helm template` render assertion. Chart bumped to 2.8.0
+  (BREAKING: `persistence.jellyfinMetadata.size` removed in favor of the derived quota+headroom size).
+
 - **Config-gated PostgreSQL backend for PhantomDb (p4-phantomdb-postgres-provider).**
   `PhantomDb`'s own state (discovery cache, catalogue, availability, materialised
   state, magnet caches, bulk-materialise queue, user prefs/hidden-items, TMDB

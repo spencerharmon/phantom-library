@@ -149,6 +149,21 @@ jellyfin:
   resources:
     requests: { cpu: "500m", memory: 1Gi }
     limits: { cpu: "2", memory: 4Gi }
+  # Cut jellyfin-metadata generation AT THE SOURCE (cheaper than reaping it after the fact). These
+  # become env vars the entrypoint/wrapper applies to Jellyfin's encoding/library options at
+  # startup (PHANTOM_JELLYFIN_* — read by the patched entrypoint, never a baked config file so a
+  # value change here needs no image rebuild). All three directly bound the three subtrees the
+  # reaper below also targets (channels/ trickplay tiles, People/ artwork, library/ artwork).
+  metadataGeneration:
+    # Trickplay (hover-scrub filmstrip) generation. Trickplay tiles are the bulk of `channels/`.
+    trickplayEnabled: true
+    trickplayIntervalSeconds: 15        # sparser sampling -> fewer tiles per item
+    trickplayQualityPercent: 60         # lower JPEG quality -> smaller tiles
+    # Person (actor/director) artwork download cap. Bounds `People/` growth (~18G on the incident PVC).
+    personImageMaxDownloadsPerRefresh: 500
+    # Library artwork (poster/backdrop/logo) resolution cap in pixels on the long edge. Bounds
+    # `library/` per-item directory size (~250-275MB/item on the incident PVC).
+    artworkMaxResolutionPx: 1500
 
 # ---------------------------------------------------------------- shared PostgreSQL (P4 Stage A) --
 # Generic, OFF-by-default wiring for pointing this instance's Jellyfin (via the external
@@ -251,8 +266,35 @@ realMkv:
 # The /var/lib/jellyfin/metadata artwork cache, split into ONE shared RWO PVC both colors mount (by
 # fixed name) at /var/lib/jellyfin/metadata via extraVolumes/extraVolumeMounts. Derived + color-
 # independent, so it is never part of a flip's DB sync. Created by components.jellyfinMetadata.
+#
+# SINGLE SOURCE OF TRUTH for metadata cache sizing, mirroring `warmup` above: quotaGb is what the
+# reaper CronJob (jellyfin-metadata-reaper-cronjob.yaml) enforces by LRU-evicting regenerable
+# artifacts once usage exceeds it; the PVC (jellyfin-pvcs.yaml) is sized quotaGb + headroomGi so the
+# quota can never exceed the volume. `persistence.jellyfinMetadata.size` below is DERIVED from these
+# two values in the template — do not hand-set a byte size in two places.
 jellyfinMetadata:
   pvcName: jellyfin-metadata
+  quotaGb: 60
+  headroomGi: 10   # PVC capacity = quotaGb + headroomGi (Gi)
+
+# Enforcing LRU reaper CronJob for the jellyfin-metadata cache. Owned by the release that enables
+# components.jellyfinMetadata (the singleton owner), same as the PVC itself. The script is baked
+# into the workload's own image at /usr/local/bin/jellyfin-metadata-reaper.sh (see
+# scripts/jellyfin-metadata-reaper.sh) — the CronJob just supplies args/env, no separate image.
+jellyfinMetadataReaper:
+  enabled: true
+  schedule: "17 * * * *"   # hourly, off-the-hour to avoid thundering-herd with other cron
+  # Subtrees the reaper is allowed to touch — every entry MUST be a derived/regenerable artifact
+  # directory under the PVC mount; a scan/refresh can always rebuild anything reaped here.
+  paths:
+    - library
+    - People
+    - channels
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  resources:
+    requests: { cpu: "50m", memory: 64Mi }
+    limits: { cpu: "500m", memory: 256Mi }
 
 # --------------------------------------------------------------- gostream tuning config --
 # configMapName is the fixed (unsuffixed) name the workload mounts and components.gostreamConfig
@@ -283,10 +325,9 @@ persistence:
     size: 100Gi   # real library metadata ≈ 84G; local-path does not enforce, sized honestly
   jellyfinEtc:
     size: 256Mi
-  # SHARED Jellyfin metadata artwork cache (split out of jellyfinVarLib; ~78G today). Sized honestly;
-  # local-path does not enforce. Created by components.jellyfinMetadata.
-  jellyfinMetadata:
-    size: 100Gi
+  # jellyfinMetadata size is DERIVED from jellyfinMetadata.quotaGb + jellyfinMetadata.headroomGi
+  # (see jellyfin-pvcs.yaml) — not set here. The reaper CronJob enforces the quota; local-path only
+  # honors the resulting capacity as an upper bound.
 
 # gostream non-secret tuning config (rendered verbatim to the ConfigMap's config.tuning.json). This
 # is the structured form of gostream's reference config; disk_warmup_quota_gb is injected from

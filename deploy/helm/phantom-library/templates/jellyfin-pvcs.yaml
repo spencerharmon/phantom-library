@@ -40,6 +40,11 @@ blue/green flip never has to copy it (it is derived + identical across colors) a
 does not duplicate ~78G. Shared singleton like warmup/real-mkv: one RWO PVC (fixed name) both colors
 mount at /var/lib/jellyfin/metadata via extraVolumes/extraVolumeMounts. Owned by whichever release
 enables components.jellyfinMetadata (the `shared` release in the blue/green topology).
+
+SIZING INVARIANT (mirrors warmup in state-pvcs.yaml): capacity = jellyfinMetadata.quotaGb +
+jellyfinMetadata.headroomGi, so it can never be smaller than the quota the reaper CronJob
+(jellyfin-metadata-reaper-cronjob.yaml) enforces. `persistence.jellyfinMetadata.size` is intentionally
+NOT read here — quotaGb+headroomGi is the single source of truth.
 */}}
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -53,5 +58,5 @@ spec:
   storageClassName: {{ .Values.persistence.storageClassName }}
   resources:
     requests:
-      storage: {{ .Values.persistence.jellyfinMetadata.size }}
+      storage: {{ printf "%dGi" (add (.Values.jellyfinMetadata.quotaGb | int) (.Values.jellyfinMetadata.headroomGi | int)) }}
 {{- end }}

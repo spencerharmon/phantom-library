@@ -1,0 +1,87 @@
+{{- if and .Values.components.jellyfinMetadata .Values.jellyfinMetadataReaper.enabled }}
+{{/*
+Enforcing LRU reaper for the shared jellyfin-metadata cache (task jellyfin-metadata-quota-reaper).
+Owned by the release that enables components.jellyfinMetadata — the SAME release that owns the PVC
+(jellyfin-pvcs.yaml), so the CronJob and the volume it reaps are always rendered together.
+
+The reaper script itself ships in THIS ConfigMap rather than a separate image: it runs inside the
+jellyfin-phantom image (already mounted here, already has GNU coreutils/findutils), so no extra image
+build/pin is needed for what is fundamentally `find` + `du` + `rm`. `jellyfinMetadata.quotaGb` is the
+single source of truth shared with the PVC's derived size (see jellyfin-pvcs.yaml) — changing it
+alone moves both the enforced quota and the volume capacity.
+
+The script content is `deploy/helm/phantom-library/files/jellyfin-metadata-reaper.sh` — a byte-
+identical copy of `scripts/jellyfin-metadata-reaper.sh` (Helm's `.Files.Get` cannot read outside the
+chart directory, so the authoritative, directly-tested copy at `scripts/` and the chart-embedded copy
+here must be kept in sync by hand on any edit; `scripts/tests/jellyfin-metadata-quota-reaper.test.sh`
+asserts the two are identical so a drift fails the check rather than silently diverging).
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jellyfin-metadata-reaper-script
+  labels:
+    {{- include "phantom-library.labels" . | nindent 4 }}
+    app.kubernetes.io/component: jellyfin-metadata-reaper
+data:
+  jellyfin-metadata-reaper.sh: |
+{{ .Files.Get "files/jellyfin-metadata-reaper.sh" | indent 4 }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: jellyfin-metadata-reaper
+  labels:
+    {{- include "phantom-library.labels" . | nindent 4 }}
+    app.kubernetes.io/component: jellyfin-metadata-reaper
+spec:
+  schedule: {{ .Values.jellyfinMetadataReaper.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: {{ .Values.jellyfinMetadataReaper.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.jellyfinMetadataReaper.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      # A slow/interrupted reap must not pile up runs; Forbid above + a bounded deadline together
+      # keep at most one reaper active at a time.
+      activeDeadlineSeconds: 3600
+      template:
+        metadata:
+          labels:
+            {{- include "phantom-library.labels" . | nindent 12 }}
+            app.kubernetes.io/component: jellyfin-metadata-reaper
+        spec:
+          restartPolicy: OnFailure
+          imagePullSecrets:
+            - name: {{ .Values.imagePullSecret }}
+          containers:
+            - name: reaper
+              image: {{ include "phantom-library.image" (dict "which" "jellyfin" "root" $) }}
+              imagePullPolicy: {{ .Values.images.pullPolicy }}
+              command:
+                - /bin/bash
+                - /var/run/jellyfin-metadata-reaper/jellyfin-metadata-reaper.sh
+                - --root
+                - /var/lib/jellyfin/metadata
+                - --quota-gb
+                - {{ .Values.jellyfinMetadata.quotaGb | quote }}
+                {{- range .Values.jellyfinMetadataReaper.paths }}
+                - --path
+                - {{ . | quote }}
+                {{- end }}
+              resources:
+                {{- toYaml .Values.jellyfinMetadataReaper.resources | nindent 16 }}
+              volumeMounts:
+                - name: jellyfin-metadata
+                  mountPath: /var/lib/jellyfin/metadata
+                - name: reaper-script
+                  mountPath: /var/run/jellyfin-metadata-reaper
+                  readOnly: true
+          volumes:
+            - name: jellyfin-metadata
+              persistentVolumeClaim:
+                claimName: {{ .Values.jellyfinMetadata.pvcName }}
+            - name: reaper-script
+              configMap:
+                name: jellyfin-metadata-reaper-script
+                defaultMode: 0555
+{{- end }}
