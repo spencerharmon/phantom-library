@@ -8,6 +8,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Jellyfin.Plugin.PhantomLibrary.Channels;
 using Jellyfin.Plugin.PhantomLibrary.State.Db;
 
 namespace Jellyfin.Plugin.PhantomLibrary.State;
@@ -2205,6 +2206,50 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
     /// </summary>
     public Task TouchUserActivityAsync(DateTimeOffset now, CancellationToken ct)
         => SetMetaAsync("availability.user_activity_at", now.ToUnixTimeSeconds().ToString(System.Globalization.CultureInfo.InvariantCulture), ct);
+
+    /// <summary>
+    /// Priority value stamped onto an availability row by a user-initiated
+    /// path (playback/details, materialise, autopilot prefetch, favourite
+    /// ingest). It sits above the background default (0) so the sweep's
+    /// priority-first claim ordering preempts to the user's item.
+    /// </summary>
+    public const int UserActivityPriority = 100;
+
+    /// <summary>
+    /// Wire-point for every user-initiated availability path: promote the
+    /// target availability row's claim priority to <see cref="UserActivityPriority"/>
+    /// (movie or a single episode) AND stamp the user-activity yield marker,
+    /// in one call. The background sweep (priority-first + marker-honouring)
+    /// then preempts to this item and backs off the UI. <paramref name="type"/>
+    /// is <c>movie</c> or <c>episode</c>; a series/season promotion uses
+    /// <see cref="PromoteSeriesForUserActivityAsync"/>. A missing row (nothing
+    /// to promote) still stamps the marker — the user is active regardless.
+    /// </summary>
+    public async Task PromoteForUserActivityAsync(int tmdbId, string type, int? season, int? episode, DateTimeOffset now, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        var (sSentinel, eSentinel) = ChannelItemId.ToSentinels(season, episode);
+        if (type == "movie" || type == "episode")
+        {
+            await SetAvailabilityPriorityAsync(tmdbId, type, sSentinel, eSentinel, UserActivityPriority, ct)
+                .ConfigureAwait(false);
+        }
+
+        await TouchUserActivityAsync(now, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Series/season-level counterpart to <see cref="PromoteForUserActivityAsync"/>:
+    /// raise every episode availability row of the series to
+    /// <see cref="UserActivityPriority"/> and stamp the user-activity marker.
+    /// Used by favourite ingest of a series/season favourite where the exact
+    /// episodes are materialised episode-by-episode.
+    /// </summary>
+    public async Task PromoteSeriesForUserActivityAsync(int seriesTmdbId, DateTimeOffset now, CancellationToken ct)
+    {
+        await BumpSeriesAvailabilityPriorityAsync(seriesTmdbId, UserActivityPriority, ct).ConfigureAwait(false);
+        await TouchUserActivityAsync(now, ct).ConfigureAwait(false);
+    }
 
     private static string? SanitizeError(string? value, int maxLength)
     {

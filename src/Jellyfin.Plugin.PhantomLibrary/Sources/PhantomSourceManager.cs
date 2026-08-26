@@ -199,6 +199,36 @@ public sealed class PhantomSourceManager
 
         var currentMagnet = current is null ? null : current.Value.Entry?.Magnet;
         var cfg = _configProvider();
+
+        // User-initiated availability wiring (ROI P6): a details/playback view
+        // that actively refreshes candidates IS a user-initiated availability
+        // action. Bump this item's availability-row priority and stamp the
+        // user-activity yield marker so the background sweep preempts to it and
+        // backs off. Best effort — never block the user's view on a promote.
+        if (refreshCandidates)
+        {
+            try
+            {
+                if (key.Type == "movie" || key.Type == "episode")
+                {
+                    await _db.PromoteForUserActivityAsync(key.TmdbId, key.Type, key.Season, key.Episode, DateTimeOffset.UtcNow, ct)
+                        .ConfigureAwait(false);
+                }
+                else
+                {
+                    // series/season detail view: promote the whole series.
+                    await _db.PromoteSeriesForUserActivityAsync(key.TmdbId, DateTimeOffset.UtcNow, ct)
+                        .ConfigureAwait(false);
+                }
+            }
+            catch (Exception ex)
+            {
+                // Best effort: a promote failure must never break the user's
+                // source view. Swallow (no logger on this manager).
+                _ = ex;
+            }
+        }
+
         var (candidates, errorKind, errorMessage) = await GetRankedCandidatesAsync(key, imdb, meta, includeRejected: true, currentMagnet: currentMagnet, allowProbe: refreshCandidates, ct)
             .ConfigureAwait(false);
 

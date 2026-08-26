@@ -220,6 +220,23 @@ public sealed class Materialiser : IMaterialiser
 
         var (sSentinel, eSentinel) = ChannelItemId.ToSentinels(season, episode);
 
+        // User-initiated availability wiring (ROI P6): every materialise —
+        // whether triggered by playback, an explicit materialise, autopilot
+        // prefetch, or favourite ingest — is a user-initiated availability
+        // action. Bump this item's availability-row priority and stamp the
+        // user-activity yield marker so the background sweep (priority-first
+        // + marker-honouring) preempts to it and backs off the UI. Best
+        // effort: a promote failure must never block the materialise itself.
+        try
+        {
+            await _db.PromoteForUserActivityAsync(tmdbId, type, season, episode, DateTimeOffset.UtcNow, ct)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "PromoteForUserActivity failed for {Type}/{Tmdb} (s={Season} e={Episode}); continuing materialise", type, tmdbId, season, episode);
+        }
+
         var existingState = await _db.GetMaterialisedStateAsync(tmdbId, type, sSentinel, eSentinel, ct)
             .ConfigureAwait(false);
         if (existingState is not null)
