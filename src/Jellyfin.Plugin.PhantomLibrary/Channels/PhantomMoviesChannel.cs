@@ -123,10 +123,29 @@ public sealed class PhantomMoviesChannel
     /// <inheritdoc />
     public bool IsEnabledFor(string userId) => true;
 
+    /// <summary>
+    /// Sentinel <see cref="InternalChannelItemQuery.FolderId"/> for the
+    /// search/BaseItem emission path (p6-search-list-surface-split): unlike
+    /// the browse LIST (empty <c>FolderId</c>, filtered to materialised/
+    /// available movies only), this folder emits the FULL movie catalogue —
+    /// including unavailable/unknown phantoms — so a periodic sync (see
+    /// <c>DiscoveryRefreshTask</c>) can walk it and let Jellyfin's channel
+    /// manager persist every catalogued movie as a real, globally-searchable
+    /// BaseItem, badged accordingly by the existing badge overlay. It is
+    /// never linked to from the UI, so it never appears as a browsable
+    /// folder to a user.
+    /// </summary>
+    public const string SearchSyncFolderId = "__search_sync_movies__";
+
     /// <inheritdoc />
     public async Task<ChannelItemResult> GetChannelItems(InternalChannelItemQuery query, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(query);
+
+        if (string.Equals(query.FolderId, SearchSyncFolderId, StringComparison.Ordinal))
+        {
+            return await GetSearchSyncItemsAsync(cancellationToken).ConfigureAwait(false);
+        }
 
         // Movies channel is flat: no folder navigation.
         if (!string.IsNullOrEmpty(query.FolderId))
@@ -261,6 +280,67 @@ public sealed class PhantomMoviesChannel
         }
 
         flowScope.ItemCount = items.Count;
+        return new ChannelItemResult
+        {
+            Items = items,
+            TotalRecordCount = items.Count,
+        };
+    }
+
+    /// <summary>
+    /// The search/BaseItem emission path (p6-search-list-surface-split):
+    /// every discovered movie, including unavailable/unknown phantoms the
+    /// browse LIST above filters out. Tags each item so the badge overlay
+    /// (<c>PhantomLibraryBadgesController</c>) — which already computes
+    /// Phantom/Materialising/Materialised/Unavailable live from
+    /// materialise/availability state — resolves it correctly wherever it
+    /// surfaces (e.g. global search results), without changing what the
+    /// interactive Movies channel root shows.
+    /// </summary>
+    private async Task<ChannelItemResult> GetSearchSyncItemsAsync(CancellationToken cancellationToken)
+    {
+        var items = new List<ChannelItemInfo>();
+        var all = await _db.ListAllMovieRowsAsync(cancellationToken).ConfigureAwait(false);
+        foreach (var row in all)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var tags = new List<string>();
+            MediaSourceInfo source;
+            if (row.Materialised is not null)
+            {
+                var materialisedPath = GostreamPathResolver.ResolveMoviePath(row.Materialised.FusePath);
+                if (File.Exists(materialisedPath))
+                {
+                    source = await FuseMediaSourceAsync(materialisedPath, cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    source = PhantomMaterialisingMediaSourceProvider.CreateOpeningMediaSource(ChannelItemId.ForMovie(row.Metadata.TmdbId), prefixedToken: true);
+                    tags.Add("phantom");
+                }
+            }
+            else if (row.Availability?.Status == "available")
+            {
+                source = PhantomMaterialisingMediaSourceProvider.CreateOpeningMediaSource(ChannelItemId.ForMovie(row.Metadata.TmdbId), prefixedToken: true);
+                tags.Add("phantom");
+            }
+            else if (row.Availability?.Status == "unavailable")
+            {
+                source = PhantomMaterialisingMediaSourceProvider.CreateOpeningMediaSource(ChannelItemId.ForMovie(row.Metadata.TmdbId), prefixedToken: true);
+                tags.Add("phantom");
+                tags.Add("unavailable");
+            }
+            else
+            {
+                // Never probed yet — Unknown.
+                source = PhantomMaterialisingMediaSourceProvider.CreateOpeningMediaSource(ChannelItemId.ForMovie(row.Metadata.TmdbId), prefixedToken: true);
+                tags.Add("phantom");
+                tags.Add("unknown");
+            }
+
+            items.Add(BuildMovieItemFromMetadata(row.Metadata, new[] { source }, tags));
+        }
+
         return new ChannelItemResult
         {
             Items = items,
