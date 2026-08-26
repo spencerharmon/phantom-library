@@ -48,7 +48,7 @@ public class PhantomDbTests : IDisposable
     // ----------------------------------------------------------------
 
     [Fact]
-    public async Task FreshDb_CreatesSchemaV18_WithAllExpectedTables()
+    public async Task FreshDb_CreatesSchemaV19_WithAllExpectedTables()
     {
         using var db = await NewDbAsync();
 
@@ -67,7 +67,7 @@ public class PhantomDbTests : IDisposable
             version = Convert.ToInt32(await v.ExecuteScalarAsync());
         }
 
-        Assert.Equal(18, version);
+        Assert.Equal(19, version);
 
         var expectedTables = new[]
         {
@@ -93,6 +93,8 @@ public class PhantomDbTests : IDisposable
             // v16 additive per-user tables (REQ-M14-PER-USER branch B).
             "user_prefs",
             "user_hidden_items",
+            // v19 additive magnet-cache job queue (p6-magnet-cache-store).
+            "magnet_cache_jobs",
         };
 
         foreach (var tbl in expectedTables)
@@ -144,6 +146,7 @@ public class PhantomDbTests : IDisposable
     [InlineData(15)]
     [InlineData(16)]
     [InlineData(17)]
+    [InlineData(18)]
     public async Task HardRefuse_PreCurrentSchemaVersion_ThrowsWithWipePointer(int oldVersion)
     {
         await CreateDbWithUserVersionAsync(oldVersion);
@@ -152,7 +155,7 @@ public class PhantomDbTests : IDisposable
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => db.SetMetaAsync("test", "1", CancellationToken.None));
 
-        Assert.Contains("version 18", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("version 19", ex.Message, StringComparison.Ordinal);
         Assert.Contains("phantom-wipe.sh", ex.Message, StringComparison.Ordinal);
     }
 

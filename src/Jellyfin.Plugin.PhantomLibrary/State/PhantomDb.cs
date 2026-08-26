@@ -84,6 +84,27 @@ public sealed record SourceCandidateValidationUpdate(
     string? SelectedFilePath,
     long? SelectedFileSize);
 
+/// <summary>
+/// A row of the <c>magnet_cache_jobs</c> queue (p6-magnet-cache-store): a
+/// request to build/refresh the magnet cache for one phantom item, at a
+/// given priority, claimed by a builder in priority order.
+/// </summary>
+public sealed record MagnetCacheJobRow(
+    int TmdbId,
+    string Type,
+    int Season,
+    int Episode,
+    string Preset,
+    string Status,
+    int Priority,
+    DateTimeOffset EnqueuedAt,
+    DateTimeOffset UpdatedAt,
+    string? LeaseOwner,
+    DateTimeOffset? LeaseUntil,
+    int AttemptCount,
+    string? LastError,
+    int? CandidateCount);
+
 public sealed record BulkMaterialiseRequestRow(
     string RequestId,
     string UserId,
@@ -294,10 +315,21 @@ public sealed record HiddenItemRow(int TmdbId, string Type, DateTimeOffset Hidde
 /// (<c>scripts/phantom-wipe.sh --commit</c>) before restart. Both the SQLite
 /// and Postgres backends build the column from the same
 /// <c>SchemaV10Sql</c> DDL, so no ALTER path is required.
+/// v19 adds the <c>magnet_cache_jobs</c> table (p6-magnet-cache-store): a
+/// job-queue primitive that opportunistic/background callers enqueue
+/// "build/refresh the magnet cache for item X" work against, claimed in
+/// priority order (higher <c>priority</c> first) with the same lease/claim
+/// discipline as <c>availability_items</c>. The magnet-cache builder runs the
+/// full Prowlarr fan-out for a claimed job and writes its high-confidence
+/// candidate set into the existing <c>source_candidates</c> store. This is a
+/// PURELY ADDITIVE delta (one new table + indexes, no existing table touched);
+/// per AGENTS.md it is a schema-version bump — pre-v19 databases are
+/// HARD-REFUSED and the operator must wipe
+/// (<c>scripts/phantom-wipe.sh --commit</c>) before restart.
 /// </summary>
 public sealed class PhantomDb : IDisposable
 {
-    public const int CurrentSchemaVersion = 18;
+    public const int CurrentSchemaVersion = 19;
 
     private readonly IPhantomDbProvider _provider;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
@@ -831,6 +863,39 @@ CREATE TABLE IF NOT EXISTS user_hidden_items (
 );
 CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
     ON user_hidden_items(user_id);
+
+-- v19 magnet-cache job queue (additive; p6-magnet-cache-store). Callers
+-- (opportunistic prefetch, background sweep) enqueue one row per phantom
+-- item they want the magnet cache built/refreshed for. A builder claims the
+-- highest-priority pending job (priority DESC, then oldest enqueued first),
+-- runs the full Prowlarr fan-out for that item, writes the resulting
+-- candidate set into source_candidates, and marks the job done. Same
+-- (tmdb_id, type, season, episode, preset) item tuple + sentinel discipline
+-- (movie => season=-1, episode=-1) as source_candidates / availability_items.
+-- The claim/lease columns mirror availability_items so competing builders
+-- never claim the same job: a pending or lease-expired row is claimable,
+-- ORDER BY priority DESC picks the most urgent, and claiming stamps
+-- lease_owner + lease_until.
+CREATE TABLE IF NOT EXISTS magnet_cache_jobs (
+    tmdb_id     INTEGER NOT NULL,
+    type        TEXT NOT NULL CHECK(type IN ('movie','episode')),
+    season      INTEGER NOT NULL DEFAULT -1,
+    episode     INTEGER NOT NULL DEFAULT -1,
+    preset      TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','running','done','failed')),
+    priority    INTEGER NOT NULL DEFAULT 0,
+    enqueued_at INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    lease_owner TEXT,
+    lease_until INTEGER,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_error  TEXT,
+    candidate_count INTEGER,
+    CHECK ((type='movie' AND season=-1 AND episode=-1) OR (type='episode' AND season>=0 AND episode>0)),
+    PRIMARY KEY (tmdb_id, type, season, episode, preset)
+);
+CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
+    ON magnet_cache_jobs(status, priority, lease_until, enqueued_at);
 ";
 
     // ---- magnet_cache ----
@@ -1351,6 +1416,251 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
             r.IsDBNull(21) ? null : r.GetInt64(21),
             r.IsDBNull(22) ? null : r.GetString(22),
             r.IsDBNull(23) ? null : r.GetInt64(23));
+
+    // ---- magnet_cache_jobs (p6-magnet-cache-store) ----
+
+    /// <summary>
+    /// Enqueue (or re-prioritise) a build/refresh job for the magnet cache of
+    /// one item. If a job for the same item tuple already exists it is reset to
+    /// <c>pending</c> and its priority is RAISED to the max of the existing and
+    /// requested priority (never lowered), so an opportunistic high-priority
+    /// enqueue always wins over a stale background one. Returns the resulting
+    /// (effective) priority of the job.
+    /// </summary>
+    public async Task<int> EnqueueMagnetCacheJobAsync(
+        int tmdbId,
+        string type,
+        int season,
+        int episode,
+        string preset,
+        int priority,
+        CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        ArgumentNullException.ThrowIfNull(preset);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            await using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = @"INSERT INTO magnet_cache_jobs
+                        (tmdb_id,type,season,episode,preset,status,priority,enqueued_at,updated_at,attempt_count)
+                    VALUES (@tmdb,@type,@season,@episode,@preset,'pending',@priority,@now,@now,0)
+                    ON CONFLICT(tmdb_id,type,season,episode,preset) DO UPDATE SET
+                        status='pending',
+                        priority=MAX(magnet_cache_jobs.priority, excluded.priority),
+                        updated_at=excluded.updated_at,
+                        lease_owner=NULL,
+                        lease_until=NULL,
+                        last_error=NULL;";
+                cmd.AddWithValue("@tmdb", tmdbId);
+                cmd.AddWithValue("@type", type);
+                cmd.AddWithValue("@season", season);
+                cmd.AddWithValue("@episode", episode);
+                cmd.AddWithValue("@preset", preset);
+                cmd.AddWithValue("@priority", priority);
+                cmd.AddWithValue("@now", now);
+                await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            }
+
+            await using (var read = conn.CreateCommand())
+            {
+                read.CommandText = @"SELECT priority FROM magnet_cache_jobs
+                    WHERE tmdb_id=@tmdb AND type=@type AND season=@season AND episode=@episode AND preset=@preset;";
+                read.AddWithValue("@tmdb", tmdbId);
+                read.AddWithValue("@type", type);
+                read.AddWithValue("@season", season);
+                read.AddWithValue("@episode", episode);
+                read.AddWithValue("@preset", preset);
+                var v = await read.ExecuteScalarAsync(ct).ConfigureAwait(false);
+                return v is null || v is DBNull ? priority : Convert.ToInt32(v, CultureInfo.InvariantCulture);
+            }
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Atomically claim the single highest-priority claimable magnet-cache job
+    /// (status <c>pending</c>, or <c>running</c> with an expired lease), stamp
+    /// it <c>running</c> with the given lease, and return it. Ties on priority
+    /// break to the oldest enqueued job first. Returns <c>null</c> when no job
+    /// is claimable. Two competing builders never claim the same job because
+    /// the claim happens inside the write lock + a transaction.
+    /// </summary>
+    public async Task<MagnetCacheJobRow?> ClaimNextMagnetCacheJobAsync(
+        string owner,
+        TimeSpan lease,
+        CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(owner);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var tx = await conn.BeginTransactionAsync(ct).ConfigureAwait(false);
+            var now = DateTimeOffset.UtcNow;
+            var nowUnix = now.ToUnixTimeSeconds();
+
+            MagnetCacheJobRow? candidate;
+            await using (var sel = conn.CreateCommand())
+            {
+                sel.Transaction = tx;
+                sel.CommandText = @"SELECT tmdb_id,type,season,episode,preset,status,priority,enqueued_at,updated_at,lease_owner,lease_until,attempt_count,last_error,candidate_count
+                    FROM magnet_cache_jobs
+                    WHERE (status='pending' OR (status='running' AND (lease_until IS NULL OR lease_until < @now)))
+                    ORDER BY priority DESC, enqueued_at ASC, tmdb_id ASC, season ASC, episode ASC
+                    LIMIT 1;";
+                sel.AddWithValue("@now", nowUnix);
+                await using var r = await sel.ExecuteReaderAsync(ct).ConfigureAwait(false);
+                candidate = await r.ReadAsync(ct).ConfigureAwait(false) ? ReadMagnetCacheJob(r) : null;
+            }
+
+            if (candidate is null)
+            {
+                await tx.CommitAsync(ct).ConfigureAwait(false);
+                return null;
+            }
+
+            var leaseUntil = now.Add(lease <= TimeSpan.Zero ? TimeSpan.FromMinutes(5) : lease);
+            await using (var upd = conn.CreateCommand())
+            {
+                upd.Transaction = tx;
+                upd.CommandText = @"UPDATE magnet_cache_jobs
+                    SET status='running', lease_owner=@owner, lease_until=@leaseUntil,
+                        attempt_count=attempt_count+1, updated_at=@now
+                    WHERE tmdb_id=@tmdb AND type=@type AND season=@season AND episode=@episode AND preset=@preset;";
+                upd.AddWithValue("@owner", owner);
+                upd.AddWithValue("@leaseUntil", leaseUntil.ToUnixTimeSeconds());
+                upd.AddWithValue("@now", nowUnix);
+                upd.AddWithValue("@tmdb", candidate.TmdbId);
+                upd.AddWithValue("@type", candidate.Type);
+                upd.AddWithValue("@season", candidate.Season);
+                upd.AddWithValue("@episode", candidate.Episode);
+                upd.AddWithValue("@preset", candidate.Preset);
+                await upd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            }
+
+            await tx.CommitAsync(ct).ConfigureAwait(false);
+            return candidate with
+            {
+                Status = "running",
+                LeaseOwner = owner,
+                LeaseUntil = leaseUntil,
+                AttemptCount = candidate.AttemptCount + 1,
+                UpdatedAt = now,
+            };
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    /// <summary>Mark a claimed job <c>done</c>, recording how many candidates were written.</summary>
+    public async Task CompleteMagnetCacheJobAsync(
+        int tmdbId,
+        string type,
+        int season,
+        int episode,
+        string preset,
+        int candidateCount,
+        CancellationToken ct)
+        => await SetMagnetCacheJobTerminalAsync(tmdbId, type, season, episode, preset, "done", candidateCount, null, ct).ConfigureAwait(false);
+
+    /// <summary>Mark a claimed job <c>failed</c>, recording the error.</summary>
+    public async Task FailMagnetCacheJobAsync(
+        int tmdbId,
+        string type,
+        int season,
+        int episode,
+        string preset,
+        string error,
+        CancellationToken ct)
+        => await SetMagnetCacheJobTerminalAsync(tmdbId, type, season, episode, preset, "failed", null, error, ct).ConfigureAwait(false);
+
+    private async Task SetMagnetCacheJobTerminalAsync(
+        int tmdbId,
+        string type,
+        int season,
+        int episode,
+        string preset,
+        string status,
+        int? candidateCount,
+        string? error,
+        CancellationToken ct)
+    {
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"UPDATE magnet_cache_jobs
+                SET status=@status, updated_at=@now, lease_owner=NULL, lease_until=NULL,
+                    candidate_count=@count, last_error=@error
+                WHERE tmdb_id=@tmdb AND type=@type AND season=@season AND episode=@episode AND preset=@preset;";
+            cmd.AddWithValue("@status", status);
+            cmd.AddWithValue("@now", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            cmd.AddWithValue("@count", (object?)candidateCount ?? DBNull.Value);
+            cmd.AddWithValue("@error", (object?)error ?? DBNull.Value);
+            cmd.AddWithValue("@tmdb", tmdbId);
+            cmd.AddWithValue("@type", type);
+            cmd.AddWithValue("@season", season);
+            cmd.AddWithValue("@episode", episode);
+            cmd.AddWithValue("@preset", preset);
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    /// <summary>Read a single magnet-cache job by its item tuple, or <c>null</c>.</summary>
+    public async Task<MagnetCacheJobRow?> GetMagnetCacheJobAsync(
+        int tmdbId,
+        string type,
+        int season,
+        int episode,
+        string preset,
+        CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        ArgumentNullException.ThrowIfNull(preset);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT tmdb_id,type,season,episode,preset,status,priority,enqueued_at,updated_at,lease_owner,lease_until,attempt_count,last_error,candidate_count
+            FROM magnet_cache_jobs
+            WHERE tmdb_id=@tmdb AND type=@type AND season=@season AND episode=@episode AND preset=@preset;";
+        cmd.AddWithValue("@tmdb", tmdbId);
+        cmd.AddWithValue("@type", type);
+        cmd.AddWithValue("@season", season);
+        cmd.AddWithValue("@episode", episode);
+        cmd.AddWithValue("@preset", preset);
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        return await r.ReadAsync(ct).ConfigureAwait(false) ? ReadMagnetCacheJob(r) : null;
+    }
+
+    private static MagnetCacheJobRow ReadMagnetCacheJob(DbDataReader r)
+        => new(
+            r.GetInt32(0),
+            r.GetString(1),
+            r.GetInt32(2),
+            r.GetInt32(3),
+            r.GetString(4),
+            r.GetString(5),
+            r.GetInt32(6),
+            DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(7)),
+            DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(8)),
+            r.IsDBNull(9) ? null : r.GetString(9),
+            r.IsDBNull(10) ? null : DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(10)),
+            r.GetInt32(11),
+            r.IsDBNull(12) ? null : r.GetString(12),
+            r.IsDBNull(13) ? null : r.GetInt32(13));
 
     // ---- unavailable_marker ----
 

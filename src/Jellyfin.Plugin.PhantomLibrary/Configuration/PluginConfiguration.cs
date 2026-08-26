@@ -114,6 +114,7 @@ public class PluginConfiguration : BasePluginConfiguration
         SourcePickerPreset = "gostream-default";
         UnavailableRetryAfterHours = 24;
         MagnetCacheTtlHours = 24 * 7;
+        MagnetCacheBuildLeaseMinutes = 10;
         MaterialiseInFlightStaleMinutes = 10;
         MaterialiseInFlightForeignOwnerHardTtlMinutes = 60;
         GostreamMinQuality = string.Empty;
@@ -512,6 +513,14 @@ public class PluginConfiguration : BasePluginConfiguration
     /// Per-magnet cache TTL written into <c>magnet_cache</c> rows.
     /// </summary>
     public int MagnetCacheTtlHours { get; set; }
+
+    /// <summary>
+    /// Lease (minutes) a magnet-cache builder holds a claimed
+    /// <c>magnet_cache_jobs</c> row for while it runs the Prowlarr fan-out.
+    /// After it expires an unfinished job becomes claimable again so a crashed
+    /// builder never strands a job (p6-magnet-cache-store).
+    /// </summary>
+    public int MagnetCacheBuildLeaseMinutes { get; set; }
 
     /// <summary>
     /// Age threshold (minutes) above which a row in
