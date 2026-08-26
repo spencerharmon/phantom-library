@@ -21,6 +21,17 @@ public interface IIndexerClient
     /// </summary>
     bool RequiresImdb => false;
 
+    /// <summary>
+    /// True if this indexer is eligible to run in the HIGH-frequency,
+    /// full-catalogue availability-oracle hot loop (ROI Priority 6,
+    /// revised architecture item 1 — 2026-08-26). Only Torrentio's cheap,
+    /// cached IMDB lookup belongs here; Prowlarr's heavy multi-indexer
+    /// fan-out is reserved for the separate, lower-frequency magnet-cache
+    /// loop and must default to <c>false</c> so it is never re-added to
+    /// the availability sweep by accident.
+    /// </summary>
+    bool IsAvailabilityOracle => false;
+
     Task<IReadOnlyList<IndexerCandidate>> SearchAsync(IndexerQuery query, CancellationToken ct);
 }
 

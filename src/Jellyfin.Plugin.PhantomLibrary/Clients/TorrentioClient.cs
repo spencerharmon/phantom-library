@@ -51,6 +51,8 @@ public sealed class TorrentioClient : IIndexerClient
 
     public bool RequiresImdb => true;
 
+    public bool IsAvailabilityOracle => true;
+
     public async Task<IReadOnlyList<IndexerCandidate>> SearchAsync(IndexerQuery query, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(query);
