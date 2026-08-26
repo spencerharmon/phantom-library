@@ -384,12 +384,23 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
         }
     }
 
+    /// <summary>
+    /// p6-search-list-surface-split: the computed-id fallback map must cover
+    /// every movie/episode the search/BaseItem path can surface, not only
+    /// what the browse LIST shows — otherwise an unavailable/unknown phantom
+    /// reached via global search (or a list-hidden series' own season-detail
+    /// grid) would resolve to no badge state at all here. Movies use the
+    /// full unfiltered catalogue; episodes use the flat (series-visibility-
+    /// agnostic) available/materialised id set — <c>ListVisibleEpisodeIdsAsync</c>
+    /// deliberately does not gate on <c>SeriesMinAvailableEpisodes</c>, unlike
+    /// the browse LIST's per-series <c>ListDisplayEpisodeIdsForVisibleSeriesAsync</c>.
+    /// </summary>
     private async Task<Dictionary<Guid, ChannelItemId>> BuildComputedChannelIdMapAsync(CancellationToken ct)
     {
         var result = new Dictionary<Guid, ChannelItemId>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
 
-        foreach (var row in await _db.ListVisibleMovieRowsAsync(ct).ConfigureAwait(false))
+        foreach (var row in await _db.ListAllMovieRowsAsync(ct).ConfigureAwait(false))
         {
             ct.ThrowIfCancellationRequested();
             var id = ChannelItemId.ForMovie(row.Metadata.TmdbId);
@@ -409,7 +420,7 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
             }
         }
 
-        foreach (var row in await _db.ListDisplayEpisodeIdsForVisibleSeriesAsync(Math.Max(1, _configProvider().SeriesMinAvailableEpisodes), ct).ConfigureAwait(false))
+        foreach (var row in await _db.ListVisibleEpisodeIdsAsync(ct).ConfigureAwait(false))
         {
             ct.ThrowIfCancellationRequested();
             var id = ChannelItemId.ForEpisode(row.SeriesTmdbId, row.Season, row.Episode);

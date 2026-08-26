@@ -8,6 +8,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Browse-LIST vs search/BaseItem surface split
+  (p6-search-list-surface-split).** The channel-item emission the interactive
+  browse LIST uses (Movies root, Shows root) is now separate from the
+  emission path used to keep unavailable/unknown phantoms searchable:
+  - `PhantomMoviesChannel.SearchSyncFolderId` / `PhantomShowsChannel.SearchSyncFolderId`
+    are new, UI-unreachable `GetChannelItems` folder ids that emit the FULL
+    catalogue (`PhantomDb.ListAllMovieRowsAsync` / `ListAllSeriesRowsAsync`),
+    tagged so the existing badge overlay resolves Unavailable/Unknown
+    correctly, instead of the browse-LIST-filtered set
+    (`ListVisibleMovieRowsAsync` / `ListVisibleSeriesRowsAsync`).
+  - `PhantomLibraryBadgesController`'s computed-channel-id fallback map (used
+    to badge an item that is not yet a real BaseItem) now covers the full
+    movie catalogue and the series-visibility-agnostic episode set, instead
+    of being restricted to the browse-LIST's `SeriesMinAvailableEpisodes`
+    filter.
+  - **Fixed:** a series below `SeriesMinAvailableEpisodes` (list-hidden) now
+    still emits its FULL season/episode grid when its season-detail is
+    reached directly — previously `GetEpisodesForSeasonAsync` blanked the
+    entire episode list for such a series, contradicting the "still
+    reachable via search, full grid" contract. Only an explicit per-user
+    hide still blanks season/episode detail.
+  - **Scope note:** wiring a periodic sync that actually WALKS the new
+    `SearchSyncFolderId` path through `IChannelManager` (so Jellyfin persists
+    every catalogued item as a real, globally-searchable BaseItem even when
+    it has never been interactively browsed) is not included in this change.
+    `IChannelManager.GetChannelItemsInternal` derives the channel's
+    `InternalChannelItemQuery.FolderId` from an existing library `ParentId`
+    BaseItem's `ExternalId`, and the search-sync folder is deliberately never
+    linked from any browsable parent — so persisting it requires either
+    exposing a real (tag-hidden) parent folder or a dedicated follow-up that
+    reimplements the BaseItem-materialisation ChannelManager already does
+    privately. Tracked as a follow-up; this change's DB/channel-level split
+    (LIST vs full-catalogue emission, badge coverage, season-detail full
+    grid) is complete and covered by unit tests.
+
 - **Breadth-first, priority-aware, user-yielding availability probe
   (probe-redesign-worker-queue).** The background source-availability probe no
   longer enqueues one row per TV episode and grinds through the whole catalogue

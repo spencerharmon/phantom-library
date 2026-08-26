@@ -103,6 +103,22 @@ public class PhantomMoviesChannelTests : IDisposable
         await cmd.ExecuteNonQueryAsync(CancellationToken.None);
     }
 
+    private async Task SeedUnavailableMovieAsync(int tmdb)
+    {
+        await _db.SetMetaAsync("__test_schema__", "1", CancellationToken.None);
+        await using var conn = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"INSERT OR REPLACE INTO availability_items
+            (tmdb_id,type,season,episode,status,checked_at,next_check_at)
+            VALUES ($tmdb,'movie',-1,-1,'unavailable',$now,$next);";
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        cmd.Parameters.AddWithValue("$tmdb", tmdb);
+        cmd.Parameters.AddWithValue("$now", now);
+        cmd.Parameters.AddWithValue("$next", DateTimeOffset.UtcNow.AddDays(7).ToUnixTimeSeconds());
+        await cmd.ExecuteNonQueryAsync(CancellationToken.None);
+    }
+
     [Fact]
     public async Task GetChannelItems_AllEmpty_ReturnsEmpty()
     {
@@ -590,6 +606,46 @@ public class PhantomMoviesChannelTests : IDisposable
         Assert.DoesNotContain(
             typeof(MediaBrowser.Controller.Channels.ISupportsLatestMedia),
             _channel.GetType().GetInterfaces());
+    }
+
+    // ------------------------------------------------------------
+    // p6-search-list-surface-split: browse LIST vs search/BaseItem set
+    // ------------------------------------------------------------
+
+    [Fact]
+    public async Task GetChannelItems_RootList_ExcludesUnavailablePhantom()
+    {
+        await SeedMetaAsync(301, "Never Materialised Movie");
+        await SeedUnavailableMovieAsync(301);
+
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+
+        Assert.Empty(result.Items);
+    }
+
+    [Fact]
+    public async Task GetChannelItems_SearchSyncFolder_IncludesUnavailablePhantomBadgedUnavailable()
+    {
+        await SeedMetaAsync(301, "Never Materialised Movie");
+        await SeedUnavailableMovieAsync(301);
+        await SeedMetaAsync(302, "Available Movie");
+        await SeedAvailableMovieAsync(302);
+
+        var searchResult = await _channel.GetChannelItems(
+            new InternalChannelItemQuery { FolderId = PhantomMoviesChannel.SearchSyncFolderId },
+            CancellationToken.None);
+
+        Assert.Equal(2, searchResult.Items.Count);
+        var unavailable = Assert.Single(searchResult.Items, i => i.Id == "movie_301");
+        Assert.Contains("unavailable", unavailable.Tags);
+        var available = Assert.Single(searchResult.Items, i => i.Id == "movie_302");
+        Assert.DoesNotContain("unavailable", available.Tags);
+
+        // And the root browse LIST must still exclude the unavailable one —
+        // confirming the two emission paths are genuinely split.
+        var rootResult = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        Assert.DoesNotContain(rootResult.Items, i => i.Id == "movie_301");
+        Assert.Contains(rootResult.Items, i => i.Id == "movie_302");
     }
 
     private static IApplicationPaths MockPaths(string root)
