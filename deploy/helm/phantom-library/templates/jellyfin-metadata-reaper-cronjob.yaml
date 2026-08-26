@@ -68,6 +68,22 @@ spec:
                 - --path
                 - {{ . | quote }}
                 {{- end }}
+                {{- if .Values.jellyfinMetadataReaper.importance.enabled }}
+                - --db-host
+                - {{ .Values.jellyfinMetadataReaper.importance.host | quote }}
+                - --db-port
+                - {{ .Values.jellyfinMetadataReaper.importance.port | quote }}
+                - --db-name
+                - {{ .Values.jellyfinMetadataReaper.importance.database | quote }}
+                - --db-user
+                - {{ .Values.jellyfinMetadataReaper.importance.user | quote }}
+                - --db-password-file
+                - /var/run/jellyfin-metadata-reaper-db/password
+                - --recent-days
+                - {{ .Values.jellyfinMetadataReaper.importance.recentDays | quote }}
+                {{- else }}
+                - --no-db
+                {{- end }}
               resources:
                 {{- toYaml .Values.jellyfinMetadataReaper.resources | nindent 16 }}
               volumeMounts:
@@ -76,6 +92,11 @@ spec:
                 - name: reaper-script
                   mountPath: /var/run/jellyfin-metadata-reaper
                   readOnly: true
+                {{- if .Values.jellyfinMetadataReaper.importance.enabled }}
+                - name: reaper-db-password
+                  mountPath: /var/run/jellyfin-metadata-reaper-db
+                  readOnly: true
+                {{- end }}
           volumes:
             - name: jellyfin-metadata
               persistentVolumeClaim:
@@ -84,4 +105,16 @@ spec:
               configMap:
                 name: jellyfin-metadata-reaper-script
                 defaultMode: 0555
+            {{- if .Values.jellyfinMetadataReaper.importance.enabled }}
+            # Read-only projection of the SAME Secret the workload already uses for its
+            # Jellyfin Postgres DSN — the reaper only ever runs a read-only aggregate over
+            # UserData, and the password never reaches argv (passed as --db-password-file).
+            - name: reaper-db-password
+              secret:
+                secretName: {{ .Values.jellyfinMetadataReaper.importance.passwordSecretName | quote }}
+                defaultMode: 0400
+                items:
+                  - key: {{ .Values.jellyfinMetadataReaper.importance.passwordSecretKey | quote }}
+                    path: password
+            {{- end }}
 {{- end }}

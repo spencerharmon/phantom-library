@@ -29,7 +29,7 @@ type: application
 # quota and exposes usage-vs-quota metrics; new `jellyfin.metadataGeneration.*` values cut
 # trickplay/person-image/artwork generation at the source. BREAKING values schema
 # (`persistence.jellyfinMetadata.size` removed).
-version: 2.8.0
+version: 2.9.0
 # Tracks the app milestone, not a container tag (images are digest-pinned in values).
 appVersion: "m14"
 keywords:

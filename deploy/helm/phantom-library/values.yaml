@@ -290,6 +290,27 @@ jellyfinMetadataReaper:
     - library
     - People
     - channels
+  # DB-backed IMPORTANCE ranking. atime alone is a weak signal on this volume (it is mounted
+  # `relatime`, so an atime only refreshes when the old one is >24h stale) — which means a pure-LRU
+  # reaper can evict a poster you view constantly before one you have never opened. When enabled the
+  # reaper runs ONE read-only aggregate over Jellyfin's `UserData` table and evicts in tier order:
+  #   tier 0 never played by anyone   -> evicted FIRST (the overwhelming bulk of the cache)
+  #   tier 1 played, but not within recentDays
+  #   tier 2 played within recentDays
+  #   tier 3 favourited or in-progress -> evicted LAST
+  # atime only breaks ties WITHIN a tier. If the DB is unreachable the run degrades to atime-only
+  # LRU and still protects the disk (never a hard dependency); the
+  # jellyfin_metadata_reaper_importance_ranking_active metric exposes which mode ran.
+  # Point these at the SAME Jellyfin DB the workload uses (see `postgres.jellyfin`).
+  importance:
+    enabled: false
+    host: ""
+    port: 5432
+    database: ""
+    user: ""
+    passwordSecretName: ""
+    passwordSecretKey: postgres-password
+    recentDays: 30
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
   resources:
