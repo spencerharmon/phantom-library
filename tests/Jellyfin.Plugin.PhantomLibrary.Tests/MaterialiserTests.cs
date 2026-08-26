@@ -156,7 +156,8 @@ public class MaterialiserTests : IDisposable
             refresh.Object,
             state,
             NullLogger<Materialiser>.Instance,
-            () => cfg);
+            () => cfg,
+            new MagnetCacheBuilder(db, selector, externalIds, NullLogger<MagnetCacheBuilder>.Instance));
 
         return (sut, gostream, refresh, indexer, db, cfg);
     }
@@ -674,18 +675,24 @@ public class MaterialiserTests : IDisposable
     }
 
     [Fact]
-    public async Task Materialise_ProbesFreshSourcesEvenWhenCachedCandidatesExist()
+    public async Task Materialise_CacheHit_ReusesCachedCandidate_DoesNotProbeIndependently()
     {
+        // p6-materialise-ttfb-fix: on a cache HIT (a pre-built source_candidate
+        // from the magnet-cache store), materialise reuses the cached candidate
+        // and MUST NOT run an independent fresh probe/fan-out. Probe source ==
+        // download source. The FakeIndexer would return a DIFFERENT "fresh"
+        // magnet; asserting the cached magnet is the one added proves no
+        // independent guess ran.
         using var db = await NewDbAsync();
         await SeedMovieMetadataAsync(db, 42);
-        var old = new MagnetCandidate("magnet:?xt=urn:btih:OLD", "OLD", 5L * 1024 * 1024 * 1024, 10, "old") { Title = "Old 1080p" };
-        var fresh = new MagnetCandidate("magnet:?xt=urn:btih:NEW", "NEW", 8L * 1024 * 1024 * 1024, 50, "fresh") { Title = "Fresh 1080p" };
-        await db.UpsertSourceCandidatesAsync(42, "movie", -1, -1, "test", new[] { old }, "details_probe", TimeSpan.FromHours(1), CancellationToken.None);
+        var cachedRow = new MagnetCandidate("magnet:?xt=urn:btih:CACHED", "CACHED", 5L * 1024 * 1024 * 1024, 10, "cache") { Title = "Cached 1080p" };
+        var wouldBeFreshGuess = new MagnetCandidate("magnet:?xt=urn:btih:GUESS", "GUESS", 8L * 1024 * 1024 * 1024, 50, "indexer") { Title = "Independent Guess 1080p" };
+        await db.UpsertSourceCandidatesAsync(42, "movie", -1, -1, "test", new[] { cachedRow }, "magnet_cache_builder", TimeSpan.FromHours(1), CancellationToken.None);
         var validatedMagnets = new List<string>();
         string? addedMagnet = null;
         var (sut, _, _, indexer, _, cfg) = BuildSut(
             db,
-            magnets: new[] { fresh },
+            magnets: new[] { wouldBeFreshGuess },
             gostreamSetup: g =>
             {
                 g.Setup(x => x.ValidateAsync(It.IsAny<GostreamValidateRequest>(), It.IsAny<CancellationToken>()))
@@ -695,7 +702,7 @@ public class MaterialiserTests : IDisposable
                         return new GostreamValidateResult
                         {
                             Status = "valid",
-                            Hash = req.Magnet.Contains("NEW", StringComparison.Ordinal) ? "NEW" : "OLD",
+                            Hash = "CACHED",
                             SelectedFile = new GostreamSelectedFile { Id = 0, Path = "movie.mkv", Size = 100 },
                             ValidationSessionId = req.ValidationSessionId,
                         };
@@ -708,7 +715,7 @@ public class MaterialiserTests : IDisposable
                         {
                             StubPath = "/var/gostream/stubs/movie.mkv",
                             FusePath = Path.Combine(_fuseMount, "movie.mkv"),
-                            Hash = req.Magnet.Contains("NEW", StringComparison.Ordinal) ? "NEW" : "OLD",
+                            Hash = "CACHED",
                             Size = 100,
                         };
                     });
@@ -720,12 +727,131 @@ public class MaterialiserTests : IDisposable
         var outcome = await sut.MaterialiseAsync(42, "movie", null, null, MaterialiseTrigger.Manual, CancellationToken.None);
 
         Assert.Equal(MaterialisationStatus.Success, outcome.Status);
-        Assert.Contains(fresh.Magnet, validatedMagnets);
-        Assert.Equal(fresh.Magnet, addedMagnet);
+        // The cached candidate is the one validated AND downloaded.
+        Assert.Equal(cachedRow.Magnet, addedMagnet);
+        Assert.Contains(cachedRow.Magnet, validatedMagnets);
+        // The independent indexer guess was NEVER validated (no fresh probe ran).
+        Assert.DoesNotContain(wouldBeFreshGuess.Magnet, validatedMagnets);
+        // And it was never written into the store, because no probe ran.
         var rows = await db.ListSourceCandidatesAsync(42, "movie", -1, -1, "test", includeExpired: false, CancellationToken.None);
-        Assert.Contains(rows, r => r.Magnet == old.Magnet);
-        Assert.Contains(rows, r => r.Magnet == fresh.Magnet);
+        Assert.Contains(rows, r => r.Magnet == cachedRow.Magnet);
+        Assert.DoesNotContain(rows, r => r.Magnet == wouldBeFreshGuess.Magnet);
         Assert.IsType<FakeIndexer>(indexer);
+    }
+
+    [Fact]
+    public async Task Materialise_Movie_CacheMiss_TriggersSynchronousCacheBuild_ThenSucceeds()
+    {
+        // p6-materialise-ttfb-fix: with NO cached candidate and NO
+        // source_candidate rows (a cold cache miss), materialise must drive a
+        // SYNCHRONOUS high-priority cache-build (the same Prowlarr fan-out the
+        // async MagnetCacheBuilder uses), persist the result into the
+        // source_candidates STORE, and then materialise from it — instead of an
+        // independent Torrentio-only guess. Proven by: no rows before, the
+        // built rows carry the synchronous-build provenance after, and the
+        // built magnet is the one downloaded.
+        using var db = await NewDbAsync();
+        await SeedMovieMetadataAsync(db, 42);
+        var built = new MagnetCandidate("magnet:?xt=urn:btih:BUILT", "BUILT", 6L * 1024 * 1024 * 1024, 40, "prowlarr") { Title = "Test Movie 1080p" };
+
+        var before = await db.ListSourceCandidatesAsync(42, "movie", -1, -1, "test", includeExpired: false, CancellationToken.None);
+        Assert.Empty(before);
+
+        string? addedMagnet = null;
+        var (sut, _, _, _, _, _) = BuildSut(
+            db,
+            magnets: new[] { built },
+            gostreamSetup: g =>
+            {
+                g.Setup(x => x.ValidateAsync(It.IsAny<GostreamValidateRequest>(), It.IsAny<CancellationToken>()))
+                    .ReturnsAsync((GostreamValidateRequest req, CancellationToken _) => new GostreamValidateResult
+                    {
+                        Status = "valid",
+                        Hash = "BUILT",
+                        SelectedFile = new GostreamSelectedFile { Id = 0, Path = "movie.mkv", Size = 100 },
+                        ValidationSessionId = req.ValidationSessionId,
+                    });
+                g.Setup(x => x.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()))
+                    .ReturnsAsync((GostreamAddRequest req, CancellationToken _) =>
+                    {
+                        addedMagnet = req.Magnet;
+                        return new GostreamAddResult
+                        {
+                            StubPath = "/var/gostream/stubs/movie.mkv",
+                            FusePath = Path.Combine(_fuseMount, "movie.mkv"),
+                            Hash = "BUILT",
+                            Size = 100,
+                        };
+                    });
+            });
+        File.WriteAllText(Path.Combine(_fuseMount, "movie.mkv"), "x");
+
+        var outcome = await sut.MaterialiseAsync(42, "movie", null, null, MaterialiseTrigger.Manual, CancellationToken.None);
+
+        Assert.Equal(MaterialisationStatus.Success, outcome.Status);
+        Assert.Equal(built.Magnet, addedMagnet);
+        var after = await db.ListSourceCandidatesAsync(42, "movie", -1, -1, "test", includeExpired: false, CancellationToken.None);
+        Assert.Contains(after, r => r.Magnet == built.Magnet && r.Source == "magnet_cache_builder_sync");
+    }
+
+    [Fact]
+    public async Task Materialise_Episode_CacheMiss_TriggersSynchronousCacheBuild_ThenSucceeds()
+    {
+        // Movie/TV parity for the p6-materialise-ttfb-fix cache-miss →
+        // synchronous cache-build path.
+        using var db = await NewDbAsync();
+        await SeedSeriesMetadataAsync(db, 200, "The Twilight Zone", 1959);
+        var built = new MagnetCandidate(
+            "magnet:?xt=urn:btih:EP1959000000000000000000000000000000000",
+            "EP1959000000000000000000000000000000000",
+            2L * 1024 * 1024 * 1024,
+            8,
+            "prowlarr")
+        {
+            Title = "The Twilight Zone S01E01 Where Is Everybody 1080p WEB-DL",
+        };
+
+        var before = await db.ListSourceCandidatesAsync(200, "episode", 1, 1, "test", includeExpired: false, CancellationToken.None);
+        Assert.Empty(before);
+
+        GostreamAddRequest? added = null;
+        var (sut, _, _, _, _, _) = BuildSut(
+            db,
+            imdb: "tt0052520",
+            magnets: new[] { built },
+            gostreamSetup: g =>
+            {
+                g.Setup(x => x.ValidateAsync(It.IsAny<GostreamValidateRequest>(), It.IsAny<CancellationToken>()))
+                    .ReturnsAsync((GostreamValidateRequest req, CancellationToken _) => new GostreamValidateResult
+                    {
+                        Status = "valid",
+                        Hash = built.InfoHash,
+                        SelectedFile = new GostreamSelectedFile { Id = 7, Path = "The Twilight Zone S01E01.mkv", Size = built.Size },
+                        ValidationSessionId = req.ValidationSessionId,
+                    });
+                g.Setup(x => x.AddAsync(It.IsAny<GostreamAddRequest>(), It.IsAny<CancellationToken>()))
+                    .Returns<GostreamAddRequest, CancellationToken>((req, _) =>
+                    {
+                        added = req;
+                        var fuse = Path.Combine(_fuseMount, "tz-ep-built.mkv");
+                        File.WriteAllText(fuse, "x");
+                        return Task.FromResult(new GostreamAddResult
+                        {
+                            StubPath = "/var/gostream/stubs/good.mkv",
+                            FusePath = fuse,
+                            Hash = built.InfoHash,
+                            Size = built.Size,
+                        });
+                    });
+            });
+
+        var outcome = await sut.MaterialiseAsync(200, "episode", 1, 1, MaterialiseTrigger.Manual, CancellationToken.None);
+
+        Assert.Equal(MaterialisationStatus.Success, outcome.Status);
+        Assert.NotNull(added);
+        Assert.Equal(built.Magnet, added!.Magnet);
+        var after = await db.ListSourceCandidatesAsync(200, "episode", 1, 1, "test", includeExpired: false, CancellationToken.None);
+        Assert.Contains(after, r => r.Magnet == built.Magnet && r.Source == "magnet_cache_builder_sync");
     }
 
     [Fact]

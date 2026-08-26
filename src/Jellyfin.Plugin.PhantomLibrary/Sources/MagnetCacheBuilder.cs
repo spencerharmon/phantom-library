@@ -60,9 +60,28 @@ public sealed class MagnetCacheBuilder
         int? year,
         CancellationToken ct);
 
+    /// <summary>
+    /// Runs the full Prowlarr fan-out and returns the classified probe result
+    /// (so a transient indexer failure is distinguishable from a definitive
+    /// "no candidate"). Used by the SYNCHRONOUS materialise cache-build so
+    /// materialise can surface a transient failure as a transient error rather
+    /// than a definitive "unavailable". Defaults to
+    /// <see cref="MagnetSelector.ProbeAsync"/>.
+    /// </summary>
+    public delegate Task<MagnetProbeResult> Probe(
+        int tmdbId,
+        string? imdbId,
+        string type,
+        int? season,
+        int? episode,
+        string title,
+        int? year,
+        CancellationToken ct);
+
     private readonly PhantomDb _db;
     private readonly MetaResolver _resolveMeta;
     private readonly FanOut _fanOut;
+    private readonly Probe? _probe;
     private readonly ILogger<MagnetCacheBuilder> _logger;
     private readonly Func<PluginConfiguration> _configProvider;
     private readonly string _owner = $"magnet-cache-builder-{Environment.MachineName}-{Guid.NewGuid():N}";
@@ -77,7 +96,8 @@ public sealed class MagnetCacheBuilder
             BuildTmdbMetaResolver(db, externalIds),
             selector.SelectRankedAsync,
             logger,
-            () => Plugin.Instance?.Configuration ?? new PluginConfiguration())
+            () => Plugin.Instance?.Configuration ?? new PluginConfiguration(),
+            selector.ProbeAsync)
     {
     }
 
@@ -86,13 +106,15 @@ public sealed class MagnetCacheBuilder
         MetaResolver resolveMeta,
         FanOut fanOut,
         ILogger<MagnetCacheBuilder> logger,
-        Func<PluginConfiguration> configProvider)
+        Func<PluginConfiguration> configProvider,
+        Probe? probe = null)
     {
         _db = db ?? throw new ArgumentNullException(nameof(db));
         _resolveMeta = resolveMeta ?? throw new ArgumentNullException(nameof(resolveMeta));
         _fanOut = fanOut ?? throw new ArgumentNullException(nameof(fanOut));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _configProvider = configProvider ?? throw new ArgumentNullException(nameof(configProvider));
+        _probe = probe;
     }
 
     private static MetaResolver BuildTmdbMetaResolver(PhantomDb db, TmdbExternalIdResolver externalIds)
@@ -130,6 +152,109 @@ public sealed class MagnetCacheBuilder
         }
 
         return await BuildClaimedAsync(job, cfg, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Synchronously build (and store) the magnet-cache candidate set for a
+    /// single item tuple, bypassing the job queue. This is the high-priority
+    /// SYNCHRONOUS cache-build path used by the materialise hot loop
+    /// (p6-materialise-ttfb-fix) on a cache miss: rather than falling back to
+    /// an independent Torrentio-only guess, materialise drives the SAME full
+    /// Prowlarr fan-out the async builder uses and writes the result into the
+    /// <c>source_candidates</c> store, so the download source it then picks is
+    /// exactly the probed source (probe source == download source).
+    ///
+    /// Movie => season/episode both null (persisted under the -1/-1
+    /// sentinels); episode => real season/episode. Returns the number of
+    /// candidates written (0 on a metadata miss or an empty fan-out). Never
+    /// throws for a "no candidate" outcome — that is a normal cache-miss
+    /// result the caller distinguishes from a transient fan-out failure, which
+    /// DOES propagate so the caller can surface it as a transient materialise
+    /// error rather than a definitive "unavailable".
+    /// </summary>
+    public async Task<int> BuildSynchronousAsync(
+        int tmdbId,
+        string type,
+        int? season,
+        int? episode,
+        string preset,
+        PluginConfiguration cfg,
+        CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        ArgumentNullException.ThrowIfNull(preset);
+        ArgumentNullException.ThrowIfNull(cfg);
+
+        var seasonSentinel = type == "episode" ? season ?? -1 : -1;
+        var episodeSentinel = type == "episode" ? episode ?? -1 : -1;
+
+        var meta = await _resolveMeta(tmdbId, type, seasonSentinel, episodeSentinel, ct).ConfigureAwait(false);
+        if (meta is null || string.IsNullOrWhiteSpace(meta.Title))
+        {
+            _logger.LogWarning(
+                "MagnetCacheBuilder(sync): no metadata for {Type}/{Tmdb} s{Season}e{Episode}; cannot build cache",
+                type, tmdbId, seasonSentinel, episodeSentinel);
+            return 0;
+        }
+
+        IReadOnlyList<MagnetCandidate> candidates;
+        if (_probe is not null)
+        {
+            // Preferred path: use the classified probe so a transient indexer
+            // failure THROWS (surfaced by materialise as a transient error)
+            // rather than being silently collapsed into "0 candidates" (which
+            // would look like a definitive "unavailable").
+            var probe = await _probe(
+                tmdbId,
+                meta.ImdbId,
+                type,
+                type == "episode" ? season : null,
+                type == "episode" ? episode : null,
+                meta.Title,
+                meta.Year,
+                ct).ConfigureAwait(false);
+            if (probe.Outcome == MagnetProbeOutcome.IndeterminateTransient)
+            {
+                throw new MagnetCacheTransientBuildException(
+                    $"transient fan-out failure for {type}/{tmdbId} s{seasonSentinel}e{episodeSentinel}: {probe.ErrorKind} {probe.ErrorMessage}");
+            }
+
+            candidates = probe.Outcome == MagnetProbeOutcome.Available
+                ? probe.Candidates
+                : Array.Empty<MagnetCandidate>();
+        }
+        else
+        {
+            candidates = await _fanOut(
+                tmdbId,
+                meta.ImdbId,
+                type,
+                type == "episode" ? season : null,
+                type == "episode" ? episode : null,
+                meta.Title,
+                meta.Year,
+                ct).ConfigureAwait(false);
+        }
+
+        var ttl = TimeSpan.FromHours(Math.Max(1, cfg.MagnetCacheTtlHours));
+        if (candidates.Count > 0)
+        {
+            await _db.UpsertSourceCandidatesAsync(
+                tmdbId,
+                type,
+                seasonSentinel,
+                episodeSentinel,
+                preset,
+                candidates,
+                "magnet_cache_builder_sync",
+                ttl,
+                ct).ConfigureAwait(false);
+        }
+
+        _logger.LogInformation(
+            "MagnetCacheBuilder(sync): built {Count} candidates for {Type}/{Tmdb} s{Season}e{Episode}",
+            candidates.Count, type, tmdbId, seasonSentinel, episodeSentinel);
+        return candidates.Count;
     }
 
     /// <summary>
@@ -213,3 +338,26 @@ public sealed record MagnetCacheItemMeta(string? ImdbId, string Title, int? Year
 
 /// <summary>Outcome of building one magnet-cache job.</summary>
 public sealed record MagnetCacheBuildResult(MagnetCacheJobRow Job, int CandidateCount, string? Error);
+
+/// <summary>
+/// Thrown by <see cref="MagnetCacheBuilder.BuildSynchronousAsync"/> when the
+/// fan-out fails TRANSIENTLY (indexer timeout / partial failure). Distinct from
+/// a definitive "no candidate" so the materialise hot loop surfaces it as a
+/// transient error and does NOT write a definitive unavailable-marker.
+/// </summary>
+public sealed class MagnetCacheTransientBuildException : Exception
+{
+    public MagnetCacheTransientBuildException(string message)
+        : base(message)
+    {
+    }
+
+    public MagnetCacheTransientBuildException(string message, Exception inner)
+        : base(message, inner)
+    {
+    }
+
+    public MagnetCacheTransientBuildException()
+    {
+    }
+}

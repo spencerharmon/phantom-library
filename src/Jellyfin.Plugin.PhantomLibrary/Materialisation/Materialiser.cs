@@ -52,6 +52,7 @@ public sealed class Materialiser : IMaterialiser
     private readonly PhantomDb _db;
     private readonly IGostreamClient _gostream;
     private readonly MagnetSelector _magnetSelector;
+    private readonly MagnetCacheBuilder? _magnetCacheBuilder;
     private readonly TmdbExternalIdResolver _externalIds;
     private readonly GostreamHeavyLimiter _gostreamLimiter;
     private readonly IChannelItemRefreshManager _refreshManager;
@@ -71,13 +72,14 @@ public sealed class Materialiser : IMaterialiser
         PhantomDb db,
         IGostreamClient gostream,
         MagnetSelector magnetSelector,
+        MagnetCacheBuilder magnetCacheBuilder,
         TmdbExternalIdResolver externalIds,
         GostreamHeavyLimiter gostreamLimiter,
         IChannelItemRefreshManager refreshManager,
         ChannelStateProvider state,
         ILogger<Materialiser> logger)
         : this(libraryManager, db, gostream, magnetSelector, externalIds, gostreamLimiter, refreshManager, state, logger,
-               () => Plugin.Instance?.Configuration ?? new PluginConfiguration())
+               () => Plugin.Instance?.Configuration ?? new PluginConfiguration(), magnetCacheBuilder)
     {
     }
 
@@ -90,8 +92,9 @@ public sealed class Materialiser : IMaterialiser
         IChannelItemRefreshManager refreshManager,
         ChannelStateProvider state,
         ILogger<Materialiser> logger,
-        Func<PluginConfiguration> configProvider)
-        : this(libraryManager, db, gostream, magnetSelector, externalIds, new GostreamHeavyLimiter(configProvider), refreshManager, state, logger, configProvider)
+        Func<PluginConfiguration> configProvider,
+        MagnetCacheBuilder? magnetCacheBuilder = null)
+        : this(libraryManager, db, gostream, magnetSelector, externalIds, new GostreamHeavyLimiter(configProvider), refreshManager, state, logger, configProvider, magnetCacheBuilder)
     {
     }
 
@@ -105,7 +108,8 @@ public sealed class Materialiser : IMaterialiser
         IChannelItemRefreshManager refreshManager,
         ChannelStateProvider state,
         ILogger<Materialiser> logger,
-        Func<PluginConfiguration> configProvider)
+        Func<PluginConfiguration> configProvider,
+        MagnetCacheBuilder? magnetCacheBuilder = null)
     {
         _libraryManager = libraryManager ?? throw new ArgumentNullException(nameof(libraryManager));
         _db = db ?? throw new ArgumentNullException(nameof(db));
@@ -117,6 +121,7 @@ public sealed class Materialiser : IMaterialiser
         _state = state ?? throw new ArgumentNullException(nameof(state));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _configProvider = configProvider ?? throw new ArgumentNullException(nameof(configProvider));
+        _magnetCacheBuilder = magnetCacheBuilder;
     }
 
     public event EventHandler<MaterialisationLifecycleEvent>? LifecycleChanged;
@@ -538,20 +543,14 @@ public sealed class Materialiser : IMaterialiser
             return new CandidatePlan(candidates, null);
         }
 
-        var freshCandidatesTask = BuildFreshMaterialiseCandidatesAsync(
-            tmdbId,
-            type,
-            season,
-            episode,
-            imdb,
-            metadataType,
-            meta,
-            cfg,
-            magnetKey,
-            sSentinel,
-            eSentinel,
-            ct);
-
+        // Cache-first magnet selection (p6-materialise-ttfb-fix). Materialise
+        // reuses the PRE-BUILT high-confidence Prowlarr candidate set from the
+        // magnet-cache store (the cached magnet + source_candidates rows the
+        // MagnetCacheBuilder populates) rather than running its own independent
+        // guess. Only on a genuine cache MISS does it drive a SYNCHRONOUS,
+        // high-priority cache-build through the SAME MagnetCacheBuilder fan-out
+        // (probe source == download source), instead of the legacy inline
+        // Torrentio/Prowlarr probe that made materialise fail cold.
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var cached = await _db.GetCachedMagnetAsync(magnetKey, ct).ConfigureAwait(false);
         if (cached is not null)
@@ -574,6 +573,93 @@ public sealed class Materialiser : IMaterialiser
             }
         }
 
+        await AppendSourceCandidatesAsync(
+            candidates, seen, tmdbId, type, season, episode, imdb, meta, cfg, magnetKey, sSentinel, eSentinel, ct)
+            .ConfigureAwait(false);
+
+        // Cache HIT: at least one pre-built candidate is usable. Do NOT run any
+        // independent probe — the download source is the probed source.
+        if (candidates.Count > 0)
+        {
+            return new CandidatePlan(candidates, null);
+        }
+
+        // Cache MISS. When the synchronous cache-builder is wired (production
+        // + the p6-materialise-ttfb-fix regression tests), drive a high-priority
+        // synchronous cache-build now — the identical Prowlarr fan-out the async
+        // builder uses — then re-read the freshly-stored candidates. This is the
+        // replacement for the old independent Torrentio-only fallback guess.
+        if (_magnetCacheBuilder is not null)
+        {
+            try
+            {
+                var built = await _magnetCacheBuilder.BuildSynchronousAsync(
+                    tmdbId, type, season, episode, cfg.SourcePickerPreset, cfg, ct).ConfigureAwait(false);
+                _logger.LogInformation(
+                    "Materialise cache-miss for {Type}/{Tmdb} s{Season}e{Episode}: synchronous cache-build produced {Count} candidate(s)",
+                    type, tmdbId, season, episode, built);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // A transient fan-out failure must surface as a transient
+                // materialise error (not a definitive "unavailable"), matching
+                // the legacy probe's IndeterminateTransient contract.
+                throw new InvalidOperationException(
+                    $"Synchronous magnet cache-build failed for {metadataType}/{tmdbId} (season={season} episode={episode}): {ex.GetType().Name} {ex.Message}",
+                    ex);
+            }
+
+            await AppendSourceCandidatesAsync(
+                candidates, seen, tmdbId, type, season, episode, imdb, meta, cfg, magnetKey, sSentinel, eSentinel, ct)
+                .ConfigureAwait(false);
+
+            return new CandidatePlan(candidates, null);
+        }
+
+        // Legacy fallback (no builder injected): the pre-p6 independent probe.
+        var freshCandidatesTask = BuildFreshMaterialiseCandidatesAsync(
+            tmdbId,
+            type,
+            season,
+            episode,
+            imdb,
+            metadataType,
+            meta,
+            cfg,
+            magnetKey,
+            sSentinel,
+            eSentinel,
+            ct);
+
+        return new CandidatePlan(candidates, freshCandidatesTask);
+    }
+
+    /// <summary>
+    /// Reads the pre-built magnet-cache STORE (<c>source_candidates</c>) for
+    /// this item tuple and appends every usable, unfailed, unblocked candidate
+    /// to <paramref name="candidates"/>. Shared by the cache-first read and the
+    /// post-synchronous-build re-read so both go through the identical
+    /// allow/validation gating.
+    /// </summary>
+    private async Task AppendSourceCandidatesAsync(
+        List<CandidateAddRequest> candidates,
+        HashSet<string> seen,
+        int tmdbId,
+        string type,
+        int? season,
+        int? episode,
+        string? imdb,
+        TmdbMetadataRow meta,
+        PluginConfiguration cfg,
+        MagnetCacheKey magnetKey,
+        int sSentinel,
+        int eSentinel,
+        CancellationToken ct)
+    {
         var sourceCandidates = await _db.ListSourceCandidatesAsync(
             tmdbId,
             type,
@@ -610,8 +696,6 @@ public sealed class Materialiser : IMaterialiser
 
             candidates.Add(BuildCandidateRequest(meta, type, tmdbId, imdb, season, episode, magnet, cfg, fromCache: false, rank: sourceCandidate.Rank, sourceRow: sourceCandidate));
         }
-
-        return new CandidatePlan(candidates, freshCandidatesTask);
     }
 
     private async Task<IReadOnlyList<CandidateAddRequest>> BuildFreshMaterialiseCandidatesAsync(
