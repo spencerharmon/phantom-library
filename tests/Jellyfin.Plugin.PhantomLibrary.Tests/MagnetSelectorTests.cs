@@ -304,6 +304,64 @@ public class MagnetSelectorTests
     }
 
     [Fact]
+    public async Task BothCapable_Movie_ProwlarrHigherQuality_ProwlarrCandidateWins()
+    {
+        // p6-prowlarr-indexer-wiring "ranking case": when BOTH Torrentio and Prowlarr are
+        // capable (an IMDB id is present so Torrentio does NOT abstain) and both return
+        // candidates, the better RELEASE wins regardless of which indexer produced it — a
+        // configured Prowlarr must not be starved by always preferring Torrentio, nor must a
+        // higher-quality Torrentio release lose to a lesser Prowlarr one.
+        var prowlarr = new Mock<IIndexerClient>(MockBehavior.Strict);
+        prowlarr.SetupGet(i => i.IsEnabled).Returns(true);
+        prowlarr.SetupGet(i => i.Name).Returns("Prowlarr");
+        prowlarr.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { MakeCandidate("Movie 1080p Prowlarr", 8, 50) });
+
+        var torrentio = new Mock<IIndexerClient>(MockBehavior.Strict);
+        torrentio.SetupGet(i => i.IsEnabled).Returns(true);
+        torrentio.SetupGet(i => i.Name).Returns("Torrentio");
+        torrentio.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { MakeCandidate("Movie 480p Torrentio", 1, 5) });
+
+        var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
+        var sel = new MagnetSelector(new[] { torrentio.Object, prowlarr.Object }, scorer, NullLogger<MagnetSelector>.Instance, TestConfig);
+
+        var probe = await sel.ProbeAsync(1, "tt1234567", "movie", null, null, "Movie", 2020, CancellationToken.None);
+
+        Assert.Equal(MagnetProbeOutcome.Available, probe.Outcome);
+        Assert.NotEmpty(probe.Candidates);
+        Assert.Contains("Prowlarr", probe.Candidates[0].Title, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task BothCapable_Episode_TorrentioHigherQuality_TorrentioCandidateWins()
+    {
+        // Episode-parity counterpart: with an IMDB id present (so Torrentio is capable too),
+        // a higher-quality Torrentio release beats a lower-quality Prowlarr one — proving
+        // Torrentio is not starved either once Prowlarr is wired in.
+        var prowlarr = new Mock<IIndexerClient>(MockBehavior.Strict);
+        prowlarr.SetupGet(i => i.IsEnabled).Returns(true);
+        prowlarr.SetupGet(i => i.Name).Returns("Prowlarr");
+        prowlarr.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { MakeCandidate("Show S01E01 480p Prowlarr", 1, 5) });
+
+        var torrentio = new Mock<IIndexerClient>(MockBehavior.Strict);
+        torrentio.SetupGet(i => i.IsEnabled).Returns(true);
+        torrentio.SetupGet(i => i.Name).Returns("Torrentio");
+        torrentio.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { MakeCandidate("Show S01E01 1080p Torrentio", 8, 50) });
+
+        var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
+        var sel = new MagnetSelector(new[] { prowlarr.Object, torrentio.Object }, scorer, NullLogger<MagnetSelector>.Instance, TestConfig);
+
+        var probe = await sel.ProbeAsync(99, "tt9999999", "episode", 1, 1, "Show", 2020, CancellationToken.None);
+
+        Assert.Equal(MagnetProbeOutcome.Available, probe.Outcome);
+        Assert.NotEmpty(probe.Candidates);
+        Assert.Contains("Torrentio", probe.Candidates[0].Title, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task TorrentioAbstains_ProwlarrEmpty_ReturnsDefinitiveUnavailable()
     {
         // Prowlarr actually ran and returned nothing; Torrentio abstained. Since a

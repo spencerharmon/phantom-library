@@ -245,6 +245,25 @@ prowlarr:
     requests: { cpu: "50m", memory: 128Mi }
     limits: { cpu: "1", memory: 512Mi }
 
+# ---------------------------------------------------- plugin -> Prowlarr wiring (p6-prowlarr-indexer-wiring) --
+# Projects the plugin's PluginConfiguration.ProwlarrBaseUrl/ProwlarrApiKey into the deployed
+# Jellyfin.Plugin.PhantomLibrary.xml on the jellyfin-var-lib PVC, so the plugin's MagnetSelector
+# treats the in-cluster Prowlarr (rendered above) as a capable indexer for no-IMDB titles. Runs as
+# an idempotent init container (patches the existing XML in place; a fresh/never-configured install
+# still boots and writes the file itself, so the patch step tolerates the file being absent on
+# first boot and simply skips). The API key is sourced from a k8s Secret — NEVER inline in
+# values/git — materialised out of band by the flux cross-dep `phantom-library-prowlarr-apikey-
+# secret` (data key `ProwlarrApiKey`). Leave `apiKeySecretName` empty to skip wiring entirely (the
+# plugin then behaves exactly as before: Torrentio-only, ProwlarrBaseUrl/ProwlarrApiKey stay empty).
+prowlarrConfig:
+  # In-cluster Prowlarr Service URL the plugin should call (matches prowlarr.port above).
+  baseUrl: "http://prowlarr:9696"
+  # Out-of-band Secret (Opaque) holding the Prowlarr API key, keyed `ProwlarrApiKey`. Provisioned by
+  # flux:phantom-library-prowlarr-apikey-secret (scripts/provision-prowlarr-apikey-secret.sh in the
+  # flux repo). Empty disables the init container (no Prowlarr wiring rendered).
+  apiKeySecretName: "prowlarr-apikey"
+  apiKeySecretKey: "ProwlarrApiKey"
+
 # ------------------------------------------------------------------------ warmup cache --
 # SINGLE SOURCE OF TRUTH for the warmup sizing. gostream enforces quotaGb as GiB (quota =
 # quotaGb * 1024^3) and evicts toward it; the warmup PVC is sized quotaGb + headroomGi so the quota
