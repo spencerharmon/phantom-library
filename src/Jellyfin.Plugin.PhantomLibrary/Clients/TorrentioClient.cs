@@ -60,8 +60,8 @@ public sealed class TorrentioClient : IIndexerClient
 
         if (string.IsNullOrWhiteSpace(query.Imdb) && string.IsNullOrWhiteSpace(query.SeriesImdb))
         {
-            _logger.LogWarning("Torrentio requires an IMDB id; query for type={Type} title={Title} cannot be proven empty", query.Type, query.Title);
-            throw new IndexerTransientException("Torrentio requires an IMDB id");
+            _logger.LogDebug("Torrentio requires an IMDB id; abstaining from query for type={Type} title={Title}", query.Type, query.Title);
+            throw new IndexerNotApplicableException("Torrentio requires an IMDB id");
         }
 
         string url;

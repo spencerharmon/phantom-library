@@ -33,6 +33,7 @@ public enum MagnetProbeOutcome
     Available,
     DefinitiveUnavailable,
     IndeterminateTransient,
+    NoCapableIndexer,
 }
 
 public sealed record MagnetProbeResult(
@@ -46,6 +47,9 @@ public sealed record MagnetProbeResult(
 
     public static MagnetProbeResult DefinitiveUnavailable()
         => new(MagnetProbeOutcome.DefinitiveUnavailable, Array.Empty<MagnetCandidate>(), null, null);
+
+    public static MagnetProbeResult NoCapableIndexer(string? message)
+        => new(MagnetProbeOutcome.NoCapableIndexer, Array.Empty<MagnetCandidate>(), "no_capable_indexer", message);
 
     public static MagnetProbeResult Transient(string kind, string? message)
         => new(MagnetProbeOutcome.IndeterminateTransient, Array.Empty<MagnetCandidate>(), kind, message);
@@ -166,14 +170,13 @@ public sealed class MagnetSelector
 
         var aggregated = new List<IndexerCandidate>();
         var failures = new List<string>();
-        var successfulResponses = 0;
+        var abstentions = new List<string>();
         foreach (var indexer in enabled)
         {
             ct.ThrowIfCancellationRequested();
             try
             {
                 var hits = await indexer.SearchAsync(query, ct).ConfigureAwait(false);
-                successfulResponses++;
                 if (hits is { Count: > 0 })
                 {
                     aggregated.AddRange(hits);
@@ -182,6 +185,13 @@ public sealed class MagnetSelector
             catch (OperationCanceledException)
             {
                 throw;
+            }
+            catch (IndexerNotApplicableException ex)
+            {
+                // Abstention: the indexer cannot serve this query as-is (e.g. Torrentio
+                // with no IMDB id). Not a failure and not transient — do not count it.
+                abstentions.Add(indexer.Name);
+                _logger.LogDebug(ex, "Indexer {Indexer} abstained (not applicable) for {Type}/{Tmdb}", indexer.Name, type, tmdbId);
             }
             catch (IndexerAuthException ex)
             {
@@ -197,9 +207,19 @@ public sealed class MagnetSelector
 
         if (aggregated.Count == 0)
         {
-            if (failures.Count > 0 || successfulResponses == 0)
+            if (failures.Count > 0)
             {
                 return MagnetProbeResult.Transient("indexer_partial_or_total_failure", string.Join(";", failures));
+            }
+
+            if (abstentions.Count == enabled.Count)
+            {
+                // No enabled indexer could even serve this query (e.g. only Torrentio
+                // enabled and no IMDB id). Not a definitive "unavailable" — no indexer ran.
+                _logger.LogInformation(
+                    "No capable indexer for {Type}/{Tmdb} s{Season} e{Episode}; all {N} enabled indexer(s) abstained",
+                    type, tmdbId, season, episode, enabled.Count);
+                return MagnetProbeResult.NoCapableIndexer(string.Join(";", abstentions));
             }
 
             _logger.LogInformation("No indexer returned candidates for {Type}/{Tmdb} s{Season} e{Episode}", type, tmdbId, season, episode);

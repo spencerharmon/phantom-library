@@ -29,10 +29,10 @@ public class TorrentioClientTests
     }
 
     [Fact]
-    public async Task Missing_Imdb_Throws_Transient()
+    public async Task Missing_Imdb_Throws_NotApplicable()
     {
         var c = Make(new QueuedHandler());
-        await Assert.ThrowsAsync<IndexerTransientException>(() =>
+        await Assert.ThrowsAsync<IndexerNotApplicableException>(() =>
             c.SearchAsync(new IndexerQuery { Type = "movie", Title = "X" }, CancellationToken.None));
     }
 

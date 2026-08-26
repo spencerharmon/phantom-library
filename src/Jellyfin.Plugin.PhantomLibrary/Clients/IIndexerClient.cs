@@ -54,6 +54,19 @@ public sealed class IndexerTransientException : Exception
     public IndexerTransientException(string message, Exception inner) : base(message, inner) { }
 }
 
+/// <summary>
+/// This indexer cannot serve the given query as-is (an abstention) — e.g. Torrentio
+/// queried without an IMDB id. This is NOT a failure and NOT transient: it must not
+/// be retried as though it might succeed later with the same query, and it must not
+/// be counted as an error when deciding a probe outcome.
+/// </summary>
+public sealed class IndexerNotApplicableException : Exception
+{
+    public IndexerNotApplicableException() { }
+    public IndexerNotApplicableException(string message) : base(message) { }
+    public IndexerNotApplicableException(string message, Exception inner) : base(message, inner) { }
+}
+
 /// <summary>Helpers for building magnet URIs and parsing info-hashes.</summary>
 public static class MagnetUtils
 {

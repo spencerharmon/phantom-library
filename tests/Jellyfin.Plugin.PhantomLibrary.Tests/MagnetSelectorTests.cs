@@ -255,6 +255,104 @@ public class MagnetSelectorTests
     }
 
     [Fact]
+    public async Task OnlyTorrentioEnabled_NoImdb_ReturnsNoCapableIndexer()
+    {
+        // Torrentio abstains (IndexerNotApplicableException) when no IMDB id is
+        // available. With no other capable indexer, this must be NoCapableIndexer,
+        // not IndeterminateTransient (which would churn) nor DefinitiveUnavailable
+        // (nothing actually ran).
+        var torrentio = new Mock<IIndexerClient>(MockBehavior.Strict);
+        torrentio.SetupGet(i => i.IsEnabled).Returns(true);
+        torrentio.SetupGet(i => i.Name).Returns("Torrentio");
+        torrentio.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new IndexerNotApplicableException("Torrentio requires an IMDB id"));
+
+        var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
+        var sel = new MagnetSelector(new[] { torrentio.Object }, scorer, NullLogger<MagnetSelector>.Instance, TestConfig);
+
+        var probe = await sel.ProbeAsync(1, null, "movie", null, null, "Movie", 2020, CancellationToken.None);
+
+        Assert.Equal(MagnetProbeOutcome.NoCapableIndexer, probe.Outcome);
+        Assert.Empty(probe.Candidates);
+        Assert.Equal("no_capable_indexer", probe.ErrorKind);
+    }
+
+    [Fact]
+    public async Task ProwlarrEnabled_NoImdb_TorrentioAbstains_ReturnsAvailable()
+    {
+        // Prowlarr is title-based and does not need an IMDB id. Torrentio abstains,
+        // but Prowlarr returns a candidate, so the probe is Available.
+        var prowlarr = new Mock<IIndexerClient>(MockBehavior.Strict);
+        prowlarr.SetupGet(i => i.IsEnabled).Returns(true);
+        prowlarr.SetupGet(i => i.Name).Returns("Prowlarr");
+        prowlarr.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { MakeCandidate("Movie 1080p", 5, 30) });
+
+        var torrentio = new Mock<IIndexerClient>(MockBehavior.Strict);
+        torrentio.SetupGet(i => i.IsEnabled).Returns(true);
+        torrentio.SetupGet(i => i.Name).Returns("Torrentio");
+        torrentio.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new IndexerNotApplicableException("Torrentio requires an IMDB id"));
+
+        var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
+        var sel = new MagnetSelector(new[] { prowlarr.Object, torrentio.Object }, scorer, NullLogger<MagnetSelector>.Instance, TestConfig);
+
+        var probe = await sel.ProbeAsync(1, null, "movie", null, null, "Movie", 2020, CancellationToken.None);
+
+        Assert.Equal(MagnetProbeOutcome.Available, probe.Outcome);
+        Assert.Single(probe.Candidates);
+    }
+
+    [Fact]
+    public async Task TorrentioAbstains_ProwlarrEmpty_ReturnsDefinitiveUnavailable()
+    {
+        // Prowlarr actually ran and returned nothing; Torrentio abstained. Since a
+        // capable indexer produced a genuine empty result, this is definitive.
+        var prowlarr = new Mock<IIndexerClient>(MockBehavior.Strict);
+        prowlarr.SetupGet(i => i.IsEnabled).Returns(true);
+        prowlarr.SetupGet(i => i.Name).Returns("Prowlarr");
+        prowlarr.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Array.Empty<IndexerCandidate>());
+
+        var torrentio = new Mock<IIndexerClient>(MockBehavior.Strict);
+        torrentio.SetupGet(i => i.IsEnabled).Returns(true);
+        torrentio.SetupGet(i => i.Name).Returns("Torrentio");
+        torrentio.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new IndexerNotApplicableException("Torrentio requires an IMDB id"));
+
+        var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
+        var sel = new MagnetSelector(new[] { prowlarr.Object, torrentio.Object }, scorer, NullLogger<MagnetSelector>.Instance, TestConfig);
+
+        var probe = await sel.ProbeAsync(1, null, "movie", null, null, "Movie", 2020, CancellationToken.None);
+
+        Assert.Equal(MagnetProbeOutcome.DefinitiveUnavailable, probe.Outcome);
+    }
+
+    [Fact]
+    public async Task OneRealTransient_OtherAbstains_NoCandidates_ReturnsIndeterminateTransient()
+    {
+        // A real transient failure dominates an abstention: retrying may help.
+        var prowlarr = new Mock<IIndexerClient>(MockBehavior.Strict);
+        prowlarr.SetupGet(i => i.IsEnabled).Returns(true);
+        prowlarr.SetupGet(i => i.Name).Returns("Prowlarr");
+        prowlarr.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new IndexerTransientException("timeout"));
+
+        var torrentio = new Mock<IIndexerClient>(MockBehavior.Strict);
+        torrentio.SetupGet(i => i.IsEnabled).Returns(true);
+        torrentio.SetupGet(i => i.Name).Returns("Torrentio");
+        torrentio.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new IndexerNotApplicableException("Torrentio requires an IMDB id"));
+
+        var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
+        var sel = new MagnetSelector(new[] { prowlarr.Object, torrentio.Object }, scorer, NullLogger<MagnetSelector>.Instance, TestConfig);
+
+        var probe = await sel.ProbeAsync(1, null, "movie", null, null, "Movie", 2020, CancellationToken.None);
+
+        Assert.Equal(MagnetProbeOutcome.IndeterminateTransient, probe.Outcome);
+    }
+
+    [Fact]
     public async Task EpisodeQuery_PassesSeriesImdb()
     {
         IndexerQuery? captured = null;

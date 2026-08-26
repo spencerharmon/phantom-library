@@ -102,6 +102,33 @@ public class ProwlarrClientTests
     }
 
     [Fact]
+    public async Task Movie_Without_Imdb_Still_Issues_Title_Year_Text_Query()
+    {
+        // A no-imdb movie must NOT be skipped: Prowlarr is title-based and is the
+        // capable indexer for items without an IMDB id. It should issue exactly one
+        // text query (title + year), with no imdbid parameter.
+        var titleBody = "[{\"title\":\"Spirited Away 2001 QxR\",\"size\":8580000000,\"seeders\":292,\"magnetUrl\":\"magnet:?xt=urn:btih:BBBB&dn=QxR\",\"indexer\":\"lime\"}]";
+        var handler = new QueuedHandler().Enqueue(HttpStatusCode.OK, titleBody);
+        var c = Make(handler);
+
+        var res = await c.SearchAsync(new IndexerQuery
+        {
+            Type = "movie",
+            Imdb = null,
+            Title = "Spirited Away",
+            Year = 2001,
+        }, CancellationToken.None);
+
+        Assert.Single(res);
+        Assert.Equal("BBBB", res[0].InfoHash);
+        var uri = handler.Requests.Single().RequestUri!.ToString();
+        Assert.Contains("type=search", uri);
+        Assert.Contains("Spirited", uri);
+        Assert.Contains("2001", uri);
+        Assert.DoesNotContain("imdbid", uri);
+    }
+
+    [Fact]
     public async Task Auth_Failure_Throws()
     {
         var c = Make(new QueuedHandler().Enqueue(HttpStatusCode.Unauthorized));
