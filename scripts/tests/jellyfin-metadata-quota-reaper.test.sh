@@ -205,4 +205,86 @@ pvc_storage2="$(awk '
 [ "$pvc_storage2" = "100Gi" ] || fail "expected jellyfin-metadata PVC storage 100Gi after bumping quotaGb to 90, got '${pvc_storage2:-<empty>}'"
 pass "bumping quotaGb alone moves the derived PVC size (100Gi)"
 
+# =====================================================================
+# Scenario D: IMPORTANCE-AWARE ordering must beat raw atime.
+#
+# This is the regression guard for the core defect of a pure-LRU reaper on a
+# `relatime` volume: atime is a coarse/unreliable importance signal, so a
+# favourite item that happens to have an old atime must NOT be evicted before a
+# never-played item with a fresh atime. Pure atime LRU gets this exactly
+# backwards; the DB-backed tier ranking must invert it.
+# =====================================================================
+FIXTURE_D="$WORK/importance"
+FAV_ID="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"   # tier 3 via stub psql, atime 100 days old
+COLD_ID="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"  # tier 0 (absent from DB), atime now
+mkfile "$FIXTURE_D/library/aa/$FAV_ID/poster.jpg" 3 8640000
+mkfile "$FIXTURE_D/library/bb/$COLD_ID/poster.jpg" 3 0
+
+# Stub psql on PATH: reports ONLY the favourite item, as tier 3.
+STUB_BIN="$WORK/stubbin"
+mkdir -p "$STUB_BIN"
+cat > "$STUB_BIN/psql" <<EOF
+#!/usr/bin/env bash
+echo "$FAV_ID 3"
+EOF
+chmod +x "$STUB_BIN/psql"
+
+D_OUT="$WORK/importance-order.txt"
+PATH="$STUB_BIN:$PATH" "$REAPER" \
+  --root "$FIXTURE_D" --quota-gb 0 --path library \
+  --db-host stub --db-name stub --db-user stub \
+  --metrics-file "$FIXTURE_D/.usage.prom" --dry-run > "$D_OUT" 2>&1 \
+  || fail "reaper exited non-zero against the importance fixture"
+
+grep -q "importance ranking ACTIVE" "$D_OUT" \
+  || fail "reaper did not activate DB-backed importance ranking with --db-* supplied"
+pass "importance ranking activates when the DB is reachable"
+
+cold_line="$(grep -n "$COLD_ID" "$D_OUT" | head -1 | cut -d: -f1)"
+fav_line="$(grep -n "$FAV_ID" "$D_OUT" | head -1 | cut -d: -f1)"
+[ -n "$cold_line" ] && [ -n "$fav_line" ] \
+  || fail "expected both fixture items to appear in the dry-run eviction plan"
+[ "$cold_line" -lt "$fav_line" ] \
+  || fail "IMPORTANCE INVERSION: favourite (old atime) was ordered for eviction before the never-played item (fresh atime) — this is the pure-LRU bug this ranking exists to fix"
+pass "never-played item evicted before favourite despite favourite having the older atime"
+
+# The favourite must be reported at tier 3 and the never-played one at tier 0.
+grep -q "$COLD_ID.*tier 0" "$D_OUT" || fail "never-played item was not classified tier 0"
+grep -q "$FAV_ID.*tier 3" "$D_OUT"  || fail "favourite item was not classified tier 3"
+pass "tier classification is correct (never-played=0, favourite=3)"
+
+# =====================================================================
+# Scenario E: DB unavailable MUST degrade to atime LRU, never fail the run.
+# A cache reaper that refuses to protect the disk because Postgres is down is
+# worse than a coarse one.
+# =====================================================================
+FIXTURE_E="$WORK/degrade"
+mkfile "$FIXTURE_E/library/cc/cccccccccccccccccccccccccccccccc/poster.jpg" 2 500000
+mkfile "$FIXTURE_E/library/dd/dddddddddddddddddddddddddddddddd/poster.jpg" 2 10
+
+E_OUT="$WORK/degrade.txt"
+FAIL_BIN="$WORK/failbin"
+mkdir -p "$FAIL_BIN"
+cat > "$FAIL_BIN/psql" <<'EOF'
+#!/usr/bin/env bash
+exit 2
+EOF
+chmod +x "$FAIL_BIN/psql"
+
+PATH="$FAIL_BIN:$PATH" "$REAPER" \
+  --root "$FIXTURE_E" --quota-gb 0 --path library \
+  --db-host stub --db-name stub --db-user stub \
+  --metrics-file "$FIXTURE_E/.usage.prom" > "$E_OUT" 2>&1 \
+  || fail "reaper must still succeed (protect the disk) when the DB query fails"
+
+grep -q "DEGRADED to atime-only LRU" "$E_OUT" \
+  || fail "reaper did not announce its degraded mode when the DB was unreachable"
+remaining="$(find "$FIXTURE_E/library" -type f | wc -l)"
+[ "$remaining" -eq 0 ] || fail "degraded run did not reap to a 0Gi quota (left $remaining files)"
+pass "DB unavailable degrades to atime-only LRU and still protects the disk"
+
+grep -q '^jellyfin_metadata_reaper_importance_ranking_active 0' "$FIXTURE_E/.usage.prom" \
+  || fail "degraded run must expose importance_ranking_active=0 for alerting"
+pass "degraded run is observable via importance_ranking_active metric"
+
 echo "ALL PASS: jellyfin-metadata-quota-reaper"
