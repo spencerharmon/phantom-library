@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Data.Common;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -283,10 +284,18 @@ public sealed record HiddenItemRow(int TmdbId, string Type, DateTimeOffset Hidde
 /// in-flight dedup guard. The column is populated with <see cref="HostId"/>
 /// on every claim/steal so <see cref="PurgeStaleMaterialiseInFlightAsync"/>
 /// can tell them apart. No existing table/column is touched.
+/// v18 adds an <c>availability_items.priority</c> column (INTEGER NOT NULL
+/// DEFAULT 0) that the claim ordering sorts by (DESC) so user-initiated
+/// paths can promote rows ahead of the background backlog. Per AGENTS.md
+/// "No database migrations until v1.0" this is a schema-version bump:
+/// existing pre-v18 databases are HARD-REFUSED and the operator must wipe
+/// (<c>scripts/phantom-wipe.sh --commit</c>) before restart. Both the SQLite
+/// and Postgres backends build the column from the same
+/// <c>SchemaV10Sql</c> DDL, so no ALTER path is required.
 /// </summary>
 public sealed class PhantomDb : IDisposable
 {
-    public const int CurrentSchemaVersion = 17;
+    public const int CurrentSchemaVersion = 18;
 
     private readonly IPhantomDbProvider _provider;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
@@ -496,6 +505,7 @@ CREATE TABLE IF NOT EXISTS availability_items (
     status TEXT NOT NULL CHECK(status IN ('unknown','available','unavailable')),
     checked_at INTEGER,
     next_check_at INTEGER NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
     candidate_magnet TEXT,
     candidate_info_hash TEXT,
     candidate_size INTEGER,
@@ -514,6 +524,8 @@ CREATE TABLE IF NOT EXISTS availability_items (
 );
 CREATE INDEX IF NOT EXISTS idx_availability_due
     ON availability_items(next_check_at, lease_until, status);
+CREATE INDEX IF NOT EXISTS idx_availability_priority_due
+    ON availability_items(priority, status, next_check_at, lease_until);
 CREATE INDEX IF NOT EXISTS idx_availability_status_type
     ON availability_items(status, type, tmdb_id, season, episode);
 
@@ -1898,7 +1910,8 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
             WHERE (next_check_at <= @now OR probe_policy_hash IS NULL OR probe_policy_hash <> @policy)
               AND (lease_until IS NULL OR lease_until < @now)
               AND (@preferred IS NULL OR type=@preferred)
-            ORDER BY CASE WHEN checked_at IS NULL THEN 0 WHEN status='available' THEN 1 WHEN status='unavailable' THEN 2 ELSE 3 END,
+            ORDER BY priority DESC,
+                     CASE WHEN checked_at IS NULL THEN 0 WHEN status='available' THEN 1 WHEN status='unavailable' THEN 2 ELSE 3 END,
                      next_check_at ASC
             LIMIT 1;";
         cmd.AddWithValue("@now", now.ToUnixTimeSeconds());
@@ -1926,7 +1939,8 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
               AND (@cursor IS NULL OR tmdb_id > @cursor)
               AND (next_check_at <= @now OR probe_policy_hash IS NULL OR probe_policy_hash <> @policy)
               AND (lease_until IS NULL OR lease_until < @now)
-            ORDER BY tmdb_id ASC,
+            ORDER BY priority DESC,
+                     tmdb_id ASC,
                      CASE WHEN checked_at IS NULL THEN 0 WHEN status='available' THEN 1 WHEN status='unavailable' THEN 2 ELSE 3 END,
                      season ASC,
                      episode ASC
@@ -2114,6 +2128,84 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
         }
     }
 
+    /// <summary>
+    /// Sets the claim priority for a single availability row. Higher priority
+    /// is claimed first by the background sweep. Used by user-initiated paths
+    /// to promote a specific item. Returns true if a row was updated.
+    /// </summary>
+    public async Task<bool> SetAvailabilityPriorityAsync(int tmdbId, string type, int season, int episode, int priority, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"UPDATE availability_items SET priority=@priority
+                WHERE tmdb_id=@tmdb AND type=@type AND season=@season AND episode=@episode;";
+            cmd.AddWithValue("@priority", priority);
+            cmd.AddWithValue("@tmdb", tmdbId);
+            cmd.AddWithValue("@type", type);
+            cmd.AddWithValue("@season", season);
+            cmd.AddWithValue("@episode", episode);
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) == 1;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Raises (never lowers) the priority of every episode availability row of
+    /// a series so a user-initiated series-level request promotes its
+    /// representative (and any other) episodes ahead of the background
+    /// backlog. Returns the number of rows raised.
+    /// </summary>
+    public async Task<int> BumpSeriesAvailabilityPriorityAsync(int seriesTmdbId, int priority, CancellationToken ct)
+    {
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"UPDATE availability_items SET priority=@priority
+                WHERE tmdb_id=@tmdb AND type='episode' AND priority<@priority;";
+            cmd.AddWithValue("@priority", priority);
+            cmd.AddWithValue("@tmdb", seriesTmdbId);
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Reads the last recorded user-activity timestamp (a probe/on-demand path
+    /// touched <c>availability.user_activity_at</c>), or null if never set.
+    /// The background sweep uses this to yield while the user is actively
+    /// driving on-demand probes.
+    /// </summary>
+    public async Task<DateTimeOffset?> GetUserActivityAtAsync(CancellationToken ct)
+    {
+        var raw = await GetMetaAsync("availability.user_activity_at", ct).ConfigureAwait(false);
+        if (raw is null
+            || !long.TryParse(raw, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var secs))
+        {
+            return null;
+        }
+
+        return DateTimeOffset.FromUnixTimeSeconds(secs);
+    }
+
+    /// <summary>
+    /// Records that a user-initiated availability action just happened, so the
+    /// background sweep yields for <c>AvailabilityYieldToUserSeconds</c>.
+    /// </summary>
+    public Task TouchUserActivityAsync(DateTimeOffset now, CancellationToken ct)
+        => SetMetaAsync("availability.user_activity_at", now.ToUnixTimeSeconds().ToString(System.Globalization.CultureInfo.InvariantCulture), ct);
+
     private static string? SanitizeError(string? value, int maxLength)
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -2194,11 +2286,22 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
         DateTimeOffset now,
         DateTimeOffset nextExpandAt,
         TimeSpan releaseDelay,
+        int backgroundEpisodesPerSeries,
+        TimeSpan deferredEpisodeDelay,
         CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(lease);
         ArgumentNullException.ThrowIfNull(episodes);
         ArgumentNullException.ThrowIfNull(episodeIds);
+
+        // Breadth-first: only a small set of REPRESENTATIVE episodes per series
+        // is enqueued as immediately due; the rest are deferred far into the
+        // future so the background sweep does not probe every episode (the TV
+        // churn). Series visibility keys off the representative(s). On-demand /
+        // user probes bypass this queue and can check any episode immediately.
+        // Representatives are the earliest-aired real episodes, falling back to
+        // the lowest season/episode when no air dates are known.
+        var reps = SelectRepresentativeEpisodes(episodes, Math.Max(1, backgroundEpisodesPerSeries));
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
@@ -2246,6 +2349,19 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
                 }
 
                 var nextCheck = ComputeEpisodeNextCheck(row.AirDate, now, releaseDelay);
+                if (!reps.Contains((row.Season, row.Episode)))
+                {
+                    // Non-representative: defer far into the future. Keep the
+                    // later of the computed (air-date-derived) time and the
+                    // deferral horizon so a not-yet-aired episode is never made
+                    // due earlier than its release-derived schedule.
+                    var deferred = now.Add(deferredEpisodeDelay);
+                    if (deferred > nextCheck)
+                    {
+                        nextCheck = deferred;
+                    }
+                }
+
                 await using (var cmd = conn.CreateCommand())
                 {
                     cmd.Transaction = tx;
@@ -2289,6 +2405,54 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
         finally
         {
             _writeLock.Release();
+        }
+    }
+
+    private static HashSet<(int Season, int Episode)> SelectRepresentativeEpisodes(IReadOnlyList<TmdbEpisodeRow> episodes, int count)
+    {
+        // Order: earliest parseable air date first (unparseable/absent sort
+        // last), then lowest season, then lowest episode. The first `count`
+        // become the immediately-due representatives.
+        static (DateTimeOffset Air, int Season, int Episode) SortKey(TmdbEpisodeRow e)
+        {
+            var air = DateTimeOffset.MaxValue;
+            if (!string.IsNullOrWhiteSpace(e.AirDate)
+                && DateTimeOffset.TryParse(e.AirDate, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AssumeUniversal, out var parsed))
+            {
+                air = parsed;
+            }
+
+            return (air, e.Season, e.Episode);
+        }
+
+        var reps = new HashSet<(int Season, int Episode)>();
+        foreach (var e in episodes.OrderBy(SortKey, RepresentativeComparer.Instance))
+        {
+            if (reps.Count >= count)
+            {
+                break;
+            }
+
+            reps.Add((e.Season, e.Episode));
+        }
+
+        return reps;
+    }
+
+    private sealed class RepresentativeComparer : IComparer<(DateTimeOffset Air, int Season, int Episode)>
+    {
+        public static readonly RepresentativeComparer Instance = new();
+
+        public int Compare((DateTimeOffset Air, int Season, int Episode) x, (DateTimeOffset Air, int Season, int Episode) y)
+        {
+            var c = x.Air.CompareTo(y.Air);
+            if (c != 0)
+            {
+                return c;
+            }
+
+            c = x.Season.CompareTo(y.Season);
+            return c != 0 ? c : x.Episode.CompareTo(y.Episode);
         }
     }
 

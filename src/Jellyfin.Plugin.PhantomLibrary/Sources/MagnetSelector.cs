@@ -33,6 +33,7 @@ public enum MagnetProbeOutcome
     Available,
     DefinitiveUnavailable,
     IndeterminateTransient,
+    NoCapableIndexer,
 }
 
 public sealed record MagnetProbeResult(

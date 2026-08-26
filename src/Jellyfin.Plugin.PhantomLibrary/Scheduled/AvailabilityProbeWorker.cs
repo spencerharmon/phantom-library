@@ -31,6 +31,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
     private readonly ChannelStateProvider _state;
     private readonly ILogger<AvailabilityProbeWorker> _logger;
     private readonly Func<PluginConfiguration> _configProvider;
+    private readonly ProbeDelegate _probe;
     private readonly string _owner = $"availability-{Environment.MachineName}-{Guid.NewGuid():N}";
     private Timer? _timer;
     private CancellationTokenSource? _stopping;
@@ -56,6 +57,35 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
         ChannelStateProvider state,
         ILogger<AvailabilityProbeWorker> logger,
         Func<PluginConfiguration> configProvider)
+        : this(db, selector, externalIds, tmdb, state, logger, configProvider, probe: null)
+    {
+    }
+
+    /// <summary>
+    /// Delegate matching <see cref="MagnetSelector.ProbeAsync"/>. Exists purely
+    /// as a test seam so a test can inject a synthetic probe outcome (e.g.
+    /// <see cref="MagnetProbeOutcome.NoCapableIndexer"/>) without reaching into
+    /// the source-selection layer owned by a sibling.
+    /// </summary>
+    internal delegate Task<MagnetProbeResult> ProbeDelegate(
+        int tmdbId,
+        string? imdbId,
+        string type,
+        int? season,
+        int? episode,
+        string title,
+        int? year,
+        CancellationToken ct);
+
+    internal AvailabilityProbeWorker(
+        PhantomDb db,
+        MagnetSelector selector,
+        TmdbExternalIdResolver externalIds,
+        ITmdbClient tmdb,
+        ChannelStateProvider state,
+        ILogger<AvailabilityProbeWorker> logger,
+        Func<PluginConfiguration> configProvider,
+        ProbeDelegate? probe)
     {
         _db = db ?? throw new ArgumentNullException(nameof(db));
         _selector = selector ?? throw new ArgumentNullException(nameof(selector));
@@ -64,6 +94,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
         _state = state ?? throw new ArgumentNullException(nameof(state));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _configProvider = configProvider ?? throw new ArgumentNullException(nameof(configProvider));
+        _probe = probe ?? _selector.ProbeAsync;
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -106,6 +137,24 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
             if (!cfg.AvailabilityProbeEnabled)
             {
                 return;
+            }
+
+            // Yield to user-initiated work: if a user-driven on-demand probe
+            // touched the activity marker very recently, back off this tick so
+            // the background sweep does not compete for the DB write lock /
+            // indexer budget while the user is actively driving. Reschedule at
+            // the slow (max) interval.
+            var yieldWindow = Math.Max(0, cfg.AvailabilityYieldToUserSeconds);
+            if (yieldWindow > 0)
+            {
+                var lastActivity = await _db.GetUserActivityAtAsync(serviceStopping).ConfigureAwait(false);
+                if (lastActivity is { } activityAt
+                    && DateTimeOffset.UtcNow - activityAt < TimeSpan.FromSeconds(yieldWindow))
+                {
+                    var backoff = TimeSpan.FromSeconds(Math.Max(1, cfg.AvailabilityProbeMaxIntervalSeconds));
+                    _timer?.Change(backoff, backoff);
+                    return;
+                }
             }
 
             var batch = Math.Max(1, cfg.AvailabilityMaxBatchSize);
@@ -197,7 +246,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
 
             var imdbType = lease.Type == "movie" ? "movie" : "series";
             var imdb = await _externalIds.GetImdbIdAsync(lease.TmdbId, imdbType, ct).ConfigureAwait(false);
-            var probe = await _selector.ProbeAsync(
+            var probe = await _probe(
                 lease.TmdbId,
                 imdb,
                 lease.Type,
@@ -294,6 +343,29 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
                     _logger.LogInformation("Availability transient {Type}/{Tmdb} s{Season}e{Episode}: {Kind}", lease.Type, lease.TmdbId, lease.Season, lease.Episode, probe.ErrorKind);
                     return true;
 
+                case MagnetProbeOutcome.NoCapableIndexer:
+                    {
+                        // No enabled indexer can serve this query as-is (e.g. no
+                        // resolvable imdb id and Prowlarr disabled). This is NOT a
+                        // 30-minute transient: retrying at that cadence just churns
+                        // the queue. Apply a long backoff and leave status
+                        // 'unknown' (visibility unchanged). RescheduleAvailability-
+                        // Transient only moves next_check_at + records the error;
+                        // it does not change status.
+                        var backoff = now.AddHours(Math.Max(1, cfg.AvailabilityNoIndexerRetryHours));
+                        await _db.RescheduleAvailabilityTransientAsync(
+                            lease,
+                            backoff,
+                            probe.ErrorKind ?? "no_capable_indexer",
+                            probe.ErrorMessage,
+                            ct).ConfigureAwait(false);
+                        PhantomMetrics.AvailabilityProbe(lease.Type, "no_capable_indexer");
+                        _logger.LogInformation(
+                            "Availability no-capable-indexer {Type}/{Tmdb} s{Season}e{Episode}; long backoff {Hours}h",
+                            lease.Type, lease.TmdbId, lease.Season, lease.Episode, cfg.AvailabilityNoIndexerRetryHours);
+                        return true;
+                    }
+
                 default:
                     throw new InvalidOperationException($"Unknown probe outcome {probe.Outcome}");
             }
@@ -385,6 +457,8 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
                 now,
                 now.AddDays(Math.Max(1, cfg.SeriesExpansionTtlDays)),
                 TimeSpan.FromHours(Math.Max(0, cfg.EpisodeReleaseDelayHours)),
+                Math.Max(1, cfg.AvailabilityBackgroundEpisodesPerSeries),
+                TimeSpan.FromDays(Math.Max(1, cfg.AvailabilityDeferredEpisodeDays)),
                 ct).ConfigureAwait(false);
             PhantomMetrics.SeriesExpansion("success");
             _logger.LogInformation("Series expansion complete tmdb={Tmdb} episodes={Episodes}", lease.SeriesTmdbId, rows.Count);
