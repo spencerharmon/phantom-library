@@ -48,7 +48,7 @@ public class PhantomDbTests : IDisposable
     // ----------------------------------------------------------------
 
     [Fact]
-    public async Task FreshDb_CreatesSchemaV17_WithAllExpectedTables()
+    public async Task FreshDb_CreatesSchemaV18_WithAllExpectedTables()
     {
         using var db = await NewDbAsync();
 
@@ -67,7 +67,7 @@ public class PhantomDbTests : IDisposable
             version = Convert.ToInt32(await v.ExecuteScalarAsync());
         }
 
-        Assert.Equal(17, version);
+        Assert.Equal(18, version);
 
         var expectedTables = new[]
         {
@@ -143,6 +143,7 @@ public class PhantomDbTests : IDisposable
     [InlineData(14)]
     [InlineData(15)]
     [InlineData(16)]
+    [InlineData(17)]
     public async Task HardRefuse_PreCurrentSchemaVersion_ThrowsWithWipePointer(int oldVersion)
     {
         await CreateDbWithUserVersionAsync(oldVersion);
@@ -151,7 +152,7 @@ public class PhantomDbTests : IDisposable
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => db.SetMetaAsync("test", "1", CancellationToken.None));
 
-        Assert.Contains("version 17", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("version 18", ex.Message, StringComparison.Ordinal);
         Assert.Contains("phantom-wipe.sh", ex.Message, StringComparison.Ordinal);
     }
 

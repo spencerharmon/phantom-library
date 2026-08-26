@@ -8,6 +8,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Breadth-first, priority-aware, user-yielding availability probe
+  (probe-redesign-worker-queue).** The background source-availability probe no
+  longer enqueues one row per TV episode and grinds through the whole catalogue
+  blindly. Changes:
+  - **Priority-aware claim ordering.** `availability_items` gains a
+    `priority INTEGER NOT NULL DEFAULT 0` column; the claim SELECT (both the
+    plain and the round-robin episode-cursor variants) now orders by
+    `priority DESC` first, so user-initiated paths can promote specific items /
+    series ahead of the background backlog via the new
+    `PhantomDb.SetAvailabilityPriorityAsync` /
+    `PhantomDb.BumpSeriesAvailabilityPriorityAsync`.
+  - **Breadth-first series expansion.** On series expansion only a small set of
+    representative episodes (earliest-aired, else lowest season/episode;
+    `AvailabilityBackgroundEpisodesPerSeries`, default 1) is enqueued as due now;
+    the rest are deferred `AvailabilityDeferredEpisodeDays` (default 30) into the
+    future. Series visibility still keys off the representative. On-demand/user
+    probes bypass this queue and can check any episode immediately.
+  - **No-capable-indexer handling.** When a probe reports `NoCapableIndexer`
+    (no enabled indexer can serve the query as-is, e.g. no resolvable imdb id +
+    Prowlarr disabled) the row is deferred a long `AvailabilityNoIndexerRetryHours`
+    (default 24h) with status left `unknown`, instead of churning on the 30-minute
+    transient retry.
+  - **Yield to user-initiated work.** A `availability.user_activity_at` plugin_meta
+    marker (via `PhantomDb.TouchUserActivityAsync` / `GetUserActivityAtAsync`) lets
+    the sweep back off for `AvailabilityYieldToUserSeconds` (default 20) while the
+    user is actively driving on-demand probes.
+  - **BREAKING: requires wipe.** Schema bumped 17 → 18 (adds
+    `availability_items.priority` + `idx_availability_priority_due`). Per
+    AGENTS.md "No database migrations until v1.0", an existing pre-v18 DB is
+    hard-refused at startup. Stop Jellyfin, run
+    `sudo bash scripts/phantom-wipe.sh --commit`, then restart. Both SQLite and
+    Postgres build the new column from the shared schema DDL; no ALTER path.
+
 - **Enforcing LRU reaper for the shared jellyfin-metadata cache (jellyfin-metadata-quota-reaper).**
   The shared `jellyfin-metadata` PVC reached 78G on `spray` (library 50G / People 18G / channels 9G)
   with no enforced upper bound (`persistence.jellyfinMetadata.size` was documentation only — local-path

@@ -134,6 +134,120 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
         Assert.Equal("unavailable", status);
     }
 
+    [Fact]
+    public async Task NoCapableIndexer_AppliesLongBackoffAndLeavesStatusUnknown()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 99000003);
+        // No imdb set: mirrors the "no imdb + no capable indexer" case.
+        var cfg = Config();
+        cfg.AvailabilityNoIndexerRetryHours = 24;
+        cfg.AvailabilityTransientRetryMinutes = 30;
+        var before = DateTimeOffset.UtcNow;
+        var worker = BuildWorker(
+            db,
+            cfg,
+            new EmptyIndexer(),
+            probe: (_, _, _, _, _, _, _, _) => Task.FromResult(
+                new MagnetProbeResult(MagnetProbeOutcome.NoCapableIndexer, Array.Empty<MagnetCandidate>(), "no_capable_indexer", "no enabled indexer")));
+
+        var didWork = await InvokeProbeOneAsync(worker, cfg);
+
+        Assert.True(didWork);
+        var (status, error, nextCheck) = await ReadAvailabilityFullAsync(99000003, "movie", -1, -1);
+        Assert.Equal("unknown", status);
+        Assert.Equal("no_capable_indexer", error);
+        // Backoff must be the long (>= NoIndexerRetryHours) horizon, NOT the
+        // 30-minute transient retry.
+        var delay = DateTimeOffset.FromUnixTimeSeconds(nextCheck) - before;
+        Assert.True(delay >= TimeSpan.FromHours(cfg.AvailabilityNoIndexerRetryHours) - TimeSpan.FromMinutes(5),
+            $"expected >= {cfg.AvailabilityNoIndexerRetryHours}h backoff, got {delay}");
+        Assert.True(delay > TimeSpan.FromHours(1), "backoff must be far longer than a 30-minute transient");
+    }
+
+    [Fact]
+    public async Task Claim_PrefersHigherPriorityOverOlderNextCheck()
+    {
+        using var db = await NewDbAsync();
+        var now = DateTimeOffset.UtcNow;
+        // Low-priority row is "more overdue" (older next_check_at) but priority 0.
+        await InsertMovieAvailabilityAsync(db, 99000201, status: "unavailable", nextCheckAt: now.AddHours(-10), priority: 0);
+        // High-priority row is less overdue but priority 5.
+        await InsertMovieAvailabilityAsync(db, 99000202, status: "unavailable", nextCheckAt: now.AddHours(-1), priority: 5);
+
+        var lease = await db.ClaimDueAvailabilityAsync(
+            "test-owner", TimeSpan.FromMinutes(5), now, "policy", CancellationToken.None, "movie");
+
+        Assert.NotNull(lease);
+        Assert.Equal(99000202, lease!.TmdbId);
+    }
+
+    [Fact]
+    public async Task SeriesExpansion_OnlyRepresentativeEpisodeIsDueNow()
+    {
+        using var db = await NewDbAsync();
+        await SeedSeriesAsync(db, 99000300);
+        var cfg = Config();
+        cfg.AvailabilityBackgroundEpisodesPerSeries = 1;
+        cfg.AvailabilityDeferredEpisodeDays = 30;
+        var tmdb = new Mock<ITmdbClient>(MockBehavior.Loose);
+        tmdb.Setup(t => t.GetSeriesAsync(99000300, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new TmdbSeriesDetails(
+                99000300, "Rep Series", "Rep Series", string.Empty, string.Empty,
+                "2019-01-01", "2019-01-01", 0, 0, Array.Empty<string>(), string.Empty, 1, 3,
+                Array.Empty<string>(), "tt99000300"));
+        tmdb.Setup(t => t.GetSeasonAsync(99000300, 1, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new TmdbSeasonDetails
+            {
+                SeriesTmdbId = 99000300,
+                SeasonNumber = 1,
+                Episodes = new List<TmdbEpisodeSummary>
+                {
+                    // Deliberately out of air-date order to prove the earliest
+                    // aired episode is the representative.
+                    new() { Id = 3, SeasonNumber = 1, EpisodeNumber = 3, Name = "Third", AirDate = "2019-03-01" },
+                    new() { Id = 1, SeasonNumber = 1, EpisodeNumber = 1, Name = "First", AirDate = "2019-01-01" },
+                    new() { Id = 2, SeasonNumber = 1, EpisodeNumber = 2, Name = "Second", AirDate = "2019-02-01" },
+                },
+            });
+        var worker = BuildWorker(db, cfg, new EmptyIndexer(), tmdb.Object);
+
+        await InvokeExpandOneSeriesAsync(worker, cfg);
+
+        Assert.Equal(3, await CountEpisodeAvailabilityRowsAsync());
+        var now = DateTimeOffset.UtcNow;
+        var dueNow = await CountEpisodesDueAtOrBeforeAsync(99000300, now.AddMinutes(1));
+        Assert.Equal(1, dueNow);
+        // The single due episode is the earliest aired (S1E1).
+        var repNext = await ReadEpisodeNextCheckAsync(99000300, 1, 1);
+        Assert.True(DateTimeOffset.FromUnixTimeSeconds(repNext) <= now.AddMinutes(1));
+        // Siblings deferred well into the future (>= ~29 days out).
+        var sibNext = await ReadEpisodeNextCheckAsync(99000300, 1, 2);
+        Assert.True(DateTimeOffset.FromUnixTimeSeconds(sibNext) >= now.AddDays(29),
+            "non-representative episodes must be deferred");
+    }
+
+    [Fact]
+    public async Task Tick_YieldsWhenUserActivityIsRecent()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 99000401);
+        await db.SetImdbIdAsync(99000401, "movie", "tt99000401", CancellationToken.None);
+        // Make the movie row due now so, absent yielding, the tick would probe.
+        await InsertMovieAvailabilityAsync(db, 99000401, status: "unknown", nextCheckAt: DateTimeOffset.UtcNow.AddHours(-1), priority: 0);
+        var cfg = Config();
+        cfg.AvailabilityYieldToUserSeconds = 60;
+        await db.TouchUserActivityAsync(DateTimeOffset.UtcNow, CancellationToken.None);
+        var worker = BuildWorker(db, cfg, new EmptyIndexer());
+
+        await InvokeTickAsync(worker);
+
+        // No probe ran: attempt_count stays 0 and status stays unknown.
+        Assert.Equal(0, await ReadAttemptCountAsync(99000401, "movie", -1, -1));
+        var (status, _) = await ReadAvailabilityAsync(99000401);
+        Assert.Equal("unknown", status);
+    }
+
     private async Task<PhantomDb> NewDbAsync()
     {
         var db = new PhantomDb(_dbPath);
@@ -202,6 +316,27 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
             () => cfg);
     }
 
+    private static AvailabilityProbeWorker BuildWorker(
+        PhantomDb db,
+        PluginConfiguration cfg,
+        IIndexerClient indexer,
+        AvailabilityProbeWorker.ProbeDelegate probe)
+    {
+        var tmdb = new Mock<ITmdbClient>(MockBehavior.Loose).Object;
+        var externalIds = new TmdbExternalIdResolver(db, tmdb, NullLogger<TmdbExternalIdResolver>.Instance);
+        var scorer = new QualityScorer(NullLogger<QualityScorer>.Instance);
+        var selector = new MagnetSelector(new[] { indexer }, scorer, NullLogger<MagnetSelector>.Instance, () => cfg);
+        return new AvailabilityProbeWorker(
+            db,
+            selector,
+            externalIds,
+            tmdb,
+            new ChannelStateProvider(db),
+            NullLogger<AvailabilityProbeWorker>.Instance,
+            () => cfg,
+            probe);
+    }
+
     private static async Task<bool> InvokeProbeOneAsync(AvailabilityProbeWorker worker, PluginConfiguration cfg)
     {
         var method = typeof(AvailabilityProbeWorker).GetMethod(
@@ -223,6 +358,76 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
         var task = (Task)(method.Invoke(worker, new object[] { CancellationToken.None })
             ?? throw new InvalidOperationException("TickAsync returned null"));
         await task;
+    }
+
+    private static async Task InvokeExpandOneSeriesAsync(AvailabilityProbeWorker worker, PluginConfiguration cfg)
+    {
+        var method = typeof(AvailabilityProbeWorker).GetMethod(
+            "ExpandOneSeriesAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new MissingMethodException(nameof(AvailabilityProbeWorker), "ExpandOneSeriesAsync");
+        var task = (Task<bool>)(method.Invoke(worker, new object[] { cfg, CancellationToken.None })
+            ?? throw new InvalidOperationException("ExpandOneSeriesAsync returned null"));
+        await task;
+    }
+
+    private async Task InsertMovieAvailabilityAsync(PhantomDb db, int tmdbId, string status, DateTimeOffset nextCheckAt, int priority)
+    {
+        // Ensure the schema exists before we write a raw row.
+        await db.SetMetaAsync("__init__", "1", CancellationToken.None);
+        // Seed a raw availability_items row directly so tests control status,
+        // next_check_at, and priority precisely.
+        await using var conn = new SqliteConnection("Data Source=" + _dbPath);
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"INSERT INTO availability_items
+                (tmdb_id, type, season, episode, status, next_check_at, priority)
+            VALUES ($tmdb,'movie',-1,-1,$status,$next,$priority)
+            ON CONFLICT(tmdb_id, type, season, episode) DO UPDATE SET
+                status=excluded.status, next_check_at=excluded.next_check_at, priority=excluded.priority;";
+        cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+        cmd.Parameters.AddWithValue("$status", status);
+        cmd.Parameters.AddWithValue("$next", nextCheckAt.ToUnixTimeSeconds());
+        cmd.Parameters.AddWithValue("$priority", priority);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    private async Task<int> CountEpisodesDueAtOrBeforeAsync(int seriesTmdbId, DateTimeOffset at)
+    {
+        await using var conn = new SqliteConnection("Data Source=" + _dbPath);
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT COUNT(*) FROM availability_items WHERE tmdb_id=$tmdb AND type='episode' AND next_check_at<=$at;";
+        cmd.Parameters.AddWithValue("$tmdb", seriesTmdbId);
+        cmd.Parameters.AddWithValue("$at", at.ToUnixTimeSeconds());
+        return Convert.ToInt32(await cmd.ExecuteScalarAsync(), System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    private async Task<long> ReadEpisodeNextCheckAsync(int seriesTmdbId, int season, int episode)
+    {
+        await using var conn = new SqliteConnection("Data Source=" + _dbPath);
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT next_check_at FROM availability_items WHERE tmdb_id=$tmdb AND type='episode' AND season=$s AND episode=$e;";
+        cmd.Parameters.AddWithValue("$tmdb", seriesTmdbId);
+        cmd.Parameters.AddWithValue("$s", season);
+        cmd.Parameters.AddWithValue("$e", episode);
+        return Convert.ToInt64(await cmd.ExecuteScalarAsync(), System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    private async Task<(string Status, string? ErrorKind, long NextCheck)> ReadAvailabilityFullAsync(int tmdbId, string type, int season, int episode)
+    {
+        await using var conn = new SqliteConnection("Data Source=" + _dbPath);
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT status,last_error_kind,next_check_at FROM availability_items WHERE tmdb_id=$tmdb AND type=$type AND season=$s AND episode=$e;";
+        cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+        cmd.Parameters.AddWithValue("$type", type);
+        cmd.Parameters.AddWithValue("$s", season);
+        cmd.Parameters.AddWithValue("$e", episode);
+        await using var r = await cmd.ExecuteReaderAsync();
+        Assert.True(await r.ReadAsync());
+        return (r.GetString(0), r.IsDBNull(1) ? null : r.GetString(1), r.GetInt64(2));
     }
 
     private async Task<int> CountRowsAsync(string table)

@@ -99,6 +99,10 @@ public class PluginConfiguration : BasePluginConfiguration
         AvailabilityTransientRetryMinutes = 30;
         AvailabilityMaxBatchSize = 1;
         AvailabilityLeaseMinutes = 15;
+        AvailabilityBackgroundEpisodesPerSeries = 1;
+        AvailabilityDeferredEpisodeDays = 30;
+        AvailabilityNoIndexerRetryHours = 24;
+        AvailabilityYieldToUserSeconds = 20;
         SeriesExpansionTtlDays = 7;
         SeriesExpansionTransientRetryMinutes = 60;
         EpisodeReleaseDelayHours = 12;
@@ -385,6 +389,39 @@ public class PluginConfiguration : BasePluginConfiguration
 
     /// <summary>Lease window for in-progress availability probes.</summary>
     public int AvailabilityLeaseMinutes { get; set; }
+
+    /// <summary>
+    /// Number of representative episodes per series the BACKGROUND sweep
+    /// enqueues as immediately due on series expansion. The remaining
+    /// episodes are deferred (see <see cref="AvailabilityDeferredEpisodeDays"/>)
+    /// so a series does not flood the probe queue with one row per episode.
+    /// On-demand/user probes bypass this queue and can check any episode
+    /// immediately. Default 1 (breadth-first: one rep decides series visibility).
+    /// </summary>
+    public int AvailabilityBackgroundEpisodesPerSeries { get; set; }
+
+    /// <summary>
+    /// How far into the future non-representative episodes are deferred at
+    /// series-expansion time so the background sweep stays breadth-first
+    /// instead of probing every episode. Default 30 days.
+    /// </summary>
+    public int AvailabilityDeferredEpisodeDays { get; set; }
+
+    /// <summary>
+    /// Long backoff applied when a probe reports that no enabled indexer can
+    /// serve the query as-is (<c>no_capable_indexer</c>): e.g. no resolvable
+    /// imdb id and Prowlarr disabled. Status stays <c>unknown</c>; this is not
+    /// treated as a 30-minute transient retry. Default 24 hours.
+    /// </summary>
+    public int AvailabilityNoIndexerRetryHours { get; set; }
+
+    /// <summary>
+    /// If a user-initiated probe touched the activity marker within this many
+    /// seconds, the background sweep yields (skips its tick and reschedules at
+    /// the max interval) so on-demand work is not slowed by the sweep.
+    /// Default 20 seconds.
+    /// </summary>
+    public int AvailabilityYieldToUserSeconds { get; set; }
 
     /// <summary>TTL for TV series expansion passes.</summary>
     public int SeriesExpansionTtlDays { get; set; }
