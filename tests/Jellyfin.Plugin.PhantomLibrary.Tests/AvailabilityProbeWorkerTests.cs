@@ -204,6 +204,78 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
         Assert.True(delay > TimeSpan.FromHours(1), "backoff must be far longer than a 30-minute transient");
     }
 
+    // ---- p6-decouple-oracle-magnetcache: end-to-end oracle/magnet-cache split ----
+    // ROI Priority 6, revised architecture item 1 (2026-08-26). These exercise the
+    // worker's REAL (non-delegate-overridden) probe path across BOTH a Torrentio-shaped
+    // and a Prowlarr-shaped indexer, proving the availability sweep invokes only
+    // Torrentio end to end.
+
+    [Fact]
+    public async Task Sweep_ImdbBearingMovie_InvokesTorrentioOnly_NeverProwlarr()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 99000800);
+        await db.SetImdbIdAsync(99000800, "movie", "tt99000800", CancellationToken.None);
+        var cfg = Config();
+        var torrentio = new TorrentioLikeAvailableIndexer();
+        var prowlarr = new ProwlarrLikeIndexer();
+        var worker = BuildWorker(db, cfg, torrentio, prowlarr);
+
+        var didWork = await InvokeProbeOneAsync(worker, cfg);
+
+        Assert.True(didWork);
+        Assert.Equal(1, torrentio.SearchCallCount);
+        Assert.Equal(0, prowlarr.SearchCallCount);
+        var (status, _) = await ReadAvailabilityAsync(99000800);
+        Assert.Equal("available", status);
+    }
+
+    [Fact]
+    public async Task Sweep_ImdbBearingEpisode_InvokesTorrentioOnly_NeverProwlarr()
+    {
+        // Episode parity of the movie assertion above.
+        using var db = await NewDbAsync();
+        await SeedSeriesAsync(db, 99000900);
+        await InsertEpisodeCatalogueAsync(db, 99000900, 1, 1, "2020-01-01");
+        await InsertEpisodeAvailabilityAsync(db, 99000900, 1, 1, "unknown", DateTimeOffset.UtcNow.AddHours(-1));
+        await db.SetImdbIdAsync(99000900, "series", "tt99000900", CancellationToken.None);
+        var cfg = Config();
+        var torrentio = new TorrentioLikeAvailableIndexer();
+        var prowlarr = new ProwlarrLikeIndexer();
+        var worker = BuildWorker(db, cfg, torrentio, prowlarr);
+
+        var didWork = await InvokeProbeOneAsync(worker, cfg);
+
+        Assert.True(didWork);
+        Assert.Equal(1, torrentio.SearchCallCount);
+        Assert.Equal(0, prowlarr.SearchCallCount);
+    }
+
+    [Fact]
+    public async Task Sweep_NoImdb_DeepDefersWithoutInvokingProwlarrFanOut()
+    {
+        // No-IMDB movie: the pre-classification (HasCapableAvailabilityIndexer,
+        // scoped to Torrentio only) must deep-defer before the probe layer is
+        // reached at all, even though a Prowlarr-shaped indexer is enabled and
+        // could otherwise serve the query.
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 99000950);
+        // Deliberately no imdb id set.
+        var cfg = Config();
+        cfg.AvailabilityNoIndexerRetryHours = 24;
+        var torrentio = new TorrentioLikeIndexer();
+        var prowlarr = new ProwlarrLikeIndexer();
+        var worker = BuildWorker(db, cfg, torrentio, prowlarr);
+
+        var didWork = await InvokeProbeOneAsync(worker, cfg);
+
+        Assert.True(didWork);
+        Assert.Equal(0, prowlarr.SearchCallCount);
+        var (status, error) = await ReadAvailabilityAsync(99000950);
+        Assert.Equal("unknown", status);
+        Assert.Equal("no_capable_indexer", error);
+    }
+
     // ---- p6-availability-convergence: no-forever-churn + TTL reprobe ----
 
     [Fact]
@@ -582,6 +654,28 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
             () => cfg);
     }
 
+    /// <summary>
+    /// Wires the REAL (non-delegate-overridden) <see cref="MagnetSelector.ProbeAvailabilityAsync"/>
+    /// path across MULTIPLE indexers — used to prove the worker's availability sweep
+    /// invokes only the availability-oracle-eligible indexer(s) end to end (ROI
+    /// Priority 6, revised architecture item 1).
+    /// </summary>
+    private static AvailabilityProbeWorker BuildWorker(PhantomDb db, PluginConfiguration cfg, params IIndexerClient[] indexers)
+    {
+        var tmdb = new Mock<ITmdbClient>(MockBehavior.Loose).Object;
+        var externalIds = new TmdbExternalIdResolver(db, tmdb, NullLogger<TmdbExternalIdResolver>.Instance);
+        var scorer = new QualityScorer(NullLogger<QualityScorer>.Instance);
+        var selector = new MagnetSelector(indexers, scorer, NullLogger<MagnetSelector>.Instance, () => cfg);
+        return new AvailabilityProbeWorker(
+            db,
+            selector,
+            externalIds,
+            tmdb,
+            new ChannelStateProvider(db),
+            NullLogger<AvailabilityProbeWorker>.Instance,
+            () => cfg);
+    }
+
     private static AvailabilityProbeWorker BuildWorker(
         PhantomDb db,
         PluginConfiguration cfg,
@@ -783,6 +877,12 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
     {
         public string Name => "transient";
         public bool IsEnabled => true;
+        // These generic fakes stand in for "whatever the single configured indexer
+        // is" across tests unrelated to the Torrentio/Prowlarr availability-oracle
+        // split (ROI Priority 6, revised architecture item 1) — mark them
+        // availability-oracle-eligible so the worker's real ProbeAvailabilityAsync
+        // path still exercises them via BuildWorker's single-indexer overload.
+        public bool IsAvailabilityOracle => true;
         public Task<IReadOnlyList<IndexerCandidate>> SearchAsync(IndexerQuery query, CancellationToken ct)
             => throw new IndexerTransientException(message);
     }
@@ -791,6 +891,7 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
     {
         public string Name => "empty";
         public bool IsEnabled => true;
+        public bool IsAvailabilityOracle => true;
         public Task<IReadOnlyList<IndexerCandidate>> SearchAsync(IndexerQuery query, CancellationToken ct)
             => Task.FromResult<IReadOnlyList<IndexerCandidate>>(Array.Empty<IndexerCandidate>());
     }
@@ -801,7 +902,65 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
         public string Name => "Torrentio";
         public bool IsEnabled => true;
         public bool RequiresImdb => true;
+        public bool IsAvailabilityOracle => true;
         public Task<IReadOnlyList<IndexerCandidate>> SearchAsync(IndexerQuery query, CancellationToken ct)
             => throw new IndexerNotApplicableException("Torrentio requires an IMDB id");
+    }
+
+    /// <summary>
+    /// Torrentio-shaped fake that RETURNS a candidate when an imdb id is present
+    /// (rather than always abstaining like <see cref="TorrentioLikeIndexer"/>), so
+    /// end-to-end availability-sweep tests can assert a real Available outcome while
+    /// still counting invocations.
+    /// </summary>
+    private sealed class TorrentioLikeAvailableIndexer : IIndexerClient
+    {
+        public int SearchCallCount { get; private set; }
+        public string Name => "Torrentio";
+        public bool IsEnabled => true;
+        public bool RequiresImdb => true;
+        public bool IsAvailabilityOracle => true;
+        public Task<IReadOnlyList<IndexerCandidate>> SearchAsync(IndexerQuery query, CancellationToken ct)
+        {
+            SearchCallCount++;
+            if (string.IsNullOrWhiteSpace(query.Imdb) && string.IsNullOrWhiteSpace(query.SeriesImdb))
+            {
+                throw new IndexerNotApplicableException("Torrentio requires an IMDB id");
+            }
+
+            IReadOnlyList<IndexerCandidate> hits = new[]
+            {
+                new IndexerCandidate
+                {
+                    Title = "Torrentio candidate",
+                    Magnet = "magnet:?xt=urn:btih:" + Guid.NewGuid().ToString("N"),
+                    InfoHash = Guid.NewGuid().ToString("N"),
+                    Size = 5L * 1024 * 1024 * 1024,
+                    Seeders = 40,
+                    IndexerName = "Torrentio",
+                },
+            };
+            return Task.FromResult(hits);
+        }
+    }
+
+    /// <summary>
+    /// Prowlarr-shaped fake: does NOT require an IMDB id and is NOT an
+    /// availability-oracle indexer (ROI Priority 6, revised architecture item 1).
+    /// Any invocation of <see cref="SearchAsync"/> is a bug in the availability-sweep
+    /// path — Prowlarr's heavy fan-out must never be called there.
+    /// </summary>
+    private sealed class ProwlarrLikeIndexer : IIndexerClient
+    {
+        public int SearchCallCount { get; private set; }
+        public string Name => "Prowlarr";
+        public bool IsEnabled => true;
+        public bool RequiresImdb => false;
+        public bool IsAvailabilityOracle => false;
+        public Task<IReadOnlyList<IndexerCandidate>> SearchAsync(IndexerQuery query, CancellationToken ct)
+        {
+            SearchCallCount++;
+            return Task.FromResult<IReadOnlyList<IndexerCandidate>>(Array.Empty<IndexerCandidate>());
+        }
     }
 }

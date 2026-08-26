@@ -497,4 +497,156 @@ public class MagnetSelectorTests
         Assert.Equal(1, captured.Season);
         Assert.Equal(1, captured.Episode);
     }
+
+    // --- p6-decouple-oracle-magnetcache: availability oracle (Torrentio-only) ---
+    // ROI Priority 6, revised architecture item 1 (2026-08-26). ProbeAvailabilityAsync
+    // is the hot per-item availability-sweep path and must invoke ONLY an indexer with
+    // IsAvailabilityOracle=true (Torrentio); Prowlarr's heavy fan-out must never run
+    // in this loop even when it is enabled.
+
+    [Fact]
+    public async Task ProbeAvailabilityAsync_Movie_WithImdb_CallsTorrentioOnly_NotProwlarr()
+    {
+        var torrentio = new Mock<IIndexerClient>(MockBehavior.Strict);
+        torrentio.SetupGet(i => i.IsEnabled).Returns(true);
+        torrentio.SetupGet(i => i.Name).Returns("Torrentio");
+        torrentio.SetupGet(i => i.IsAvailabilityOracle).Returns(true);
+        torrentio.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { MakeCandidate("Movie 1080p Torrentio", 5, 40) });
+
+        var prowlarr = new Mock<IIndexerClient>(MockBehavior.Strict);
+        prowlarr.SetupGet(i => i.IsEnabled).Returns(true);
+        prowlarr.SetupGet(i => i.Name).Returns("Prowlarr");
+        prowlarr.SetupGet(i => i.IsAvailabilityOracle).Returns(false);
+        // Deliberately NO SearchAsync setup on Prowlarr (Strict mock): the availability
+        // oracle must never call it. Any invocation throws a MockException, failing
+        // the test — the assertion IS the call-count check.
+
+        var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
+        var sel = new MagnetSelector(new[] { torrentio.Object, prowlarr.Object }, scorer, NullLogger<MagnetSelector>.Instance, TestConfig);
+
+        var probe = await sel.ProbeAvailabilityAsync(1, "tt1234567", "movie", null, null, "Movie", 2020, CancellationToken.None);
+
+        Assert.Equal(MagnetProbeOutcome.Available, probe.Outcome);
+        Assert.Single(probe.Candidates);
+        torrentio.Verify(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()), Times.Once);
+        prowlarr.Verify(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task ProbeAvailabilityAsync_Episode_WithImdb_CallsTorrentioOnly_NotProwlarr()
+    {
+        // Episode parity counterpart of the movie assertion above.
+        var torrentio = new Mock<IIndexerClient>(MockBehavior.Strict);
+        torrentio.SetupGet(i => i.IsEnabled).Returns(true);
+        torrentio.SetupGet(i => i.Name).Returns("Torrentio");
+        torrentio.SetupGet(i => i.IsAvailabilityOracle).Returns(true);
+        torrentio.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { MakeCandidate("Show S01E01 1080p Torrentio", 5, 40) });
+
+        var prowlarr = new Mock<IIndexerClient>(MockBehavior.Strict);
+        prowlarr.SetupGet(i => i.IsEnabled).Returns(true);
+        prowlarr.SetupGet(i => i.Name).Returns("Prowlarr");
+        prowlarr.SetupGet(i => i.IsAvailabilityOracle).Returns(false);
+        // No SearchAsync setup: any call fails the (Strict) mock.
+
+        var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
+        var sel = new MagnetSelector(new[] { torrentio.Object, prowlarr.Object }, scorer, NullLogger<MagnetSelector>.Instance, TestConfig);
+
+        var probe = await sel.ProbeAvailabilityAsync(99, "tt9999999", "episode", 1, 1, "Show", 2020, CancellationToken.None);
+
+        Assert.Equal(MagnetProbeOutcome.Available, probe.Outcome);
+        torrentio.Verify(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()), Times.Once);
+        prowlarr.Verify(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task ProbeAvailabilityAsync_NoImdb_FallsBackToNoCapableIndexer_WithoutProwlarrFanOut()
+    {
+        // No-IMDB item: Torrentio (the only availability-oracle indexer) abstains via
+        // IndexerNotApplicableException, and even though a heavier Prowlarr is
+        // enabled it must NOT be invoked inline by the availability sweep — the
+        // caller instead applies the existing no-capable-indexer deep-defer.
+        var torrentio = new Mock<IIndexerClient>(MockBehavior.Strict);
+        torrentio.SetupGet(i => i.IsEnabled).Returns(true);
+        torrentio.SetupGet(i => i.Name).Returns("Torrentio");
+        torrentio.SetupGet(i => i.IsAvailabilityOracle).Returns(true);
+        torrentio.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new IndexerNotApplicableException("Torrentio requires an IMDB id"));
+
+        var prowlarr = new Mock<IIndexerClient>(MockBehavior.Strict);
+        prowlarr.SetupGet(i => i.IsEnabled).Returns(true);
+        prowlarr.SetupGet(i => i.Name).Returns("Prowlarr");
+        prowlarr.SetupGet(i => i.IsAvailabilityOracle).Returns(false);
+        // No SearchAsync setup: any call fails the (Strict) mock.
+
+        var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
+        var sel = new MagnetSelector(new[] { torrentio.Object, prowlarr.Object }, scorer, NullLogger<MagnetSelector>.Instance, TestConfig);
+
+        var probe = await sel.ProbeAvailabilityAsync(1, null, "movie", null, null, "Movie", 2020, CancellationToken.None);
+
+        Assert.Equal(MagnetProbeOutcome.NoCapableIndexer, probe.Outcome);
+        prowlarr.Verify(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public void HasCapableAvailabilityIndexer_ProwlarrEnabledOnly_NoTorrentio_NoImdb_ReturnsTrue()
+    {
+        // A Prowlarr-only configuration has ZERO availability-oracle-eligible
+        // indexers enabled — the same "config gap, not a per-title fact" shape as
+        // HasCapableIndexer_NoEnabledIndexers_ReturnsTrue, just scoped to the
+        // availability-oracle set. It must stay on the ordinary transient retry
+        // cadence (true = "capable"), not deep-defer, so it recovers promptly once
+        // Torrentio is actually configured.
+        var prowlarr = new Mock<IIndexerClient>(MockBehavior.Strict);
+        prowlarr.SetupGet(i => i.IsEnabled).Returns(true);
+        prowlarr.SetupGet(i => i.RequiresImdb).Returns(false);
+        prowlarr.SetupGet(i => i.IsAvailabilityOracle).Returns(false);
+
+        var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
+        var sel = new MagnetSelector(new[] { prowlarr.Object }, scorer, NullLogger<MagnetSelector>.Instance, TestConfig);
+
+        Assert.True(sel.HasCapableAvailabilityIndexer(null));
+        Assert.True(sel.HasCapableIndexer(null));
+    }
+
+    [Fact]
+    public void HasCapableAvailabilityIndexer_TorrentioAndProwlarrEnabled_NoImdb_ReturnsFalse()
+    {
+        // Torrentio (the only availability-oracle-eligible indexer) requires an
+        // IMDB id and none is present; Prowlarr is ALSO enabled and could serve
+        // this query in general (HasCapableIndexer would say true), but must NOT
+        // be counted for the availability-scoped variant since it is never
+        // invoked by the availability sweep.
+        var torrentio = new Mock<IIndexerClient>(MockBehavior.Strict);
+        torrentio.SetupGet(i => i.IsEnabled).Returns(true);
+        torrentio.SetupGet(i => i.RequiresImdb).Returns(true);
+        torrentio.SetupGet(i => i.IsAvailabilityOracle).Returns(true);
+
+        var prowlarr = new Mock<IIndexerClient>(MockBehavior.Strict);
+        prowlarr.SetupGet(i => i.IsEnabled).Returns(true);
+        prowlarr.SetupGet(i => i.RequiresImdb).Returns(false);
+        prowlarr.SetupGet(i => i.IsAvailabilityOracle).Returns(false);
+
+        var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
+        var sel = new MagnetSelector(new[] { torrentio.Object, prowlarr.Object }, scorer, NullLogger<MagnetSelector>.Instance, TestConfig);
+
+        Assert.False(sel.HasCapableAvailabilityIndexer(null));
+        // The general (non-scoped) variant is unaffected: Prowlarr still counts there.
+        Assert.True(sel.HasCapableIndexer(null));
+    }
+
+    [Fact]
+    public void HasCapableAvailabilityIndexer_TorrentioEnabled_WithImdb_ReturnsTrue()
+    {
+        var torrentio = new Mock<IIndexerClient>(MockBehavior.Strict);
+        torrentio.SetupGet(i => i.IsEnabled).Returns(true);
+        torrentio.SetupGet(i => i.RequiresImdb).Returns(true);
+        torrentio.SetupGet(i => i.IsAvailabilityOracle).Returns(true);
+
+        var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
+        var sel = new MagnetSelector(new[] { torrentio.Object }, scorer, NullLogger<MagnetSelector>.Instance, TestConfig);
+
+        Assert.True(sel.HasCapableAvailabilityIndexer("tt1234567"));
+    }
 }

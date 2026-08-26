@@ -62,7 +62,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
     }
 
     /// <summary>
-    /// Delegate matching <see cref="MagnetSelector.ProbeAsync"/>. Exists purely
+    /// Delegate matching <see cref="MagnetSelector.ProbeAvailabilityAsync"/>. Exists purely
     /// as a test seam so a test can inject a synthetic probe outcome (e.g.
     /// <see cref="MagnetProbeOutcome.NoCapableIndexer"/>) without reaching into
     /// the source-selection layer owned by a sibling.
@@ -94,7 +94,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
         _state = state ?? throw new ArgumentNullException(nameof(state));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _configProvider = configProvider ?? throw new ArgumentNullException(nameof(configProvider));
-        _probe = probe ?? _selector.ProbeAsync;
+        _probe = probe ?? _selector.ProbeAvailabilityAsync;
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -252,7 +252,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
             // 30-minute transient — churning the queue at that cadence on a
             // permanent (or long-lived) no-op wastes cycles that should go to
             // items where availability is plausible. Deep-defer both instead.
-            if (!_selector.HasCapableIndexer(imdb))
+            if (!_selector.HasCapableAvailabilityIndexer(imdb))
             {
                 var backoff = now.AddHours(Math.Max(1, cfg.AvailabilityNoIndexerRetryHours));
                 await _db.RescheduleAvailabilityTransientAsync(

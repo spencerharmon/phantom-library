@@ -150,8 +150,23 @@ public sealed class MagnetSelector
     /// retry cadence so it recovers promptly once an indexer is enabled.
     /// </summary>
     public bool HasCapableIndexer(string? imdbId)
+        => HasCapableIndexer(imdbId, availabilityOracleOnly: false);
+
+    /// <summary>
+    /// Availability-sweep variant of <see cref="HasCapableIndexer"/>: pre-classifies
+    /// "no capable indexer" scoped to ONLY the indexers eligible for the
+    /// high-frequency availability-oracle hot loop (Torrentio) — see
+    /// <see cref="ProbeAvailabilityAsync"/>. A Prowlarr-only configuration (which
+    /// can serve without an IMDB id) must NOT be counted here: Prowlarr is not
+    /// invoked by the availability sweep, so its presence must not mask a
+    /// no-IMDB item as "capable" when only Torrentio actually runs.
+    /// </summary>
+    public bool HasCapableAvailabilityIndexer(string? imdbId)
+        => HasCapableIndexer(imdbId, availabilityOracleOnly: true);
+
+    private bool HasCapableIndexer(string? imdbId, bool availabilityOracleOnly)
     {
-        var enabled = _indexers.Where(i => i.IsEnabled).ToList();
+        var enabled = EnabledIndexers(availabilityOracleOnly);
         if (enabled.Count == 0)
         {
             return true;
@@ -160,7 +175,7 @@ public sealed class MagnetSelector
         return enabled.Any(i => !i.RequiresImdb || !string.IsNullOrWhiteSpace(imdbId));
     }
 
-    public async Task<MagnetProbeResult> ProbeAsync(
+    public Task<MagnetProbeResult> ProbeAsync(
         int tmdbId,
         string? imdbId,
         string type,
@@ -168,6 +183,47 @@ public sealed class MagnetSelector
         int? episode,
         string title,
         int? year,
+        CancellationToken ct)
+        => ProbeCoreAsync(tmdbId, imdbId, type, season, episode, title, year, availabilityOracleOnly: false, ct);
+
+    /// <summary>
+    /// Availability-oracle probe (ROI Priority 6, revised architecture item 1 —
+    /// 2026-08-26): used by the high-frequency, full-catalogue availability
+    /// sweep. Restricted to indexers with <see cref="Clients.IIndexerClient.IsAvailabilityOracle"/>
+    /// set (Torrentio only) so Prowlarr's heavy multi-indexer fan-out never
+    /// runs in this hot per-item loop. A no-IMDB item still gets a cheap
+    /// signal: Torrentio abstains via <see cref="IndexerNotApplicableException"/>,
+    /// which this method (like <see cref="ProbeAsync"/>) surfaces as
+    /// <see cref="MagnetProbeOutcome.NoCapableIndexer"/> so the caller applies
+    /// the existing no-capable-indexer deep-defer rather than an inline heavy
+    /// Prowlarr search.
+    /// </summary>
+    public Task<MagnetProbeResult> ProbeAvailabilityAsync(
+        int tmdbId,
+        string? imdbId,
+        string type,
+        int? season,
+        int? episode,
+        string title,
+        int? year,
+        CancellationToken ct)
+        => ProbeCoreAsync(tmdbId, imdbId, type, season, episode, title, year, availabilityOracleOnly: true, ct);
+
+    private List<IIndexerClient> EnabledIndexers(bool availabilityOracleOnly)
+    {
+        var candidates = availabilityOracleOnly ? _indexers.Where(i => i.IsAvailabilityOracle) : _indexers;
+        return candidates.Where(i => i.IsEnabled).ToList();
+    }
+
+    private async Task<MagnetProbeResult> ProbeCoreAsync(
+        int tmdbId,
+        string? imdbId,
+        string type,
+        int? season,
+        int? episode,
+        string title,
+        int? year,
+        bool availabilityOracleOnly,
         CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(type);
@@ -185,7 +241,7 @@ public sealed class MagnetSelector
             Episode = episode,
         };
 
-        var enabled = _indexers.Where(i => i.IsEnabled).ToList();
+        var enabled = EnabledIndexers(availabilityOracleOnly);
         if (enabled.Count == 0)
         {
             return MagnetProbeResult.Transient("no_enabled_indexers", "No enabled indexers are configured");
