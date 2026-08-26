@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Magnet-cache background sweep (p6-magnet-cache-background-sweep).** ROI
+  Priority 6, revised architecture item 2b. The lowest-priority magnet-cache
+  lane: a new `MagnetCacheBackgroundSweepWorker` hosted service mirrors
+  `AvailabilityProbeWorker`'s timer-driven, breadth-first pattern to walk
+  available items (`availability_items.status='available'`) lacking a
+  fresh `source_candidates` entry and enqueue LOW-priority
+  `magnet_cache_jobs` rows (`PhantomDb.BackgroundSweepMagnetCachePriority =
+  0`, via the new `PhantomDb.GetAvailableItemsMissingFreshMagnetCacheAsync`
+  query). Because the queue's claim ordering
+  (`PhantomDb.ClaimNextMagnetCacheJobAsync`) is strictly priority-first,
+  these rows are ALWAYS claimed after any pending opportunistic job
+  (`OpportunisticMagnetCachePriority = 100`), no matter how large the
+  background backlog grows. The sweep yields to a recent user-activity
+  marker exactly like `AvailabilityProbeWorker` (new config
+  `MagnetCacheSweepEnabled` / `MagnetCacheSweepMinIntervalSeconds` /
+  `MagnetCacheSweepMaxIntervalSeconds` / `MagnetCacheSweepBatchSize`,
+  reusing `AvailabilityYieldToUserSeconds`). TTL: a `source_candidates` row
+  whose `expires_at` has already passed is treated as no row at all, so a
+  stale cached entry is re-enqueued exactly like a never-cached one. Movie
+  AND episode parity. No schema change. See
+  `tests/Jellyfin.Plugin.PhantomLibrary.Tests/MagnetCacheBackgroundSweepWorkerTests.cs`.
+
 - **Opportunistic magnet-cache prefetch on user activity
   (p6-magnet-cache-opportunistic-prefetch).** ROI Priority 6, revised
   architecture item 2a. Every user-initiated caller site

@@ -1662,6 +1662,69 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
             r.IsDBNull(12) ? null : r.GetString(12),
             r.IsDBNull(13) ? null : r.GetInt32(13));
 
+    /// <summary>
+    /// Priority stamped onto a background-sweep-enqueued
+    /// <c>magnet_cache_jobs</c> row (p6-magnet-cache-background-sweep). The
+    /// lowest lane in the magnet-cache priority scheme: below
+    /// <see cref="OpportunisticMagnetCachePriority"/> (100) and the queue's
+    /// implicit default (0), so a background-sweep row is ALWAYS claimed
+    /// after any pending opportunistic job, no matter how large the
+    /// background backlog grows (see <see cref="ClaimNextMagnetCacheJobAsync"/>'s
+    /// priority-first ordering).
+    /// </summary>
+    public const int BackgroundSweepMagnetCachePriority = 0;
+
+    /// <summary>
+    /// Breadth-first candidate scan for the background magnet-cache sweep
+    /// (p6-magnet-cache-background-sweep, mirrors
+    /// <see cref="AvailabilityProbeWorker"/>'s claim pattern): returns up to
+    /// <paramref name="limit"/> available (<c>availability_items.status='available'</c>)
+    /// movie/episode tuples that currently lack a FRESH <c>source_candidates</c>
+    /// row for <paramref name="preset"/> (missing entirely, or its
+    /// <c>expires_at</c> has passed the TTL — the same row a stale entry is
+    /// re-enqueued from) AND have no already-pending/running
+    /// <c>magnet_cache_jobs</c> row for the same tuple+preset (so a sweep
+    /// tick never re-enqueues work already in flight). Ordered by
+    /// tmdb/season/episode for a deterministic breadth-first walk across
+    /// ticks. Movie and episode tuples both flow through this single query.
+    /// </summary>
+    public async Task<IReadOnlyList<(int TmdbId, string Type, int Season, int Episode)>> GetAvailableItemsMissingFreshMagnetCacheAsync(
+        string preset,
+        int limit,
+        DateTimeOffset now,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(preset);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT ai.tmdb_id, ai.type, ai.season, ai.episode
+            FROM availability_items ai
+            WHERE ai.status='available'
+              AND NOT EXISTS (
+                  SELECT 1 FROM source_candidates sc
+                  WHERE sc.tmdb_id=ai.tmdb_id AND sc.type=ai.type AND sc.season=ai.season AND sc.episode=ai.episode
+                    AND sc.preset=@preset AND sc.expires_at > @now
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM magnet_cache_jobs mcj
+                  WHERE mcj.tmdb_id=ai.tmdb_id AND mcj.type=ai.type AND mcj.season=ai.season AND mcj.episode=ai.episode
+                    AND mcj.preset=@preset AND mcj.status IN ('pending','running')
+              )
+            ORDER BY ai.tmdb_id ASC, ai.season ASC, ai.episode ASC
+            LIMIT @limit;";
+        cmd.AddWithValue("@preset", preset);
+        cmd.AddWithValue("@now", now.ToUnixTimeSeconds());
+        cmd.AddWithValue("@limit", Math.Max(1, limit));
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        var results = new List<(int, string, int, int)>();
+        while (await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            results.Add((r.GetInt32(0), r.GetString(1), r.GetInt32(2), r.GetInt32(3)));
+        }
+
+        return results;
+    }
+
     // ---- unavailable_marker ----
 
     /// <summary>

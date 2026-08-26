@@ -115,6 +115,10 @@ public class PluginConfiguration : BasePluginConfiguration
         UnavailableRetryAfterHours = 24;
         MagnetCacheTtlHours = 24 * 7;
         MagnetCacheBuildLeaseMinutes = 10;
+        MagnetCacheSweepEnabled = true;
+        MagnetCacheSweepMinIntervalSeconds = 15;
+        MagnetCacheSweepMaxIntervalSeconds = 120;
+        MagnetCacheSweepBatchSize = 5;
         MaterialiseInFlightStaleMinutes = 10;
         MaterialiseInFlightForeignOwnerHardTtlMinutes = 60;
         GostreamMinQuality = string.Empty;
@@ -521,6 +525,33 @@ public class PluginConfiguration : BasePluginConfiguration
     /// builder never strands a job (p6-magnet-cache-store).
     /// </summary>
     public int MagnetCacheBuildLeaseMinutes { get; set; }
+
+    /// <summary>
+    /// Master switch for <c>MagnetCacheBackgroundSweepWorker</c> (p6-magnet-cache-background-sweep):
+    /// the lowest-priority magnet-cache lane that walks available items
+    /// lacking a fresh cache entry and enqueues LOW-priority
+    /// <c>magnet_cache_jobs</c> rows to backfill them.
+    /// </summary>
+    public bool MagnetCacheSweepEnabled { get; set; }
+
+    /// <summary>
+    /// Fast tick interval (seconds) for the background magnet-cache sweep
+    /// while it is finding work to enqueue.
+    /// </summary>
+    public int MagnetCacheSweepMinIntervalSeconds { get; set; }
+
+    /// <summary>
+    /// Slow tick interval (seconds) for the background magnet-cache sweep
+    /// once it finds no more items to enqueue, or when it yields to a
+    /// recent user-activity marker.
+    /// </summary>
+    public int MagnetCacheSweepMaxIntervalSeconds { get; set; }
+
+    /// <summary>
+    /// How many available items the background magnet-cache sweep
+    /// considers per tick.
+    /// </summary>
+    public int MagnetCacheSweepBatchSize { get; set; }
 
     /// <summary>
     /// Age threshold (minutes) above which a row in
