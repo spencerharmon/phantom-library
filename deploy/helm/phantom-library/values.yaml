@@ -318,8 +318,11 @@ jellyfinMetadataReaper:
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
   resources:
-    requests: { cpu: "50m", memory: 64Mi }
-    limits: { cpu: "500m", memory: 256Mi }
+    requests: { cpu: "50m", memory: 96Mi }
+    # 256Mi OOMKilled (exit 137) while ranking ~126k files: GNU sort sizes its buffer from HOST
+    # RAM, not the cgroup limit. The script now caps it (-S) and spills to the volume (-T), but
+    # keep a little headroom for the candidate list itself.
+    limits: { cpu: "500m", memory: 384Mi }
 
 # --------------------------------------------------------------- gostream tuning config --
 # configMapName is the fixed (unsuffixed) name the workload mounts and components.gostreamConfig

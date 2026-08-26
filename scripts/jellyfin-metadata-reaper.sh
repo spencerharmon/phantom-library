@@ -256,9 +256,13 @@ fi
 echo "jellyfin-metadata-reaper: usage ${USAGE_BYTES}B > quota ${QUOTA_BYTES}B (${QUOTA_GB}Gi) — evicting lowest-importance first"
 
 # Importance map: itemid -> tier. Absent => tier 0 (never played by anyone).
-IMPORTANCE_FILE="$(mktemp)"
-CANDIDATES_FILE="$(mktemp)"
-RANKED_FILE="$(mktemp)"
+# Scratch files live on the CACHE VOLUME by default, not the container filesystem: the
+# candidate/ranked lists are proportional to the file count (~126k lines in production) and
+# a container's writable layer is typically far smaller than the volume they describe.
+SCRATCH_DIR="${SORT_TMPDIR:-$ROOT}"
+IMPORTANCE_FILE="$(mktemp "$SCRATCH_DIR/.reaper-importance.XXXXXX")"
+CANDIDATES_FILE="$(mktemp "$SCRATCH_DIR/.reaper-candidates.XXXXXX")"
+RANKED_FILE="$(mktemp "$SCRATCH_DIR/.reaper-ranked.XXXXXX")"
 trap 'rm -f "$CANDIDATES_FILE" "$IMPORTANCE_FILE" "$RANKED_FILE"' EXIT
 
 fetch_importance > "$IMPORTANCE_FILE" || true
@@ -272,7 +276,7 @@ esac
 # Collect candidates as: <atime> <size> <path>
 : > "$CANDIDATES_FILE"
 for p in "${RESOLVED_PATHS[@]}"; do
-  find "$p" -type f ! -name '.jellyfin-metadata-usage.prom' -printf '%A@ %s %p\0' >> "$CANDIDATES_FILE"
+  find "$p" -type f ! -name '.jellyfin-metadata-usage.prom' ! -name '.reaper-*' -printf '%A@ %s %p\0' >> "$CANDIDATES_FILE"
 done
 
 # Rank: emit "<tier> <atime> <size> <path>" NUL-delimited, resolving each file's
@@ -332,7 +336,14 @@ while IFS=' ' read -r -d '' tier atime size path; do
   TIER_DELETED[$tier]=$(( ${TIER_DELETED[$tier]:-0} + 1 ))
   USAGE_BYTES=$((USAGE_BYTES - size))
   RECLAIMED=$((RECLAIMED + size))
-done < <(sort -z -k1,1n -k2,2n "$RANKED_FILE")
+# Sort by tier ascending (least important first), then atime ascending within tier.
+#
+# -S/-T are REQUIRED for correctness under a container memory limit: GNU sort sizes its
+# in-memory buffer from the HOST's RAM, not the cgroup limit, so on a large node it will
+# happily try to buffer far more than the pod is allowed and get OOMKilled (observed:
+# exit 137 ranking ~126k files under a 256Mi limit). Cap the buffer and spill to the
+# cache volume, which has headroom by construction.
+done < <(sort -z -S "${SORT_BUFFER:-32M}" -T "${SORT_TMPDIR:-$ROOT}" -k1,1n -k2,2n "$RANKED_FILE")
 
 echo "jellyfin-metadata-reaper: reclaimed ${RECLAIMED}B across ${DELETED_COUNT} files; usage now ${USAGE_BYTES}B (quota ${QUOTA_BYTES}B)"
 echo "jellyfin-metadata-reaper: evicted by tier — never-played=${TIER_DELETED[0]:-0} old-played=${TIER_DELETED[1]:-0} recent=${TIER_DELETED[2]:-0} favourite/in-progress=${TIER_DELETED[3]:-0}"
