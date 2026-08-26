@@ -2501,7 +2501,15 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
         }
     }
 
-    private static DateTimeOffset ComputeEpisodeNextCheck(string? airDate, DateTimeOffset now, TimeSpan releaseDelay)
+    /// <summary>
+    /// Computes the next_check_at boundary for an episode given its TMDB air
+    /// date: if the air date parses and is still in the future, defer to
+    /// <c>airDate + releaseDelay</c>; otherwise <paramref name="now"/> (due
+    /// immediately). Shared by series-expansion scheduling and the
+    /// availability-sweep claim path's future-aired pre-classification so
+    /// both use one definition of "not yet aired".
+    /// </summary>
+    internal static DateTimeOffset ComputeEpisodeNextCheck(string? airDate, DateTimeOffset now, TimeSpan releaseDelay)
     {
         if (!string.IsNullOrWhiteSpace(airDate)
             && DateTimeOffset.TryParse(airDate, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AssumeUniversal, out var parsed)
@@ -3994,6 +4002,26 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Raw TMDB air_date string for a single cached episode, or null if the
+    /// episode has not been catalogued (e.g. series not yet expanded) or has
+    /// no air date. Used by the availability-sweep claim path to
+    /// pre-classify not-yet-aired episodes so they deep-defer instead of
+    /// churning at the transient-retry cadence.
+    /// </summary>
+    public async Task<string?> GetEpisodeAirDateAsync(int seriesTmdbId, int season, int episode, CancellationToken ct)
+    {
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT air_date FROM series_episode_catalogue
+            WHERE series_tmdb_id=@tmdb AND season=@season AND episode=@episode LIMIT 1;";
+        cmd.AddWithValue("@tmdb", seriesTmdbId);
+        cmd.AddWithValue("@season", season);
+        cmd.AddWithValue("@episode", episode);
+        var v = await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
+        return v is null || v is DBNull ? null : (string)v;
     }
 
     public async Task<TmdbMetadataRow?> GetTmdbMetadataAsync(int tmdbId, string type, CancellationToken ct)

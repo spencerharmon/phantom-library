@@ -137,6 +137,29 @@ public sealed class MagnetSelector
         return probe.Outcome == MagnetProbeOutcome.Available ? probe.Candidates : Array.Empty<MagnetCandidate>();
     }
 
+    /// <summary>
+    /// Pre-classifies "no capable indexer" for the given imdb id WITHOUT
+    /// invoking <see cref="ProbeAsync"/> — lets the availability-sweep
+    /// claim/enqueue path deep-defer a title before spending a probe cycle
+    /// on it. Mirrors <see cref="ProbeAsync"/>'s abstention logic exactly:
+    /// an item is capable if at least one enabled indexer either does not
+    /// require an IMDB id (e.g. a configured Prowlarr) or an IMDB id is
+    /// present. If no indexer is enabled at all, this returns true
+    /// (capable) deliberately — that is a configuration gap, not a
+    /// permanent per-title fact, and stays on the ordinary transient
+    /// retry cadence so it recovers promptly once an indexer is enabled.
+    /// </summary>
+    public bool HasCapableIndexer(string? imdbId)
+    {
+        var enabled = _indexers.Where(i => i.IsEnabled).ToList();
+        if (enabled.Count == 0)
+        {
+            return true;
+        }
+
+        return enabled.Any(i => !i.RequiresImdb || !string.IsNullOrWhiteSpace(imdbId));
+    }
+
     public async Task<MagnetProbeResult> ProbeAsync(
         int tmdbId,
         string? imdbId,

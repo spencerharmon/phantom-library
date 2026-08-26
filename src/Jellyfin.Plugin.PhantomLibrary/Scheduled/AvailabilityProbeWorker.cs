@@ -246,6 +246,68 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
 
             var imdbType = lease.Type == "movie" ? "movie" : "series";
             var imdb = await _externalIds.GetImdbIdAsync(lease.TmdbId, imdbType, ct).ConfigureAwait(false);
+
+            // Pre-classify before spending a probe cycle: neither
+            // "no capable indexer" nor "not yet released/aired" is a
+            // 30-minute transient — churning the queue at that cadence on a
+            // permanent (or long-lived) no-op wastes cycles that should go to
+            // items where availability is plausible. Deep-defer both instead.
+            if (!_selector.HasCapableIndexer(imdb))
+            {
+                var backoff = now.AddHours(Math.Max(1, cfg.AvailabilityNoIndexerRetryHours));
+                await _db.RescheduleAvailabilityTransientAsync(
+                    lease,
+                    backoff,
+                    "no_capable_indexer",
+                    "Pre-filtered: no enabled indexer can serve this query without an imdb id",
+                    ct).ConfigureAwait(false);
+                PhantomMetrics.AvailabilityProbe(lease.Type, "no_capable_indexer");
+                _logger.LogInformation(
+                    "Availability pre-filtered no-capable-indexer {Type}/{Tmdb} s{Season}e{Episode}; long backoff {Hours}h",
+                    lease.Type, lease.TmdbId, lease.Season, lease.Episode, cfg.AvailabilityNoIndexerRetryHours);
+                return true;
+            }
+
+            if (lease.Type == "episode")
+            {
+                var airDate = await _db.GetEpisodeAirDateAsync(lease.TmdbId, lease.Season, lease.Episode, ct).ConfigureAwait(false);
+                var releaseDelay = TimeSpan.FromHours(Math.Max(0, cfg.EpisodeReleaseDelayHours));
+                var boundary = PhantomDb.ComputeEpisodeNextCheck(airDate, now, releaseDelay);
+                if (boundary > now)
+                {
+                    await _db.RescheduleAvailabilityTransientAsync(
+                        lease,
+                        boundary,
+                        "unreleased",
+                        $"Episode air date {airDate} is in the future",
+                        ct).ConfigureAwait(false);
+                    PhantomMetrics.AvailabilityProbe(lease.Type, "unreleased");
+                    _logger.LogInformation(
+                        "Availability pre-filtered unreleased {Type}/{Tmdb} s{Season}e{Episode}; deferred to {Boundary}",
+                        lease.Type, lease.TmdbId, lease.Season, lease.Episode, boundary);
+                    return true;
+                }
+            }
+            else if (meta.Year.Value > now.Year)
+            {
+                // Movies only carry a release YEAR (see tmdb_metadata), not a
+                // precise date; mirror the same Jan-1 synthetic boundary
+                // PhantomMoviesChannel already uses for display so scheduling
+                // and UI agree on what "unreleased" means.
+                var boundary = new DateTimeOffset(meta.Year.Value, 1, 1, 0, 0, 0, TimeSpan.Zero);
+                await _db.RescheduleAvailabilityTransientAsync(
+                    lease,
+                    boundary,
+                    "unreleased",
+                    $"Movie release year {meta.Year.Value} is in the future",
+                    ct).ConfigureAwait(false);
+                PhantomMetrics.AvailabilityProbe(lease.Type, "unreleased");
+                _logger.LogInformation(
+                    "Availability pre-filtered unreleased movie {Tmdb}; deferred to {Boundary}",
+                    lease.TmdbId, boundary);
+                return true;
+            }
+
             var probe = await _probe(
                 lease.TmdbId,
                 imdb,

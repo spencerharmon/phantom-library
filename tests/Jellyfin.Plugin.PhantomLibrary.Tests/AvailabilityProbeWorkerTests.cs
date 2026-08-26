@@ -166,6 +166,172 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
     }
 
     [Fact]
+    public async Task PreFilter_NoCapableIndexer_DeepDefersWithoutInvokingProbe()
+    {
+        // p6-prefilter-unavailable: unlike NoCapableIndexer_AppliesLongBackoff...
+        // above (which synthesizes the outcome via a probe delegate), this
+        // exercises the real claim-path pre-classification: no imdb id + a
+        // Torrentio-shaped indexer (RequiresImdb=true) must deep-defer WITHOUT
+        // ever invoking the probe/indexer layer.
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 99000600);
+        // Deliberately no imdb id set.
+        await InsertMovieAvailabilityAsync(db, 99000600, status: "unknown", nextCheckAt: DateTimeOffset.UtcNow.AddHours(-1), priority: 0);
+        var cfg = Config();
+        cfg.AvailabilityNoIndexerRetryHours = 24;
+        var before = DateTimeOffset.UtcNow;
+        var probeCalled = false;
+        var worker = BuildWorker(
+            db,
+            cfg,
+            new TorrentioLikeIndexer(),
+            probe: (_, _, _, _, _, _, _, _) =>
+            {
+                probeCalled = true;
+                return Task.FromResult(MagnetProbeResult.DefinitiveUnavailable());
+            });
+
+        var didWork = await InvokeProbeOneAsync(worker, cfg);
+
+        Assert.True(didWork);
+        Assert.False(probeCalled, "no-capable-indexer must be pre-filtered before reaching the probe delegate");
+        var (status, error, nextCheck) = await ReadAvailabilityFullAsync(99000600, "movie", -1, -1);
+        Assert.Equal("unknown", status);
+        Assert.Equal("no_capable_indexer", error);
+        var delay = DateTimeOffset.FromUnixTimeSeconds(nextCheck) - before;
+        Assert.True(delay >= TimeSpan.FromHours(cfg.AvailabilityNoIndexerRetryHours) - TimeSpan.FromMinutes(5),
+            $"expected >= {cfg.AvailabilityNoIndexerRetryHours}h backoff, got {delay}");
+        Assert.True(delay > TimeSpan.FromHours(1), "backoff must be far longer than a 30-minute transient");
+    }
+
+    [Fact]
+    public async Task PreFilter_ProwlarrCapable_NoImdb_DoesNotDeepDeferAndReachesProbe()
+    {
+        // p6-prowlarr-indexer-wiring parity: once a title-based indexer (e.g.
+        // Prowlarr) is enabled, a no-imdb title must NOT be pre-filtered as
+        // no-capable-indexer — the probe still runs and the item stays in the
+        // ready set.
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 99000601);
+        await InsertMovieAvailabilityAsync(db, 99000601, status: "unknown", nextCheckAt: DateTimeOffset.UtcNow.AddHours(-1), priority: 0);
+        var cfg = Config();
+        var probeCalled = false;
+        var worker = BuildWorker(
+            db,
+            cfg,
+            new EmptyIndexer(), // RequiresImdb=false (default), like Prowlarr
+            probe: (_, _, _, _, _, _, _, _) =>
+            {
+                probeCalled = true;
+                return Task.FromResult(MagnetProbeResult.DefinitiveUnavailable());
+            });
+
+        var didWork = await InvokeProbeOneAsync(worker, cfg);
+
+        Assert.True(didWork);
+        Assert.True(probeCalled, "a title-based-capable indexer must not be pre-filtered out");
+        var (status, error) = await ReadAvailabilityAsync(99000601);
+        Assert.Equal("unavailable", status);
+    }
+
+    [Fact]
+    public async Task PreFilter_FutureReleaseYearMovie_DeepDefersToJanFirstBoundary()
+    {
+        using var db = await NewDbAsync();
+        var futureYear = DateTimeOffset.UtcNow.Year + 1;
+        await db.UpsertCatalogueHitsAsync(new[]
+        {
+            new TmdbMetadataRow(99000602, "movie", "Future Movie", futureYear, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+        }, sourceMask: 1, DateTimeOffset.UtcNow, CancellationToken.None);
+        await db.SetImdbIdAsync(99000602, "movie", "tt99000602", CancellationToken.None);
+        await InsertMovieAvailabilityAsync(db, 99000602, status: "unknown", nextCheckAt: DateTimeOffset.UtcNow.AddHours(-1), priority: 0);
+        var cfg = Config();
+        var probeCalled = false;
+        var worker = BuildWorker(
+            db,
+            cfg,
+            new EmptyIndexer(),
+            probe: (_, _, _, _, _, _, _, _) =>
+            {
+                probeCalled = true;
+                return Task.FromResult(MagnetProbeResult.DefinitiveUnavailable());
+            });
+
+        var didWork = await InvokeProbeOneAsync(worker, cfg);
+
+        Assert.True(didWork);
+        Assert.False(probeCalled, "an unreleased movie must be deep-deferred before reaching the probe");
+        var (status, error, nextCheck) = await ReadAvailabilityFullAsync(99000602, "movie", -1, -1);
+        Assert.Equal("unknown", status);
+        Assert.Equal("unreleased", error);
+        Assert.Equal(new DateTimeOffset(futureYear, 1, 1, 0, 0, 0, TimeSpan.Zero).ToUnixTimeSeconds(), nextCheck);
+    }
+
+    [Fact]
+    public async Task PreFilter_FutureAiredEpisode_DeepDefersToReleaseBoundary()
+    {
+        using var db = await NewDbAsync();
+        await SeedSeriesAsync(db, 99000603);
+        var futureAirDate = DateTimeOffset.UtcNow.AddDays(30).Date;
+        await InsertEpisodeCatalogueAsync(db, 99000603, season: 1, episode: 1, airDate: futureAirDate.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture));
+        await InsertEpisodeAvailabilityAsync(db, 99000603, season: 1, episode: 1, status: "unknown", nextCheckAt: DateTimeOffset.UtcNow.AddHours(-1));
+        var cfg = Config();
+        cfg.EpisodeReleaseDelayHours = 12;
+        var probeCalled = false;
+        var worker = BuildWorker(
+            db,
+            cfg,
+            new EmptyIndexer(),
+            probe: (_, _, _, _, _, _, _, _) =>
+            {
+                probeCalled = true;
+                return Task.FromResult(MagnetProbeResult.DefinitiveUnavailable());
+            });
+
+        var didWork = await InvokeProbeOneAsync(worker, cfg);
+
+        Assert.True(didWork);
+        Assert.False(probeCalled, "a not-yet-aired episode must be deep-deferred before reaching the probe");
+        var (status, error, nextCheck) = await ReadAvailabilityFullAsync(99000603, "episode", 1, 1);
+        Assert.Equal("unknown", status);
+        Assert.Equal("unreleased", error);
+        var expectedBoundary = new DateTimeOffset(futureAirDate, TimeSpan.Zero).AddHours(12);
+        Assert.True(
+            Math.Abs((DateTimeOffset.FromUnixTimeSeconds(nextCheck) - expectedBoundary).TotalMinutes) < 5,
+            $"expected boundary ~{expectedBoundary}, got {DateTimeOffset.FromUnixTimeSeconds(nextCheck)}");
+    }
+
+    [Fact]
+    public async Task PreFilter_ReleasedEpisode_ReachesProbeAndStaysReady()
+    {
+        // Parity check: a released, capable episode must NOT be pre-filtered —
+        // it reaches the probe like today, staying in the ready set.
+        using var db = await NewDbAsync();
+        await SeedSeriesAsync(db, 99000604);
+        var pastAirDate = DateTimeOffset.UtcNow.AddDays(-30).Date;
+        await InsertEpisodeCatalogueAsync(db, 99000604, season: 1, episode: 1, airDate: pastAirDate.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture));
+        await InsertEpisodeAvailabilityAsync(db, 99000604, season: 1, episode: 1, status: "unknown", nextCheckAt: DateTimeOffset.UtcNow.AddHours(-1));
+        var cfg = Config();
+        var probeCalled = false;
+        var worker = BuildWorker(
+            db,
+            cfg,
+            new EmptyIndexer(),
+            probe: (_, _, _, _, _, _, _, _) =>
+            {
+                probeCalled = true;
+                return Task.FromResult(MagnetProbeResult.DefinitiveUnavailable());
+            });
+
+        var didWork = await InvokeProbeOneAsync(worker, cfg);
+
+        Assert.True(didWork);
+        Assert.True(probeCalled, "a released episode must reach the probe, not be deep-deferred");
+        var (status, _, _) = await ReadAvailabilityFullAsync(99000604, "episode", 1, 1);
+        Assert.Equal("unavailable", status);
+    }
+
+    [Fact]
     public async Task Claim_PrefersHigherPriorityOverOlderNextCheck()
     {
         using var db = await NewDbAsync();
@@ -392,6 +558,46 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
         await cmd.ExecuteNonQueryAsync();
     }
 
+    private async Task InsertEpisodeAvailabilityAsync(PhantomDb db, int seriesTmdbId, int season, int episode, string status, DateTimeOffset nextCheckAt)
+    {
+        await db.SetMetaAsync("__init__", "1", CancellationToken.None);
+        await using var conn = new SqliteConnection("Data Source=" + _dbPath);
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"INSERT INTO availability_items
+                (tmdb_id, type, season, episode, status, next_check_at, priority)
+            VALUES ($tmdb,'episode',$season,$episode,$status,$next,0)
+            ON CONFLICT(tmdb_id, type, season, episode) DO UPDATE SET
+                status=excluded.status, next_check_at=excluded.next_check_at;";
+        cmd.Parameters.AddWithValue("$tmdb", seriesTmdbId);
+        cmd.Parameters.AddWithValue("$season", season);
+        cmd.Parameters.AddWithValue("$episode", episode);
+        cmd.Parameters.AddWithValue("$status", status);
+        cmd.Parameters.AddWithValue("$next", nextCheckAt.ToUnixTimeSeconds());
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    private async Task InsertEpisodeCatalogueAsync(PhantomDb db, int seriesTmdbId, int season, int episode, string airDate)
+    {
+        await db.SetMetaAsync("__init__", "1", CancellationToken.None);
+        await using var conn = new SqliteConnection("Data Source=" + _dbPath);
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"INSERT INTO series_episode_catalogue
+                (series_tmdb_id, episode_tmdb_id, season, episode, air_date, first_seen_at, last_seen_at)
+            VALUES ($tmdb,$episodeTmdb,$season,$episode,$air,$now,$now)
+            ON CONFLICT(series_tmdb_id, season, episode) DO UPDATE SET
+                air_date=excluded.air_date, last_seen_at=excluded.last_seen_at;";
+        cmd.Parameters.AddWithValue("$tmdb", seriesTmdbId);
+        cmd.Parameters.AddWithValue("$episodeTmdb", seriesTmdbId * 1000 + season * 100 + episode);
+        cmd.Parameters.AddWithValue("$season", season);
+        cmd.Parameters.AddWithValue("$episode", episode);
+        cmd.Parameters.AddWithValue("$air", airDate);
+        cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+
     private async Task<int> CountEpisodesDueAtOrBeforeAsync(int seriesTmdbId, DateTimeOffset at)
     {
         await using var conn = new SqliteConnection("Data Source=" + _dbPath);
@@ -487,5 +693,15 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
         public bool IsEnabled => true;
         public Task<IReadOnlyList<IndexerCandidate>> SearchAsync(IndexerQuery query, CancellationToken ct)
             => Task.FromResult<IReadOnlyList<IndexerCandidate>>(Array.Empty<IndexerCandidate>());
+    }
+
+    /// <summary>Torrentio-shaped fake: RequiresImdb=true, abstains without an imdb id.</summary>
+    private sealed class TorrentioLikeIndexer : IIndexerClient
+    {
+        public string Name => "Torrentio";
+        public bool IsEnabled => true;
+        public bool RequiresImdb => true;
+        public Task<IReadOnlyList<IndexerCandidate>> SearchAsync(IndexerQuery query, CancellationToken ct)
+            => throw new IndexerNotApplicableException("Torrentio requires an IMDB id");
     }
 }

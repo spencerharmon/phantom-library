@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Availability-sweep pre-filter for unavailable titles
+  (p6-prefilter-unavailable).** The background availability sweep now
+  pre-classifies a claimed item BEFORE spending a probe cycle on it, so the
+  sweep spends cycles where availability is plausible instead of churning on
+  a permanent (or long-lived) no-op:
+  - **No capable indexer.** `MagnetSelector.HasCapableIndexer` mirrors
+    `ProbeAsync`'s abstention logic (an indexer that `RequiresImdb`, e.g.
+    Torrentio, abstains without an imdb id) without invoking the indexer
+    layer. If no enabled indexer can serve the query, the item deep-defers
+    with the existing `AvailabilityNoIndexerRetryHours` long backoff (status
+    stays `unknown`) instead of retrying at the 30-minute transient cadence.
+    Once a title-based indexer (e.g. a configured Prowlarr) is enabled, it
+    is correctly treated as capable even without an imdb id — this pre-
+    filter depends on `p6-prowlarr-indexer-wiring` for that reason.
+  - **Unreleased / not-yet-aired.** A movie whose TMDB release year is still
+    in the future, or an episode whose catalogued TMDB air date has not yet
+    passed, now deep-defers to the release boundary (Jan-1 of the release
+    year for a movie, matching the existing UI synthetic date; the air date
+    plus `EpisodeReleaseDelayHours` for an episode, mirroring the boundary
+    series-expansion already computes) instead of being probed every cycle.
+    `last_error_kind` is recorded as `unreleased`.
+  - Both pre-filters reuse the existing `next_check_at`/backoff columns and
+    `RescheduleAvailabilityTransientAsync` primitive — no schema change.
+
 - **Browse-LIST vs search/BaseItem surface split
   (p6-search-list-surface-split).** The channel-item emission the interactive
   browse LIST uses (Movies root, Shows root) is now separate from the

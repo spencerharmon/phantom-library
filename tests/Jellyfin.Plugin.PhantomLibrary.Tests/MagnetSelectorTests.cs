@@ -304,6 +304,69 @@ public class MagnetSelectorTests
     }
 
     [Fact]
+    public void HasCapableIndexer_TorrentioOnly_NoImdb_ReturnsFalse()
+    {
+        // p6-prefilter-unavailable: mirrors ProbeAsync's abstention logic so the
+        // availability-sweep claim path can pre-classify without a probe call.
+        var torrentio = new Mock<IIndexerClient>(MockBehavior.Strict);
+        torrentio.SetupGet(i => i.IsEnabled).Returns(true);
+        torrentio.SetupGet(i => i.RequiresImdb).Returns(true);
+
+        var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
+        var sel = new MagnetSelector(new[] { torrentio.Object }, scorer, NullLogger<MagnetSelector>.Instance, TestConfig);
+
+        Assert.False(sel.HasCapableIndexer(null));
+    }
+
+    [Fact]
+    public void HasCapableIndexer_TorrentioOnly_WithImdb_ReturnsTrue()
+    {
+        var torrentio = new Mock<IIndexerClient>(MockBehavior.Strict);
+        torrentio.SetupGet(i => i.IsEnabled).Returns(true);
+        torrentio.SetupGet(i => i.RequiresImdb).Returns(true);
+
+        var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
+        var sel = new MagnetSelector(new[] { torrentio.Object }, scorer, NullLogger<MagnetSelector>.Instance, TestConfig);
+
+        Assert.True(sel.HasCapableIndexer("tt1234567"));
+    }
+
+    [Fact]
+    public void HasCapableIndexer_ProwlarrEnabled_NoImdb_ReturnsTrue()
+    {
+        // p6-prowlarr-indexer-wiring: Prowlarr is title-based, so once it is part
+        // of the capability set a no-IMDB title must NOT be pre-classified as
+        // "no capable indexer" — that would wrongly deep-defer a title Prowlarr
+        // could still probe.
+        var prowlarr = new Mock<IIndexerClient>(MockBehavior.Strict);
+        prowlarr.SetupGet(i => i.IsEnabled).Returns(true);
+        prowlarr.SetupGet(i => i.RequiresImdb).Returns(false);
+
+        var torrentio = new Mock<IIndexerClient>(MockBehavior.Strict);
+        torrentio.SetupGet(i => i.IsEnabled).Returns(true);
+        torrentio.SetupGet(i => i.RequiresImdb).Returns(true);
+
+        var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
+        var sel = new MagnetSelector(new[] { prowlarr.Object, torrentio.Object }, scorer, NullLogger<MagnetSelector>.Instance, TestConfig);
+
+        Assert.True(sel.HasCapableIndexer(null));
+    }
+
+    [Fact]
+    public void HasCapableIndexer_NoEnabledIndexers_ReturnsTrue()
+    {
+        // No enabled indexers is a configuration gap, not a per-title fact — it
+        // must stay on the ordinary transient retry cadence, not deep-defer.
+        var disabled = new Mock<IIndexerClient>(MockBehavior.Strict);
+        disabled.SetupGet(i => i.IsEnabled).Returns(false);
+
+        var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
+        var sel = new MagnetSelector(new[] { disabled.Object }, scorer, NullLogger<MagnetSelector>.Instance, TestConfig);
+
+        Assert.True(sel.HasCapableIndexer(null));
+    }
+
+    [Fact]
     public async Task BothCapable_Movie_ProwlarrHigherQuality_ProwlarrCandidateWins()
     {
         // p6-prowlarr-indexer-wiring "ranking case": when BOTH Torrentio and Prowlarr are

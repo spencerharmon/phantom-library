@@ -10,6 +10,17 @@ public interface IIndexerClient
 {
     string Name { get; }
     bool IsEnabled { get; }
+
+    /// <summary>
+    /// True if this indexer can only serve a query that carries an IMDB id
+    /// (e.g. Torrentio) and abstains (throws <see cref="IndexerNotApplicableException"/>)
+    /// otherwise. Lets callers pre-classify "no capable indexer" for a title
+    /// without invoking <see cref="SearchAsync"/>. Defaults to false so
+    /// existing/test implementations compile unchanged; only an indexer that
+    /// genuinely requires an IMDB id overrides it.
+    /// </summary>
+    bool RequiresImdb => false;
+
     Task<IReadOnlyList<IndexerCandidate>> SearchAsync(IndexerQuery query, CancellationToken ct);
 }
 

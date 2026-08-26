@@ -49,6 +49,8 @@ public sealed class TorrentioClient : IIndexerClient
 
     public bool IsEnabled => !string.IsNullOrWhiteSpace(_baseUrlProvider());
 
+    public bool RequiresImdb => true;
+
     public async Task<IReadOnlyList<IndexerCandidate>> SearchAsync(IndexerQuery query, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(query);
