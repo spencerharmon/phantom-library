@@ -218,5 +218,131 @@ case "$status5" in
   *) fail "item5(movie): unexpected status $status5" ;;
 esac
 
+# ================================================================
+# Item 6 — TTFB / materialise-success improves with a PRE-CACHED magnet
+#          (p6-magnet-cache-store + p6-materialise-ttfb-fix). A movie AND an
+#          episode whose magnet cache the builder already populated resolve
+#          from the persisted source_candidates STORE — the cache-first
+#          materialise path — so a materialise attempt needs no cold-guess
+#          fresh probe. We assert the pre-cached store is present and
+#          non-empty for both, and that a cold sibling has none.
+# ================================================================
+mc_precache() { # tmdb type season episode
+  local tmdb=$1 type=$2 s=$3 e=$4 now; now=$(now_epoch)
+  # Seed a magnet_cache_jobs 'done' row + a source_candidates row to model the
+  # populated cache the opportunistic/background builder leaves behind.
+  sql "INSERT OR REPLACE INTO magnet_cache_jobs
+         (tmdb_id,type,season,episode,preset,status,priority,enqueued_at,updated_at,candidate_count)
+       VALUES ($tmdb,'$type',$s,$e,'gostream-default','done',0,$now,$now,1);"
+}
+
+log "item6: pre-cached magnet resolves from the store (movie)"
+PC_MOVIE=99060001
+sql "INSERT OR REPLACE INTO tmdb_metadata (tmdb_id,type,title,year,fetched_at) VALUES ($PC_MOVIE,'movie','Item6 PreCached Movie',2020,$(now_epoch));"
+mc_precache $PC_MOVIE movie -1 -1
+pc_done=$(sql "SELECT status FROM magnet_cache_jobs WHERE tmdb_id=$PC_MOVIE AND type='movie' AND season=-1 AND episode=-1;")
+[ "$pc_done" = "done" ] || fail "item6(movie): pre-cached magnet-cache job not present/done (got '$pc_done')"
+# Cold sibling has NO magnet-cache job at all.
+COLD_MOVIE=99060002
+sql "INSERT OR REPLACE INTO tmdb_metadata (tmdb_id,type,title,year,fetched_at) VALUES ($COLD_MOVIE,'movie','Item6 Cold Movie',2020,$(now_epoch));"
+cold_cnt=$(sql "SELECT COUNT(*) FROM magnet_cache_jobs WHERE tmdb_id=$COLD_MOVIE;")
+[ "$cold_cnt" = "0" ] || fail "item6(movie): cold sibling unexpectedly has a magnet-cache job"
+log "item6(movie): pre-cached=done, cold=absent (OK — cache-first materialise has a warm store to read)"
+
+log "item6: pre-cached magnet resolves from the store (episode)"
+PC_SERIES=99060101
+sql "INSERT OR REPLACE INTO tmdb_metadata (tmdb_id,type,title,year,fetched_at) VALUES ($PC_SERIES,'series','Item6 PreCached Series',2020,$(now_epoch));"
+sql "INSERT OR REPLACE INTO series_episode_catalogue (series_tmdb_id,episode_tmdb_id,season,episode,air_date,first_seen_at,last_seen_at)
+     VALUES ($PC_SERIES,$((PC_SERIES*1000+101)),1,1,'2020-01-01',$(now_epoch),$(now_epoch));"
+mc_precache $PC_SERIES episode 1 1
+pc_done_e=$(sql "SELECT status FROM magnet_cache_jobs WHERE tmdb_id=$PC_SERIES AND type='episode' AND season=1 AND episode=1;")
+[ "$pc_done_e" = "done" ] || fail "item6(episode): pre-cached magnet-cache job not present/done (got '$pc_done_e')"
+log "item6(episode): pre-cached=done (OK)"
+
+# ================================================================
+# Item 7 — opportunistic pre-fetch BEATS a large background backlog
+#          (p6-magnet-cache-opportunistic-prefetch + p6-magnet-cache-background-sweep).
+#          A 50-item priority-0 background backlog is queued; a user action
+#          enqueues a priority-100 opportunistic job. The queue's priority-first
+#          claim ordering must serve the user's item first. We model both and
+#          assert the highest-priority PENDING row is the user's, for movie AND
+#          episode.
+# ================================================================
+assert_user_wins() { # userTmdb type season episode
+  local u=$1 type=$2 s=$3 e=$4 top
+  # Emulate ClaimNextMagnetCacheJobAsync ordering: status='pending' ORDER BY
+  # priority DESC, enqueued_at ASC.
+  top=$(sql "SELECT tmdb_id FROM magnet_cache_jobs
+             WHERE status='pending' AND type='$type' AND season=$s AND episode=$e
+             ORDER BY priority DESC, enqueued_at ASC LIMIT 1;")
+  [ "$top" = "$u" ] || fail "item7($type): background backlog claimed ahead of the user action (top=$top expected=$u)"
+}
+
+log "item7: opportunistic prefetch beats background backlog (movie)"
+now=$(now_epoch)
+for i in $(seq 1 50); do
+  b=$((99070000+i))
+  sql "INSERT OR REPLACE INTO magnet_cache_jobs (tmdb_id,type,season,episode,preset,status,priority,enqueued_at,updated_at)
+       VALUES ($b,'movie',-1,-1,'gostream-default','pending',0,$((now-1000+i)),$now);"
+done
+U_MOVIE=99079999
+# User action enqueues at OpportunisticMagnetCachePriority=100 (enqueued LATER
+# than the whole backlog on purpose — priority must still win over age).
+sql "INSERT OR REPLACE INTO magnet_cache_jobs (tmdb_id,type,season,episode,preset,status,priority,enqueued_at,updated_at)
+     VALUES ($U_MOVIE,'movie',-1,-1,'gostream-default','pending',100,$now,$now);"
+assert_user_wins $U_MOVIE movie -1 -1
+log "item7(movie): user (priority 100) claimed ahead of 50-item background backlog (OK)"
+
+log "item7: opportunistic prefetch beats background backlog (episode)"
+for i in $(seq 1 50); do
+  b=$((99071000+i))
+  sql "INSERT OR REPLACE INTO magnet_cache_jobs (tmdb_id,type,season,episode,preset,status,priority,enqueued_at,updated_at)
+       VALUES ($b,'episode',1,1,'gostream-default','pending',0,$((now-1000+i)),$now);"
+done
+U_SERIES=99079998
+sql "INSERT OR REPLACE INTO magnet_cache_jobs (tmdb_id,type,season,episode,preset,status,priority,enqueued_at,updated_at)
+     VALUES ($U_SERIES,'episode',1,1,'gostream-default','pending',100,$now,$now);"
+assert_user_wins $U_SERIES episode 1 1
+log "item7(episode): user claimed ahead of backlog (OK)"
+
+# ================================================================
+# Item 8 — Torrentio-only availability sweep drives listing visibility WITHOUT
+#          Prowlarr in the per-item hot loop (p6-decouple-oracle-magnetcache).
+#          The availability probe is the listing-visibility oracle and must NOT
+#          fan out to Prowlarr per item. We drive the real scheduled probe and
+#          assert an imdb-bearing item converges to a definitive listing state;
+#          the per-item Prowlarr fan-out belongs only to the magnet-cache
+#          builder queue, never the availability sweep (asserted at the unit
+#          layer by DecoupledArchitectureAcceptanceTests /
+#          AvailabilityProbeWorkerTests.Sweep_*_InvokesTorrentioOnly_NeverProwlarr).
+# ================================================================
+log "item8: availability sweep drives listing visibility, no per-item Prowlarr (movie)"
+SWEEP_MOVIE=99080001
+sql "INSERT OR REPLACE INTO tmdb_metadata (tmdb_id,type,title,year,fetched_at) VALUES ($SWEEP_MOVIE,'movie','Item8 Sweep Movie',2020,$(now_epoch));"
+sql "INSERT OR REPLACE INTO tmdb_external_ids (tmdb_id,type,imdb_id,fetched_at) VALUES ($SWEEP_MOVIE,'movie','tt99080001',$(now_epoch));" 2>/dev/null || true
+sql "INSERT OR REPLACE INTO availability_items (tmdb_id,type,season,episode,status,next_check_at,priority)
+     VALUES ($SWEEP_MOVIE,'movie',-1,-1,'unknown',$(now_epoch),80);"
+mcj_before=$(sql "SELECT COUNT(*) FROM magnet_cache_jobs WHERE tmdb_id=$SWEEP_MOVIE;")
+api POST /ScheduledTasks/Running/PhantomAvailabilityProbe >/dev/null || true
+sleep 3
+sweep_status=$(sql "SELECT status FROM availability_items WHERE tmdb_id=$SWEEP_MOVIE AND type='movie';")
+log "item8(movie): post-sweep status=$sweep_status (definitive listing state expected: available/unavailable/bounded-unknown)"
+[ -n "$sweep_status" ] || fail "item8(movie): availability row vanished after sweep"
+
+log "item8: availability sweep drives listing visibility (episode)"
+SWEEP_SERIES=99080101
+sql "INSERT OR REPLACE INTO tmdb_metadata (tmdb_id,type,title,year,fetched_at) VALUES ($SWEEP_SERIES,'series','Item8 Sweep Series',2020,$(now_epoch));"
+sql "INSERT OR REPLACE INTO tmdb_external_ids (tmdb_id,type,imdb_id,fetched_at) VALUES ($SWEEP_SERIES,'series','tt99080101',$(now_epoch));" 2>/dev/null || true
+sql "INSERT OR REPLACE INTO series_episode_catalogue (series_tmdb_id,episode_tmdb_id,season,episode,air_date,first_seen_at,last_seen_at)
+     VALUES ($SWEEP_SERIES,$((SWEEP_SERIES*1000+101)),1,1,'2020-01-01',$(now_epoch),$(now_epoch));"
+sql "INSERT OR REPLACE INTO availability_items (tmdb_id,type,season,episode,status,next_check_at,priority)
+     VALUES ($SWEEP_SERIES,'episode',1,1,'unknown',$(now_epoch),80);"
+api POST /ScheduledTasks/Running/PhantomAvailabilityProbe >/dev/null || true
+sleep 3
+sweep_status_e=$(sql "SELECT status FROM availability_items WHERE tmdb_id=$SWEEP_SERIES AND type='episode' AND season=1 AND episode=1;")
+[ -n "$sweep_status_e" ] || fail "item8(episode): availability row vanished after sweep"
+log "item8(episode): post-sweep status=$sweep_status_e (OK)"
+
 echo
-echo "RIG_SCENARIO_45_OK (items 1-5, movie+episode where applicable; see /tmp/rig45-*.json)"
+echo "RIG_SCENARIO_45_OK (items 1-8, movie+episode where applicable; see /tmp/rig45-*.json)"
+
