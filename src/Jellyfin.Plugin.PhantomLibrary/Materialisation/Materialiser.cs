@@ -237,6 +237,22 @@ public sealed class Materialiser : IMaterialiser
             _logger.LogWarning(ex, "PromoteForUserActivity failed for {Type}/{Tmdb} (s={Season} e={Episode}); continuing materialise", type, tmdbId, season, episode);
         }
 
+        // Opportunistic magnet-cache prefetch (ROI P6, item 2a): the SAME
+        // materialise trigger — playback, explicit materialise, autopilot
+        // prefetch, favourite ingest — also enqueues a HIGH-priority
+        // magnet_cache_jobs row for this touched item, preempting any
+        // competing low-priority background-sweep job. Best effort, same as
+        // the promote above: never block the materialise itself.
+        try
+        {
+            await _db.EnqueueOpportunisticMagnetCacheJobAsync(tmdbId, type, season, episode, _configProvider().SourcePickerPreset, ct)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "EnqueueOpportunisticMagnetCacheJob failed for {Type}/{Tmdb} (s={Season} e={Episode}); continuing materialise", type, tmdbId, season, episode);
+        }
+
         var existingState = await _db.GetMaterialisedStateAsync(tmdbId, type, sSentinel, eSentinel, ct)
             .ConfigureAwait(false);
         if (existingState is not null)

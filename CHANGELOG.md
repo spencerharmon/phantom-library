@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Opportunistic magnet-cache prefetch on user activity
+  (p6-magnet-cache-opportunistic-prefetch).** ROI Priority 6, revised
+  architecture item 2a. Every user-initiated caller site
+  `p6-yield-to-user-callers` wired for the availability-priority bump +
+  activity-marker stamp — `PhantomSourceManager`'s details/playback
+  candidate-refresh view, and `Materialiser.MaterialiseAsync` (which
+  autopilot prefetch and favourite ingest already route through) — now ALSO
+  enqueues a HIGH-priority `magnet_cache_jobs` row
+  (`PhantomDb.EnqueueOpportunisticMagnetCacheJobAsync`, priority
+  `PhantomDb.OpportunisticMagnetCachePriority = 100`) for the touched
+  movie/episode item, alongside (never replacing) the existing promote. This
+  preempts any competing low-priority background-sweep job, reusing
+  `p6-magnet-cache-store`'s max-never-lowered enqueue + priority-first claim
+  ordering. Series/season-level views (no single touched item) are
+  unaffected. Best-effort, movie AND episode parity. No schema change. See
+  `tests/Jellyfin.Plugin.PhantomLibrary.Tests/OpportunisticMagnetCachePrefetchTests.cs`.
+
 - **Availability convergence guarantee + TTL re-probe
   (p6-availability-convergence).** ROI Priority 6 item 5 (the acceptance
   capstone over the whole Priority 6 set). No availability item churns the

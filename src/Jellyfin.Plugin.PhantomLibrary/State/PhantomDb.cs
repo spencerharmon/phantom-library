@@ -2552,6 +2552,43 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
     }
 
     /// <summary>
+    /// Priority stamped onto an opportunistically-enqueued
+    /// <c>magnet_cache_jobs</c> row (p6-magnet-cache-opportunistic-prefetch).
+    /// Sits above the background sweep's default (0) so
+    /// <see cref="ClaimNextMagnetCacheJobAsync"/>'s priority-first claim
+    /// ordering preempts to the user's touched item ahead of any queued
+    /// low-priority background-sweep backlog.
+    /// </summary>
+    public const int OpportunisticMagnetCachePriority = 100;
+
+    /// <summary>
+    /// Wire-point for every user-initiated action that touches a single
+    /// movie/episode item (playback/details refresh, materialise, autopilot
+    /// prefetch, favourite ingest): ENQUEUE a HIGH-priority
+    /// <c>magnet_cache_jobs</c> row for the touched item, alongside (never
+    /// replacing) the existing availability-priority + activity-marker stamp
+    /// done by <see cref="PromoteForUserActivityAsync"/>. Movie/episode only —
+    /// a series/season-level view has no single touched item to enqueue for
+    /// (see <see cref="PromoteSeriesForUserActivityAsync"/>, which does not
+    /// enqueue a magnet-cache job for the same reason). Reuses
+    /// <see cref="EnqueueMagnetCacheJobAsync"/>'s max-never-lowered priority
+    /// semantics, so re-touching an already-queued job only ever raises it.
+    /// </summary>
+    public async Task<int?> EnqueueOpportunisticMagnetCacheJobAsync(int tmdbId, string type, int? season, int? episode, string preset, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        ArgumentNullException.ThrowIfNull(preset);
+        if (type != "movie" && type != "episode")
+        {
+            return null;
+        }
+
+        var (sSentinel, eSentinel) = ChannelItemId.ToSentinels(season, episode);
+        return await EnqueueMagnetCacheJobAsync(tmdbId, type, sSentinel, eSentinel, preset, OpportunisticMagnetCachePriority, ct)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Series/season-level counterpart to <see cref="PromoteForUserActivityAsync"/>:
     /// raise every episode availability row of the series to
     /// <see cref="UserActivityPriority"/> and stamp the user-activity marker.

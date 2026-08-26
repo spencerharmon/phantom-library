@@ -213,6 +213,15 @@ public sealed class PhantomSourceManager
                 {
                     await _db.PromoteForUserActivityAsync(key.TmdbId, key.Type, key.Season, key.Episode, DateTimeOffset.UtcNow, ct)
                         .ConfigureAwait(false);
+
+                    // Opportunistic magnet-cache prefetch (ROI P6, item 2a):
+                    // a details/playback view that actively refreshes
+                    // candidates ALSO enqueues a HIGH-priority
+                    // magnet_cache_jobs row for the touched item, preempting
+                    // any competing low-priority background-sweep job. Best
+                    // effort — never block the user's view on an enqueue.
+                    await _db.EnqueueOpportunisticMagnetCacheJobAsync(key.TmdbId, key.Type, key.Season, key.Episode, cfg.SourcePickerPreset, ct)
+                        .ConfigureAwait(false);
                 }
                 else
                 {
