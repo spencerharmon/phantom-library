@@ -304,6 +304,10 @@ jellyfinMetadataReaper:
   # Point these at the SAME Jellyfin DB the workload uses (see `postgres.jellyfin`).
   importance:
     enabled: false
+    # Image used ONLY by the init container that runs the importance query. The workload
+    # (jellyfin-phantom) image ships no psql, so the query cannot run in the reaper container
+    # itself; this must be an image that provides psql. Pinned to the same major as the server.
+    clientImage: docker.io/library/postgres:16.14-alpine
     host: ""
     port: 5432
     database: ""

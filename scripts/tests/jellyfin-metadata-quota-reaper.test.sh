@@ -287,4 +287,48 @@ grep -q '^jellyfin_metadata_reaper_importance_ranking_active 0' "$FIXTURE_E/.usa
   || fail "degraded run must expose importance_ranking_active=0 for alerting"
 pass "degraded run is observable via importance_ranking_active metric"
 
+# =====================================================================
+# Scenario F: the rendered CronJob must not require psql in the REAPER
+# container.
+#
+# Regression guard for a defect that shipped and only showed up in-cluster: the
+# reaper ran --db-* flags in the workload (jellyfin-phantom) image, which has NO
+# psql, so every live run silently degraded to atime-only LRU while the unit
+# tests passed against a stubbed psql on PATH. The query must therefore run in a
+# separate init container with a postgres-client image, handing the tier map to
+# the reaper as a file.
+# =====================================================================
+RENDERED3="$WORK/rendered3.yaml"
+"$HELM_BIN" template phantom-library "$CHART_DIR" \
+  --set components.jellyfinMetadata=true \
+  --set jellyfinMetadataReaper.importance.enabled=true \
+  --set jellyfinMetadataReaper.importance.host=db.example.com \
+  --set jellyfinMetadataReaper.importance.database=jellyfin \
+  --set jellyfinMetadataReaper.importance.user=jellyfin \
+  --set jellyfinMetadataReaper.importance.passwordSecretName=jellyfin-postgres \
+  > "$RENDERED3" 2>> "$WORK/helm-template.log" || {
+    cat "$WORK/helm-template.log" >&2
+    fail "helm template (importance enabled) failed"
+  }
+
+python3 - "$RENDERED3" <<'PY' || fail "rendered CronJob failed the psql-placement invariant"
+import sys
+docs = open(sys.argv[1]).read().split('\n---\n')
+cj = [d for d in docs if 'kind: CronJob' in d]
+assert cj, "no CronJob rendered with importance enabled"
+d = cj[0]
+# The reaper must consume a pre-computed map, never run the query itself.
+assert '--importance-file' in d, "reaper container is not wired to an --importance-file"
+assert '--db-host' not in d, "reaper still passes --db-host; the query would run in an image without psql"
+# The query must live in an init container using an explicit client image.
+assert 'initContainers:' in d, "no init container renders the importance query"
+assert 'importance-query' in d, "init container 'importance-query' missing"
+assert 'postgres' in d.split('initContainers:')[1].split('containers:')[0], \
+    "init container does not use a postgres-client image"
+# The DB credential must not be handed to the reaper container at all.
+init_part = d.split('initContainers:')[1]
+assert init_part.count('reaper-db-password') >= 1, "init container cannot read the DB password"
+PY
+pass "importance query runs in a psql-bearing init container, not the reaper image"
+
 echo "ALL PASS: jellyfin-metadata-quota-reaper"

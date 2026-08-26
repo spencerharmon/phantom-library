@@ -53,6 +53,61 @@ spec:
           restartPolicy: OnFailure
           imagePullSecrets:
             - name: {{ .Values.imagePullSecret }}
+          {{- if .Values.jellyfinMetadataReaper.importance.enabled }}
+          # The workload image ships no psql, so the importance query runs HERE, in a
+          # postgres-client image, and hands the resulting "<itemid> <tier>" map to the
+          # reaper over an emptyDir. Failure is deliberately non-fatal: the init container
+          # exits 0 having written whatever it could, and the reaper degrades to atime-only
+          # LRU rather than leaving the disk unprotected.
+          initContainers:
+            - name: importance-query
+              image: {{ .Values.jellyfinMetadataReaper.importance.clientImage | quote }}
+              imagePullPolicy: {{ .Values.images.pullPolicy }}
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -u
+                  out=/var/run/jellyfin-metadata-importance/map.txt
+                  : > "$out"
+                  if ! PGPASSWORD="$(cat /var/run/jellyfin-metadata-reaper-db/password)" \
+                       PGCONNECT_TIMEOUT=10 \
+                       psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
+                            -tA -F' ' --no-align -c "$SQL" > "$out" 2>/tmp/err; then
+                    echo "importance-query: FAILED, reaper will degrade to atime LRU" >&2
+                    sed -e 's/^/importance-query: /' /tmp/err >&2 || true
+                    : > "$out"
+                  fi
+                  echo "importance-query: wrote $(wc -l < "$out") item tiers"
+              env:
+                - name: DB_HOST
+                  value: {{ .Values.jellyfinMetadataReaper.importance.host | quote }}
+                - name: DB_PORT
+                  value: {{ .Values.jellyfinMetadataReaper.importance.port | quote }}
+                - name: DB_NAME
+                  value: {{ .Values.jellyfinMetadataReaper.importance.database | quote }}
+                - name: DB_USER
+                  value: {{ .Values.jellyfinMetadataReaper.importance.user | quote }}
+                - name: SQL
+                  value: |-
+                    select replace(ud."ItemId"::text,'-',''),
+                           max(case
+                                 when ud."IsFavorite" then 3
+                                 when coalesce(ud."PlaybackPositionTicks",0) > 0 then 3
+                                 when ud."LastPlayedDate" is not null
+                                      and ud."LastPlayedDate" > now() - interval '{{ .Values.jellyfinMetadataReaper.importance.recentDays }} days' then 2
+                                 when coalesce(ud."PlayCount",0) > 0 or ud."Played" then 1
+                                 else 0
+                               end)
+                      from "UserData" ud
+                     group by 1
+              volumeMounts:
+                - name: importance-map
+                  mountPath: /var/run/jellyfin-metadata-importance
+                - name: reaper-db-password
+                  mountPath: /var/run/jellyfin-metadata-reaper-db
+                  readOnly: true
+          {{- end }}
           containers:
             - name: reaper
               image: {{ include "phantom-library.image" (dict "which" "jellyfin" "root" $) }}
@@ -69,16 +124,8 @@ spec:
                 - {{ . | quote }}
                 {{- end }}
                 {{- if .Values.jellyfinMetadataReaper.importance.enabled }}
-                - --db-host
-                - {{ .Values.jellyfinMetadataReaper.importance.host | quote }}
-                - --db-port
-                - {{ .Values.jellyfinMetadataReaper.importance.port | quote }}
-                - --db-name
-                - {{ .Values.jellyfinMetadataReaper.importance.database | quote }}
-                - --db-user
-                - {{ .Values.jellyfinMetadataReaper.importance.user | quote }}
-                - --db-password-file
-                - /var/run/jellyfin-metadata-reaper-db/password
+                - --importance-file
+                - /var/run/jellyfin-metadata-importance/map.txt
                 - --recent-days
                 - {{ .Values.jellyfinMetadataReaper.importance.recentDays | quote }}
                 {{- else }}
@@ -93,8 +140,8 @@ spec:
                   mountPath: /var/run/jellyfin-metadata-reaper
                   readOnly: true
                 {{- if .Values.jellyfinMetadataReaper.importance.enabled }}
-                - name: reaper-db-password
-                  mountPath: /var/run/jellyfin-metadata-reaper-db
+                - name: importance-map
+                  mountPath: /var/run/jellyfin-metadata-importance
                   readOnly: true
                 {{- end }}
           volumes:
@@ -106,9 +153,10 @@ spec:
                 name: jellyfin-metadata-reaper-script
                 defaultMode: 0555
             {{- if .Values.jellyfinMetadataReaper.importance.enabled }}
-            # Read-only projection of the SAME Secret the workload already uses for its
-            # Jellyfin Postgres DSN — the reaper only ever runs a read-only aggregate over
-            # UserData, and the password never reaches argv (passed as --db-password-file).
+            # emptyDir carrying the init container's tier map to the reaper. The DB password
+            # is mounted ONLY into the init container — the reaper never sees the credential.
+            - name: importance-map
+              emptyDir: {}
             - name: reaper-db-password
               secret:
                 secretName: {{ .Values.jellyfinMetadataReaper.importance.passwordSecretName | quote }}

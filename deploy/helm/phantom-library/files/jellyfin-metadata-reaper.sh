@@ -49,7 +49,8 @@
 #   jellyfin-metadata-reaper.sh --root <mount-path> --quota-gb <N> \
 #       [--path <subdir>]... [--metrics-file <path>] [--dry-run] \
 #       [--db-host H] [--db-port P] [--db-name N] [--db-user U] \
-#       [--db-password-file F] [--recent-days N] [--no-db]
+#       [--db-password-file F] [--recent-days N] [--no-db] \
+#       [--importance-file F]
 #
 # Exit codes: 0 = success (no-op or reclaimed enough), 1 = usage bad args,
 # 2 = could not reclaim below quota (all candidate files already deleted).
@@ -65,11 +66,12 @@ DB_PORT="5432"
 DB_NAME=""
 DB_USER=""
 DB_PASSWORD_FILE=""
+IMPORTANCE_INPUT=""
 RECENT_DAYS="30"
 NO_DB=0
 
 usage() {
-  echo "usage: $0 --root <path> --quota-gb <N> [--path <subdir>]... [--metrics-file <path>] [--dry-run] [--db-host <h> --db-name <n> --db-user <u> --db-password-file <f>] [--db-port <p>] [--recent-days <n>] [--no-db]" >&2
+  echo "usage: $0 --root <path> --quota-gb <N> [--path <subdir>]... [--metrics-file <path>] [--dry-run] [--db-host <h> --db-name <n> --db-user <u> --db-password-file <f>] [--db-port <p>] [--recent-days <n>] [--no-db] [--importance-file <f>]" >&2
   exit 1
 }
 
@@ -85,6 +87,7 @@ while [ $# -gt 0 ]; do
     --db-name) DB_NAME="$2"; shift 2 ;;
     --db-user) DB_USER="$2"; shift 2 ;;
     --db-password-file) DB_PASSWORD_FILE="$2"; shift 2 ;;
+    --importance-file) IMPORTANCE_INPUT="$2"; shift 2 ;;
     --recent-days) RECENT_DAYS="$2"; shift 2 ;;
     --no-db) NO_DB=1; shift ;;
     -h|--help) usage ;;
@@ -140,6 +143,23 @@ DB_STATUS="disabled"
 # tier gauges always resolve under `set -u`.
 declare -A TIER_DELETED=([0]=0 [1]=0 [2]=0 [3]=0)
 fetch_importance() {
+  # Pre-computed map supplied by an init container (the workload image has no psql,
+  # so the query runs in a postgres-client image and hands the result over a shared
+  # volume). Format is identical to the psql output: "<32-hex-itemid> <tier>" lines.
+  if [ -n "$IMPORTANCE_INPUT" ]; then
+    if [ ! -r "$IMPORTANCE_INPUT" ]; then
+      echo "jellyfin-metadata-reaper: --importance-file not readable — falling back to atime-only LRU" >&2
+      DB_STATUS="unavailable"; return 0
+    fi
+    if [ ! -s "$IMPORTANCE_INPUT" ]; then
+      # An EMPTY map means the producer ran but found no user-data rows. That is a
+      # legitimate "everything is tier 0" answer, not a failure.
+      DB_STATUS="empty"; return 0
+    fi
+    DB_STATUS="ok"
+    cat "$IMPORTANCE_INPUT"
+    return 0
+  fi
   [ "$NO_DB" -eq 0 ] || { DB_STATUS="disabled"; return 0; }
   if [ -z "$DB_HOST" ] || [ -z "$DB_NAME" ] || [ -z "$DB_USER" ]; then
     DB_STATUS="disabled"; return 0
