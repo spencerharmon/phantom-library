@@ -223,6 +223,31 @@ public class PhantomShowsChannelTests : IDisposable
         Assert.Empty(result.Items);
     }
 
+    [Fact]
+    public async Task GetChannelItems_SearchSyncFolder_IncludesSeriesBelowMinAvailableEpisodes()
+    {
+        // p6-search-list-surface-split: the browse LIST excludes a series
+        // with zero available/materialised episodes, but the search/
+        // BaseItem emission path must still include it so it stays
+        // searchable.
+        await SeedSeriesMetaAsync(1399, "Below Threshold Series");
+        await SeedAvailabilityEpisodeAsync(1399, 1, 1, "unavailable");
+        await SeedSeriesMetaAsync(1400, "Visible Series");
+        await SeedAvailableEpisodeAsync(1400, 1, 1);
+
+        var topLevel = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        Assert.Single(topLevel.Items);
+        Assert.Equal("series_1400", topLevel.Items[0].Id);
+
+        var searchResult = await _channel.GetChannelItems(
+            new InternalChannelItemQuery { FolderId = PhantomShowsChannel.SearchSyncFolderId },
+            CancellationToken.None);
+
+        Assert.Equal(2, searchResult.Items.Count);
+        Assert.Contains(searchResult.Items, i => i.Id == "series_1399");
+        Assert.Contains(searchResult.Items, i => i.Id == "series_1400");
+    }
+
     // ----------------------------------------------------------------
     // Series → Seasons folder navigation
     // ----------------------------------------------------------------
@@ -341,6 +366,36 @@ public class PhantomShowsChannelTests : IDisposable
         Assert.Equal(new int?[] { 1, 2, 3 }, result.Items.Select(i => i.IndexNumber).ToArray());
         Assert.All(result.Items, i => Assert.Contains("phantom", i.Tags));
         Assert.All(result.Items, i => AssertOpeningSource(i.MediaSources[0], i.Id));
+    }
+
+    [Fact]
+    public async Task GetChannelItems_SeasonFolder_SeriesBelowMinAvailableEpisodes_StillEmitsFullEpisodeGrid()
+    {
+        // p6-search-list-surface-split: a series with too few available
+        // episodes to clear SeriesMinAvailableEpisodes disappears from the
+        // top-level browse LIST, but a user who reaches its season/episode
+        // detail directly (search, deep link) must still see the FULL
+        // known-episode grid (Available/Unknown/Unavailable), not an empty
+        // list. Only an explicit per-user hide may blank it (covered by the
+        // HiddenForUser tests above).
+        await SeedSeriesMetaAsync(1399, "Game of Thrones");
+        await SeedAvailabilityEpisodeAsync(1399, 1, 3, "unavailable");
+        _tmdb.Setup(t => t.GetSeasonAsync(1399, 1, null, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MakeSeasonDetails(1399, 1, 3));
+
+        // Confirm the premise: this series has zero available/materialised
+        // episodes, so it is excluded from the top-level list.
+        var topLevel = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        Assert.Empty(topLevel.Items);
+
+        var result = await _channel.GetChannelItems(
+            new InternalChannelItemQuery { FolderId = "season_1399_s01" },
+            CancellationToken.None);
+
+        // Full grid: episodes 1-3 all present (1 unknown/never-probed, 1
+        // unknown, 1 explicitly unavailable) rather than an empty result.
+        Assert.Equal(new int?[] { 1, 2, 3 }, result.Items.Select(i => i.IndexNumber).ToArray());
+        Assert.All(result.Items, i => Assert.Contains("phantom", i.Tags));
     }
 
     [Fact]

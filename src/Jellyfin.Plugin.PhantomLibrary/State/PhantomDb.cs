@@ -2570,6 +2570,43 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
         return list;
     }
 
+    /// <summary>
+    /// The full movie catalogue (every discovered <c>tmdb_metadata</c> row of
+    /// type "movie"), regardless of materialise/availability state — used by
+    /// the search/BaseItem emission path (p6-search-list-surface-split) so an
+    /// unavailable/unknown phantom still becomes a real, badge-able BaseItem
+    /// even though <see cref="ListVisibleMovieRowsAsync(CancellationToken)"/>
+    /// (the browse-LIST path) filters it out.
+    /// </summary>
+    public async Task<IReadOnlyList<VisibleMovieRow>> ListAllMovieRowsAsync(CancellationToken ct)
+    {
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT m.tmdb_id,m.type,m.title,m.year,m.overview,m.poster_url,m.backdrop_url,
+                   m.genres_json,m.official_rating,m.community_rating,m.original_title,m.fetched_at,m.runtime_minutes,
+                   ms.tmdb_id,ms.type,ms.season,ms.episode,ms.stub_path,ms.fuse_path,ms.materialised_at,
+                   a.tmdb_id,a.type,a.season,a.episode,a.status,a.checked_at,a.next_check_at,
+                   a.candidate_magnet,a.candidate_info_hash,a.candidate_size,a.candidate_seeders,
+                   a.candidate_indexer,a.candidate_source,a.probe_generation,a.lease_owner
+            FROM tmdb_metadata m
+            LEFT JOIN materialised_state ms ON ms.tmdb_id=m.tmdb_id AND ms.type='movie'
+            LEFT JOIN availability_items a ON a.tmdb_id=m.tmdb_id AND a.type='movie' AND a.season=-1 AND a.episode=-1
+            WHERE m.type='movie'
+            ORDER BY COALESCE(ms.materialised_at, m.fetched_at) DESC;";
+        var list = new List<VisibleMovieRow>();
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            var meta = ReadTmdbMetadata(r, 0);
+            MaterialisedStateRow? mat = r.IsDBNull(13) ? null : new MaterialisedStateRow(
+                r.GetInt32(13), r.GetString(14), r.GetInt32(15), r.GetInt32(16), r.GetString(17), r.GetString(18), DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(19)));
+            AvailabilityItemRow? av = r.IsDBNull(20) ? null : ReadAvailability(r, 20);
+            list.Add(new VisibleMovieRow(meta, mat, av));
+        }
+
+        return list;
+    }
+
     public async Task<IReadOnlyList<VisibleSeriesRow>> ListVisibleSeriesRowsAsync(int minAvailableEpisodes, CancellationToken ct)
     {
         minAvailableEpisodes = Math.Max(1, minAvailableEpisodes);
@@ -2616,6 +2653,47 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
 
     public Task<IReadOnlyList<VisibleSeriesRow>> ListVisibleSeriesRowsAsync(CancellationToken ct)
         => ListVisibleSeriesRowsAsync(1, ct);
+
+    /// <summary>
+    /// The full series catalogue (every discovered <c>tmdb_metadata</c> row
+    /// of type "series"), regardless of <c>SeriesMinAvailableEpisodes</c> —
+    /// used by the search/BaseItem emission path (p6-search-list-surface-
+    /// split) so a series with too few available episodes to appear in the
+    /// browse LIST (<see cref="ListVisibleSeriesRowsAsync(int,CancellationToken)"/>)
+    /// still becomes a real, badge-able BaseItem reachable via search.
+    /// </summary>
+    public async Task<IReadOnlyList<VisibleSeriesRow>> ListAllSeriesRowsAsync(CancellationToken ct)
+    {
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT m.tmdb_id,m.type,m.title,m.year,m.overview,m.poster_url,m.backdrop_url,
+                   m.genres_json,m.official_rating,m.community_rating,m.original_title,m.fetched_at,m.runtime_minutes,
+                   COALESCE(av.available_count,0), COALESCE(mat.materialised_count,0)
+            FROM tmdb_metadata m
+            LEFT JOIN (
+                SELECT tmdb_id, COUNT(*) AS available_count FROM availability_items
+                WHERE type='episode' AND status='available'
+                GROUP BY tmdb_id
+            ) av ON av.tmdb_id=m.tmdb_id
+            LEFT JOIN (
+                SELECT tmdb_id, COUNT(*) AS materialised_count FROM materialised_state
+                WHERE type='episode'
+                GROUP BY tmdb_id
+            ) mat ON mat.tmdb_id=m.tmdb_id
+            WHERE m.type='series'
+            ORDER BY m.fetched_at DESC;";
+        var list = new List<VisibleSeriesRow>();
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            list.Add(new VisibleSeriesRow(
+                ReadTmdbMetadata(r, 0),
+                Convert.ToInt32(r.GetInt64(13)),
+                Convert.ToInt32(r.GetInt64(14))));
+        }
+
+        return list;
+    }
 
     public async Task<IReadOnlyList<VisibleSeasonRow>> ListVisibleSeasonsAsync(int seriesTmdbId, CancellationToken ct)
     {

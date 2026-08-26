@@ -169,11 +169,29 @@ public sealed partial class PhantomShowsChannel
     /// <inheritdoc />
     public bool IsEnabledFor(string userId) => true;
 
+    /// <summary>
+    /// Sentinel <see cref="InternalChannelItemQuery.FolderId"/> for the
+    /// search/BaseItem emission path (p6-search-list-surface-split): unlike
+    /// the browse LIST root (empty <c>FolderId</c>, filtered to series with
+    /// &gt;= <c>SeriesMinAvailableEpisodes</c> available/materialised
+    /// episodes), this folder emits the FULL series catalogue — including
+    /// series with too few (or zero) available episodes — so a periodic
+    /// sync (see <c>DiscoveryRefreshTask</c>) can walk it and let Jellyfin's
+    /// channel manager persist every catalogued series as a real, globally-
+    /// searchable BaseItem. It is never linked to from the UI.
+    /// </summary>
+    public const string SearchSyncFolderId = "__search_sync_shows__";
+
     /// <inheritdoc />
     public async Task<ChannelItemResult> GetChannelItems(InternalChannelItemQuery query, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(query);
         var userId = query.UserId;
+
+        if (string.Equals(query.FolderId, SearchSyncFolderId, StringComparison.Ordinal))
+        {
+            return await GetSearchSyncItemsAsync(cancellationToken).ConfigureAwait(false);
+        }
 
         if (string.IsNullOrEmpty(query.FolderId))
         {
@@ -426,6 +444,38 @@ public sealed partial class PhantomShowsChannel
         };
     }
 
+    /// <summary>
+    /// The search/BaseItem emission path (p6-search-list-surface-split):
+    /// every discovered series, including those below
+    /// <see cref="SeriesMinAvailableEpisodes"/> that the browse LIST root
+    /// (<see cref="GetTopLevelSeriesAsync"/>) filters out. Tagged as
+    /// "external" only for the (rare) case of a query result racing an
+    /// external gostream directory; the normal case is a plain phantom
+    /// series item — the badge overlay resolves its state live from
+    /// materialise/availability state, not from a tag baked in here.
+    /// </summary>
+    private async Task<ChannelItemResult> GetSearchSyncItemsAsync(CancellationToken ct)
+    {
+        var items = new List<ChannelItemInfo>();
+        var seen = new HashSet<int>();
+        foreach (var row in await _db.ListAllSeriesRowsAsync(ct).ConfigureAwait(false))
+        {
+            ct.ThrowIfCancellationRequested();
+            if (!seen.Add(row.Metadata.TmdbId))
+            {
+                continue;
+            }
+
+            items.Add(BuildSeriesItemFromMetadata(row.Metadata));
+        }
+
+        return new ChannelItemResult
+        {
+            Items = items,
+            TotalRecordCount = items.Count,
+        };
+    }
+
     private async Task<ChannelItemResult> GetSeasonsForSeriesAsync(Guid userId, int seriesTmdb, CancellationToken ct)
     {
         using var flowScope = PhantomFlowMetrics.Time(PhantomFlowMetrics.FlowSeasonListing);
@@ -563,20 +613,22 @@ public sealed partial class PhantomShowsChannel
             .GroupBy(e => e.Episode)
             .ToDictionary(g => g.Key, g => g.First().Entry);
         var hasExternalSeries = externalSeries.Count > 0;
-        var seriesVisible = userId == Guid.Empty
-            ? await _db.IsSeriesVisibleAsync(seriesTmdb, SeriesMinAvailableEpisodes(), ct).ConfigureAwait(false)
-            : await _db.IsSeriesVisibleAsync(userId, seriesTmdb, SeriesMinAvailableEpisodes(), ct).ConfigureAwait(false);
-        var exposeFullSeries = hasExternalSeries || seriesVisible;
+        // p6-search-list-surface-split: season-detail always emits the FULL
+        // known-episode grid (Available/Unknown/Unavailable, per
+        // BuildEpisodeItemFromRowAsync's live materialise/availability
+        // lookup) regardless of whether the series clears
+        // SeriesMinAvailableEpisodes to appear in the top-level browse LIST
+        // (GetTopLevelSeriesAsync). A series being list-hidden for too few
+        // available episodes must not also blank out its season/episode
+        // detail view for a user who reached it via search or a direct
+        // link — only an explicit per-user hide (checked above, before this
+        // method does any other work) may do that.
         var externalSeriesName = hasExternalSeries ? externalSeries[0].Metadata.Title : null;
         var items = new List<ChannelItemInfo>(rows.Count + externalEpisodes.Count);
         var emittedEpisodes = new HashSet<int>();
         foreach (var row in rows)
         {
             ct.ThrowIfCancellationRequested();
-            if (!exposeFullSeries)
-            {
-                continue;
-            }
 
             if (externalByEpisode.TryGetValue(row.Episode, out var externalEpisode))
             {
