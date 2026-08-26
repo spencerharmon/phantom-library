@@ -204,6 +204,106 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
         Assert.True(delay > TimeSpan.FromHours(1), "backoff must be far longer than a 30-minute transient");
     }
 
+    // ---- p6-availability-convergence: no-forever-churn + TTL reprobe ----
+
+    [Fact]
+    public async Task Transient_EscalatesToLongBackoffAfterMaxAttempts_Movie()
+    {
+        // Convergence guarantee (movie): a permanently-transient item (every
+        // probe throws IndexerTransientException) must not churn the short
+        // AvailabilityTransientRetryMinutes cadence forever. Once
+        // AttemptCount exceeds AvailabilityTransientMaxAttempts, the backoff
+        // escalates to the bounded AvailabilityTransientEscalatedRetryHours.
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 99000700);
+        await db.SetImdbIdAsync(99000700, "movie", "tt99000700", CancellationToken.None);
+        var cfg = Config();
+        cfg.AvailabilityTransientRetryMinutes = 5;
+        cfg.AvailabilityTransientMaxAttempts = 2;
+        cfg.AvailabilityTransientEscalatedRetryHours = 24;
+        var worker = BuildWorker(db, cfg, new TransientIndexer("timeout"));
+
+        long nextCheck = 0;
+        for (var i = 0; i < 3; i++)
+        {
+            await InsertMovieAvailabilityAsync(db, 99000700, status: "unknown", nextCheckAt: DateTimeOffset.UtcNow.AddHours(-1), priority: 0);
+            var didWork = await InvokeProbeOneAsync(worker, cfg);
+            Assert.True(didWork);
+            (_, _, nextCheck) = await ReadAvailabilityFullAsync(99000700, "movie", -1, -1);
+        }
+
+        // Third attempt: attempt_count (2 prior + this claim = 3) exceeds
+        // MaxAttempts(2) -> escalated long backoff, not the 5-minute cadence.
+        var before = DateTimeOffset.UtcNow;
+        var delay = DateTimeOffset.FromUnixTimeSeconds(nextCheck) - before;
+        Assert.True(delay >= TimeSpan.FromHours(cfg.AvailabilityTransientEscalatedRetryHours) - TimeSpan.FromMinutes(5),
+            $"expected escalated >= {cfg.AvailabilityTransientEscalatedRetryHours}h backoff after exceeding max attempts, got {delay}");
+        Assert.True(await ReadAttemptCountAsync(99000700, "movie", -1, -1) > cfg.AvailabilityTransientMaxAttempts);
+    }
+
+    [Fact]
+    public async Task Transient_EscalatesToLongBackoffAfterMaxAttempts_Episode()
+    {
+        // Convergence guarantee (episode/TV parity of the movie test above).
+        using var db = await NewDbAsync();
+        await SeedSeriesAsync(db, 99000701);
+        await db.SetImdbIdAsync(99000701, "series", "tt99000701", CancellationToken.None);
+        var pastAirDate = DateTimeOffset.UtcNow.AddDays(-30).Date;
+        await InsertEpisodeCatalogueAsync(db, 99000701, season: 1, episode: 1, airDate: pastAirDate.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture));
+        var cfg = Config();
+        cfg.AvailabilityTransientRetryMinutes = 5;
+        cfg.AvailabilityTransientMaxAttempts = 2;
+        cfg.AvailabilityTransientEscalatedRetryHours = 24;
+        cfg.EpisodeReleaseDelayHours = 0;
+        var worker = BuildWorker(db, cfg, new TransientIndexer("timeout"));
+
+        long nextCheck = 0;
+        for (var i = 0; i < 3; i++)
+        {
+            await InsertEpisodeAvailabilityAsync(db, 99000701, season: 1, episode: 1, status: "unknown", nextCheckAt: DateTimeOffset.UtcNow.AddHours(-1));
+            var didWork = await InvokeProbeOneAsync(worker, cfg);
+            Assert.True(didWork);
+            (_, _, nextCheck) = await ReadAvailabilityFullAsync(99000701, "episode", 1, 1);
+        }
+
+        var before = DateTimeOffset.UtcNow;
+        var delay = DateTimeOffset.FromUnixTimeSeconds(nextCheck) - before;
+        Assert.True(delay >= TimeSpan.FromHours(cfg.AvailabilityTransientEscalatedRetryHours) - TimeSpan.FromMinutes(5),
+            $"expected escalated >= {cfg.AvailabilityTransientEscalatedRetryHours}h backoff after exceeding max attempts, got {delay}");
+        Assert.True(await ReadAttemptCountAsync(99000701, "episode", 1, 1) > cfg.AvailabilityTransientMaxAttempts);
+    }
+
+    [Fact]
+    public async Task DefinitiveOutcome_ResetsAttemptCountAfterPriorTransientChurn_Movie()
+    {
+        // Convergence guarantee: once an item reaches a DEFINITIVE state
+        // (available/unavailable) its attempt_count resets to 0, so a later
+        // TTL re-probe starts the escalation window fresh rather than
+        // inheriting stale churn from a since-resolved problem.
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 99000702);
+        await db.SetImdbIdAsync(99000702, "movie", "tt99000702", CancellationToken.None);
+        var cfg = Config();
+        cfg.AvailabilityTransientRetryMinutes = 5;
+        var transientWorker = BuildWorker(db, cfg, new TransientIndexer("timeout"));
+        for (var i = 0; i < 3; i++)
+        {
+            await InsertMovieAvailabilityAsync(db, 99000702, status: "unknown", nextCheckAt: DateTimeOffset.UtcNow.AddHours(-1), priority: 0);
+            Assert.True(await InvokeProbeOneAsync(transientWorker, cfg));
+        }
+
+        Assert.True(await ReadAttemptCountAsync(99000702, "movie", -1, -1) > 0);
+
+        // The source now resolves definitively -> attempt_count must reset.
+        await InsertMovieAvailabilityAsync(db, 99000702, status: "unknown", nextCheckAt: DateTimeOffset.UtcNow.AddHours(-1), priority: 0);
+        var definitiveWorker = BuildWorker(db, cfg, new EmptyIndexer());
+        Assert.True(await InvokeProbeOneAsync(definitiveWorker, cfg));
+
+        var (status, _) = await ReadAvailabilityAsync(99000702);
+        Assert.Equal("unavailable", status);
+        Assert.Equal(0, await ReadAttemptCountAsync(99000702, "movie", -1, -1));
+    }
+
     [Fact]
     public async Task PreFilter_ProwlarrCapable_NoImdb_DoesNotDeepDeferAndReachesProbe()
     {

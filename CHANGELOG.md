@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Availability convergence guarantee + TTL re-probe
+  (p6-availability-convergence).** ROI Priority 6 item 5 (the acceptance
+  capstone over the whole Priority 6 set). No availability item churns the
+  short `AvailabilityTransientRetryMinutes` interval forever: once an item's
+  consecutive-transient `attempt_count` (bumped on every claim, reset to 0 on
+  any definitive `available`/`unavailable` completion) exceeds the new
+  `AvailabilityTransientMaxAttempts` (default 8), `AvailabilityProbeWorker`
+  escalates the retry cadence to the bounded `AvailabilityTransientEscalatedRetryHours`
+  (default 24h) — the same long-backoff shape already used for the
+  `no_capable_indexer`/unreleased pre-filters — for missing-metadata,
+  indeterminate-transient, and probe-exception outcomes alike, movie and
+  episode. `attempt_count` is now exposed on `AvailabilityItemRow` and
+  threaded through every `availability_items` read/claim path in
+  `PhantomDb`. Added
+  `tools/rig-scenarios/45-availability-probe.sh`, the Priority 6 acceptance
+  rig proving all five Priority 6 acceptance items (no-IMDB Prowlarr-shaped
+  resolve, user-priority queue-jump ahead of a backlog, no-capable-indexer/
+  future-aired deep-defer, search/browse-list unavailable-badge split with
+  full hidden-series episode grid, and this task's convergence + TTL
+  re-probe) for movie AND episode.
+
 - **Availability-sweep pre-filter for unavailable titles
   (p6-prefilter-unavailable).** The background availability sweep now
   pre-classifies a claimed item BEFORE spending a probe cycle on it, so the

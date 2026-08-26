@@ -103,6 +103,8 @@ public class PluginConfiguration : BasePluginConfiguration
         AvailabilityDeferredEpisodeDays = 30;
         AvailabilityNoIndexerRetryHours = 24;
         AvailabilityYieldToUserSeconds = 20;
+        AvailabilityTransientMaxAttempts = 8;
+        AvailabilityTransientEscalatedRetryHours = 24;
         SeriesExpansionTtlDays = 7;
         SeriesExpansionTransientRetryMinutes = 60;
         EpisodeReleaseDelayHours = 12;
@@ -422,6 +424,29 @@ public class PluginConfiguration : BasePluginConfiguration
     /// Default 20 seconds.
     /// </summary>
     public int AvailabilityYieldToUserSeconds { get; set; }
+
+    /// <summary>
+    /// Convergence guarantee (ROI Priority 6 item 5): once an item's
+    /// consecutive-transient <c>attempt_count</c> exceeds this threshold, the
+    /// short <see cref="AvailabilityTransientRetryMinutes"/> retry cadence is
+    /// replaced by <see cref="AvailabilityTransientEscalatedRetryHours"/> so a
+    /// permanently-transient item (a flaky indexer, a persistent probe
+    /// exception, missing metadata that never resolves) stops churning the
+    /// short interval forever. The counter is reset to 0 whenever the item
+    /// reaches a definitive state (<c>available</c>/<c>unavailable</c>), so
+    /// only *consecutive* transient failures escalate. Default 8 attempts
+    /// (~4 hours of churn at the default 30-minute retry before escalating).
+    /// </summary>
+    public int AvailabilityTransientMaxAttempts { get; set; }
+
+    /// <summary>
+    /// Bounded long backoff applied once <see cref="AvailabilityTransientMaxAttempts"/>
+    /// is exceeded. Default 24 hours — the same bound already used for the
+    /// <c>no_capable_indexer</c> / unreleased pre-filters, so every non-
+    /// definitive outcome converges to the same long-backoff cadence rather
+    /// than looping on the short interval forever.
+    /// </summary>
+    public int AvailabilityTransientEscalatedRetryHours { get; set; }
 
     /// <summary>TTL for TV series expansion passes.</summary>
     public int SeriesExpansionTtlDays { get; set; }

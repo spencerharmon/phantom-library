@@ -141,7 +141,8 @@ public sealed record AvailabilityItemRow(
     string? CandidateIndexer,
     string? CandidateSource,
     int ProbeGeneration,
-    string? LeaseOwner);
+    string? LeaseOwner,
+    int AttemptCount = 0);
 
 public sealed record VisibleMovieRow(
     TmdbMetadataRow Metadata,
@@ -1886,7 +1887,7 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
             }
 
             await tx.CommitAsync(ct).ConfigureAwait(false);
-            return row with { ProbeGeneration = generation, LeaseOwner = owner };
+            return row with { ProbeGeneration = generation, LeaseOwner = owner, AttemptCount = row.AttemptCount + 1 };
         }
         finally
         {
@@ -1906,7 +1907,7 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
         cmd.Transaction = tx;
         cmd.CommandText = @"SELECT tmdb_id,type,season,episode,status,checked_at,next_check_at,
                    candidate_magnet,candidate_info_hash,candidate_size,candidate_seeders,
-                   candidate_indexer,candidate_source,probe_generation,lease_owner
+                   candidate_indexer,candidate_source,probe_generation,lease_owner,attempt_count
             FROM availability_items
             WHERE (next_check_at <= @now OR probe_policy_hash IS NULL OR probe_policy_hash <> @policy)
               AND (lease_until IS NULL OR lease_until < @now)
@@ -1934,7 +1935,7 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
         cmd.Transaction = tx;
         cmd.CommandText = @"SELECT tmdb_id,type,season,episode,status,checked_at,next_check_at,
                    candidate_magnet,candidate_info_hash,candidate_size,candidate_seeders,
-                   candidate_indexer,candidate_source,probe_generation,lease_owner
+                   candidate_indexer,candidate_source,probe_generation,lease_owner,attempt_count
             FROM availability_items
             WHERE type='episode'
               AND (@cursor IS NULL OR tmdb_id > @cursor)
@@ -2018,7 +2019,8 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
                     last_error_kind=@errKind,
                     last_error_message=@errMsg,
                     lease_owner=NULL,
-                    lease_until=NULL
+                    lease_until=NULL,
+                    attempt_count=0
                 WHERE tmdb_id=@tmdb AND type=@type AND season=@season AND episode=@episode
                   AND lease_owner=@owner AND probe_generation=@generation;";
             cmd.AddWithValue("@status", status);
@@ -2076,7 +2078,8 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
                     last_error_kind=NULL,
                     last_error_message=NULL,
                     lease_owner=NULL,
-                    lease_until=NULL;";
+                    lease_until=NULL,
+                    attempt_count=0;";
             cmd.AddWithValue("@tmdb", tmdbId);
             cmd.AddWithValue("@type", type);
             cmd.AddWithValue("@season", season);
@@ -2558,7 +2561,7 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
                    ms.tmdb_id,ms.type,ms.season,ms.episode,ms.stub_path,ms.fuse_path,ms.materialised_at,
                    a.tmdb_id,a.type,a.season,a.episode,a.status,a.checked_at,a.next_check_at,
                    a.candidate_magnet,a.candidate_info_hash,a.candidate_size,a.candidate_seeders,
-                   a.candidate_indexer,a.candidate_source,a.probe_generation,a.lease_owner
+                   a.candidate_indexer,a.candidate_source,a.probe_generation,a.lease_owner,a.attempt_count
             FROM tmdb_metadata m
             LEFT JOIN materialised_state ms ON ms.tmdb_id=m.tmdb_id AND ms.type='movie'
             LEFT JOIN availability_items a ON a.tmdb_id=m.tmdb_id AND a.type='movie' AND a.season=-1 AND a.episode=-1
@@ -2595,7 +2598,7 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
                    ms.tmdb_id,ms.type,ms.season,ms.episode,ms.stub_path,ms.fuse_path,ms.materialised_at,
                    a.tmdb_id,a.type,a.season,a.episode,a.status,a.checked_at,a.next_check_at,
                    a.candidate_magnet,a.candidate_info_hash,a.candidate_size,a.candidate_seeders,
-                   a.candidate_indexer,a.candidate_source,a.probe_generation,a.lease_owner
+                   a.candidate_indexer,a.candidate_source,a.probe_generation,a.lease_owner,a.attempt_count
             FROM tmdb_metadata m
             LEFT JOIN materialised_state ms ON ms.tmdb_id=m.tmdb_id AND ms.type='movie'
             LEFT JOIN availability_items a ON a.tmdb_id=m.tmdb_id AND a.type='movie' AND a.season=-1 AND a.episode=-1
@@ -2863,7 +2866,7 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = @"SELECT tmdb_id,type,season,episode,status,checked_at,next_check_at,
                    candidate_magnet,candidate_info_hash,candidate_size,candidate_seeders,
-                   candidate_indexer,candidate_source,probe_generation,lease_owner
+                   candidate_indexer,candidate_source,probe_generation,lease_owner,attempt_count
             FROM availability_items
             WHERE tmdb_id=@tmdb AND type=@type AND season=@season AND episode=@episode
             LIMIT 1;";
@@ -3205,7 +3208,8 @@ CREATE INDEX IF NOT EXISTS idx_user_hidden_items_user
             r.IsDBNull(offset + 11) ? null : r.GetString(offset + 11),
             r.IsDBNull(offset + 12) ? null : r.GetString(offset + 12),
             r.GetInt32(offset + 13),
-            r.IsDBNull(offset + 14) ? null : r.GetString(offset + 14));
+            r.IsDBNull(offset + 14) ? null : r.GetString(offset + 14),
+            r.GetInt32(offset + 15));
 
     // ---- materialise_in_flight ----
 

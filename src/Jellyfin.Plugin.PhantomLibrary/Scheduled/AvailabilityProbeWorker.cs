@@ -236,7 +236,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
             {
                 await _db.RescheduleAvailabilityTransientAsync(
                     lease,
-                    now.AddMinutes(Math.Max(1, cfg.AvailabilityTransientRetryMinutes)),
+                    ComputeTransientRetryAt(cfg, lease, now),
                     "missing_metadata",
                     $"Missing title/year for {metaType}/{lease.TmdbId}",
                     ct).ConfigureAwait(false);
@@ -397,7 +397,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
                 case MagnetProbeOutcome.IndeterminateTransient:
                     await _db.RescheduleAvailabilityTransientAsync(
                         lease,
-                        now.AddMinutes(Math.Max(1, cfg.AvailabilityTransientRetryMinutes)),
+                        ComputeTransientRetryAt(cfg, lease, now),
                         probe.ErrorKind ?? "transient",
                         probe.ErrorMessage,
                         ct).ConfigureAwait(false);
@@ -440,7 +440,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
         {
             await _db.RescheduleAvailabilityTransientAsync(
                 lease,
-                DateTimeOffset.UtcNow.AddMinutes(Math.Max(1, cfg.AvailabilityTransientRetryMinutes)),
+                ComputeTransientRetryAt(cfg, lease, DateTimeOffset.UtcNow),
                 "probe_exception",
                 ex.Message,
                 CancellationToken.None).ConfigureAwait(false);
@@ -542,6 +542,33 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
             _logger.LogWarning(ex, "Series expansion failed for tmdb={Tmdb}", lease.SeriesTmdbId);
             return true;
         }
+    }
+
+    /// <summary>
+    /// Convergence guarantee (ROI Priority 6 item 5): computes the next
+    /// transient-retry boundary. Below the escalation threshold this is the
+    /// ordinary short <see cref="PluginConfiguration.AvailabilityTransientRetryMinutes"/>
+    /// cadence; once <see cref="AvailabilityItemRow.AttemptCount"/> (the
+    /// count of consecutive non-definitive outcomes for this row, bumped by
+    /// <c>ClaimDueAvailabilityAsync</c> on every claim and reset to 0 on any
+    /// definitive completion) exceeds
+    /// <see cref="PluginConfiguration.AvailabilityTransientMaxAttempts"/>, the
+    /// short interval is replaced with the bounded
+    /// <see cref="PluginConfiguration.AvailabilityTransientEscalatedRetryHours"/>
+    /// backoff — the same shape already used for the
+    /// <c>no_capable_indexer</c>/unreleased pre-filters — so a permanently
+    /// transient item (a flaky indexer, a persistent probe exception, missing
+    /// metadata that never resolves) cannot churn the short interval forever.
+    /// </summary>
+    internal static DateTimeOffset ComputeTransientRetryAt(PluginConfiguration cfg, AvailabilityItemRow lease, DateTimeOffset now)
+    {
+        var maxAttempts = Math.Max(1, cfg.AvailabilityTransientMaxAttempts);
+        if (lease.AttemptCount > maxAttempts)
+        {
+            return now.AddHours(Math.Max(1, cfg.AvailabilityTransientEscalatedRetryHours));
+        }
+
+        return now.AddMinutes(Math.Max(1, cfg.AvailabilityTransientRetryMinutes));
     }
 
     private void BumpFor(string type)
