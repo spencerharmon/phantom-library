@@ -3,9 +3,9 @@
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
     <RootNamespace>Jellyfin.Plugin.PhantomLibrary</RootNamespace>
-    <AssemblyVersion>0.5.0.0</AssemblyVersion>
-    <FileVersion>0.5.0.0</FileVersion>
-    <Version>0.5.0</Version>
+    <AssemblyVersion>0.5.1.0</AssemblyVersion>
+    <FileVersion>0.5.1.0</FileVersion>
+    <Version>0.5.1</Version>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
@@ -59,8 +59,13 @@
     <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="9.0.0" />
     <PackageReference Include="NCrontab" Version="3.3.3" />
     <PackageReference Include="prometheus-net" Version="8.2.1" />
-    <PackageReference Include="OpenTelemetry" Version="1.15.3" />
-    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.15.3" />
+    <!-- OpenTelemetry MUST stay on the .NET 9-aligned 1.10.0 line: it binds
+         System.Diagnostics.DiagnosticSource 9.0, which the Jellyfin 10.11.9 host provides.
+         1.11+/1.15.x demand DiagnosticSource 10.0, which the host does NOT ship, so the
+         plugin fails to load (ReflectionTypeLoadException) and Jellyfin DISABLES it -> no
+         channels/libraries. Do not bump past 1.10.x until the host framework moves to .NET 10. -->
+    <PackageReference Include="OpenTelemetry" Version="1.10.0" />
+    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.10.0" />
   </ItemGroup>
 
   <ItemGroup>
