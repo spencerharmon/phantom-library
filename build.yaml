@@ -6,7 +6,7 @@
 # See: https://github.com/oddstr13/jellyfin-plugin-repository-manager
 name: "Phantom Library"
 guid: "9e7a1f4c-2b5d-4e8f-9a3b-7c1d2e5f6a8b"
-version: "0.4.0.0"
+version: "0.5.0.0"
 targetAbi: "10.11.0.0"
 framework: "net9.0"
 owner: "spencerharmon"
