@@ -3,9 +3,9 @@
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
     <RootNamespace>Jellyfin.Plugin.PhantomLibrary</RootNamespace>
-    <AssemblyVersion>0.5.1.0</AssemblyVersion>
-    <FileVersion>0.5.1.0</FileVersion>
-    <Version>0.5.1</Version>
+    <AssemblyVersion>0.5.2.0</AssemblyVersion>
+    <FileVersion>0.5.2.0</FileVersion>
+    <Version>0.5.2</Version>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
@@ -66,6 +66,16 @@
          channels/libraries. Do not bump past 1.10.x until the host framework moves to .NET 10. -->
     <PackageReference Include="OpenTelemetry" Version="1.10.0" />
     <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.10.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The host-compatible OpenTelemetry 1.10.0 pin (DiagnosticSource 9.0 — see above) trips
+         NU1902 for a moderate OTLP-exporter DoS advisory (GHSA-4625-4j76-fww9) that is only fixed
+         in 1.11+, which requires DiagnosticSource 10.0 the Jellyfin 10.11.9 host does NOT ship.
+         Bumping to fix the CVE therefore DISABLES the plugin at runtime (no channels/libraries).
+         Telemetry goes over OTLP to a trusted in-infra collector, so suppress THIS one advisory
+         rather than lose the plugin. Revisit when the host framework moves to .NET 10. -->
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-4625-4j76-fww9" />
   </ItemGroup>
 
   <ItemGroup>
