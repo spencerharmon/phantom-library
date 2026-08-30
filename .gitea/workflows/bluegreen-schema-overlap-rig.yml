@@ -1,0 +1,59 @@
+# Gitea Actions — blue/green shared-Postgres schema overlap live rig (P7 item 5).
+#
+# Job `phantom-library-bluegreen-schema-overlap-rig` runs
+# tools/rig-scenarios/46-bluegreen-schema-overlap.sh on the swarm's self-hosted
+# Gitea Actions runner. Mirrors migration-rig.yml's shape: synthetic fixture
+# only (the TMDB mock's deterministic catalogue), never a production clone;
+# the scenario owns a trap-based cleanup of BOTH colors + the ephemeral
+# Postgres container, and this job adds an `if: always()` teardown as belt +
+# braces.
+
+name: bluegreen-schema-overlap-rig
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  phantom-library-bluegreen-schema-overlap-rig:
+    name: phantom-library-bluegreen-schema-overlap-rig
+    runs-on: self-hosted
+    timeout-minutes: 60
+    env:
+      PHANTOM_REPO_ROOT: ${{ gitea.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Build the plugin (Release)
+        run: |
+          dotnet build src/Jellyfin.Plugin.PhantomLibrary/Jellyfin.Plugin.PhantomLibrary.csproj \
+            -c Release
+
+      - name: Build the patched rig Jellyfin (Release)
+        run: |
+          dotnet build jellyfin/Jellyfin.Server/Jellyfin.Server.csproj -c Release
+
+      - name: Run the blue/green schema overlap rig (synthetic fixture)
+        run: |
+          set -euo pipefail
+          chmod +x tools/rig-scenarios/*.sh
+          out="$(mktemp)"
+          bash tools/rig-scenarios/46-bluegreen-schema-overlap.sh | tee "$out"
+          grep -q '^BLUEGREEN_RIG_OK$' "$out" \
+            || { echo 'bluegreen-schema-overlap rig did not reach BLUEGREEN_RIG_OK' >&2; exit 1; }
+
+      - name: Teardown rig (always)
+        if: always()
+        run: |
+          bash tools/rig-scenarios/rig-down.sh || true
+          podman rm -f rig-bluegreen-pg || true

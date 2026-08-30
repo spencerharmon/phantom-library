@@ -204,10 +204,29 @@ done
 # ---------------------------------------------------------------- launch jellyfin under user systemd
 log "start rig-jellyfin.service"
 mkdir -p /var/tmp/jf-test/tmp
+# Opt-in Postgres passthrough for the p7-bluegreen-schema-overlap-rig scenario
+# (46-bluegreen-schema-overlap.sh): when the CALLER's shell has
+# PHANTOM_POSTGRES_HOST set, forward the whole PHANTOM_POSTGRES_* surface
+# (see PhantomDbOptions.TryBuildPostgresConnectionString) into the spawned
+# jellyfin.service via --setenv, so this same well-tested rig-up path can
+# stand up a color against a SHARED Postgres DB instead of the SQLite
+# default. `systemd-run` does not inherit the caller's exported env, so this
+# must be forwarded explicitly. Purely additive/opt-in: unset (the default),
+# this changes nothing and every existing caller/scenario is unaffected.
+PG_SETENV_ARGS=()
+if [ -n "${PHANTOM_POSTGRES_HOST:-}" ]; then
+  PG_SETENV_ARGS+=("--setenv=PHANTOM_POSTGRES_HOST=$PHANTOM_POSTGRES_HOST")
+  [ -n "${PHANTOM_POSTGRES_PORT:-}" ]     && PG_SETENV_ARGS+=("--setenv=PHANTOM_POSTGRES_PORT=$PHANTOM_POSTGRES_PORT")
+  [ -n "${PHANTOM_POSTGRES_DB:-}" ]       && PG_SETENV_ARGS+=("--setenv=PHANTOM_POSTGRES_DB=$PHANTOM_POSTGRES_DB")
+  [ -n "${PHANTOM_POSTGRES_USER:-}" ]     && PG_SETENV_ARGS+=("--setenv=PHANTOM_POSTGRES_USER=$PHANTOM_POSTGRES_USER")
+  [ -n "${PHANTOM_POSTGRES_PASSWORD:-}" ] && PG_SETENV_ARGS+=("--setenv=PHANTOM_POSTGRES_PASSWORD=$PHANTOM_POSTGRES_PASSWORD")
+  log "PHANTOM_POSTGRES_HOST set: this color will use the shared Postgres backend, not SQLite"
+fi
 systemd-run --user --unit=rig-jellyfin \
   --description='Phantom rig Jellyfin' \
   --working-directory=$JF_DATA \
   --setenv=TMPDIR=/var/tmp/jf-test/tmp \
+  "${PG_SETENV_ARGS[@]}" \
   -- /usr/bin/dotnet $JF_DLL \
        --datadir $JF_DATA --configdir $JF_CFG \
        --cachedir $JF_CACHE --logdir $JF_LOG \
