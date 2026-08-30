@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.State;
@@ -202,7 +203,7 @@ public sealed class PhantomDbPostgresIntegrationTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task EnsureSchema_HardRefusesNewerVersion()
+    public async Task EnsureSchema_ForwardTolerant_NewerVersionIsToleratedNotRefused()
     {
         if (!Enabled)
         {
@@ -222,10 +223,26 @@ public sealed class PhantomDbPostgresIntegrationTests : IAsyncLifetime
             await cmd.ExecuteNonQueryAsync();
         }
 
+        // Forward-tolerant gate (p7-forward-tolerant-schema-gate): a db_version
+        // strictly GREATER than this build's CurrentSchemaVersion means a newer
+        // color already ran its additive expand migration — the blue/green
+        // coexistence contract requires this build to TOLERATE that, not
+        // hard-refuse it, so the still-running older-schema color keeps working
+        // during the shared-Postgres cutover window.
         using var futureDb = NewDb();
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => futureDb.CountCatalogueItemsAsync("movie", null, default));
-        Assert.Contains("Downgrade is not supported", ex.Message, StringComparison.Ordinal);
+        var count = await futureDb.CountCatalogueItemsAsync("movie", null, default);
+        Assert.Equal(0, count);
+
+        // The recorded version must NOT be rewritten downward to this older
+        // build's CurrentSchemaVersion — the newer color's stamp stands.
+        await using (var conn = new NpgsqlConnection(_connectionString))
+        {
+            await conn.OpenAsync();
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT version FROM phantom_schema_meta LIMIT 1;";
+            var version = Convert.ToInt32(await cmd.ExecuteScalarAsync(), CultureInfo.InvariantCulture);
+            Assert.Equal(PhantomDb.CurrentSchemaVersion + 1, version);
+        }
     }
 
     // ---- (c) multi-writer safety against the SAME logical Postgres DB ----
