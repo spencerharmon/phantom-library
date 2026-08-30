@@ -433,27 +433,34 @@ public sealed class PhantomDb : IDisposable
 
         var version = await _provider.ReadSchemaVersionAsync(conn, ct).ConfigureAwait(false);
 
-        if (version == CurrentSchemaVersion)
+        // MINIMUM-required gate (forward-tolerant): proceed whenever the DB is
+        // AT LEAST as new as what this build requires. This is the blue/green
+        // coexistence contract — both colors share one Postgres logical DB, so
+        // a newer-schema color's additive (expand-phase) migration must not
+        // disable an older-schema color still reading/writing the same rows.
+        // A db_version strictly GREATER than CurrentSchemaVersion means a
+        // newer color already ran its additive migration; that is tolerated,
+        // never a hard-fail, PROVIDED every query in this file selects/writes
+        // explicit named columns (never `SELECT *` / positional access), so an
+        // extra defaulted/NULLABLE column from the newer schema is invisible
+        // and harmless to this older build. We never rewrite the recorded
+        // version downward in that case — the newer color's stamp stands.
+        if (version >= CurrentSchemaVersion)
         {
             return;
         }
 
         if (version > 0 && version < CurrentSchemaVersion)
         {
-            // HARD-REFUSE: pre-v1.0 = wipe-and-rebuild, no migrations.
+            // HARD-REFUSE: pre-v1.0 = wipe-and-rebuild, no migrations. This is
+            // the genuinely-missing-structure case (the DB predates a
+            // structure this build's queries assume exists) — the one case
+            // forward tolerance must NOT paper over.
             throw new InvalidOperationException(
                 $"Phantom Library schema is at version {version}; this build requires" + Environment.NewLine
                 + $"version {CurrentSchemaVersion}. Pre-v1.0 has no migrations." + Environment.NewLine
                 + "Stop Jellyfin, run" + Environment.NewLine
                 + "`sudo bash scripts/phantom-wipe.sh --commit`, then restart.");
-        }
-
-        if (version > CurrentSchemaVersion)
-        {
-            // Operator downgraded the plugin against a newer DB. Also unsafe.
-            throw new InvalidOperationException(
-                $"Phantom Library schema is at version {version}; this build only knows about"
-                + $" version {CurrentSchemaVersion}. Downgrade is not supported. Wipe and rebuild.");
         }
 
         // version == 0: fresh / never-initialised DB. Create the current schema.

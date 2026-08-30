@@ -177,9 +177,23 @@ public class PhantomDbTests : IDisposable
         Assert.Equal(333, await db.GetGostreamPathTmdbAsync("/tv/s", "series", CancellationToken.None));
     }
 
+    // p7-forward-tolerant-schema-gate: a NEWER (additive) schema than this
+    // build requires must be TOLERATED, not hard-refused — both colors of a
+    // blue/green deploy share one Postgres logical DB, so a new-schema color
+    // running its additive migration must never disable an old-schema color
+    // still serving traffic against the same rows.
     [Fact]
-    public async Task HardRefuse_NewerSchemaVersion_Throws()
+    public async Task ForwardTolerant_NewerSchemaVersion_DoesNotThrow_AndPreservesVersionStamp()
     {
+        // Build a real, fully-formed current schema first (so the tables
+        // this build's queries assume exist are genuinely present), then
+        // simulate "a newer color already ran its additive migration" by
+        // bumping the recorded version past CurrentSchemaVersion.
+        using (var seed = await NewDbAsync())
+        {
+            // no-op; NewDbAsync already created the v19 schema via SetMetaAsync.
+        }
+
         var cs = new SqliteConnectionStringBuilder { DataSource = _dbPath, Mode = SqliteOpenMode.ReadWriteCreate }.ToString();
         await using (var conn = new SqliteConnection(cs))
         {
@@ -198,8 +212,104 @@ public class PhantomDbTests : IDisposable
         }
 
         using var db = new PhantomDb(_dbPath);
-        await Assert.ThrowsAsync<InvalidOperationException>(
-            () => db.SetMetaAsync("test", "1", CancellationToken.None));
+
+        // No throw: forward tolerance.
+        await db.SetMetaAsync("test", "1", CancellationToken.None);
+        Assert.Equal("1", await db.GetMetaAsync("test", CancellationToken.None));
+
+        // The newer color's version stamp is never rewritten downward.
+        await using var verifyConn = new SqliteConnection(cs);
+        await verifyConn.OpenAsync();
+        Assert.Equal(99, Convert.ToInt32(await ScalarAsync(verifyConn, "PRAGMA user_version;")));
+    }
+
+    // Movie/TV parity for the same fixture, per AGENTS.md's movie/TV parity
+    // rule: exercise the forward-tolerant path through a source-candidates
+    // round-trip covering both a movie row (season/episode = -1) and an
+    // episode row, proving neither path is disabled by a newer db_version.
+    [Theory]
+    [InlineData("movie")]
+    [InlineData("episode")]
+    public async Task ForwardTolerant_NewerSchemaVersion_MovieAndEpisodeReadsWritesStillWork(string type)
+    {
+        using (await NewDbAsync())
+        {
+            // seed schema
+        }
+
+        var cs = new SqliteConnectionStringBuilder { DataSource = _dbPath, Mode = SqliteOpenMode.ReadWriteCreate }.ToString();
+        await using (var conn = new SqliteConnection(cs))
+        {
+            await conn.OpenAsync();
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "PRAGMA user_version = 20;";
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        using (var poolConn = new SqliteConnection(cs))
+        {
+            SqliteConnection.ClearPool(poolConn);
+        }
+
+        using var db = new PhantomDb(_dbPath);
+
+        // gostream_path_tmdb round-trip exercises a real named-column
+        // read/write path shared by movie and episode kinds.
+        var path = $"/media/{type}/forward-tolerant.mkv";
+        Assert.Null(await db.GetGostreamPathTmdbAsync(path, type, CancellationToken.None));
+        await db.UpsertGostreamPathTmdbAsync(path, type, 7001, CancellationToken.None);
+        Assert.Equal(7001, await db.GetGostreamPathTmdbAsync(path, type, CancellationToken.None));
+    }
+
+    // An unknown newer column (added by a color running a schema ahead of
+    // this build) on an existing table must be harmless: this build's own
+    // explicit-column reads/writes never reference it, so it is silently
+    // ignored rather than tripping a positional-column assumption.
+    [Fact]
+    public async Task ForwardTolerant_UnknownNewerColumn_IsReadAndWrittenWithoutError()
+    {
+        using (await NewDbAsync())
+        {
+            // seed schema
+        }
+
+        var cs = new SqliteConnectionStringBuilder { DataSource = _dbPath, Mode = SqliteOpenMode.ReadWriteCreate }.ToString();
+        await using (var conn = new SqliteConnection(cs))
+        {
+            await conn.OpenAsync();
+            await using (var alter = conn.CreateCommand())
+            {
+                // Simulate an additive column a newer color's migration added.
+                alter.CommandText = "ALTER TABLE plugin_meta ADD COLUMN future_only_column TEXT NULL;";
+                await alter.ExecuteNonQueryAsync();
+            }
+
+            await using (var seedRow = conn.CreateCommand())
+            {
+                seedRow.CommandText = "INSERT INTO plugin_meta(key, value, future_only_column) VALUES ('future-row', 'v', 'from-the-future');";
+                await seedRow.ExecuteNonQueryAsync();
+            }
+
+            await using var bump = conn.CreateCommand();
+            bump.CommandText = "PRAGMA user_version = 20;";
+            await bump.ExecuteNonQueryAsync();
+        }
+
+        using (var poolConn = new SqliteConnection(cs))
+        {
+            SqliteConnection.ClearPool(poolConn);
+        }
+
+        using var db = new PhantomDb(_dbPath);
+
+        // Reading a pre-existing row that carries the unknown column must
+        // not throw — this build's SELECT names only key/value.
+        Assert.Equal("v", await db.GetMetaAsync("future-row", CancellationToken.None));
+
+        // Writing (upsert) must not throw and must not clobber/require the
+        // unknown column.
+        await db.SetMetaAsync("plain-row", "ok", CancellationToken.None);
+        Assert.Equal("ok", await db.GetMetaAsync("plain-row", CancellationToken.None));
     }
 
     [Fact]
