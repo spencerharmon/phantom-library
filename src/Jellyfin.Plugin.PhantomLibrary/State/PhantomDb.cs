@@ -1,4 +1,5 @@
 using System;
+using System.Data;
 using System.Collections.Generic;
 using System.Data.Common;
 using System.Globalization;
@@ -2195,7 +2196,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         cmd.AddWithValue("@tmdb", row.TmdbId);
         cmd.AddWithValue("@type", row.Type);
         cmd.AddWithValue("@title", row.Title);
-        cmd.AddWithValue("@year", (object?)row.Year ?? DBNull.Value);
+        cmd.AddWithValue("@year", (object?)row.Year ?? DBNull.Value, DbType.Int32);
         cmd.AddWithValue("@overview", (object?)row.Overview ?? DBNull.Value);
         cmd.AddWithValue("@poster", (object?)row.PosterUrl ?? DBNull.Value);
         cmd.AddWithValue("@backdrop", (object?)row.BackdropUrl ?? DBNull.Value);
@@ -2299,7 +2300,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
             LIMIT 1;";
         cmd.AddWithValue("@now", now.ToUnixTimeSeconds());
         cmd.AddWithValue("@policy", policyHash);
-        cmd.AddWithValue("@preferred", (object?)preferredType ?? DBNull.Value);
+        cmd.AddWithValue("@preferred", (object?)preferredType ?? DBNull.Value, DbType.String);
         await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
         return await r.ReadAsync(ct).ConfigureAwait(false) ? ReadAvailability(r) : null;
     }
@@ -2328,7 +2329,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                      season ASC,
                      episode ASC
             LIMIT 1;";
-        cmd.AddWithValue("@cursor", (object?)cursor ?? DBNull.Value);
+        cmd.AddWithValue("@cursor", (object?)cursor ?? DBNull.Value, DbType.Int64);
         cmd.AddWithValue("@now", now.ToUnixTimeSeconds());
         cmd.AddWithValue("@policy", policyHash);
         await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
@@ -4377,7 +4378,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
             cmd.AddWithValue("@tmdb", row.TmdbId);
             cmd.AddWithValue("@type", row.Type);
             cmd.AddWithValue("@title", row.Title);
-            cmd.AddWithValue("@year", (object?)row.Year ?? DBNull.Value);
+            cmd.AddWithValue("@year", (object?)row.Year ?? DBNull.Value, DbType.Int32);
             cmd.AddWithValue("@overview", (object?)row.Overview ?? DBNull.Value);
             cmd.AddWithValue("@poster", (object?)row.PosterUrl ?? DBNull.Value);
             cmd.AddWithValue("@backdrop", (object?)row.BackdropUrl ?? DBNull.Value);
@@ -4410,7 +4411,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
             WHERE type=@type AND (@year IS NULL OR year=@year)
             ORDER BY fetched_at DESC;";
         cmd.AddWithValue("@type", type);
-        cmd.AddWithValue("@year", (object?)year ?? DBNull.Value);
+        cmd.AddWithValue("@year", (object?)year ?? DBNull.Value, DbType.Int32);
         var wanted = NormalizeTitle(title);
         await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
         while (await r.ReadAsync(ct).ConfigureAwait(false))

@@ -56,4 +56,22 @@ public static class DbCommandExtensions
         cmd.Parameters.Add(p);
         return p;
     }
+
+    /// <summary>
+    /// Adds a named parameter with an EXPLICIT <see cref="DbType"/>. Required when the value can be
+    /// <see langword="null"/> (DBNull) AND the parameter is used in a position Postgres cannot type
+    /// from context — notably the <c>(@p IS NULL OR col=@p)</c> optional-filter pattern, where a
+    /// null param with no type triggers 42P08 "could not determine data type of parameter". SQLite
+    /// ignores the type harmlessly.
+    /// </summary>
+    public static DbParameter AddWithValue(this DbCommand cmd, string name, object? value, DbType dbType)
+    {
+        ArgumentNullException.ThrowIfNull(cmd);
+        var p = cmd.CreateParameter();
+        p.ParameterName = name;
+        p.Value = value ?? DBNull.Value;
+        p.DbType = dbType;
+        cmd.Parameters.Add(p);
+        return p;
+    }
 }
