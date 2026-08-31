@@ -1457,7 +1457,8 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                     VALUES (@tmdb,@type,@season,@episode,@preset,'pending',@priority,@now,@now,0)
                     ON CONFLICT(tmdb_id,type,season,episode,preset) DO UPDATE SET
                         status='pending',
-                        priority=MAX(magnet_cache_jobs.priority, excluded.priority),
+                        priority=CASE WHEN excluded.priority > magnet_cache_jobs.priority
+                                      THEN excluded.priority ELSE magnet_cache_jobs.priority END,
                         updated_at=excluded.updated_at,
                         lease_owner=NULL,
                         lease_until=NULL,
