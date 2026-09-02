@@ -1,25 +1,53 @@
 {{- if .Values.components.workload }}
 {{/*
-Single-environment Deployment: gostream (virtual-MKV FUSE producer) + patched Jellyfin (FUSE
+Single-environment workload: gostream (virtual-MKV FUSE producer) + patched Jellyfin (FUSE
 consumer) run in ONE CONTAINER, replicating the host's original single-mount-namespace layout.
 Kubernetes cannot share a mount namespace between two containers, so a FUSE mounted by a separate
 gostream container is invisible (content-wise) to Jellyfin — which is what broke materialise ("FUSE
 path did not appear"). The combined image (jellyfin-phantom, which bakes in the gostream binary +
 fuse3) runs a supervisor entrypoint: gostream mounts the FUSE at /var/gostream/gostream-mkv-virtual
-(the plugin's own GostreamMoviesRoot/ShowsRoot), then Jellyfin reads it in the same namespace.
-Strategy Recreate: an instance must not double-bind its RWO state PVC with itself mid-redeploy.
+(the plugin's own GostreamMoviesRoot/ShowsRoot), then Jellyfin reads it in the same namespace. Each
+replica keeps its OWN co-located FUSE — never the abandoned gostream-split.
+
+P4 Stage B multi-replica topology: this is a StatefulSet, NOT a Deployment, so ≥2 concurrent
+Jellyfin+gostream replicas can run on a color. The per-instance single-writer RWO state
+(jellyfin-var-lib, jellyfin-etc, gostream-state) is bound PER REPLICA:
+  * replicas == 1 (default, the blue/green single-instance-per-color case): the pod binds the
+    pre-existing STATIC per-instance PVCs by fixed claim name (jellyfin-var-lib[-<suffix>] etc.,
+    rendered by jellyfin-pvcs.yaml / state-pvcs.yaml). Behaviour and on-disk claims are UNCHANGED
+    from the previous Deployment — no PVC is renamed or orphaned.
+  * replicas > 1: the per-instance RWO volumes come from volumeClaimTemplates, so replica-N gets its
+    OWN <template>-<statefulset>-<N> claim and two replicas can never double-bind one RWO claim
+    (Multi-Attach / corrupted single-writer gostream state). The static per-instance PVC objects are
+    then suppressed (jellyfin-pvcs.yaml / state-pvcs.yaml) so no unused duplicate is created.
+The genuinely SHARED sources (real-mkv, warmup) stay ReadWriteOnce singletons mounted by fixed name
+by every replica — they are content-addressed (infohash-named), so replicas co-scheduled on a node
+converge on byte-identical files and can share one claim. Shared authoritative library/user data is
+in PostgreSQL (Stage A), not shared sqlite. P3 blue/green atomic cutover is unchanged (nameSuffix
+still discriminates colors; the Service still selects this color's Pods).
+
+OrderedReady/Recreate semantics: an instance must not double-bind its RWO state PVC with itself
+mid-redeploy. podManagementPolicy is OrderedReady (StatefulSet default): a replica's old Pod is
+fully terminated (releasing its RWO claim) before its replacement starts, exactly as the old
+Deployment's strategy Recreate guaranteed.
 */}}
+{{- $multi := gt (int .Values.jellyfin.replicas) 1 -}}
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: {{ include "phantom-library.fullname" . }}
   labels:
     {{- include "phantom-library.labels" . | nindent 4 }}
     app.kubernetes.io/component: jellyfin
 spec:
-  replicas: 1
-  strategy:
-    type: Recreate
+  replicas: {{ .Values.jellyfin.replicas }}
+  # Headless Service governing the StatefulSet's stable per-Pod network identities.
+  serviceName: {{ include "phantom-library.fullname" . }}-headless
+  # OrderedReady: a replica's old Pod is torn down (RWO claim released) before its replacement
+  # starts — the single-writer guarantee the old Deployment got from strategy Recreate.
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
   selector:
     matchLabels:
       {{- include "phantom-library.workloadSelector" . | nindent 6 }}
@@ -221,19 +249,15 @@ spec:
           emptyDir: {}
         - name: real-mkv
           persistentVolumeClaim:
-            # Per-instance PHYSICAL gostream source (/mnt/gostream-mkv-real): the tiny JSON stub
+            # SHARED PHYSICAL gostream source (/mnt/gostream-mkv-real): the tiny JSON stub
             # descriptors (magnet/infohash/size/stream-url) gostream scans at startup to build the
-            # virtual-MKV FS. MUST persist — an empty source yields an empty virtual FS, so every
-            # materialised item (old catalog + new) would stop resolving on restart. Rendered by
+            # virtual-MKV FS. Content-addressed (infohash-named) so every replica/color converges on
+            # byte-identical files and can share ONE RWO claim by fixed name. Rendered by
             # components.gostreamRealMkv.
             claimName: {{ .Values.realMkv.pvcName }}
-        - name: state
-          persistentVolumeClaim:
-            # Per-instance single-writer gostream STATE (STATE/gostream.db inode map + config.db BoltDB).
-            claimName: gostream-state{{ include "phantom-library.suffix" . }}
         - name: warmup
           persistentVolumeClaim:
-            # gostream warmup cache (content-addressed) — rendered by components.warmupCache.
+            # SHARED gostream warmup cache (content-addressed) — rendered by components.warmupCache.
             claimName: {{ .Values.warmup.pvcName }}
         - name: config-merged
           emptyDir: {}
@@ -244,12 +268,6 @@ spec:
         - name: config-secret
           secret:
             secretName: {{ .Values.configSecretName }}
-        - name: jellyfin-var-lib
-          persistentVolumeClaim:
-            claimName: jellyfin-var-lib{{ include "phantom-library.suffix" . }}
-        - name: jellyfin-etc
-          persistentVolumeClaim:
-            claimName: jellyfin-etc{{ include "phantom-library.suffix" . }}
         - name: plugin-preload
           emptyDir: {}
         {{- if .Values.prowlarrConfig.apiKeySecretName }}
@@ -257,7 +275,63 @@ spec:
           secret:
             secretName: {{ .Values.prowlarrConfig.apiKeySecretName }}
         {{- end }}
+        {{- if not $multi }}
+        # replicas == 1: bind the pre-existing STATIC per-instance RWO PVCs by fixed claim name
+        # (rendered by state-pvcs.yaml / jellyfin-pvcs.yaml). Identical to the previous Deployment —
+        # no PVC is renamed or orphaned on upgrade.
+        - name: state
+          persistentVolumeClaim:
+            # Per-instance single-writer gostream STATE (STATE/gostream.db inode map + config.db BoltDB).
+            claimName: gostream-state{{ include "phantom-library.suffix" . }}
+        - name: jellyfin-var-lib
+          persistentVolumeClaim:
+            claimName: jellyfin-var-lib{{ include "phantom-library.suffix" . }}
+        - name: jellyfin-etc
+          persistentVolumeClaim:
+            claimName: jellyfin-etc{{ include "phantom-library.suffix" . }}
+        {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+  {{- if $multi }}
+  # replicas > 1: each replica gets its OWN per-instance single-writer RWO state via
+  # volumeClaimTemplates (claim <template>-<statefulset>-<ordinal>), so two replicas can never
+  # double-bind one RWO claim (Multi-Attach / corrupted single-writer gostream/jellyfin state).
+  # The static per-instance PVC objects are suppressed in this mode (state-pvcs.yaml /
+  # jellyfin-pvcs.yaml), so no unused duplicate is created.
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+        labels:
+          {{- include "phantom-library.labels" . | nindent 10 }}
+          app.kubernetes.io/component: state
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ .Values.persistence.storageClassName }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.state.size }}
+    - metadata:
+        name: jellyfin-var-lib
+        labels:
+          {{- include "phantom-library.labels" . | nindent 10 }}
+          app.kubernetes.io/component: jellyfin-var-lib
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ .Values.persistence.storageClassName }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.jellyfinVarLib.size }}
+    - metadata:
+        name: jellyfin-etc
+        labels:
+          {{- include "phantom-library.labels" . | nindent 10 }}
+          app.kubernetes.io/component: jellyfin-etc
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ .Values.persistence.storageClassName }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.jellyfinEtc.size }}
+  {{- end }}
 {{- end }}

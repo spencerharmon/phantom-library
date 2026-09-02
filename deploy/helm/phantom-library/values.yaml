@@ -146,6 +146,16 @@ gostream:
 # ------------------------------------------------------------------ jellyfin (per Pod) --
 jellyfin:
   httpPort: 8096
+  # Number of concurrent Jellyfin+gostream replicas on THIS color (StatefulSet .spec.replicas).
+  # 1 (default) = the classic single-instance-per-color blue/green topology: the workload binds the
+  # STATIC per-instance RWO PVCs (jellyfin-var-lib[-<suffix>], jellyfin-etc[-<suffix>],
+  # gostream-state[-<suffix>]) by fixed claim name — unchanged from the previous Deployment.
+  # >1 = P4 Stage B multi-replica: each replica gets its OWN per-instance RWO state via the
+  # StatefulSet's volumeClaimTemplates (claim <template>-<statefulset>-<ordinal>), so two replicas
+  # never double-bind one single-writer claim. The SHARED content-addressed sources (real-mkv,
+  # warmup) stay one RWO claim mounted by every replica. Authoritative library/user data is shared
+  # via PostgreSQL (Stage A), never shared sqlite.
+  replicas: 1
   resources:
     requests: { cpu: "500m", memory: 1Gi }
     limits: { cpu: "2", memory: 4Gi }
