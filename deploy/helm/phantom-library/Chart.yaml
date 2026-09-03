@@ -29,7 +29,12 @@ type: application
 # quota and exposes usage-vs-quota metrics; new `jellyfin.metadataGeneration.*` values cut
 # trickplay/person-image/artwork generation at the source. BREAKING values schema
 # (`persistence.jellyfinMetadata.size` removed).
-version: 2.9.2
+# 2.9.3: publish the jellyfin-metadata-reaper DEADLINE-EXCEEDED fix (chart bytes from commit fab3864
+# — importance-query init container now wraps psql in `timeout ${QUERY_TIMEOUT_SECONDS}` + sets
+# `statement_timeout`, with heartbeat/progress logging) as a NEW OCI chart version so flux re-pulls
+# it; 2.9.2 was already published/pinned so the fix bytes were inert in-cluster. No values-schema
+# change vs 2.9.2 — version bump only, to carry the already-committed template/script fix.
+version: 2.9.3
 # Tracks the app milestone, not a container tag (images are digest-pinned in values).
 appVersion: "m14"
 keywords:
