@@ -70,15 +70,25 @@ spec:
                   set -u
                   out=/var/run/jellyfin-metadata-importance/map.txt
                   : > "$out"
+                  start_epoch=$(date +%s)
+                  echo "importance-query: starting (timeout ${QUERY_TIMEOUT_SECONDS}s)"
+                  # DEADLINE-EXCEEDED fix: PGCONNECT_TIMEOUT only bounds establishing the
+                  # connection, never the query itself — a slow/locked UserData scan could
+                  # previously block silently for the CronJob's entire activeDeadlineSeconds.
+                  # `timeout` is a second, outer bound in case the connection never completes;
+                  # `statement_timeout` bounds the query once connected.
                   if ! PGPASSWORD="$(cat /var/run/jellyfin-metadata-reaper-db/password)" \
-                       PGCONNECT_TIMEOUT=10 \
+                       PGCONNECT_TIMEOUT=10 timeout "${QUERY_TIMEOUT_SECONDS}" \
                        psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
-                            -tA -F' ' --no-align -c "$SQL" > "$out" 2>/tmp/err; then
-                    echo "importance-query: FAILED, reaper will degrade to atime LRU" >&2
+                            -tA -F' ' --no-align \
+                            -c "set statement_timeout = '${QUERY_TIMEOUT_SECONDS}s'; $SQL" > "$out" 2>/tmp/err; then
+                    elapsed=$(( $(date +%s) - start_epoch ))
+                    echo "importance-query: FAILED or timed out after ${QUERY_TIMEOUT_SECONDS}s (elapsed ${elapsed}s), reaper will degrade to atime LRU" >&2
                     sed -e 's/^/importance-query: /' /tmp/err >&2 || true
                     : > "$out"
                   fi
-                  echo "importance-query: wrote $(wc -l < "$out") item tiers"
+                  elapsed=$(( $(date +%s) - start_epoch ))
+                  echo "importance-query: wrote $(wc -l < "$out") item tiers (elapsed ${elapsed}s)"
               env:
                 - name: DB_HOST
                   value: {{ .Values.jellyfinMetadataReaper.importance.host | quote }}
@@ -88,6 +98,8 @@ spec:
                   value: {{ .Values.jellyfinMetadataReaper.importance.database | quote }}
                 - name: DB_USER
                   value: {{ .Values.jellyfinMetadataReaper.importance.user | quote }}
+                - name: QUERY_TIMEOUT_SECONDS
+                  value: {{ .Values.jellyfinMetadataReaper.importance.queryTimeoutSeconds | quote }}
                 - name: SQL
                   value: |-
                     select replace(ud."ItemId"::text,'-',''),

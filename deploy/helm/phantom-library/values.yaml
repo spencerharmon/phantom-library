@@ -334,6 +334,13 @@ jellyfinMetadataReaper:
     passwordSecretName: ""
     passwordSecretKey: postgres-password
     recentDays: 30
+    # DEADLINE-EXCEEDED fix (task jellyfin-metadata-reaper-deadline-exceeded-fix):
+    # bounds how long the init container's psql query may run — both as a
+    # Postgres `statement_timeout` (inside the query) and an outer `timeout`
+    # wrapper (in case the connection itself hangs). Before this fix a
+    # slow/locked UserData scan had NO bound (PGCONNECT_TIMEOUT only covers
+    # connecting) and could silently consume the whole CronJob deadline.
+    queryTimeoutSeconds: 30
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
   resources:

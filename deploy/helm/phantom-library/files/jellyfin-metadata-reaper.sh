@@ -50,7 +50,25 @@
 #       [--path <subdir>]... [--metrics-file <path>] [--dry-run] \
 #       [--db-host H] [--db-port P] [--db-name N] [--db-user U] \
 #       [--db-password-file F] [--recent-days N] [--no-db] \
-#       [--importance-file F]
+#       [--importance-file F] [--db-query-timeout N] \
+#       [--heartbeat-every N] [--heartbeat-seconds N]
+#
+# DEADLINE-EXCEEDED FIX (task jellyfin-metadata-reaper-deadline-exceeded-fix):
+#   The CronJob was observed intermittently running past its 3600s
+#   activeDeadlineSeconds with NO progress output, while other runs finished
+#   in 3-5m. Root cause: the (init-container or --db-*) `psql` importance
+#   query has no query-level timeout — `PGCONNECT_TIMEOUT` only bounds
+#   establishing the TCP connection, not the query itself, so a slow/locked
+#   `UserData` scan can block silently for the entire deadline. Fix:
+#     1. Every `psql` invocation is now wrapped in `timeout
+#        --db-query-timeout` (default 30s) AND carries a matching Postgres
+#        `statement_timeout`, so a hung/slow query can never consume more
+#        than a bounded, small slice of the deadline — it degrades to
+#        atime-only LRU instead of stalling.
+#     2. Path scanning and the eviction loop now emit periodic progress /
+#        heartbeat lines (elapsed time, per-path file counts, eviction
+#        counters) so ANY future slow run is diagnosable from the CronJob's
+#        pod logs instead of going silent until the deadline kills it.
 #
 # Exit codes: 0 = success (no-op or reclaimed enough), 1 = usage bad args,
 # 2 = could not reclaim below quota (all candidate files already deleted).
@@ -69,9 +87,12 @@ DB_PASSWORD_FILE=""
 IMPORTANCE_INPUT=""
 RECENT_DAYS="30"
 NO_DB=0
+DB_QUERY_TIMEOUT="30"
+HEARTBEAT_EVERY="2000"
+HEARTBEAT_SECONDS="30"
 
 usage() {
-  echo "usage: $0 --root <path> --quota-gb <N> [--path <subdir>]... [--metrics-file <path>] [--dry-run] [--db-host <h> --db-name <n> --db-user <u> --db-password-file <f>] [--db-port <p>] [--recent-days <n>] [--no-db] [--importance-file <f>]" >&2
+  echo "usage: $0 --root <path> --quota-gb <N> [--path <subdir>]... [--metrics-file <path>] [--dry-run] [--db-host <h> --db-name <n> --db-user <u> --db-password-file <f>] [--db-port <p>] [--recent-days <n>] [--no-db] [--importance-file <f>] [--db-query-timeout <n>] [--heartbeat-every <n>] [--heartbeat-seconds <n>]" >&2
   exit 1
 }
 
@@ -90,6 +111,9 @@ while [ $# -gt 0 ]; do
     --importance-file) IMPORTANCE_INPUT="$2"; shift 2 ;;
     --recent-days) RECENT_DAYS="$2"; shift 2 ;;
     --no-db) NO_DB=1; shift ;;
+    --db-query-timeout) DB_QUERY_TIMEOUT="$2"; shift 2 ;;
+    --heartbeat-every) HEARTBEAT_EVERY="$2"; shift 2 ;;
+    --heartbeat-seconds) HEARTBEAT_SECONDS="$2"; shift 2 ;;
     -h|--help) usage ;;
     *) echo "$0: unknown argument: $1" >&2; usage ;;
   esac
@@ -106,6 +130,23 @@ esac
 case "$QUOTA_GB" in
   ''|*[!0-9]*) echo "$0: --quota-gb must be a non-negative integer, got '$QUOTA_GB'" >&2; exit 1 ;;
 esac
+
+case "$DB_QUERY_TIMEOUT" in
+  ''|*[!0-9]*) echo "$0: --db-query-timeout must be a non-negative integer, got '$DB_QUERY_TIMEOUT'" >&2; exit 1 ;;
+esac
+
+case "$HEARTBEAT_EVERY" in
+  ''|*[!0-9]*) echo "$0: --heartbeat-every must be a non-negative integer, got '$HEARTBEAT_EVERY'" >&2; exit 1 ;;
+esac
+
+case "$HEARTBEAT_SECONDS" in
+  ''|*[!0-9]*) echo "$0: --heartbeat-seconds must be a non-negative integer, got '$HEARTBEAT_SECONDS'" >&2; exit 1 ;;
+esac
+
+# Wall-clock start, used ONLY for "elapsed Ns" progress logging (bash's builtin
+# SECONDS also resets on subshells, so an absolute epoch delta is more robust).
+SCRIPT_START_EPOCH="$(date +%s)"
+elapsed_seconds() { echo "$(( $(date +%s) - SCRIPT_START_EPOCH ))"; }
 
 ROOT="$(cd "$ROOT" && pwd)"
 [ -n "$METRICS_FILE" ] || METRICS_FILE="$ROOT/.jellyfin-metadata-usage.prom"
@@ -179,8 +220,15 @@ fetch_importance() {
   # One row per item that has ANY user-data signal; everything absent from this
   # result is implicitly tier 0. Dashes are stripped so the key matches the
   # on-disk directory name directly.
+  #
+  # `set statement_timeout` is the DEADLINE-EXCEEDED fix: PGCONNECT_TIMEOUT
+  # only bounds establishing the connection, never the query itself, so a
+  # slow/locked UserData scan could previously block for the whole 3600s
+  # CronJob deadline with zero output. Bounding it here means a stuck query
+  # degrades to atime-only LRU in --db-query-timeout seconds instead.
   local sql
-  sql="select replace(ud.\"ItemId\"::text,'-',''),
+  sql="set statement_timeout = '${DB_QUERY_TIMEOUT}s';
+       select replace(ud.\"ItemId\"::text,'-',''),
               max(case
                     when ud.\"IsFavorite\" then 3
                     when coalesce(ud.\"PlaybackPositionTicks\",0) > 0 then 3
@@ -192,10 +240,16 @@ fetch_importance() {
          from \"UserData\" ud
         group by 1"
   local out
-  if ! out="$(PGPASSWORD="$pw" PGCONNECT_TIMEOUT=10 psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -tA -F' ' --no-align -c "$sql" 2>/dev/null)"; then
-    echo "jellyfin-metadata-reaper: DB query failed — falling back to atime-only LRU" >&2
+  echo "jellyfin-metadata-reaper: querying importance DB at ${DB_HOST}:${DB_PORT}/${DB_NAME} (timeout ${DB_QUERY_TIMEOUT}s, elapsed $(elapsed_seconds)s)" >&2
+  # `timeout` is a second, OUTER bound on top of the in-query statement_timeout
+  # — belt-and-suspenders against a psql/libpq hang that never reaches the
+  # server at all (e.g. a half-open TCP connection past PGCONNECT_TIMEOUT).
+  if ! out="$(PGPASSWORD="$pw" PGCONNECT_TIMEOUT=10 timeout "${DB_QUERY_TIMEOUT}" \
+      psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -tA -F' ' --no-align -c "$sql" 2>/dev/null)"; then
+    echo "jellyfin-metadata-reaper: DB query failed or timed out after ${DB_QUERY_TIMEOUT}s (elapsed $(elapsed_seconds)s) — falling back to atime-only LRU" >&2
     DB_STATUS="unavailable"; return 0
   fi
+  echo "jellyfin-metadata-reaper: importance DB query returned (elapsed $(elapsed_seconds)s)" >&2
   if [ -z "$out" ]; then
     DB_STATUS="empty"; return 0
   fi
@@ -237,6 +291,7 @@ measure_usage_bytes() {
   local total=0
   local p
   for p in "${RESOLVED_PATHS[@]}"; do
+    echo "jellyfin-metadata-reaper: measuring usage under $p (elapsed $(elapsed_seconds)s)" >&2
     # `du -sB1` reports apparent-ish disk usage in bytes for the subtree; -s summarises to one line.
     local sz
     sz="$(du -sB1 "$p" 2>/dev/null | cut -f1)"
@@ -276,7 +331,10 @@ esac
 # Collect candidates as: <atime> <size> <path>
 : > "$CANDIDATES_FILE"
 for p in "${RESOLVED_PATHS[@]}"; do
+  echo "jellyfin-metadata-reaper: scanning $p (elapsed $(elapsed_seconds)s)" >&2
   find "$p" -type f ! -name '.jellyfin-metadata-usage.prom' ! -name '.reaper-*' -printf '%A@ %s %p\0' >> "$CANDIDATES_FILE"
+  path_file_count="$(tr -cd '\0' < "$CANDIDATES_FILE" | wc -c)"
+  echo "jellyfin-metadata-reaper: finished scanning $p — ${path_file_count} candidate files so far (elapsed $(elapsed_seconds)s)" >&2
 done
 
 # Rank: emit "<tier> <atime> <size> <path>" NUL-delimited, resolving each file's
@@ -318,6 +376,7 @@ fi
 
 RECLAIMED=0
 DELETED_COUNT=0
+LAST_HEARTBEAT_EPOCH="$SCRIPT_START_EPOCH"
 
 # Sort by tier ascending (least important first), then atime ascending within tier.
 while IFS=' ' read -r -d '' tier atime size path; do
@@ -336,6 +395,17 @@ while IFS=' ' read -r -d '' tier atime size path; do
   TIER_DELETED[$tier]=$(( ${TIER_DELETED[$tier]:-0} + 1 ))
   USAGE_BYTES=$((USAGE_BYTES - size))
   RECLAIMED=$((RECLAIMED + size))
+  # DEADLINE-EXCEEDED fix: emit a progress/heartbeat line periodically — either
+  # by deletion COUNT (deterministic, so tests can force it with
+  # --heartbeat-every 1) or by wall-clock elapsed time (so a real run always
+  # shows liveness even mid-way through a large batch) — instead of staying
+  # silent for the whole eviction pass.
+  now_epoch="$(date +%s)"
+  if { [ "$HEARTBEAT_EVERY" -gt 0 ] && [ $((DELETED_COUNT % HEARTBEAT_EVERY)) -eq 0 ]; } \
+     || { [ "$HEARTBEAT_SECONDS" -gt 0 ] && [ $((now_epoch - LAST_HEARTBEAT_EPOCH)) -ge "$HEARTBEAT_SECONDS" ]; }; then
+    echo "jellyfin-metadata-reaper: progress — evicted ${DELETED_COUNT} files, reclaimed ${RECLAIMED}B, usage now ${USAGE_BYTES}B (quota ${QUOTA_BYTES}B), elapsed $(elapsed_seconds)s"
+    LAST_HEARTBEAT_EPOCH="$now_epoch"
+  fi
 # Sort by tier ascending (least important first), then atime ascending within tier.
 #
 # -S/-T are REQUIRED for correctness under a container memory limit: GNU sort sizes its
@@ -345,10 +415,8 @@ while IFS=' ' read -r -d '' tier atime size path; do
 # cache volume, which has headroom by construction.
 done < <(sort -z -S "${SORT_BUFFER:-32M}" -T "${SORT_TMPDIR:-$ROOT}" -k1,1n -k2,2n "$RANKED_FILE")
 
-echo "jellyfin-metadata-reaper: reclaimed ${RECLAIMED}B across ${DELETED_COUNT} files; usage now ${USAGE_BYTES}B (quota ${QUOTA_BYTES}B)"
+echo "jellyfin-metadata-reaper: reclaimed ${RECLAIMED}B across ${DELETED_COUNT} files; usage now ${USAGE_BYTES}B (quota ${QUOTA_BYTES}B), elapsed $(elapsed_seconds)s"
 echo "jellyfin-metadata-reaper: evicted by tier — never-played=${TIER_DELETED[0]:-0} old-played=${TIER_DELETED[1]:-0} recent=${TIER_DELETED[2]:-0} favourite/in-progress=${TIER_DELETED[3]:-0}"
-
-echo "jellyfin-metadata-reaper: reclaimed ${RECLAIMED}B across ${DELETED_COUNT} files; usage now ${USAGE_BYTES}B (quota ${QUOTA_BYTES}B)"
 
 if [ "$DRY_RUN" -eq 0 ]; then
   write_metrics "$USAGE_BYTES" "$RECLAIMED"
