@@ -1,8 +1,12 @@
-{{- if .Values.components.jellyfinStorage }}
+{{- if and .Values.components.jellyfinStorage (not (gt (int .Values.jellyfin.replicas) 1)) }}
 {{/*
 Per-instance Jellyfin persistence (var-lib = library DB/metadata/plugins; etc = network.xml +
 encoding config). Each workload instance owns its own so a bad rollout on one instance can never
 touch the DB/config of another instance serving traffic.
+
+Rendered ONLY in the single-replica topology (jellyfin.replicas == 1). When replicas > 1 the
+workload StatefulSet's volumeClaimTemplates own the per-replica jellyfin-var-lib/jellyfin-etc claims
+(one per ordinal), so these STATIC singletons would be unused duplicates and are suppressed.
 */}}
 apiVersion: v1
 kind: PersistentVolumeClaim

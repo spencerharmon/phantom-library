@@ -23,7 +23,13 @@ WARMUP-SIZING INVARIANT: capacity = warmup.quotaGb + warmup.headroomGi, so it ca
 than the quota gostream enforces (quota = quotaGb * 1024^3). Both this size and the ConfigMap's
 disk_warmup_quota_gb come from .Values.warmup — the single source Helm gives us.
 */}}
-{{- if .Values.components.gostreamState }}
+{{- if and .Values.components.gostreamState (not (gt (int .Values.jellyfin.replicas) 1)) }}
+{{/*
+gostream-state is per-INSTANCE single-writer RWO. Rendered ONLY in the single-replica topology
+(jellyfin.replicas == 1). When replicas > 1 the workload StatefulSet's volumeClaimTemplates own the
+per-replica gostream-state claim (one per ordinal), so this STATIC singleton would be an unused
+duplicate and is suppressed.
+*/}}
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

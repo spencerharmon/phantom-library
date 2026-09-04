@@ -29,4 +29,29 @@ spec:
       port: {{ .Values.gostream.ports.gostorm }}
       targetPort: gostorm
     {{- end }}
+---
+{{/*
+Headless Service governing the workload StatefulSet — provides the stable per-Pod DNS identities
+(<pod>.<fullname>-headless) a StatefulSet requires via spec.serviceName. It does NOT front traffic
+(the ClusterIP Service above does that and load-balances across all ready replicas); clusterIP:None
+just publishes each Pod's own A record. Same instance+component selector so it only covers this
+color's workload Pods.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "phantom-library.fullname" . }}-headless
+  labels:
+    {{- include "phantom-library.labels" . | nindent 4 }}
+    app.kubernetes.io/component: jellyfin
+spec:
+  type: ClusterIP
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "phantom-library.workloadSelector" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.jellyfin.httpPort }}
+      targetPort: http
 {{- end }}

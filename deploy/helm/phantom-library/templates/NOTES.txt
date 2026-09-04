@@ -1,9 +1,9 @@
 phantom-library deployed as release {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
 
 Components rendered by THIS release:
-  workload        : {{ .Values.components.workload }}   (Deployment + Service + Ingress{{ if and .Values.tls.enabled .Values.tls.issuerRef.name }} + Certificate{{ end }})
-  jellyfinStorage : {{ .Values.components.jellyfinStorage }}   (jellyfin-var-lib{{ include "phantom-library.suffix" . }} + jellyfin-etc{{ include "phantom-library.suffix" . }} PVCs)
-  gostreamState   : {{ .Values.components.gostreamState }}   (gostream-state{{ include "phantom-library.suffix" . }} PVC)
+  workload        : {{ .Values.components.workload }}   (StatefulSet ({{ .Values.jellyfin.replicas }} replica{{ if gt (int .Values.jellyfin.replicas) 1 }}s{{ end }}) + Service + headless Service + Ingress{{ if and .Values.tls.enabled .Values.tls.issuerRef.name }} + Certificate{{ end }})
+  jellyfinStorage : {{ .Values.components.jellyfinStorage }}   ({{ if gt (int .Values.jellyfin.replicas) 1 }}per-replica jellyfin-var-lib / jellyfin-etc via StatefulSet volumeClaimTemplates{{ else }}jellyfin-var-lib{{ include "phantom-library.suffix" . }} + jellyfin-etc{{ include "phantom-library.suffix" . }} PVCs{{ end }})
+  gostreamState   : {{ .Values.components.gostreamState }}   ({{ if gt (int .Values.jellyfin.replicas) 1 }}per-replica gostream-state via StatefulSet volumeClaimTemplates{{ else }}gostream-state{{ include "phantom-library.suffix" . }} PVC{{ end }})
   gostreamRealMkv : {{ .Values.components.gostreamRealMkv }}   ({{ .Values.realMkv.pvcName }} PVC (shared))
   warmupCache     : {{ .Values.components.warmupCache }}   ({{ .Values.warmup.pvcName }} PVC)
   gostreamConfig  : {{ .Values.components.gostreamConfig }}   ({{ .Values.gostreamConfig.configMapName }} ConfigMap)
