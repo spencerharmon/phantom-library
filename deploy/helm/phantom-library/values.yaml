@@ -374,6 +374,50 @@ gostreamConfig:
 extraVolumes: []
 extraVolumeMounts: []
 
+# ------------------------------------------------------------ Grafana dashboard (p8) --
+# Operator-facing Grafana dashboard for the six ROI-priority-8 load-time flows (task
+# p8-grafana-dashboard). Rendered as a ConfigMap labeled `grafana_dashboard: "1"` so flux's Grafana
+# dashboard-sidecar auto-imports it (the sidecar + Grafana + Mimir are already deployed by flux — this
+# chart only ships the dashboard DEFINITION). Infra-identifier rule: `datasourceName` is the Grafana
+# datasource's PROVISIONED NAME (e.g. "Mimir"), never a baked Mimir/Grafana URL/hostname — the
+# dashboard JSON references it via a templated `${DS_MIMIR}` variable, resolved by Grafana at import
+# time from the name given here.
+grafanaDashboard:
+  enabled: true
+  # Provisioned Grafana datasource name backing the panels (a Mimir Prometheus-compatible datasource).
+  datasourceName: "Mimir"
+  # The fixed 0.5s target line drawn on every panel (ROI-wide load-time target).
+  targetSeconds: 0.5
+  # One entry per load-time flow (mirrors tools/perf/loadtime-thresholds.json's `scenarios`).
+  # `thresholdMs` is the CURRENT ratcheted threshold (0 = not yet ratcheted -> no threshold line
+  # beyond the fixed 0.5s target); `priority: true` visually calls the panel out (materialise +
+  # play-materialised are the priority signals per the task card).
+  flows:
+    - id: list_load
+      title: "List Load"
+      thresholdMs: 0
+      priority: false
+    - id: sort_change
+      title: "Sort Change"
+      thresholdMs: 0
+      priority: false
+    - id: info_open
+      title: "Info Page Open"
+      thresholdMs: 0
+      priority: false
+    - id: get_sources
+      title: "Get Sources"
+      thresholdMs: 0
+      priority: false
+    - id: materialise
+      title: "Materialise"
+      thresholdMs: 500
+      priority: true
+    - id: play_materialised
+      title: "Play Materialised"
+      thresholdMs: 500
+      priority: true
+
 # ---------------------------------------------------------------------------- storage --
 persistence:
   storageClassName: local-path

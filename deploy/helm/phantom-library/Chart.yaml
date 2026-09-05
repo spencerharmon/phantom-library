@@ -34,7 +34,14 @@ type: application
 # `statement_timeout`, with heartbeat/progress logging) as a NEW OCI chart version so flux re-pulls
 # it; 2.9.2 was already published/pinned so the fix bytes were inert in-cluster. No values-schema
 # change vs 2.9.2 — version bump only, to carry the already-committed template/script fix.
-version: 2.9.3
+# 2.10.0: p8-grafana-dashboard — new `grafanaDashboard.*` values + a Grafana dashboard ConfigMap
+# (templates/grafana-dashboard-configmap.yaml, labeled `grafana_dashboard: "1"` for flux's Grafana
+# sidecar) with one panel per load-time flow (list_load/sort_change/info_open/get_sources/
+# materialise/play_materialised), each drawing the `phantom_loadtime_seconds{flow=…}` trend, the
+# fixed 0.5s target line, and the current ratcheted threshold; materialise + play_materialised are
+# visually flagged as priority signals. Datasource referenced by provisioned name only (no baked
+# Mimir/Grafana URL). Additive values schema.
+version: 2.10.0
 # Tracks the app milestone, not a container tag (images are digest-pinned in values).
 appVersion: "m14"
 keywords:

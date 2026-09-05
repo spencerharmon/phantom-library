@@ -1,0 +1,79 @@
+{{- if .Values.grafanaDashboard.enabled }}
+{{/*
+Operator-facing Grafana dashboard for the six ROI-priority-8 load-time flows (task
+p8-grafana-dashboard). Labeled `grafana_dashboard: "1"` so flux's Grafana dashboard-sidecar
+auto-imports it (Grafana + Mimir + the sidecar are already deployed by flux). One panel per flow,
+each showing the `phantom_loadtime_seconds{flow=…}` latency trend, the fixed 0.5s target line, and
+the current ratcheted threshold (.Values.grafanaDashboard.flows[].thresholdMs, 0 = not yet
+ratcheted). materialise + play_materialised are visually called out as the priority signals.
+Infra-identifier rule: the datasource is referenced by its PROVISIONED NAME
+(.Values.grafanaDashboard.datasourceName) via a templated `${DS_MIMIR}` dashboard variable — never a
+baked Mimir/Grafana URL or hostname.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "phantom-library.fullname" . }}-grafana-dashboard
+  labels:
+    {{- include "phantom-library.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grafana-dashboard
+    grafana_dashboard: "1"
+data:
+  phantom-library-loadtime.json: |
+    {
+      "title": "Phantom Library \u2014 Load-Time Flows",
+      "uid": "phantom-library-loadtime",
+      "schemaVersion": 39,
+      "version": 1,
+      "timezone": "browser",
+      "panels": [
+        {{- $flows := .Values.grafanaDashboard.flows }}
+        {{- $target := .Values.grafanaDashboard.targetSeconds }}
+        {{- $last := sub (len $flows) 1 }}
+        {{- range $i, $f := $flows }}
+        {{- $row := div $i 2 }}
+        {{- $col := mod $i 2 }}
+        {
+          "id": {{ add $i 1 }},
+          "type": "timeseries",
+          "title": "{{ if $f.priority }}\u26a0 PRIORITY \u2014 {{ end }}{{ $f.title }}",
+          "datasource": { "type": "prometheus", "uid": "${DS_MIMIR}" },
+          "gridPos": { "h": 8, "w": 12, "x": {{ mul $col 12 }}, "y": {{ mul $row 8 }} },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": { "thresholdsStyle": { "mode": "line" } },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "orange", "value": {{ $target }} }
+                  {{- if gt (int $f.thresholdMs) 0 }},
+                  { "color": "red", "value": {{ divf (float64 $f.thresholdMs) 1000 }} }
+                  {{- end }}
+                ]
+              }
+            }
+          },
+          "targets": [
+            {
+              "expr": "phantom_loadtime_seconds{flow=\"{{ $f.id }}\", item_type=~\".*\"}",
+              "legendFormat": "{{ "{{item_type}}" }}",
+              "refId": "A"
+            }
+          ]
+        }{{ if ne $i $last }},{{ end }}
+        {{- end }}
+      ],
+      "templating": {
+        "list": [
+          {
+            "name": "DS_MIMIR",
+            "type": "datasource",
+            "query": "prometheus",
+            "current": { "text": "{{ .Values.grafanaDashboard.datasourceName }}", "value": "{{ .Values.grafanaDashboard.datasourceName }}" }
+          }
+        ]
+      }
+    }
+{{- end }}
