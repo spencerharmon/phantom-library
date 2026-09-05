@@ -1,0 +1,73 @@
+name: phantom-library daily load-time schedule
+# .gitea/workflows/phantom-loadtime-daily.yaml
+#
+# ROI Priority 8, item 3 — run the load-time measurement rig on a DAILY
+# cadence against the DEPLOYED stack (never a standalone rig instance).
+# Mirrors .gitea/workflows/in-cluster-acceptance-rig.yaml's toolchain/kube
+# setup (self-hosted runner, pinned .NET SDK container, kubeconfig from a
+# provisioned secret), and delegates everything substantive to
+# tools/ci/loadtime-daily-run.sh so this file stays a thin trigger +
+# toolchain declaration.
+#
+# The daily run measures the current dev/idle color's Jellyfin at
+# vars.PHANTOM_INCLUSTER_DEV_HOST — the host the user actually hits — via the
+# same P3 Stage-5 in-cluster rig harness posture (live color resolution from
+# the Ingress, prod-host equality refusal). It then pushes the measurement to
+# the Pushgateway (P8 item 2) and runs the ratcheting regression guard
+# (P8 item 5), auto-filing a follow-up task per breached scenario.
+#
+# Endpoints/hosts/tokens come from repo secrets/vars only — never baked into
+# this tracked YAML (infra-identifier rule).
+#
+# Regression harness: scripts/tests/p8-loadtime-daily-workflow.test.sh proves
+# this file parses, runs on a daily schedule trigger + the self-hosted
+# runner, declares a pinned toolchain, invokes the shared script (never a
+# hand-rolled copy), and that a toolchain-agnostic dry run
+# (PHANTOM_CI_DRYRUN=1) exits 0 with no cluster/network access.
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  loadtime-daily:
+    name: daily load-time measurement (deployed dev color, live)
+    runs-on: [self-hosted, gitea-actions-runner]
+    container:
+      image: mcr.microsoft.com/dotnet/sdk:9.0.305-noble
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install kubectl + curl + openssl + jq + python3 (needed by the rig)
+        run: |
+          set -euo pipefail
+          apt-get update -y
+          apt-get install -y --no-install-recommends \
+            curl ca-certificates openssl jq python3 python3-pip
+          curl -fsSL -o /usr/local/bin/kubectl \
+            "https://dl.k8s.io/release/$(curl -fsSL -L https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x /usr/local/bin/kubectl
+          rm -rf /var/lib/apt/lists/*
+
+      - name: mark repo safe for git (container UID != checkout owner)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: write scoped kubeconfig from the provisioned secret
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.kube"
+          printf '%s' "$PHANTOM_INCLUSTER_KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+        env:
+          PHANTOM_INCLUSTER_KUBECONFIG_B64: ${{ secrets.PHANTOM_INCLUSTER_KUBECONFIG_B64 }}
+
+      - name: daily load-time measurement (shared script; measures the DEPLOYED dev color live, pushes, guards)
+        run: ./tools/ci/loadtime-daily-run.sh
+        env:
+          PHANTOM_INCLUSTER_DEV_HOST: ${{ vars.PHANTOM_INCLUSTER_DEV_HOST }}
+          PHANTOM_INCLUSTER_PROD_HOST: ${{ vars.PHANTOM_INCLUSTER_PROD_HOST }}
+          PHANTOM_INCLUSTER_NAMESPACE: ${{ vars.PHANTOM_INCLUSTER_NAMESPACE }}
+          PHANTOM_INCLUSTER_ADMIN_TOKEN: ${{ secrets.PHANTOM_INCLUSTER_ADMIN_TOKEN }}
+          PHANTOM_PUSHGATEWAY_URL: ${{ vars.PHANTOM_PUSHGATEWAY_URL }}
