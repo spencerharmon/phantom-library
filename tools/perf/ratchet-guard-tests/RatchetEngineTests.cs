@@ -193,6 +193,119 @@ public class RatchetEngineTests
         var roundTripped = RatchetThresholds.Parse(r.UpdatedThresholds.Serialize());
         Assert.Equal(1000, roundTripped.Scenarios.Single().ThresholdMs);
     }
+
+    // --- P8 per-scenario override tests (materialise/play_materialised ratchet harder) ---
+
+    [Fact]
+    public void PerScenarioMargin_OverridesGlobal_RatchetsOnSmallerImprovement()
+    {
+        // Global margin 10% would NOT ratchet a 6% improvement, but a scenario-level
+        // 5% margin override (P8's materialise/play_materialised priority signals) does.
+        var t = new RatchetThresholds
+        {
+            ImprovementMarginRatio = 0.10,
+            RatchetHeadroomRatio = 0.05,
+            Scenarios =
+            {
+                new ScenarioThreshold
+                {
+                    Flow = "materialise", Backend = "movie", Quantile = "single", ThresholdMs = 1000,
+                    ImprovementMarginRatio = 0.05, RatchetHeadroomRatio = 0.02,
+                },
+            },
+        };
+        var m = new MeasurementSet
+        {
+            Measurements = { new ScenarioMeasurement { Flow = "materialise", Backend = "movie", Quantile = "single", ValueMs = 940 } },
+        };
+
+        var r = RatchetEngine.Evaluate(t, m);
+
+        var res = Assert.Single(r.Results);
+        Assert.Equal(ScenarioOutcome.Ratcheted, res.Outcome);
+        // candidate = 940 * 1.02 = 958.8, strictly below 1000.
+        Assert.Equal(958.8, res.NewThresholdMs, 3);
+    }
+
+    [Fact]
+    public void PerScenarioOverridesNull_FallsBackToGlobalKnobs()
+    {
+        var t = new RatchetThresholds
+        {
+            ImprovementMarginRatio = 0.10,
+            RatchetHeadroomRatio = 0.05,
+            Scenarios = { new ScenarioThreshold { Flow = "list_load", Backend = "movie", Quantile = "single", ThresholdMs = 1000 } },
+        };
+        var m = new MeasurementSet
+        {
+            Measurements = { new ScenarioMeasurement { Flow = "list_load", Backend = "movie", Quantile = "single", ValueMs = 940 } },
+        };
+
+        var r = RatchetEngine.Evaluate(t, m);
+
+        // 940 is only a 6% improvement; global margin is 10% -> holds, does not ratchet.
+        var res = Assert.Single(r.Results);
+        Assert.Equal(ScenarioOutcome.Held, res.Outcome);
+    }
+
+    [Fact]
+    public void TargetMs_IsInformationalOnly_NeverEnforced()
+    {
+        // A scenario with a target_ms of 500 still breaches normally when measured above
+        // its ceiling, and the target never floors/gates the ratchet.
+        var t = new RatchetThresholds
+        {
+            Scenarios =
+            {
+                new ScenarioThreshold
+                {
+                    Flow = "play_materialised", Backend = "movie", Quantile = "single",
+                    ThresholdMs = 1000, TargetMs = 500,
+                },
+            },
+        };
+        var m = new MeasurementSet
+        {
+            Measurements = { new ScenarioMeasurement { Flow = "play_materialised", Backend = "movie", Quantile = "single", ValueMs = 1500 } },
+        };
+
+        var r = RatchetEngine.Evaluate(t, m);
+
+        Assert.Equal(ScenarioOutcome.Breached, Assert.Single(r.Results).Outcome);
+        Assert.Equal(500, r.UpdatedThresholds.Scenarios.Single().TargetMs);
+    }
+
+    [Fact]
+    public void PerScenarioOverrides_SurviveRoundTripThroughUpdatedThresholds()
+    {
+        var t = new RatchetThresholds
+        {
+            Scenarios =
+            {
+                new ScenarioThreshold
+                {
+                    Flow = "materialise", Backend = "episode", Quantile = "single", ThresholdMs = 1000,
+                    ImprovementMarginRatio = 0.05, RatchetHeadroomRatio = 0.02, TargetMs = 500,
+                },
+            },
+        };
+        var m = new MeasurementSet
+        {
+            Measurements = { new ScenarioMeasurement { Flow = "materialise", Backend = "episode", Quantile = "single", ValueMs = 800 } },
+        };
+
+        var r = RatchetEngine.Evaluate(t, m);
+        var s = r.UpdatedThresholds.Scenarios.Single();
+        Assert.Equal(0.05, s.ImprovementMarginRatio);
+        Assert.Equal(0.02, s.RatchetHeadroomRatio);
+        Assert.Equal(500, s.TargetMs);
+
+        var roundTripped = RatchetThresholds.Parse(r.UpdatedThresholds.Serialize());
+        var rs = roundTripped.Scenarios.Single();
+        Assert.Equal(0.05, rs.ImprovementMarginRatio);
+        Assert.Equal(0.02, rs.RatchetHeadroomRatio);
+        Assert.Equal(500, rs.TargetMs);
+    }
 }
 
 public class FilingPlanTests
@@ -227,6 +340,29 @@ public class FilingPlanTests
         Assert.Equal("p5-perf-regression-season-listing-sqlite-p99", id);
         Assert.DoesNotContain(':', id);
         Assert.Equal(id, FilingPlan.TaskIdFor("season-listing:sqlite:p99"));
+    }
+
+    [Fact]
+    public void TaskIdPrefix_IsConfigurable_ForP8DailyLoadtimeGuard()
+    {
+        // P8's daily load-time guard files under a distinct prefix so its filed
+        // regression tasks never collide with P5's p5-perf-regression- ids for
+        // the same flow name (e.g. "materialise" appears in both guards).
+        var id = FilingPlan.TaskIdFor("materialise:movie:single", "p8-daily-perf-regression");
+        Assert.Equal("p8-daily-perf-regression-materialise-movie-single", id);
+
+        var t = new RatchetThresholds
+        {
+            Scenarios = { new ScenarioThreshold { Flow = "materialise", Backend = "movie", Quantile = "single", ThresholdMs = 500 } },
+        };
+        var m = new MeasurementSet
+        {
+            Measurements = { new ScenarioMeasurement { Flow = "materialise", Backend = "movie", Quantile = "single", ValueMs = 900 } },
+        };
+        var r = RatchetEngine.Evaluate(t, m);
+        var plan = FilingPlan.Build(r, "p8-daily-perf-regression");
+        var entry = Assert.Single(plan.Entries);
+        Assert.Equal("p8-daily-perf-regression-materialise-movie-single", entry.TaskId);
     }
 
     [Fact]

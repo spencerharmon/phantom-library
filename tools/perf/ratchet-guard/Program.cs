@@ -49,7 +49,7 @@ public static class Program
 
             if (result.HasBreach)
             {
-                var plan = FilingPlan.Build(result);
+                var plan = FilingPlan.Build(result, opts.TaskIdPrefix);
                 var planJson = JsonSerializer.Serialize(plan, FilingPlan.SerializerOptions);
                 if (opts.FilePlanPath is { } planPath)
                 {
@@ -92,14 +92,16 @@ public sealed class CliOptions
     public string? FilePlanPath { get; private set; }
     public bool Apply { get; private set; }
     public bool ShowHelp { get; private set; }
+    public string TaskIdPrefix { get; private set; } = "p5-perf-regression";
 
     public const string Usage =
         "usage: phantom-ratchet-guard --thresholds <file> --measurements <file> "
-        + "[--apply] [--file-plan <file>]\n"
+        + "[--apply] [--file-plan <file>] [--task-prefix <prefix>]\n"
         + "  --thresholds    ratchet threshold JSON (read; rewritten only with --apply)\n"
         + "  --measurements  perf-run measurement JSON to guard against the thresholds\n"
         + "  --apply         persist tightened/seeded thresholds back to the thresholds file\n"
         + "  --file-plan     write the breach filing plan JSON to this path instead of stdout\n"
+        + "  --task-prefix   task-id prefix for filed breach tasks (default p5-perf-regression)\n"
         + "exit 0 = ok, 3 = breach (regression), 2 = error";
 
     public static CliOptions Parse(string[] args)
@@ -120,6 +122,9 @@ public sealed class CliOptions
                     break;
                 case "--file-plan":
                     o.FilePlanPath = RequireValue(args, ref i);
+                    break;
+                case "--task-prefix":
+                    o.TaskIdPrefix = RequireValue(args, ref i);
                     break;
                 case "--apply":
                     o.Apply = true;

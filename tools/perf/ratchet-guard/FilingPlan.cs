@@ -43,14 +43,15 @@ public sealed class FilingPlan
         WriteIndented = true,
     };
 
-    public static FilingPlan Build(GuardResult result)
+    public static FilingPlan Build(GuardResult result, string taskIdPrefix = "p5-perf-regression")
     {
         ArgumentNullException.ThrowIfNull(result);
+        ArgumentNullException.ThrowIfNull(taskIdPrefix);
         var entries = result.Breaches
             .OrderBy(b => b.Key, StringComparer.Ordinal)
             .Select(b => new FilingEntry
             {
-                TaskId = TaskIdFor(b.Key),
+                TaskId = TaskIdFor(b.Key, taskIdPrefix),
                 Scenario = b.Key,
                 MeasuredMs = b.MeasuredMs,
                 ThresholdMs = b.PreviousThresholdMs,
@@ -71,9 +72,10 @@ public sealed class FilingPlan
     /// the guard on the same standing regression targets the SAME task id (the wrapper's
     /// `task add` is idempotent-by-id) rather than filing a duplicate each run.
     /// </summary>
-    public static string TaskIdFor(string scenarioKey)
+    public static string TaskIdFor(string scenarioKey, string taskIdPrefix = "p5-perf-regression")
     {
         ArgumentNullException.ThrowIfNull(scenarioKey);
+        ArgumentNullException.ThrowIfNull(taskIdPrefix);
         var chars = scenarioKey
             .Select(c => char.IsLetterOrDigit(c) ? char.ToLowerInvariant(c) : '-')
             .ToArray();
@@ -83,6 +85,6 @@ public sealed class FilingPlan
             slug = slug.Replace("--", "-", StringComparison.Ordinal);
         }
 
-        return $"p5-perf-regression-{slug}";
+        return $"{taskIdPrefix}-{slug}";
     }
 }
