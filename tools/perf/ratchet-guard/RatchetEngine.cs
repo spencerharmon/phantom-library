@@ -65,8 +65,8 @@ public static class RatchetEngine
         ArgumentNullException.ThrowIfNull(thresholds);
         ArgumentNullException.ThrowIfNull(measurements);
 
-        var margin = Math.Clamp(thresholds.ImprovementMarginRatio, 0.0, 0.99);
-        var headroom = Math.Max(0.0, thresholds.RatchetHeadroomRatio);
+        var globalMargin = Math.Clamp(thresholds.ImprovementMarginRatio, 0.0, 0.99);
+        var globalHeadroom = Math.Max(0.0, thresholds.RatchetHeadroomRatio);
 
         // Work on a copy so callers never see a mutated input; the returned object is what to persist.
         var updated = new RatchetThresholds
@@ -80,6 +80,9 @@ public static class RatchetEngine
                     Backend = s.Backend,
                     Quantile = s.Quantile,
                     ThresholdMs = s.ThresholdMs,
+                    ImprovementMarginRatio = s.ImprovementMarginRatio,
+                    RatchetHeadroomRatio = s.RatchetHeadroomRatio,
+                    TargetMs = s.TargetMs,
                 })
                 .ToList(),
         };
@@ -101,7 +104,7 @@ public static class RatchetEngine
                     Flow = m.Flow,
                     Backend = m.Backend,
                     Quantile = m.Quantile,
-                    ThresholdMs = Round(m.ValueMs * (1.0 + headroom)),
+                    ThresholdMs = Round(m.ValueMs * (1.0 + globalHeadroom)),
                 };
                 updated.Scenarios.Add(seeded);
                 byKey[m.Key] = seeded;
@@ -117,6 +120,8 @@ public static class RatchetEngine
                 continue;
             }
 
+            var margin = Math.Clamp(scenario.ImprovementMarginRatio ?? globalMargin, 0.0, 0.99);
+            var headroom = Math.Max(0.0, scenario.RatchetHeadroomRatio ?? globalHeadroom);
             var ceiling = scenario.ThresholdMs;
 
             // A registered scenario with a non-positive ceiling has never been

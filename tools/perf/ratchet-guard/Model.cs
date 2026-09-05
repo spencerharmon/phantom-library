@@ -26,6 +26,32 @@ public sealed class ScenarioThreshold
     [JsonPropertyName("threshold_ms")]
     public double ThresholdMs { get; set; }
 
+    /// <summary>
+    /// Optional per-scenario override of the global <see cref="RatchetThresholds.ImprovementMarginRatio"/>.
+    /// Used to ratchet a high-priority scenario (e.g. P8's materialise/play_materialised flows) harder
+    /// than the default — a smaller margin means a smaller improvement still counts as "beat the ceiling".
+    /// Null falls back to the global knob.
+    /// </summary>
+    [JsonPropertyName("improvement_margin_ratio")]
+    public double? ImprovementMarginRatio { get; set; }
+
+    /// <summary>
+    /// Optional per-scenario override of the global <see cref="RatchetThresholds.RatchetHeadroomRatio"/>.
+    /// A smaller headroom tracks the measurement more tightly when ratcheting down. Null falls back to
+    /// the global knob.
+    /// </summary>
+    [JsonPropertyName("ratchet_headroom_ratio")]
+    public double? RatchetHeadroomRatio { get; set; }
+
+    /// <summary>
+    /// Informational-only aspirational ceiling this scenario is being ratcheted toward (e.g. the
+    /// operator's 0.5s target for materialise/play_materialised). Never enforced directly by the
+    /// engine — it does not gate a breach or floor a ratchet — it is surfaced in reports so progress
+    /// toward the goal is visible. Null when the scenario has no named target.
+    /// </summary>
+    [JsonPropertyName("target_ms")]
+    public double? TargetMs { get; set; }
+
     /// <summary>The scenario key (stable identity used for measurements and filed task ids).</summary>
     [JsonIgnore]
     public string Key => $"{Flow}:{Backend}:{Quantile}";
