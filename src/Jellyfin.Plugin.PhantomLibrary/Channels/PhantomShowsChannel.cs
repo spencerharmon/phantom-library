@@ -370,7 +370,7 @@ public sealed partial class PhantomShowsChannel
 
     private async Task<ChannelItemResult> GetTopLevelSeriesAsync(Guid userId, CancellationToken ct)
     {
-        using var flowScope = PhantomFlowMetrics.Time(PhantomFlowMetrics.FlowListView);
+        using var flowScope = PhantomFlowMetrics.Time(PhantomFlowMetrics.FlowListView, _db.Backend);
         var seen = new HashSet<int>();
         var items = new List<ChannelItemInfo>();
 
@@ -478,7 +478,7 @@ public sealed partial class PhantomShowsChannel
 
     private async Task<ChannelItemResult> GetSeasonsForSeriesAsync(Guid userId, int seriesTmdb, CancellationToken ct)
     {
-        using var flowScope = PhantomFlowMetrics.Time(PhantomFlowMetrics.FlowSeasonListing);
+        using var flowScope = PhantomFlowMetrics.Time(PhantomFlowMetrics.FlowSeasonListing, _db.Backend);
         // Title-level hide short-circuits the whole seasons browse for this
         // series (REQ-M14-PER-USER Surface 3). This must happen BEFORE the
         // visible-seasons/external-seasons union below: unlike the top-level
@@ -549,7 +549,7 @@ public sealed partial class PhantomShowsChannel
 
     private async Task<ChannelItemResult> GetEpisodesForSeasonAsync(Guid userId, int seriesTmdb, int season, CancellationToken ct)
     {
-        using var flowScope = PhantomFlowMetrics.Time(PhantomFlowMetrics.FlowEpisodeListing);
+        using var flowScope = PhantomFlowMetrics.Time(PhantomFlowMetrics.FlowEpisodeListing, _db.Backend);
         // Title-level hide short-circuits the whole episodes browse for this
         // series (REQ-M14-PER-USER Surface 3) — before any TMDB/cache work, for
         // the same completeness reason as GetSeasonsForSeriesAsync: the known-

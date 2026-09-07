@@ -163,7 +163,8 @@ public sealed class PhantomMoviesChannel
         using var flowScope = PhantomFlowMetrics.Time(
             query.UserId == Guid.Empty
                 ? PhantomFlowMetrics.FlowMaterialisedListing
-                : PhantomFlowMetrics.FlowListView);
+                : PhantomFlowMetrics.FlowListView,
+            _db.Backend);
 
         var items = new List<ChannelItemInfo>();
         var emittedTmdbs = new HashSet<int>();

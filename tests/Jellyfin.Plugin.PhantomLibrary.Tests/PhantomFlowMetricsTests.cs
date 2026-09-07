@@ -4,6 +4,7 @@ using System.Diagnostics.Metrics;
 using System.Linq;
 using Jellyfin.Plugin.PhantomLibrary.Configuration;
 using Jellyfin.Plugin.PhantomLibrary.Diagnostics;
+using Jellyfin.Plugin.PhantomLibrary.State.Db;
 using OpenTelemetry.Exporter;
 using Xunit;
 
@@ -179,6 +180,72 @@ public sealed class PhantomFlowMetricsTests
         {
             Environment.SetEnvironmentVariable(key, null);
             Assert.Equal(expected, PhantomMetricsExporter.ResolveProtocol(config));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(key, previous);
+        }
+    }
+
+    [Theory]
+    [InlineData(PhantomDbBackend.Postgres, "postgres")]
+    [InlineData(PhantomDbBackend.Sqlite, "sqlite")]
+    public void BackendTag_MapsRuntimeBackendToLabel(PhantomDbBackend backend, string expected)
+    {
+        Assert.Equal(expected, PhantomFlowMetrics.BackendTag(backend));
+    }
+
+    [Fact]
+    public void TimeScope_TypedBackend_TagsWithRuntimeBackend()
+    {
+        var (measurements, listener) = StartListener();
+        using (listener)
+        {
+            using (PhantomFlowMetrics.Time(PhantomFlowMetrics.FlowListView, PhantomDbBackend.Postgres))
+            {
+            }
+        }
+
+        var duration = Assert.Single(measurements, m => m.Instrument == "phantom_flow_duration_ms");
+        Assert.Equal("postgres", duration.Tags["backend"]);
+    }
+
+    [Fact]
+    public void ResolveEnabled_ConfigTrue_ShortCircuitsTrue()
+    {
+        var config = new PluginConfiguration { MetricsOtlpEnabled = true };
+        var key = "PHANTOM_METRICS_OTLP_ENABLED";
+        var previous = Environment.GetEnvironmentVariable(key);
+        try
+        {
+            Environment.SetEnvironmentVariable(key, null);
+            Assert.True(PhantomMetricsExporter.ResolveEnabled(config));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(key, previous);
+        }
+    }
+
+    [Theory]
+    [InlineData("1", true)]
+    [InlineData("true", true)]
+    [InlineData("TRUE", true)]
+    [InlineData("yes", true)]
+    [InlineData("on", true)]
+    [InlineData("0", false)]
+    [InlineData("false", false)]
+    [InlineData("", false)]
+    [InlineData(null, false)]
+    public void ResolveEnabled_ConfigFalse_HonoursEnvFallback(string? envValue, bool expected)
+    {
+        var config = new PluginConfiguration { MetricsOtlpEnabled = false };
+        var key = "PHANTOM_METRICS_OTLP_ENABLED";
+        var previous = Environment.GetEnvironmentVariable(key);
+        try
+        {
+            Environment.SetEnvironmentVariable(key, envValue);
+            Assert.Equal(expected, PhantomMetricsExporter.ResolveEnabled(config));
         }
         finally
         {

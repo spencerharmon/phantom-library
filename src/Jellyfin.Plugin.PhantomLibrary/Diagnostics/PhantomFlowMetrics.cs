@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
+using Jellyfin.Plugin.PhantomLibrary.State.Db;
 
 namespace Jellyfin.Plugin.PhantomLibrary.Diagnostics;
 
@@ -86,6 +87,25 @@ internal static class PhantomFlowMetrics
     /// item count.
     /// </summary>
     public static FlowScope Time(string flow, string backend = "sqlite") => new(flow, backend);
+
+    /// <summary>
+    /// Maps the runtime <see cref="PhantomDbBackend"/> to the string value of
+    /// the <c>backend</c> metric tag (<c>postgres</c> / <c>sqlite</c>).
+    /// </summary>
+    public static string BackendTag(PhantomDbBackend backend) => backend switch
+    {
+        PhantomDbBackend.Postgres => "postgres",
+        _ => "sqlite",
+    };
+
+    /// <summary>
+    /// Starts timing a flow, tagging it with the concrete storage backend the
+    /// flow is served from (derived from <see cref="State.PhantomDb.Backend"/>).
+    /// Use this overload from a call site that has a <see cref="State.PhantomDb"/>
+    /// so the emitted series carries the real <c>backend</c> label instead of the
+    /// compiled-in default.
+    /// </summary>
+    public static FlowScope Time(string flow, PhantomDbBackend backend) => new(flow, BackendTag(backend));
 
     /// <summary>Disposable timing scope; records latency (and optional item count) on dispose.</summary>
     public sealed class FlowScope : IDisposable

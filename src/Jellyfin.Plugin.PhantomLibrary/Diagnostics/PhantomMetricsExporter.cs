@@ -25,6 +25,17 @@ namespace Jellyfin.Plugin.PhantomLibrary.Diagnostics;
 ///   <item><c>OTEL_EXPORTER_OTLP_ENDPOINT</c> environment variable.</item>
 /// </list>
 ///
+/// The endpoint is used VERBATIM (the OTLP signal path is NOT auto-appended), so
+/// an HTTP/protobuf endpoint must include the full signal path — e.g. Grafana
+/// Mimir's <c>http://&lt;mimir&gt;:8080/otlp/v1/metrics</c>. This keeps the target
+/// unambiguous across OTLP SDK versions rather than relying on path-append
+/// behaviour.
+///
+/// Enablement resolves from <c>PluginConfiguration.MetricsOtlpEnabled</c>, else
+/// the <c>PHANTOM_METRICS_OTLP_ENABLED</c> environment variable (truthy:
+/// <c>1/true/yes/on</c>) — so a GitOps deployment can turn the exporter on
+/// purely through env, matching the endpoint/protocol env fallbacks.
+///
 /// The service is fail-safe: if metrics are disabled, no endpoint resolves, or
 /// exporter construction throws, it logs and no-ops rather than breaking
 /// Jellyfin startup. The <see cref="PhantomFlowMetrics"/> instruments keep
@@ -55,7 +66,7 @@ public sealed class PhantomMetricsExporter : IHostedService, IDisposable
         try
         {
             var config = _configProvider();
-            if (!config.MetricsOtlpEnabled)
+            if (!ResolveEnabled(config))
             {
                 _logger.LogDebug("Phantom OTLP flow metrics disabled; not starting exporter.");
                 return Task.CompletedTask;
@@ -77,6 +88,10 @@ public sealed class PhantomMetricsExporter : IHostedService, IDisposable
                 .AddMeter(PhantomFlowMetrics.MeterName)
                 .AddOtlpExporter((exporterOptions, readerOptions) =>
                 {
+                    // Setting Endpoint programmatically makes the OTLP SDK use the
+                    // URL VERBATIM (the public setter flips AppendSignalPathToEndpoint
+                    // off), so the resolved endpoint must already carry the full OTLP
+                    // signal path for HTTP/protobuf — e.g. Mimir's /otlp/v1/metrics.
                     exporterOptions.Endpoint = new Uri(endpoint);
                     exporterOptions.Protocol = protocol;
                 })
@@ -108,6 +123,26 @@ public sealed class PhantomMetricsExporter : IHostedService, IDisposable
     {
         _meterProvider?.Dispose();
         _meterProvider = null;
+    }
+
+    internal static bool ResolveEnabled(PluginConfiguration config)
+    {
+        if (config.MetricsOtlpEnabled)
+        {
+            return true;
+        }
+
+        var env = Environment.GetEnvironmentVariable("PHANTOM_METRICS_OTLP_ENABLED");
+        if (string.IsNullOrWhiteSpace(env))
+        {
+            return false;
+        }
+
+        return env.Trim().ToUpperInvariant() switch
+        {
+            "1" or "TRUE" or "YES" or "ON" => true,
+            _ => false,
+        };
     }
 
     internal static string? ResolveEndpoint(PluginConfiguration config)

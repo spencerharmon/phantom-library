@@ -113,7 +113,7 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
         // P5 baseline: the badge-state batch re-resolve is the plugin-owned
         // cost of a list-view sort/filter change (phantomBadges.js re-polls the
         // freshly visible tile set on every reorder/filter).
-        using var flowScope = PhantomFlowMetrics.Time(PhantomFlowMetrics.FlowSortFilter);
+        using var flowScope = PhantomFlowMetrics.Time(PhantomFlowMetrics.FlowSortFilter, _db.Backend);
         flowScope.ItemCount = requests.Count;
 
         var resolved = new Dictionary<Guid, (BaseItem? Item, ChannelItemId Parsed)>();
