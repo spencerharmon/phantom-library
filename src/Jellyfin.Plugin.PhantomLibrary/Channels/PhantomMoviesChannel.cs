@@ -117,6 +117,8 @@ public sealed class PhantomMoviesChannel
         {
             ContentTypes = new List<ChannelMediaContentType> { ChannelMediaContentType.Movie },
             MediaTypes = new List<ChannelMediaType> { ChannelMediaType.Video },
+            DefaultSortFields = new List<ChannelItemSortField>(ChannelSortHelper.SupportedSortFields),
+            SupportsSortOrderToggle = true,
         };
     }
 
@@ -281,6 +283,13 @@ public sealed class PhantomMoviesChannel
         }
 
         flowScope.ItemCount = items.Count;
+        // p10-relevance-sort: the list is already in the default blended
+        // (materialised/available-first, then relevance_score, then
+        // recency) order from step 1's DB query, with steps 2/3 appended
+        // after it; an explicit query.SortBy request re-sorts the whole
+        // thing (see ChannelSortHelper for the field-mapping rationale and
+        // which of the ROI's five named options this can actually honor).
+        ChannelSortHelper.ApplyExplicitSort(items, query.SortBy, query.SortDescending);
         return new ChannelItemResult
         {
             Items = items,
@@ -619,6 +628,9 @@ public sealed class PhantomMoviesChannel
             ImageUrl = meta.PosterUrl,
             ProductionYear = meta.Year,
             PremiereDate = meta.Year is { } y ? new DateTime(y, 1, 1, 0, 0, 0, DateTimeKind.Utc) : null,
+            // p10-relevance-sort: "Recently added" sort proxy — when this
+            // title first entered the plugin's own catalogue.
+            DateCreated = meta.FetchedAt.UtcDateTime,
             CommunityRating = meta.CommunityRating is { } cr ? (float)cr : null,
             OfficialRating = meta.OfficialRating,
             Tags = tags,

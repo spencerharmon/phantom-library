@@ -48,7 +48,7 @@ public class PhantomDbTests : IDisposable
     // ----------------------------------------------------------------
 
     [Fact]
-    public async Task FreshDb_CreatesSchemaV19_WithAllExpectedTables()
+    public async Task FreshDb_CreatesCurrentSchema_WithAllExpectedTables()
     {
         using var db = await NewDbAsync();
 
@@ -67,7 +67,7 @@ public class PhantomDbTests : IDisposable
             version = Convert.ToInt32(await v.ExecuteScalarAsync());
         }
 
-        Assert.Equal(19, version);
+        Assert.Equal(PhantomDb.CurrentSchemaVersion, version);
 
         var expectedTables = new[]
         {
@@ -155,7 +155,7 @@ public class PhantomDbTests : IDisposable
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => db.SetMetaAsync("test", "1", CancellationToken.None));
 
-        Assert.Contains("version 19", ex.Message, StringComparison.Ordinal);
+        Assert.Contains($"version {PhantomDb.CurrentSchemaVersion}", ex.Message, StringComparison.Ordinal);
         Assert.Contains("phantom-wipe.sh", ex.Message, StringComparison.Ordinal);
     }
 
@@ -718,6 +718,182 @@ public class PhantomDbTests : IDisposable
             "invalid", "no_valid_files", now, null, 1, "policy-v1", null, null, null), CancellationToken.None);
 
         Assert.DoesNotContain(await db.ListVisibleSeriesRowsAsync(CancellationToken.None), r => r.Metadata.TmdbId == 600);
+    }
+
+    // ----------------------------------------------------------------
+    // p10-relevance-sort: default browse ordering blends availability
+    // confidence, newness and a popularity proxy into a stored, cheaply-
+    // refreshed relevance_score column.
+    // ----------------------------------------------------------------
+
+    /// <summary>
+    /// The scoring formula itself: availability confidence dominates,
+    /// then newness (linear 90-day decay off fetched_at), then the
+    /// community-rating popularity proxy. Verifies the documented weights
+    /// (0.6 / 0.25 / 0.15) directly, independent of any DB write path.
+    /// </summary>
+    [Theory]
+    [InlineData(1.0, 10.0, 0, 1.0)] // fully available, max popularity, just fetched -> max score
+    [InlineData(0.0, null, 9999, 0.0)] // never available, no rating, ancient -> zero score
+    [InlineData(1.0, null, 9999, 0.6)] // available dominates even with no newness/popularity left
+    public void ComputeRelevanceScore_BlendsAvailabilityNewnessPopularity(double availability, double? communityRating, int ageDays, double expected)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var fetchedAt = now - TimeSpan.FromDays(ageDays);
+        var score = PhantomDb.ComputeRelevanceScore(availability, communityRating, fetchedAt, now);
+        Assert.Equal(expected, score, precision: 2);
+    }
+
+    [Fact]
+    public void ComputeRelevanceScore_NewnessDecaysLinearlyOverNinetyDays()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var fresh = PhantomDb.ComputeRelevanceScore(0.0, null, now, now);
+        var halfway = PhantomDb.ComputeRelevanceScore(0.0, null, now - TimeSpan.FromDays(45), now);
+        var expired = PhantomDb.ComputeRelevanceScore(0.0, null, now - TimeSpan.FromDays(90), now);
+
+        Assert.Equal(0.25, fresh, precision: 2);
+        Assert.Equal(0.125, halfway, precision: 2);
+        Assert.Equal(0.0, expired, precision: 2);
+    }
+
+    /// <summary>
+    /// CompleteAvailabilityProbeAsync (the availability sweep's write path)
+    /// refreshes tmdb_metadata.relevance_score in place, O(1) per touched
+    /// movie — never a catalogue-wide recompute — the instant a probe
+    /// flips a movie to 'available'.
+    /// </summary>
+    [Fact]
+    public async Task CompleteAvailabilityProbeAsync_RefreshesMovieRelevanceScoreOnAvailable()
+    {
+        using var db = await NewDbAsync();
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(700, "movie", "Fresh Movie", null, null, null, null, null, null, 8.0, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+
+        await using (var conn = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString()))
+        {
+            await conn.OpenAsync();
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"INSERT INTO availability_items
+                (tmdb_id,type,season,episode,status,checked_at,next_check_at,probe_generation,lease_owner)
+                VALUES (700,'movie',-1,-1,'unknown',NULL,900,0,'owner-1');";
+            await cmd.ExecuteNonQueryAsync(CancellationToken.None);
+        }
+
+        var lease = new AvailabilityItemRow(
+            TmdbId: 700,
+            Type: "movie",
+            Season: -1,
+            Episode: -1,
+            Status: "unknown",
+            CheckedAt: null,
+            NextCheckAt: DateTimeOffset.FromUnixTimeSeconds(900),
+            CandidateMagnet: null,
+            CandidateInfoHash: null,
+            CandidateSize: null,
+            CandidateSeeders: null,
+            CandidateIndexer: null,
+            CandidateSource: null,
+            ProbeGeneration: 0,
+            LeaseOwner: "owner-1");
+
+        var completed = await db.CompleteAvailabilityProbeAsync(
+            lease,
+            "available",
+            DateTimeOffset.UtcNow,
+            DateTimeOffset.UtcNow.AddHours(6),
+            "policy-v1",
+            candidate: null,
+            errorKind: null,
+            errorMessage: null,
+            CancellationToken.None);
+        Assert.True(completed);
+
+        var visible = await db.ListVisibleMovieRowsAsync(CancellationToken.None);
+        var row = Assert.Single(visible, r => r.Metadata.TmdbId == 700);
+        // Available (0.6*0.6=0.36) + fresh newness (0.25) + 8.0/10 popularity*0.15 (0.12) ~= 0.73
+        Assert.True(row.Metadata.RelevanceScore > 0.7, $"expected a high relevance score, got {row.Metadata.RelevanceScore}");
+    }
+
+    /// <summary>
+    /// MarkAvailabilityAvailableAsync (the direct/user-triggered available
+    /// path, as opposed to the scheduled probe lease above) refreshes the
+    /// score the same way.
+    /// </summary>
+    [Fact]
+    public async Task MarkAvailabilityAvailableAsync_RefreshesMovieRelevanceScore()
+    {
+        using var db = await NewDbAsync();
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(701, "movie", "Marked Movie", null, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+
+        await db.MarkAvailabilityAvailableAsync(701, "movie", -1, -1, candidate: null, CancellationToken.None);
+
+        var row = Assert.Single(await db.ListVisibleMovieRowsAsync(CancellationToken.None), r => r.Metadata.TmdbId == 701);
+        Assert.True(row.Metadata.RelevanceScore > 0.5, $"expected an availability-boosted score, got {row.Metadata.RelevanceScore}");
+    }
+
+    /// <summary>
+    /// A series' relevance score is driven by how many of its episodes are
+    /// currently available (min(count/3, 1.0)) — one newly-available
+    /// episode of a long-buried series nudges it back toward the top
+    /// without waiting for every episode to individually resolve.
+    /// </summary>
+    [Fact]
+    public async Task MarkAvailabilityAvailableAsync_RefreshesSeriesRelevanceScoreFromEpisodeCount()
+    {
+        using var db = await NewDbAsync();
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(702, "series", "Scored Series", null, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+
+        await db.MarkAvailabilityAvailableAsync(702, "episode", 1, 1, candidate: null, CancellationToken.None);
+        var afterOne = (await db.GetTmdbMetadataAsync(702, "series", CancellationToken.None))!.RelevanceScore;
+
+        await db.MarkAvailabilityAvailableAsync(702, "episode", 1, 2, candidate: null, CancellationToken.None);
+        await db.MarkAvailabilityAvailableAsync(702, "episode", 1, 3, candidate: null, CancellationToken.None);
+        var afterThree = (await db.GetTmdbMetadataAsync(702, "series", CancellationToken.None))!.RelevanceScore;
+
+        Assert.True(afterThree > afterOne, $"expected score to rise with more available episodes: {afterOne} -> {afterThree}");
+    }
+
+    /// <summary>
+    /// Default browse ordering (no explicit sort requested): materialised
+    /// titles always rank ahead of merely-available ones (the "ties break
+    /// toward the more-playable item" rule), and within each tier, the
+    /// higher relevance_score ranks first.
+    /// </summary>
+    [Fact]
+    public async Task ListVisibleMovieRows_DefaultOrder_MaterialisedFirstThenRelevanceScore()
+    {
+        using var db = await NewDbAsync();
+
+        // Available-only, low relevance (old + no rating).
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(710, "movie", "Old Available", null, null, null, null, null, null, null, null, DateTimeOffset.UtcNow - TimeSpan.FromDays(365)),
+            CancellationToken.None);
+        await db.MarkAvailabilityAvailableAsync(710, "movie", -1, -1, candidate: null, CancellationToken.None);
+
+        // Available-only, high relevance (fresh + top rating) — should still
+        // rank BELOW any materialised title despite the higher score.
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(711, "movie", "Fresh Available", null, null, null, null, null, null, 9.5, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await db.MarkAvailabilityAvailableAsync(711, "movie", -1, -1, candidate: null, CancellationToken.None);
+
+        // Materialised, otherwise identical to the "old available" row —
+        // must still rank ahead of both available-only rows.
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(712, "movie", "Materialised Old", null, null, null, null, null, null, null, null, DateTimeOffset.UtcNow - TimeSpan.FromDays(365)),
+            CancellationToken.None);
+        await db.InsertMaterialisedStateAsync(712, "movie", -1, -1, "/s/m712", "/f/m712", CancellationToken.None);
+
+        var ordered = await db.ListVisibleMovieRowsAsync(CancellationToken.None);
+        var ids = ordered.Select(r => r.Metadata.TmdbId).Where(id => id is 710 or 711 or 712).ToList();
+
+        Assert.Equal(new[] { 712, 711, 710 }, ids);
     }
 
     [Fact]

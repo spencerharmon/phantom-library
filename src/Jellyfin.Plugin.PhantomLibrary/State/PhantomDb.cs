@@ -223,7 +223,11 @@ public sealed record TmdbMetadataRow(
     double? CommunityRating,
     string? OriginalTitle,
     DateTimeOffset FetchedAt,
-    int? RuntimeMinutes = null);
+    int? RuntimeMinutes = null,
+    // p10-relevance-sort: cheap, precomputed blend of availability
+    // confidence + newness + popularity, refreshed by the availability
+    // sweep. See PhantomDb class doc, schema v20.
+    double RelevanceScore = 0);
 
 /// <summary>
 /// Row of the <c>tmdb_episode_cache</c> table. Per-(series_tmdb_id,
@@ -327,10 +331,26 @@ public sealed record HiddenItemRow(int TmdbId, string Type, DateTimeOffset Hidde
 /// per AGENTS.md it is a schema-version bump — pre-v19 databases are
 /// HARD-REFUSED and the operator must wipe
 /// (<c>scripts/phantom-wipe.sh --commit</c>) before restart.
+/// v20 adds a stored <c>tmdb_metadata.relevance_score</c> column (REAL NOT
+/// NULL DEFAULT 0, backed by <c>idx_tmdb_metadata_relevance</c>) for
+/// p10-relevance-sort: the default browse ordering blends availability
+/// confidence, newness and a popularity proxy into a single cheap,
+/// precomputed number so <see cref="ListVisibleMovieRowsAsync(CancellationToken)"/>
+/// / <see cref="ListVisibleSeriesRowsAsync(int,CancellationToken)"/> never
+/// need an O(catalogue) scan to rank the list. It is refreshed in-place by
+/// the availability sweep (<see cref="CompleteAvailabilityProbeAsync"/> /
+/// <see cref="MarkAvailabilityAvailableAsync"/>) whenever an item's
+/// availability status changes — an O(1) write per touched item, never a
+/// bulk recompute. This is a PURELY ADDITIVE delta (one new column + index
+/// on the existing table, backfilled to 0 for every pre-existing row by
+/// <c>EnsureSchemaAsync</c>'s from-scratch CREATE); per AGENTS.md it is a
+/// schema-version bump — pre-v20 databases are HARD-REFUSED and the
+/// operator must wipe (<c>scripts/phantom-wipe.sh --commit</c>) before
+/// restart.
 /// </summary>
 public sealed class PhantomDb : IDisposable
 {
-    public const int CurrentSchemaVersion = 19;
+    public const int CurrentSchemaVersion = 20;
 
     private readonly IPhantomDbProvider _provider;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
@@ -804,10 +824,17 @@ CREATE TABLE IF NOT EXISTS tmdb_metadata (
     original_title   TEXT,
     runtime_minutes  INTEGER,
     fetched_at       INTEGER NOT NULL,
+    -- p10-relevance-sort: cheap, precomputed blend of availability
+    -- confidence + newness + popularity proxy. Refreshed in-place by the
+    -- availability sweep (see PhantomDb class doc, schema v20) — never
+    -- recomputed with a per-list-load catalogue scan.
+    relevance_score  REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (tmdb_id, type)
 );
 CREATE INDEX IF NOT EXISTS idx_tmdb_metadata_fetched_at
     ON tmdb_metadata(fetched_at);
+CREATE INDEX IF NOT EXISTS idx_tmdb_metadata_relevance
+    ON tmdb_metadata(type, relevance_score DESC);
 
 -- Channel-arch per-episode metadata cache. One row per
 -- (series_tmdb_id, season, episode). Warmed lazily by the shows
@@ -2364,6 +2391,110 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Recomputes and persists <c>tmdb_metadata.relevance_score</c> for the
+    /// catalogue title an availability-sweep write just touched
+    /// (p10-relevance-sort). Called on the SAME already-open <paramref
+    /// name="conn"/>, inside the caller's <see cref="_writeLock"/> hold —
+    /// it must never call <see cref="OpenAsync"/> or take the write lock
+    /// itself, or a nested probe/available write would deadlock.
+    ///
+    /// A movie touch (<paramref name="availabilityType"/> == "movie")
+    /// recomputes the movie's own row. An episode touch recomputes its
+    /// PARENT SERIES row (<paramref name="tmdbId"/> is already the series'
+    /// tmdb id for an episode-type availability row — see
+    /// <see cref="ListVisibleSeriesRowsAsync(int,CancellationToken)"/>'s
+    /// identical join) using the series' current available-episode count as
+    /// its availability signal, so one newly-available episode nudges a
+    /// long-buried series back up the list without waiting on every episode.
+    ///
+    /// Cost: one indexed SELECT (plus, for a series touch, one indexed
+    /// COUNT over <c>availability_items</c>) and one single-row UPDATE — an
+    /// O(1) write per touched item, never an O(catalogue) scan, satisfying
+    /// the task's "cheap/precomputed ... never an O(catalogue) scan per list
+    /// load" requirement.
+    /// </summary>
+    private static async Task RefreshRelevanceScoreAsync(DbConnection conn, int tmdbId, string availabilityType, DateTimeOffset now, CancellationToken ct)
+    {
+        var metadataType = string.Equals(availabilityType, "episode", StringComparison.Ordinal) ? "series" : availabilityType;
+
+        double availabilityConfidence;
+        if (string.Equals(metadataType, "series", StringComparison.Ordinal))
+        {
+            await using var countCmd = conn.CreateCommand();
+            countCmd.CommandText = @"SELECT COUNT(*) FROM availability_items
+                WHERE tmdb_id=@tmdb AND type='episode' AND status='available';";
+            countCmd.AddWithValue("@tmdb", tmdbId);
+            var availableEpisodes = Convert.ToInt64(await countCmd.ExecuteScalarAsync(ct).ConfigureAwait(false), CultureInfo.InvariantCulture);
+            // Three-or-more available episodes is treated as "fully relevant"
+            // availability-wise for a series; fewer scales down linearly.
+            availabilityConfidence = Math.Clamp(availableEpisodes / 3.0, 0.0, 1.0);
+        }
+        else
+        {
+            await using var statusCmd = conn.CreateCommand();
+            statusCmd.CommandText = @"SELECT status FROM availability_items
+                WHERE tmdb_id=@tmdb AND type=@type AND season=-1 AND episode=-1 LIMIT 1;";
+            statusCmd.AddWithValue("@tmdb", tmdbId);
+            statusCmd.AddWithValue("@type", metadataType);
+            var status = await statusCmd.ExecuteScalarAsync(ct).ConfigureAwait(false) as string;
+            availabilityConfidence = string.Equals(status, "available", StringComparison.Ordinal) ? 1.0 : 0.0;
+        }
+
+        await using var metaCmd = conn.CreateCommand();
+        metaCmd.CommandText = @"SELECT community_rating, fetched_at FROM tmdb_metadata
+            WHERE tmdb_id=@tmdb AND type=@type LIMIT 1;";
+        metaCmd.AddWithValue("@tmdb", tmdbId);
+        metaCmd.AddWithValue("@type", metadataType);
+        await using var reader = await metaCmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (!await reader.ReadAsync(ct).ConfigureAwait(false))
+        {
+            // Not yet ingested into tmdb_metadata (should not normally happen —
+            // an availability row implies a catalogued title — but a missing
+            // row is not this method's problem to fix; just skip the score
+            // write rather than throw from a probe-completion hot path.
+            return;
+        }
+
+        double? communityRating = reader.IsDBNull(0) ? null : reader.GetDouble(0);
+        var fetchedAt = DateTimeOffset.FromUnixTimeSeconds(reader.GetInt64(1));
+        await reader.DisposeAsync().ConfigureAwait(false);
+
+        var score = ComputeRelevanceScore(availabilityConfidence, communityRating, fetchedAt, now);
+
+        await using var updateCmd = conn.CreateCommand();
+        updateCmd.CommandText = @"UPDATE tmdb_metadata SET relevance_score=@score WHERE tmdb_id=@tmdb AND type=@type;";
+        updateCmd.AddWithValue("@score", score);
+        updateCmd.AddWithValue("@tmdb", tmdbId);
+        updateCmd.AddWithValue("@type", metadataType);
+        await updateCmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The p10-relevance-sort scoring formula: a 0..1 blend of availability
+    /// confidence (dominant — "most-available-first" is the default browse
+    /// promise), newness (linear decay over a 90-day window off
+    /// <c>tmdb_metadata.fetched_at</c> — the closest signal this layer has
+    /// to "recently released/recently added"; see the class doc's schema v20
+    /// note), and a popularity proxy (TMDB community/vote-average rating,
+    /// normalised — the plugin does not currently persist TMDB's own
+    /// "popularity" field, see the change doc's Notes for why that is
+    /// explicitly out of scope here). Weights: 0.6 / 0.25 / 0.15.
+    ///
+    /// Deliberately excluded from this formula (see change doc Notes):
+    /// favourites-adjacency and genre affinity (no per-user signal reaches
+    /// this DB layer today) and recently-played-adjacency (blocked on the
+    /// separate <c>recently-played-fix</c> task this task's ROI item names
+    /// as its dependency for that specific signal).
+    /// </summary>
+    internal static double ComputeRelevanceScore(double availabilityConfidence, double? communityRating, DateTimeOffset fetchedAt, DateTimeOffset now)
+    {
+        var ageDays = Math.Max(0.0, (now - fetchedAt).TotalDays);
+        var newness = Math.Clamp(1.0 - (ageDays / 90.0), 0.0, 1.0);
+        var popularity = communityRating.HasValue ? Math.Clamp(communityRating.Value / 10.0, 0.0, 1.0) : 0.0;
+        return Math.Clamp((availabilityConfidence * 0.6) + (newness * 0.25) + (popularity * 0.15), 0.0, 1.0);
+    }
+
     public async Task<bool> CompleteAvailabilityProbeAsync(
         AvailabilityItemRow lease,
         string status,
@@ -2423,7 +2554,13 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
             cmd.AddWithValue("@episode", lease.Episode);
             cmd.AddWithValue("@owner", lease.LeaseOwner ?? string.Empty);
             cmd.AddWithValue("@generation", lease.ProbeGeneration);
-            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) == 1;
+            var updated = await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) == 1;
+            if (updated)
+            {
+                await RefreshRelevanceScoreAsync(conn, lease.TmdbId, lease.Type, checkedAt, ct).ConfigureAwait(false);
+            }
+
+            return updated;
         }
         finally
         {
@@ -2475,6 +2612,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
             cmd.AddWithValue("@indexer", (object?)candidate?.Indexer ?? DBNull.Value);
             cmd.AddWithValue("@source", (object?)candidate?.Source ?? DBNull.Value);
             await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            await RefreshRelevanceScoreAsync(conn, tmdbId, type, now, ct).ConfigureAwait(false);
         }
         finally
         {
@@ -2976,7 +3114,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         await using var conn = await OpenAsync(ct).ConfigureAwait(false);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = @"SELECT m.tmdb_id,m.type,m.title,m.year,m.overview,m.poster_url,m.backdrop_url,
-                   m.genres_json,m.official_rating,m.community_rating,m.original_title,m.fetched_at,m.runtime_minutes,
+                   m.genres_json,m.official_rating,m.community_rating,m.original_title,m.fetched_at,m.runtime_minutes,m.relevance_score,
                    ms.tmdb_id,ms.type,ms.season,ms.episode,ms.stub_path,ms.fuse_path,ms.materialised_at,
                    a.tmdb_id,a.type,a.season,a.episode,a.status,a.checked_at,a.next_check_at,
                    a.candidate_magnet,a.candidate_info_hash,a.candidate_size,a.candidate_seeders,
@@ -2998,15 +3136,17 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                     )
                 ))
             )
-            ORDER BY COALESCE(ms.materialised_at, m.fetched_at) DESC;";
+            ORDER BY CASE WHEN ms.tmdb_id IS NOT NULL THEN 0 ELSE 1 END,
+                     m.relevance_score DESC,
+                     COALESCE(ms.materialised_at, m.fetched_at) DESC;";
         var list = new List<VisibleMovieRow>();
         await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
         while (await r.ReadAsync(ct).ConfigureAwait(false))
         {
             var meta = ReadTmdbMetadata(r, 0);
-            MaterialisedStateRow? mat = r.IsDBNull(13) ? null : new MaterialisedStateRow(
-                r.GetInt32(13), r.GetString(14), r.GetInt32(15), r.GetInt32(16), r.GetString(17), r.GetString(18), DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(19)));
-            AvailabilityItemRow? av = r.IsDBNull(20) ? null : ReadAvailability(r, 20);
+            MaterialisedStateRow? mat = r.IsDBNull(14) ? null : new MaterialisedStateRow(
+                r.GetInt32(14), r.GetString(15), r.GetInt32(16), r.GetInt32(17), r.GetString(18), r.GetString(19), DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(20)));
+            AvailabilityItemRow? av = r.IsDBNull(21) ? null : ReadAvailability(r, 21);
             list.Add(new VisibleMovieRow(meta, mat, av));
         }
 
@@ -3026,7 +3166,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         await using var conn = await OpenAsync(ct).ConfigureAwait(false);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = @"SELECT m.tmdb_id,m.type,m.title,m.year,m.overview,m.poster_url,m.backdrop_url,
-                   m.genres_json,m.official_rating,m.community_rating,m.original_title,m.fetched_at,m.runtime_minutes,
+                   m.genres_json,m.official_rating,m.community_rating,m.original_title,m.fetched_at,m.runtime_minutes,m.relevance_score,
                    ms.tmdb_id,ms.type,ms.season,ms.episode,ms.stub_path,ms.fuse_path,ms.materialised_at,
                    a.tmdb_id,a.type,a.season,a.episode,a.status,a.checked_at,a.next_check_at,
                    a.candidate_magnet,a.candidate_info_hash,a.candidate_size,a.candidate_seeders,
@@ -3041,9 +3181,9 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         while (await r.ReadAsync(ct).ConfigureAwait(false))
         {
             var meta = ReadTmdbMetadata(r, 0);
-            MaterialisedStateRow? mat = r.IsDBNull(13) ? null : new MaterialisedStateRow(
-                r.GetInt32(13), r.GetString(14), r.GetInt32(15), r.GetInt32(16), r.GetString(17), r.GetString(18), DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(19)));
-            AvailabilityItemRow? av = r.IsDBNull(20) ? null : ReadAvailability(r, 20);
+            MaterialisedStateRow? mat = r.IsDBNull(14) ? null : new MaterialisedStateRow(
+                r.GetInt32(14), r.GetString(15), r.GetInt32(16), r.GetInt32(17), r.GetString(18), r.GetString(19), DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(20)));
+            AvailabilityItemRow? av = r.IsDBNull(21) ? null : ReadAvailability(r, 21);
             list.Add(new VisibleMovieRow(meta, mat, av));
         }
 
@@ -3056,7 +3196,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         await using var conn = await OpenAsync(ct).ConfigureAwait(false);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = @"SELECT m.tmdb_id,m.type,m.title,m.year,m.overview,m.poster_url,m.backdrop_url,
-                   m.genres_json,m.official_rating,m.community_rating,m.original_title,m.fetched_at,m.runtime_minutes,
+                   m.genres_json,m.official_rating,m.community_rating,m.original_title,m.fetched_at,m.runtime_minutes,m.relevance_score,
                    COALESCE(av.available_count,0), COALESCE(mat.materialised_count,0)
             FROM tmdb_metadata m
             LEFT JOIN (
@@ -3101,7 +3241,9 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                 ) GROUP BY tmdb_id
             ) display ON display.tmdb_id=m.tmdb_id
             WHERE m.type='series' AND COALESCE(display.display_count,0) >= @min
-            ORDER BY m.fetched_at DESC;";
+            ORDER BY CASE WHEN COALESCE(mat.materialised_count,0) > 0 THEN 0 ELSE 1 END,
+                     m.relevance_score DESC,
+                     m.fetched_at DESC;";
         cmd.AddWithValue("@min", minAvailableEpisodes);
         var list = new List<VisibleSeriesRow>();
         await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
@@ -3109,8 +3251,8 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         {
             list.Add(new VisibleSeriesRow(
                 ReadTmdbMetadata(r, 0),
-                Convert.ToInt32(r.GetInt64(13)),
-                Convert.ToInt32(r.GetInt64(14))));
+                Convert.ToInt32(r.GetInt64(14)),
+                Convert.ToInt32(r.GetInt64(15))));
         }
 
         return list;
@@ -3132,7 +3274,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         await using var conn = await OpenAsync(ct).ConfigureAwait(false);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = @"SELECT m.tmdb_id,m.type,m.title,m.year,m.overview,m.poster_url,m.backdrop_url,
-                   m.genres_json,m.official_rating,m.community_rating,m.original_title,m.fetched_at,m.runtime_minutes,
+                   m.genres_json,m.official_rating,m.community_rating,m.original_title,m.fetched_at,m.runtime_minutes,m.relevance_score,
                    COALESCE(av.available_count,0), COALESCE(mat.materialised_count,0)
             FROM tmdb_metadata m
             LEFT JOIN (
@@ -3153,8 +3295,8 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         {
             list.Add(new VisibleSeriesRow(
                 ReadTmdbMetadata(r, 0),
-                Convert.ToInt32(r.GetInt64(13)),
-                Convert.ToInt32(r.GetInt64(14))));
+                Convert.ToInt32(r.GetInt64(14)),
+                Convert.ToInt32(r.GetInt64(15))));
         }
 
         return list;
@@ -3643,7 +3785,8 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
             r.IsDBNull(offset + 9) ? null : r.GetDouble(offset + 9),
             r.IsDBNull(offset + 10) ? null : r.GetString(offset + 10),
             DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(offset + 11)),
-            r.IsDBNull(offset + 12) ? null : r.GetInt32(offset + 12));
+            r.IsDBNull(offset + 12) ? null : r.GetInt32(offset + 12),
+            r.GetDouble(offset + 13));
     }
 
     private static AvailabilityItemRow ReadAvailability(DbDataReader r, int offset = 0)
@@ -4441,7 +4584,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         await using var conn = await OpenAsync(ct).ConfigureAwait(false);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = @"SELECT tmdb_id, type, title, year, overview, poster_url, backdrop_url,
-                   genres_json, official_rating, community_rating, original_title, fetched_at, runtime_minutes
+                   genres_json, official_rating, community_rating, original_title, fetched_at, runtime_minutes, relevance_score
             FROM tmdb_metadata
             WHERE type=@type AND (@year IS NULL OR year=@year)
             ORDER BY fetched_at DESC;";
@@ -4488,7 +4631,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         await using var conn = await OpenAsync(ct).ConfigureAwait(false);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = @"SELECT tmdb_id, type, title, year, overview, poster_url, backdrop_url,
-                   genres_json, official_rating, community_rating, original_title, fetched_at, runtime_minutes
+                   genres_json, official_rating, community_rating, original_title, fetched_at, runtime_minutes, relevance_score
             FROM tmdb_metadata WHERE tmdb_id=@tmdb AND type=@type LIMIT 1;";
         cmd.AddWithValue("@tmdb", tmdbId);
         cmd.AddWithValue("@type", type);
@@ -4570,7 +4713,8 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
             r.IsDBNull(9) ? null : r.GetDouble(9),
             r.IsDBNull(10) ? null : r.GetString(10),
             DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(11)),
-            r.IsDBNull(12) ? null : r.GetInt32(12));
+            r.IsDBNull(12) ? null : r.GetInt32(12),
+            r.GetDouble(13));
     }
 
     private static string NormalizeTitle(string? title)
