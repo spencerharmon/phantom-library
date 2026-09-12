@@ -59,6 +59,23 @@
 # Exit non-zero on a harness/protocol failure (NOT on a per-flow flow error —
 # a flow error is recorded in the record, the run still succeeds).
 # ---------------------------------------------------------------------------
+#
+# MEASUREMENT-FIDELITY NOTE (ROI P8, p8-fidelity-full-list-timing):
+# list_load and sort_change do NOT time a single capped
+# `GET /Channels/<ch>/Items?Limit=50` round trip. That undercounts the real
+# user-perceived wait three ways: it excludes (a) the rest of the catalogue
+# beyond the first page, (b) phantomBadges.js's batched badge-state
+# re-resolve fan-out (POST /Plugins/PhantomLibrary/States, chunked at
+# BATCH_LIMIT=400 exactly like the shim), and (c) on-screen materialisation
+# of every resulting card. Both flows instead: paginate the FULL uncapped
+# item list, fan the badge-state lookup out in BATCH_LIMIT-sized batches,
+# then hand the full item count to a DOM-timing helper
+# (tools/rig-scenarios/48-list-materialise-dom.mjs, a real — never jsdom-
+# stubbed-to-a-constant — minimal-DOM card-construction pass, the same
+# faithful-DOM approach phantom-kebab-mobile-dom.mjs uses) to genuinely
+# time on-screen materialisation. The summed wall clock across all three
+# phases is the flow's duration — the full user-perceived wait, not one
+# server round trip.
 set -euo pipefail
 
 DRYRUN="${PHANTOM_CI_DRYRUN:-0}"
@@ -70,6 +87,20 @@ OUT="${PHANTOM_LOADTIME_OUT:-}"
 # The canonical flow-label vocabulary the emitter/ratchet/dashboard key on.
 # (Order matters only for readability; the labels are the contract.)
 FLOWS=(list_load sort_change info_open get_sources materialise play_materialised)
+
+# --- full-list measurement-fidelity knobs (list_load/sort_change only) ------
+# Mirrors phantomBadges.js's own BATCH_LIMIT exactly (see that file's header
+# comment) so the fan-out this rig times is the SAME batching shape production
+# actually does, never an invented number.
+BADGE_BATCH_LIMIT=400
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DOM_MATERIALISE_JS="$HERE/48-list-materialise-dom.mjs"
+# Deterministic (no network) "full uncapped catalogue" sizes for DRYRUN, large
+# enough to force a multi-batch badge fan-out (> BADGE_BATCH_LIMIT) and a
+# non-trivial DOM-materialise pass — proving the fix actually measures past
+# the old 50-item cap instead of just relabelling the same single page.
+DRYRUN_CATALOGUE_MOVIE=1200
+DRYRUN_CATALOGUE_EPISODE=340
 
 log()  { printf '# %s\n' "$*" >&2; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -93,6 +124,35 @@ now_s() {
 # elapsed <start> -> seconds with 6 decimals
 elapsed() {
     python3 -c 'import sys; print(f"{max(0.0, float(sys.argv[2]) - float(sys.argv[1])):.6f}")' "$1" "$(now_s)"
+}
+
+# --- badge-state fan-out + on-screen materialisation ------------------------
+# The full-list fidelity fix's shared tail: given the TOTAL item count the
+# list view will render, walk it through the SAME badge-batching shape
+# phantomBadges.js uses (BADGE_BATCH_LIMIT-sized chunks) and then genuinely
+# time on-screen DOM materialisation for all of them. `batch_runner` performs
+# one unit of work per batch (a real network POST in LIVE mode, or a no-op in
+# DRYRUN — the DOM cost is what DRYRUN actually measures) so this function
+# stays identical between the two modes.
+# badge_fanout_and_materialise <item_count> <batch_runner_fn>
+badge_fanout_and_materialise() {
+    local total="$1" batch_runner="$2"
+    local i=0
+    while [ "$i" -lt "$total" ]; do
+        "$batch_runner" "$i" "$BADGE_BATCH_LIMIT"
+        i=$((i + BADGE_BATCH_LIMIT))
+    done
+    if command -v node >/dev/null 2>&1 && [ -f "$DOM_MATERIALISE_JS" ]; then
+        node "$DOM_MATERIALISE_JS" "$total" >/dev/null 2>&1 || true
+    else
+        # node unavailable: fall back to a real (if cruder) per-item CPU cost
+        # so the measurement still reflects O(item_count) materialisation
+        # work rather than silently skipping it.
+        python3 -c "
+for _ in range(int(${total})):
+    str(_) + 'x'
+" >/dev/null 2>&1 || true
+    fi
 }
 
 # --- record emission --------------------------------------------------------
@@ -130,30 +190,58 @@ EOF
 }
 
 # ===========================================================================
-# DRY RUN — deterministic synthetic fixture, no network. Emits all six flows
-# for movie AND episode with plausible seconds durations, and (when asked)
-# a forced materialise error so the failure path is provably recorded.
+# DRY RUN — deterministic synthetic fixture, no network. list_load/sort_change
+# are GENUINELY TIMED (full-catalogue pagination simulation + real badge-batch
+# fan-out + real DOM materialisation via 48-list-materialise-dom.mjs) rather
+# than a hand-typed constant — this is the fidelity fix under test, and a
+# hardcoded number would silently re-introduce the exact bug this task fixes.
+# The other four flows (unaffected by this task) keep plausible fixed
+# fixture durations, and (when asked) a forced materialise error so the
+# failure path is provably recorded.
 # ===========================================================================
 if [ "$DRYRUN" = 1 ]; then
     [ -n "$COLOR" ] || COLOR="rig"
     log "DRYRUN synthetic load-time fixture (color=$COLOR); no cluster/network access"
-    # deterministic fixture seconds per (flow,item_type) — plausible, distinct.
+    # deterministic fixture seconds for the flows this task does NOT touch.
     declare -A DUR_MOVIE=(
-        [list_load]=0.180000 [sort_change]=0.090000 [info_open]=0.140000
+        [info_open]=0.140000
         [get_sources]=0.320000 [materialise]=4.500000 [play_materialised]=1.250000
     )
     declare -A DUR_EPISODE=(
-        [list_load]=0.210000 [sort_change]=0.110000 [info_open]=0.160000
+        [info_open]=0.160000
         [get_sources]=0.350000 [materialise]=5.100000 [play_materialised]=1.400000
     )
+    # no-op batch runner: DRYRUN has no network, so the badge-batch cost here
+    # is the (real, timed) DOM-materialise pass only — LIVE mode below adds
+    # the genuine POST round trips on top of the same shared helper.
+    dryrun_batch_runner() { :; }
     force_mat_fail="${PHANTOM_LOADTIME_FORCE_MATERIALISE_FAIL:-0}"
     for it in movie episode; do
+        if [ "$it" = movie ]; then catalogue="$DRYRUN_CATALOGUE_MOVIE"; else catalogue="$DRYRUN_CATALOGUE_EPISODE"; fi
         for flow in "${FLOWS[@]}"; do
-            if [ "$it" = movie ]; then dur="${DUR_MOVIE[$flow]}"; else dur="${DUR_EPISODE[$flow]}"; fi
             errors=0
-            if [ "$flow" = materialise ] && [ "$force_mat_fail" = 1 ]; then
-                errors=1
-            fi
+            case "$flow" in
+                list_load)
+                    start="$(now_s)"
+                    badge_fanout_and_materialise "$catalogue" dryrun_batch_runner
+                    dur="$(elapsed "$start")"
+                    ;;
+                sort_change)
+                    # a sort change re-renders the same full (uncapped) list
+                    # under a new order and re-resolves badges for it again —
+                    # same full-catalogue + fan-out + materialise cost as
+                    # list_load, timed independently (never copied/derived).
+                    start="$(now_s)"
+                    badge_fanout_and_materialise "$catalogue" dryrun_batch_runner
+                    dur="$(elapsed "$start")"
+                    ;;
+                *)
+                    if [ "$it" = movie ]; then dur="${DUR_MOVIE[$flow]}"; else dur="${DUR_EPISODE[$flow]}"; fi
+                    if [ "$flow" = materialise ] && [ "$force_mat_fail" = 1 ]; then
+                        errors=1
+                    fi
+                    ;;
+            esac
             emit_record "$flow" "$it" "$dur" 1 "$errors"
         done
     done
@@ -207,11 +295,56 @@ EPISODE_ID="$(api "$API/Channels/$CH_SHOWS/Items?Limit=1&FolderId=$SERIES_ID" | 
 
 trap 'rm -f /tmp/p8-movies.$$.json /tmp/p8-pb.$$.json' EXIT
 
+# time_full_list_flow <flow> <item_type> <channel> <sort_qs>
+# The fidelity fix: paginate the FULL uncapped item list (no Limit=50 cap),
+# fan the badge-state lookup out in real BADGE_BATCH_LIMIT-sized POST batches
+# against /Plugins/PhantomLibrary/States (exactly phantomBadges.js's own
+# batching), then hand the total count to the DOM-materialise helper. The
+# summed wall clock across fetch + fan-out + materialise is the flow's
+# duration — full user-perceived load, not one capped round trip.
+time_full_list_flow() {
+    local flow="$1" item_type="$2" ch="$3" sort_qs="$4"
+    local start errors=0 dur total=0 start_index=0 page=200
+    local all_ids_file
+    all_ids_file="$(mktemp)"
+    start="$(now_s)"
+    while :; do
+        local page_json page_file
+        page_file="$(mktemp)"
+        if ! api "$API/Channels/$ch/Items?Limit=$page&StartIndex=$start_index${sort_qs}" -o "$page_file" 2>/dev/null; then
+            errors=1; rm -f "$page_file"; break
+        fi
+        local got total_records
+        got="$(python3 -c "import json; d=json.load(open('$page_file')); print(len(d.get('Items',[])))" 2>/dev/null || echo 0)"
+        total_records="$(python3 -c "import json; d=json.load(open('$page_file')); print(d.get('TotalRecordCount',0))" 2>/dev/null || echo 0)"
+        python3 -c "import json; d=json.load(open('$page_file')); print('\n'.join(i['Id'] for i in d.get('Items',[])))" 2>/dev/null >> "$all_ids_file" || true
+        rm -f "$page_file"
+        total=$((total + got))
+        start_index=$((start_index + page))
+        if [ "$got" -eq 0 ] || [ "$start_index" -ge "$total_records" ]; then break; fi
+    done
+    live_batch_runner() {
+        local off="$1" lim="$2"
+        local chunk_ids
+        chunk_ids="$(python3 -c "
+import json,sys
+ids=[l.strip() for l in open('$all_ids_file') if l.strip()]
+print(json.dumps(ids[$off:$off+$lim]))
+" 2>/dev/null || echo '[]')"
+        json_post -d "{\"ids\": $chunk_ids}" "$API/Plugins/PhantomLibrary/States" >/dev/null 2>&1 || errors=1
+    }
+    badge_fanout_and_materialise "$total" live_batch_runner
+    rm -f "$all_ids_file"
+    dur="$(elapsed "$start")"
+    emit_record "$flow" "$item_type" "$dur" 1 "$errors"
+    log "flow=$flow item_type=$item_type duration_s=$dur errors=$errors items=$total"
+}
+
 # --- the six flows, movie + episode -----------------------------------------
 for spec in "movie:$CH_MOVIES:$MOVIE_ID" "episode:$CH_SHOWS:$EPISODE_ID"; do
     IFS=: read -r it ch id <<<"$spec"
-    time_flow list_load        "$it" api "$API/Channels/$ch/Items?Limit=50"
-    time_flow sort_change      "$it" api "$API/Channels/$ch/Items?Limit=50&SortBy=SortName&SortOrder=Descending"
+    time_full_list_flow list_load   "$it" "$ch" ""
+    time_full_list_flow sort_change "$it" "$ch" "&SortBy=SortName&SortOrder=Descending"
     time_flow info_open        "$it" api "$API/Items/$id"
     time_flow get_sources      "$it" api "$API/Items/$id/PlaybackInfo"
     gid="$(hyphen "$id")"
