@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Plugin version auto-bump tool (ROI Priority 11 — continuous CI auto-rollout
+    to dev). The image entrypoint only re-installs the plugin when the baked
+    meta.json version DIFFERS from the PVC copy, so a merge that does not bump
+    the version silently no-ops on dev. This tool makes every merge produce a
+    distinct, monotonically-increasing version and keeps the three version
+    surfaces in lockstep:
+
+        - build.yaml          version: "A.B.C.D"   (canonical; install.sh reads
+                                                     this to write meta.json, so
+                                                     meta.json follows build.yaml)
+        - the plugin csproj   <AssemblyVersion>/<FileVersion>  = A.B.C.D
+                              <Version>                        = A.B.C
+
+    The CI pipeline owned by actions:phantom-library-cd-autodeploy-dev invokes
+    this as a build step. It builds NEITHER the plugin NOR the jellyfin/ nested
+    submodule (like the perf tools), so it — and its unit tests — build and run
+    in any environment with the .NET SDK, independent of a live Jellyfin.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <RootNamespace>Phantom.Tools.VersionBump</RootNamespace>
+    <AssemblyName>phantom-version-bump</AssemblyName>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="PhantomVersionBump.Tests" />
+  </ItemGroup>
+
+</Project>
