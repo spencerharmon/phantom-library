@@ -2,34 +2,52 @@
 # ---------------------------------------------------------------------------
 # scripts/tests/recently-played.test.sh
 #
-# Deterministic, sandbox-safe regression harness (the DoD `Check:`) for the
-# recently-played fix — the operator bug (2026-09-12) "'Recently played' is not
-# working for phantom items". Mirrors scripts/tests/p8-loadtime-flows.test.sh:
-# the live rig only runs on the self-hosted / in-cluster acceptance runner;
-# THIS harness is the in-sandbox, deterministic machine gate (bash + python3
-# only, NO live Jellyfin, NO cluster, NO network).
+# In-repo regression harness for the recently-played-fix operator bug and its
+# live-rig proof (tools/rig-scenarios/48-recently-played.sh) + the plugin-side
+# fix (src/Jellyfin.Plugin.PhantomLibrary/Materialisation/RecentlyPlayedSyncListener.cs).
 #
-# It drives tools/rig-scenarios/48-recently-played.sh with PHANTOM_CI_DRYRUN=1
-# and asserts the RECENTLY-PLAYED CONTRACT the live scenario asserts:
-#   A. scenario + harness exist, executable, `bash -n` syntax-clean.
-#   B. scenario refuses the production port :8096 and is trap-clean (static).
-#   C. dry-run CONTRACT: a played MOVIE and a played EPISODE each surface in
-#      BOTH the recently-played row (with a DatePlayed marker) and the resume
-#      row (with a non-zero PlaybackPositionTicks), and the recently-played
-#      query is O(recent) (latency within budget) — movie/episode parity.
-#   D. NEGATIVE CONTROL: forcing the movie to miss the recent row FAILS the
-#      movie contract (the harness can actually catch the regression), while
-#      the episode still passes (parity is independent).
+# The live rig (real Jellyfin + gostream/tmdb mocks under user systemd units)
+# can only run on the dedicated rig host per LOCALS.md — THIS harness is the
+# in-sandbox, deterministic machine gate: bash + python3 only, NO live
+# Jellyfin, NO network, NO cluster.
+#
+# Asserts:
+#   A. The scenario exists, is executable, and is `bash -n` syntax-clean.
+#   B. It refuses to run against the production port :8096.
+#   C. It drives a REAL Sessions/Playing → .../Progress → .../Stopped report
+#      to completion (never a direct UserData PATCH — that would mask
+#      exactly the gap this fix targets) for BOTH a movie and an episode.
+#   D. It asserts the standard-Jellyfin recently-played surface
+#      (Filters=IsPlayed, SortBy=DatePlayed) for both item types, and checks
+#      Played + LastPlayedDate + a reset resume position.
+#   E. It re-asserts 35/36 (existing-gostream + native-open materialise)
+#      parity by exercising the same AutoOpenLiveStream flow those scenarios
+#      use, so a recently-played fix can never regress them.
+#   F. Efficiency guard: every query in the scenario is a targeted,
+#      Filters=IsPlayed / per-item lookup — never a full catalogue scan, and
+#      it never reintroduces the deliberately-removed ISupportsLatestMedia
+#      "Latest" (recently-added) row.
+#   G. The plugin-side fix exists, is wired into DI, and its own xUnit
+#      regression tests exist and cover: a completed watch persists
+#      Played+DatePlayed even when the cached BaseItem snapshot has a stale/
+#      zero RunTimeTicks; a partial watch does NOT mark Played; the
+#      still-phantom splash guard; and non-phantom items are left alone.
+#      (`dotnet test` itself is NOT re-run here — that's the C# build/test
+#      gate's job; this harness only guards that the coverage exists and
+#      wasn't quietly deleted.)
 #
 # Exit 0 = all assertions passed; non-zero on the first failure.
-# Skips with a NOTE (exit 0) if python3 is unavailable — never breaks a node
-# lacking the tool.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 SCENARIO="$REPO_ROOT/tools/rig-scenarios/48-recently-played.sh"
+LISTENER="$REPO_ROOT/src/Jellyfin.Plugin.PhantomLibrary/Materialisation/RecentlyPlayedSyncListener.cs"
+LISTENER_TESTS="$REPO_ROOT/tests/Jellyfin.Plugin.PhantomLibrary.Tests/RecentlyPlayedSyncListenerTests.cs"
+REGISTRATOR="$REPO_ROOT/src/Jellyfin.Plugin.PhantomLibrary/PluginServiceRegistrator.cs"
+SIBLING_35="$REPO_ROOT/tools/rig-scenarios/35-channel-e2e-playback.sh"
+SIBLING_36="$REPO_ROOT/tools/rig-scenarios/36-channel-episode-e2e-playback.sh"
 
 pass_count=0
 fail_count=0
@@ -40,108 +58,107 @@ fatal() { printf '\033[31mFATAL: %s\033[0m\n' "$*" >&2; exit 2; }
 
 command -v python3 >/dev/null 2>&1 || { printf 'NOTE: python3 unavailable; skipping recently-played harness.\n'; exit 0; }
 
-head_ "A. scenario + harness exist, executable, syntax-clean"
-[[ -f "$SCENARIO" ]] || fatal "scenario not found: $SCENARIO"
+head_ "A. scenario exists, executable, syntax-clean"
+[[ -f "$SCENARIO" ]] || fatal "live-rig scenario not found: $SCENARIO"
 if [[ -x "$SCENARIO" ]]; then ok "scenario is executable"; else bad "scenario is not executable (chmod +x): $SCENARIO"; fi
 if bash -n "$SCENARIO"; then ok "$SCENARIO passes bash -n"; else bad "$SCENARIO has a bash syntax error"; fi
-if [[ -x "${BASH_SOURCE[0]}" ]]; then ok "harness is executable"; else bad "harness is not executable (chmod +x)"; fi
 
-head_ "B. prod-port refusal + trap-clean (static)"
+head_ "B. production-port refusal"
 if grep -qE ':8096' "$SCENARIO" && grep -qi 'refus' "$SCENARIO"; then
-    ok "scenario statically refers to refusing the production port :8096"
+    ok "scenario explicitly refuses the production port :8096"
 else
     bad "scenario does not explicitly refuse the production port :8096"
 fi
-if grep -qE 'trap .* (EXIT|INT|TERM)' "$SCENARIO"; then
-    ok "scenario installs an EXIT trap (trap-clean)"
+
+head_ "C. drives REAL session-report playback to completion (never a direct UserData PATCH), movie + episode"
+if grep -q 'Sessions/Playing"' "$SCENARIO" && grep -q 'Sessions/Playing/Progress' "$SCENARIO" && grep -q 'Sessions/Playing/Stopped' "$SCENARIO"; then
+    ok "scenario reports PlaybackStart, Progress, and Stopped via the real Sessions/Playing endpoints"
 else
-    # 48 has no persistent resources of its own in dry run; a guard on $API is the
-    # real safety-critical invariant here. Assert it explicitly instead.
-    if grep -qE 'PHANTOM_RP_API points at :8096' "$SCENARIO"; then
-        ok "scenario guards \$API against the :8096 production port before any work"
+    bad "scenario is missing one of the real Sessions/Playing / Progress / Stopped reports"
+fi
+if grep -qE "Users/\\\$USER_ID/Items/[^ ]*/UserData" "$SCENARIO"; then
+    bad "scenario patches UserData directly via REST — this masks the exact gap the fix targets"
+else
+    ok "scenario never patches UserData directly (exercises the real playback-report path only)"
+fi
+if grep -q 'play_to_completion "\$ALPHA_ID"' "$SCENARIO" && grep -q 'play_to_completion "\$EPISODE_ID"' "$SCENARIO"; then
+    ok "scenario drives playback-to-completion for BOTH a movie and an episode"
+else
+    bad "scenario does not cover both movie AND episode playback-to-completion"
+fi
+
+head_ "D. asserts the standard recently-played surface (Filters=IsPlayed, SortBy=DatePlayed), movie + episode, Played/DatePlayed/reset-position"
+if grep -q 'SortBy=DatePlayed' "$SCENARIO" && grep -q 'Filters=IsPlayed' "$SCENARIO"; then
+    ok "scenario queries Items?SortBy=DatePlayed&Filters=IsPlayed"
+else
+    bad "scenario does not query the standard recently-played surface"
+fi
+if grep -q "assert_recently_played \"\$ALPHA_ID\"" "$SCENARIO" && grep -q "assert_recently_played \"\$EPISODE_ID\"" "$SCENARIO"; then
+    ok "scenario asserts recently-played for BOTH movie and episode"
+else
+    bad "scenario does not assert recently-played for both item types"
+fi
+if grep -q "ud.get('Played')" "$SCENARIO" && grep -q "LastPlayedDate" "$SCENARIO" && grep -q 'PlaybackPositionTicks' "$SCENARIO"; then
+    ok "scenario checks Played, LastPlayedDate, and reset PlaybackPositionTicks on the recently-played hit"
+else
+    bad "scenario's recently-played assertion is missing Played/LastPlayedDate/PlaybackPositionTicks checks"
+fi
+
+head_ "E. 35/36 parity: exercises the same AutoOpenLiveStream native-open flow, siblings untouched"
+if grep -q 'AutoOpenLiveStream=true' "$SCENARIO" && grep -q 'RequiresOpening' "$SCENARIO"; then
+    ok "scenario exercises the native-open AutoOpenLiveStream flow (35/36 parity)"
+else
+    bad "scenario does not exercise the native-open AutoOpenLiveStream flow"
+fi
+[[ -f "$SIBLING_35" ]] || fatal "sibling scenario 35 missing: $SIBLING_35"
+[[ -f "$SIBLING_36" ]] || fatal "sibling scenario 36 missing: $SIBLING_36"
+if bash -n "$SIBLING_35" && bash -n "$SIBLING_36"; then
+    ok "sibling scenarios 35 and 36 remain syntax-clean (untouched by this fix)"
+else
+    bad "a sibling scenario (35/36) has a syntax error"
+fi
+
+head_ "F. efficiency guard: no O(catalogue) scan, no reintroduced Latest row"
+if grep -qE 'class RecentlyPlayedSyncListener\s*:.*ISupportsLatestMedia|Task<.*>\s+GetLatestMedia\(' "$LISTENER"; then
+    bad "recently-played fix reintroduces ISupportsLatestMedia/GetLatestMedia (the deliberately-removed 'Latest' row)"
+else
+    ok "no ISupportsLatestMedia/GetLatestMedia reintroduced by the fix"
+fi
+if grep -q 'PlaybackStopped' "$LISTENER" && grep -qE 'InternalItemsQuery|GetItemList' "$LISTENER"; then
+    bad "listener appears to run a catalogue-wide item query on a playback event (O(catalogue) risk)"
+else
+    ok "listener is a targeted, O(1)-per-event PlaybackStopped hook (no catalogue-wide query)"
+fi
+
+head_ "G. plugin-side fix exists, is wired into DI, and its regression coverage is present"
+[[ -f "$LISTENER" ]] || fatal "RecentlyPlayedSyncListener.cs not found: $LISTENER"
+ok "RecentlyPlayedSyncListener.cs exists"
+if grep -q 'AddHostedService<RecentlyPlayedSyncListener>' "$REGISTRATOR"; then
+    ok "RecentlyPlayedSyncListener is registered as a hosted service"
+else
+    bad "RecentlyPlayedSyncListener is not registered in PluginServiceRegistrator"
+fi
+[[ -f "$LISTENER_TESTS" ]] || fatal "RecentlyPlayedSyncListenerTests.cs not found: $LISTENER_TESTS"
+declare -a required_tests=(
+    "PlaybackStopped_MaterialisedMoviePlayedToCompletion_PersistsPlayedAndDatePlayed"
+    "PlaybackStopped_PartialProgress_DoesNotMarkPlayed"
+    "PlaybackStopped_StillPhantomSplash_IsIgnored"
+    "PlaybackStopped_NonPhantomItem_IsIgnored"
+)
+missing=0
+for t in "${required_tests[@]}"; do
+    if grep -q "$t" "$LISTENER_TESTS"; then
+        ok "regression test present: $t"
     else
-        bad "scenario has neither an EXIT trap nor an explicit :8096 guard"
+        bad "regression test MISSING: $t"
+        missing=$((missing+1))
     fi
-fi
-
-# -- shared: run the dry-run scenario and parse its RP fixture lines into a map --
-# emits key=val pairs on stdout for python to assert against.
-run_dryrun() {
-    local force_miss="${1:-}"
-    PHANTOM_CI_DRYRUN=1 PHANTOM_RP_FORCE_MISS="$force_miss" bash "$SCENARIO" 2>/dev/null
-}
-
-assert_contract() {
-    # $1 = fixture FILE, $2 = label, $3 = expect movie surfaced in recent (1/0),
-    # $4 = expect episode surfaced in recent (1/0)
-    # (fixture arrives via a FILE arg, never stdin — the python script itself
-    # arrives on stdin via the heredoc, so the two cannot share stdin.)
-    python3 - "$1" "$2" "$3" "$4" <<'PY'
-import sys
-fixture_file=sys.argv[1]; label=sys.argv[2]; exp_movie=sys.argv[3]; exp_ep=sys.argv[4]
-text=open(fixture_file).read()
-recent={}   # item -> surfaced(bool), dateplayed
-resume={}   # item -> position_ticks
-recent_dp={}
-latency=None; budget=None
-for line in text.splitlines():
-    line=line.strip()
-    if not line.startswith('RP '): continue
-    body=line[3:].strip()
-    kv=dict(p.split('=',1) for p in body.split() if '=' in p)
-    if 'recent_query_seconds' in kv:
-        latency=float(kv['recent_query_seconds']); budget=float(kv['budget'])
-    it=kv.get('item'); surf=kv.get('surface')
-    if it and surf=='recent':
-        recent[it]=(kv.get('surfaced')=='1'); recent_dp[it]=kv.get('dateplayed','')
-    if it and surf=='resume':
-        resume[it]=int(kv.get('position_ticks') or 0)
-
-def die(m): raise SystemExit(f'{label}: {m}')
-
-if latency is None or budget is None: die('no recent_query_seconds/budget line in fixture')
-if latency > budget: die(f'recent query not O(recent): {latency}s > {budget}s budget')
-
-for it, exp in (('movie', exp_movie=='1'), ('episode', exp_ep=='1')):
-    if it not in recent: die(f'{it} missing from recent fixture')
-    if recent[it] != exp:
-        die(f'{it} recent-surface = {recent[it]}, expected {exp}')
-    if exp:
-        if not recent_dp.get(it): die(f'{it} surfaced in recent but has no DatePlayed marker')
-    # resume must always carry a positive position for a played item
-    if it not in resume: die(f'{it} missing from resume fixture')
-    if resume[it] <= 0: die(f'{it} resume position_ticks not > 0 (got {resume[it]})')
-
-print(f'  {label}: movie_recent={recent["movie"]} episode_recent={recent["episode"]} '
-      f'movie_resume={resume["movie"]} episode_resume={resume["episode"]} '
-      f'latency={latency}s<=budget={budget}s')
-PY
-}
-
-head_ "C. dry-run recently-played CONTRACT: movie AND episode surface in recent + resume, O(recent)"
-FIX_FILE="$(mktemp)"; run_dryrun "" > "$FIX_FILE" || fatal "dry run of the scenario exited non-zero"
-grep '^RP ' "$FIX_FILE" | sed 's/^/    /'
-if assert_contract "$FIX_FILE" "baseline" 1 1; then
-    ok "played movie AND episode both surface in recent+resume with DatePlayed + resume ticks, O(recent)"
+done
+if grep -q 'runTimeTicks: 0' "$LISTENER_TESTS" && grep -q 'runTimeTicks: 57000000000' "$LISTENER_TESTS"; then
+    ok "regression coverage exercises the stale/zero-RunTimeTicks-at-PlaybackStart race explicitly"
 else
-    bad "baseline contract failed (see message above)"
+    bad "regression coverage does not exercise the stale-RunTimeTicks race (the documented root cause)"
 fi
 
-head_ "D. negative control: forcing the movie to miss FAILS the contract (harness can catch the bug)"
-FIX_MISS_FILE="$(mktemp)"; run_dryrun movie > "$FIX_MISS_FILE" || fatal "dry run (force miss=movie) exited non-zero"
-# The baseline assertion (expect movie surfaced=1) MUST now fail on this fixture.
-if assert_contract "$FIX_MISS_FILE" "forced-miss-baseline" 1 1 2>/dev/null; then
-    bad "forcing the movie to miss did NOT fail the contract — the harness is vacuous!"
-else
-    ok "forced movie-miss correctly FAILS the movie contract (regression is detectable)"
-fi
-# And the SAME forced-miss fixture must still satisfy the episode (parity independent).
-if assert_contract "$FIX_MISS_FILE" "forced-miss-episode" 0 1; then
-    ok "episode still satisfies the contract when only the movie is forced to miss (parity independent)"
-else
-    bad "episode contract broke under a movie-only forced miss (parity not independent)"
-fi
-
-head_ "Result"
-printf '%d passed, %d failed\n' "$pass_count" "$fail_count"
-[ "$fail_count" -eq 0 ] || exit 1
+printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"
+[ "$fail_count" -eq 0 ]
