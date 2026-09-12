@@ -104,6 +104,7 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         // and fire-and-forget materialise via IMaterialiser.
         serviceCollection.AddHostedService<UserDataSavedListener>();
         serviceCollection.AddHostedService<PlaybackTriggerListener>();
+        serviceCollection.AddHostedService<RecentlyPlayedSyncListener>();
         serviceCollection.AddHostedService<EvictionSweeper>();
         serviceCollection.AddHostedService<AvailabilityProbeWorker>();
         serviceCollection.AddHostedService<MagnetCacheBackgroundSweepWorker>();
