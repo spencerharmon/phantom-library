@@ -582,6 +582,144 @@ public class PhantomDbTests : IDisposable
         Assert.Equal(99, forA[0].Metadata.TmdbId);
     }
 
+    /// <summary>
+    /// p10-prune-nonplayable-browse: an "available" movie whose only known
+    /// source candidate has been marked permanently invalid (a known
+    /// cold-materialise-fail — every candidate exhausted, none viable) must
+    /// not clutter the main browse list even though
+    /// <c>availability_items.status</c> still reads 'available' (the P6
+    /// availability signal alone is stale/insufficient here). A movie with
+    /// no source_candidates rows at all (never validated) stays visible —
+    /// absence of validation data is not proof of failure.
+    /// </summary>
+    [Fact]
+    public async Task ListVisibleMovieRows_ExcludesAvailableMovieWhenAllCandidatesInvalid()
+    {
+        using var db = await NewDbAsync();
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(500, "movie", "Cold Movie", null, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await db.MarkAvailabilityAvailableAsync(500, "movie", -1, -1, candidate: null, CancellationToken.None);
+        await db.UpsertSourceCandidatesAsync(
+            500,
+            "movie",
+            -1,
+            -1,
+            "preset",
+            new[] { new Jellyfin.Plugin.PhantomLibrary.Sources.MagnetCandidate("magnet:?xt=urn:btih:cold", "cold", 1234, 10, "idx") { Title = "Cold" } },
+            "test",
+            TimeSpan.FromHours(1),
+            CancellationToken.None);
+
+        // Before any candidate is marked invalid, the movie is visible
+        // (unvalidated 'unknown' candidate counts as still-viable).
+        var beforeInvalidation = await db.ListVisibleMovieRowsAsync(CancellationToken.None);
+        Assert.Contains(beforeInvalidation, r => r.Metadata.TmdbId == 500);
+
+        var now = DateTimeOffset.UtcNow;
+        await db.UpdateSourceCandidateValidationAsync(new SourceCandidateValidationUpdate(
+            500,
+            "movie",
+            -1,
+            -1,
+            "preset",
+            "magnet:?xt=urn:btih:cold",
+            "invalid",
+            "no_valid_files",
+            now,
+            null,
+            123,
+            "policy-v1",
+            null,
+            null,
+            null), CancellationToken.None);
+
+        var afterInvalidation = await db.ListVisibleMovieRowsAsync(CancellationToken.None);
+        Assert.DoesNotContain(afterInvalidation, r => r.Metadata.TmdbId == 500);
+    }
+
+    /// <summary>
+    /// p10-prune-nonplayable-browse convergence: once a fresh (non-invalid)
+    /// candidate appears for a cold-failed item — e.g. a re-probe found a
+    /// new magnet — it re-enters the browse list without any special
+    /// re-promotion step, since the query re-derives visibility from
+    /// current source_candidates state on every read.
+    /// </summary>
+    [Fact]
+    public async Task ListVisibleMovieRows_ReentersListWhenNewCandidateAppearsAfterColdFail()
+    {
+        using var db = await NewDbAsync();
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(501, "movie", "Recovered Movie", null, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await db.MarkAvailabilityAvailableAsync(501, "movie", -1, -1, candidate: null, CancellationToken.None);
+        await db.UpsertSourceCandidatesAsync(
+            501,
+            "movie",
+            -1,
+            -1,
+            "preset",
+            new[] { new Jellyfin.Plugin.PhantomLibrary.Sources.MagnetCandidate("magnet:?xt=urn:btih:oldcold", "oldcold", 1234, 10, "idx") { Title = "Old" } },
+            "test",
+            TimeSpan.FromHours(1),
+            CancellationToken.None);
+        var now = DateTimeOffset.UtcNow;
+        await db.UpdateSourceCandidateValidationAsync(new SourceCandidateValidationUpdate(
+            501, "movie", -1, -1, "preset", "magnet:?xt=urn:btih:oldcold",
+            "invalid", "no_valid_files", now, null, 1, "policy-v1", null, null, null), CancellationToken.None);
+
+        Assert.DoesNotContain(await db.ListVisibleMovieRowsAsync(CancellationToken.None), r => r.Metadata.TmdbId == 501);
+
+        // A fresh re-probe surfaces a new, not-yet-validated candidate.
+        await db.UpsertSourceCandidatesAsync(
+            501,
+            "movie",
+            -1,
+            -1,
+            "preset",
+            new[] { new Jellyfin.Plugin.PhantomLibrary.Sources.MagnetCandidate("magnet:?xt=urn:btih:fresh", "fresh", 1234, 10, "idx") { Title = "Fresh" } },
+            "test",
+            TimeSpan.FromHours(1),
+            CancellationToken.None);
+
+        Assert.Contains(await db.ListVisibleMovieRowsAsync(CancellationToken.None), r => r.Metadata.TmdbId == 501);
+    }
+
+    /// <summary>
+    /// Same cold-materialise-fail exclusion, TV parity: an episode whose
+    /// only candidate is permanently invalid must not count toward the
+    /// series' min-available-episode display gate, so a series with only
+    /// cold-failed episodes drops out of the top-level Shows browse list.
+    /// </summary>
+    [Fact]
+    public async Task ListVisibleSeriesRows_ExcludesSeriesWhenOnlyEpisodeCandidateInvalid()
+    {
+        using var db = await NewDbAsync();
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(600, "series", "Cold Series", null, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await db.MarkAvailabilityAvailableAsync(600, "episode", 1, 1, candidate: null, CancellationToken.None);
+        await db.UpsertSourceCandidatesAsync(
+            600,
+            "episode",
+            1,
+            1,
+            "preset",
+            new[] { new Jellyfin.Plugin.PhantomLibrary.Sources.MagnetCandidate("magnet:?xt=urn:btih:coldep", "coldep", 1234, 10, "idx") { Title = "Cold" } },
+            "test",
+            TimeSpan.FromHours(1),
+            CancellationToken.None);
+
+        Assert.Contains(await db.ListVisibleSeriesRowsAsync(CancellationToken.None), r => r.Metadata.TmdbId == 600);
+
+        var now = DateTimeOffset.UtcNow;
+        await db.UpdateSourceCandidateValidationAsync(new SourceCandidateValidationUpdate(
+            600, "episode", 1, 1, "preset", "magnet:?xt=urn:btih:coldep",
+            "invalid", "no_valid_files", now, null, 1, "policy-v1", null, null, null), CancellationToken.None);
+
+        Assert.DoesNotContain(await db.ListVisibleSeriesRowsAsync(CancellationToken.None), r => r.Metadata.TmdbId == 600);
+    }
+
     [Fact]
     public async Task IsSeriesVisible_UserId_FalseWhenHiddenByUser()
     {

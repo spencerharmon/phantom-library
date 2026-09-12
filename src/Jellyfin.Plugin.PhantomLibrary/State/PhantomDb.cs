@@ -2984,7 +2984,20 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
             FROM tmdb_metadata m
             LEFT JOIN materialised_state ms ON ms.tmdb_id=m.tmdb_id AND ms.type='movie'
             LEFT JOIN availability_items a ON a.tmdb_id=m.tmdb_id AND a.type='movie' AND a.season=-1 AND a.episode=-1
-            WHERE m.type='movie' AND (ms.tmdb_id IS NOT NULL OR a.status='available')
+            WHERE m.type='movie' AND (
+                ms.tmdb_id IS NOT NULL
+                OR (a.status='available' AND (
+                    NOT EXISTS (
+                        SELECT 1 FROM source_candidates sc
+                        WHERE sc.tmdb_id=m.tmdb_id AND sc.type='movie' AND sc.season=-1 AND sc.episode=-1
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM source_candidates sc
+                        WHERE sc.tmdb_id=m.tmdb_id AND sc.type='movie' AND sc.season=-1 AND sc.episode=-1
+                          AND sc.validation_status <> 'invalid'
+                    )
+                ))
+            )
             ORDER BY COALESCE(ms.materialised_at, m.fetched_at) DESC;";
         var list = new List<VisibleMovieRow>();
         await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
@@ -3047,9 +3060,20 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                    COALESCE(av.available_count,0), COALESCE(mat.materialised_count,0)
             FROM tmdb_metadata m
             LEFT JOIN (
-                SELECT tmdb_id, COUNT(*) AS available_count FROM availability_items
-                WHERE type='episode' AND status='available'
-                GROUP BY tmdb_id
+                SELECT ai.tmdb_id, COUNT(*) AS available_count FROM availability_items ai
+                WHERE ai.type='episode' AND ai.status='available'
+                  AND (
+                    NOT EXISTS (
+                        SELECT 1 FROM source_candidates sc
+                        WHERE sc.tmdb_id=ai.tmdb_id AND sc.type='episode' AND sc.season=ai.season AND sc.episode=ai.episode
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM source_candidates sc
+                        WHERE sc.tmdb_id=ai.tmdb_id AND sc.type='episode' AND sc.season=ai.season AND sc.episode=ai.episode
+                          AND sc.validation_status <> 'invalid'
+                    )
+                  )
+                GROUP BY ai.tmdb_id
             ) av ON av.tmdb_id=m.tmdb_id
             LEFT JOIN (
                 SELECT tmdb_id, COUNT(*) AS materialised_count FROM materialised_state
@@ -3058,8 +3082,19 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
             ) mat ON mat.tmdb_id=m.tmdb_id
             LEFT JOIN (
                 SELECT tmdb_id, COUNT(*) AS display_count FROM (
-                    SELECT tmdb_id, season, episode FROM availability_items
-                    WHERE type='episode' AND status='available'
+                    SELECT ai.tmdb_id, ai.season, ai.episode FROM availability_items ai
+                    WHERE ai.type='episode' AND ai.status='available'
+                      AND (
+                        NOT EXISTS (
+                            SELECT 1 FROM source_candidates sc
+                            WHERE sc.tmdb_id=ai.tmdb_id AND sc.type='episode' AND sc.season=ai.season AND sc.episode=ai.episode
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM source_candidates sc
+                            WHERE sc.tmdb_id=ai.tmdb_id AND sc.type='episode' AND sc.season=ai.season AND sc.episode=ai.episode
+                              AND sc.validation_status <> 'invalid'
+                        )
+                      )
                     UNION
                     SELECT tmdb_id, season, episode FROM materialised_state
                     WHERE type='episode'

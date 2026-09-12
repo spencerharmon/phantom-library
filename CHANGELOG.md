@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Prune non-playable phantoms from the main browse lists
+  (p10-prune-nonplayable-browse).** ROI Priority 10, item 1. The top-level
+  Movies/Shows browse lists (`PhantomDb.ListVisibleMovieRowsAsync`,
+  `ListVisibleSeriesRowsAsync`) previously treated any `available_items`
+  row with `status='available'` as playable, even when every known
+  `source_candidates` row for that item had since been marked
+  `validation_status='invalid'` (a known cold-materialise-fail — the
+  cached candidate exists but repeatedly fails to actually materialise, so
+  the availability probe's long TTL never revisits it). Such an item now
+  drops out of the main browse list — a plain, cheap, index-backed
+  `EXISTS`/`NOT EXISTS` check against already-collected
+  `source_candidates` rows, reusing the same TTL/re-probe convergence
+  path (no new background loop): an item with no `source_candidates` rows
+  yet (never validated) stays visible, and any fresh (non-invalid)
+  candidate that later appears — from a re-probe or background sweep —
+  makes it reappear on the very next read, no re-promotion step needed.
+  It stays reachable via global search regardless (the existing
+  p6-search-list-surface-split `GetSearchSyncItemsAsync` path is
+  untouched). Movie AND TV/episode parity; season/episode detail views are
+  intentionally unchanged (they already show the full known-episode grid
+  per p6-search-list-surface-split). No schema change. See
+  `docs/tasks/p10-prune-nonplayable-browse.md`.
+
 - **Magnet-cache background sweep (p6-magnet-cache-background-sweep).** ROI
   Priority 6, revised architecture item 2b. The lowest-priority magnet-cache
   lane: a new `MagnetCacheBackgroundSweepWorker` hosted service mirrors
