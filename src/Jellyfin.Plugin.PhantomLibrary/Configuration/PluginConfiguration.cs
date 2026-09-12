@@ -144,7 +144,38 @@ public class PluginConfiguration : BasePluginConfiguration
         MetricsOtlpEnabled = false;
         MetricsOtlpEndpoint = string.Empty;
         MetricsOtlpProtocol = "grpc";
+
+        // p10-netflix-style-rows: curated browse rows.
+        CuratedRowsEnabled = true;
+        CuratedRowSize = 40;
+        CuratedGenreRowMinItems = 3;
     }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the movie/TV channels present
+    /// their top level as multiple curated "Netflix-style" rows (Available
+    /// now, Popular on Phantom, New releases, Trending this week, Because you
+    /// played…, genre rows, Leaving soon) instead of a single flat list.
+    /// (p10-netflix-style-rows.) When <c>false</c> the channels fall back to
+    /// the legacy single flat, relevance-sorted list. On by default.
+    /// </summary>
+    public bool CuratedRowsEnabled { get; set; }
+
+    /// <summary>
+    /// Gets or sets the maximum number of titles rendered inside a single
+    /// curated row (p10-netflix-style-rows). Each row query/derivation is
+    /// bounded by this value so a Home-screen load stays O(row-size), never an
+    /// O(catalogue) enumeration. Clamped to at least 1.
+    /// </summary>
+    public int CuratedRowSize { get; set; }
+
+    /// <summary>
+    /// Gets or sets the minimum number of titles a genre must contribute
+    /// before it earns its own curated genre row (p10-netflix-style-rows). A
+    /// genre with fewer visible playable titles is folded away rather than
+    /// surfacing a near-empty row. Clamped to at least 1.
+    /// </summary>
+    public int CuratedGenreRowMinItems { get; set; }
 
     /// <summary>
     /// Gets or sets a value indicating whether the plugin pushes its

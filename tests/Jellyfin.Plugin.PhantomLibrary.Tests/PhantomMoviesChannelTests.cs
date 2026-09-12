@@ -5,12 +5,14 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Channels;
+using Jellyfin.Plugin.PhantomLibrary.Configuration;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
 using Jellyfin.Plugin.PhantomLibrary.Clients.Models;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.Channels;
 using MediaBrowser.Controller.MediaEncoding;
+using MediaBrowser.Model.Channels;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.MediaInfo;
@@ -57,6 +59,9 @@ public class PhantomMoviesChannelTests : IDisposable
         _channel = new PhantomMoviesChannel(
             _db, _enumerator, _splash, _state, _tmdb.Object,
             NullLogger<PhantomMoviesChannel>.Instance);
+        // Existing tests assert the flat leaf list; the curated-row surface
+        // (p10-netflix-style-rows) has its own dedicated tests, so disable it here.
+        _channel.SetConfigurationProviderForTests(() => new Configuration.PluginConfiguration { CuratedRowsEnabled = false });
     }
 
     public void Dispose()
@@ -186,6 +191,7 @@ public class PhantomMoviesChannelTests : IDisposable
         var channel = new PhantomMoviesChannel(
             _db, _enumerator, _splash, _state, _tmdb.Object, encoder.Object,
             NullLogger<PhantomMoviesChannel>.Instance);
+        channel.SetConfigurationProviderForTests(() => new Configuration.PluginConfiguration { CuratedRowsEnabled = false });
 
         var result = await channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
 
@@ -395,6 +401,7 @@ public class PhantomMoviesChannelTests : IDisposable
         GostreamFilesystemEnumerator.ResetForTests();
         var cold = new PhantomMoviesChannel(_db, _enumerator, _splash, _state, _tmdb.Object,
             NullLogger<PhantomMoviesChannel>.Instance);
+        cold.SetConfigurationProviderForTests(() => new Configuration.PluginConfiguration { CuratedRowsEnabled = false });
         var second = await cold.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
         Assert.Equal("movie_1318447", Assert.Single(second.Items).Id);
         _tmdb.Verify(t => t.SearchMoviesAsync("Apex", 2026, It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Once);
@@ -534,6 +541,7 @@ public class PhantomMoviesChannelTests : IDisposable
         var channel = new PhantomMoviesChannel(
             _db, _enumerator, _splash, _state, _tmdb.Object, encoder.Object,
             NullLogger<PhantomMoviesChannel>.Instance);
+        channel.SetConfigurationProviderForTests(() => new Configuration.PluginConfiguration { CuratedRowsEnabled = false });
 
         var got = await channel.GetChannelItemMediaInfo("movie_51", CancellationToken.None);
 
@@ -646,6 +654,48 @@ public class PhantomMoviesChannelTests : IDisposable
         var rootResult = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
         Assert.DoesNotContain(rootResult.Items, i => i.Id == "movie_301");
         Assert.Contains(rootResult.Items, i => i.Id == "movie_302");
+    }
+
+    [Fact]
+    public async Task GetChannelItems_CuratedRowsEnabled_RootReturnsRowFolders_AndRowDrilldownReturnsMovie()
+    {
+        _channel.SetConfigurationProviderForTests(() => new PluginConfiguration { CuratedRowsEnabled = true });
+        await SeedMetaAsync(550, "Fight Club");
+        await SeedAvailableMovieAsync(550);
+        // Materialise it so it renders as a real (non-phantom) "Available now" title.
+        var fusePath = Path.Combine(_moviesRoot, "550.mkv");
+        File.WriteAllText(fusePath, string.Empty);
+        await _db.InsertMaterialisedStateAsync(550, "movie", -1, -1, "/stub/550.mkv", fusePath, CancellationToken.None);
+
+        // Root now returns curated-row category folders, not the flat leaf list.
+        var root = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        Assert.NotEmpty(root.Items);
+        Assert.All(root.Items, i => Assert.Equal(ChannelItemType.Folder, i.Type));
+        Assert.Contains(root.Items, i => CuratedRows.TryParseRowFolderId(i.Id, "movies", out var k) && k == CuratedRows.KeyAvailableNow);
+
+        // Drilling into the "Available now" row returns the seeded movie leaf.
+        var rowId = CuratedRows.BuildRowFolderId("movies", CuratedRows.KeyAvailableNow);
+        var rowItems = await _channel.GetChannelItems(new InternalChannelItemQuery { FolderId = rowId }, CancellationToken.None);
+        var movie = Assert.Single(rowItems.Items);
+        Assert.Equal("movie_550", movie.Id);
+        Assert.Equal(ChannelItemType.Media, movie.Type);
+    }
+
+    [Fact]
+    public async Task GetChannelItems_CuratedRowsEnabled_ExplicitSortStillReturnsFlatList()
+    {
+        _channel.SetConfigurationProviderForTests(() => new PluginConfiguration { CuratedRowsEnabled = true });
+        await SeedMetaAsync(550, "Fight Club");
+        await SeedAvailableMovieAsync(550);
+
+        // An explicit sort is a flat-list intent — rows are bypassed.
+        var result = await _channel.GetChannelItems(
+            new InternalChannelItemQuery { SortBy = ChannelItemSortField.Name },
+            CancellationToken.None);
+
+        var movie = Assert.Single(result.Items);
+        Assert.Equal("movie_550", movie.Id);
+        Assert.Equal(ChannelItemType.Media, movie.Type);
     }
 
     private static IApplicationPaths MockPaths(string root)

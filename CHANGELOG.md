@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Curated "Netflix-style" browse rows (p10-netflix-style-rows).** ROI
+  Priority 10, item 3. The Phantom Movies and Phantom Shows channels now present
+  their top level as multiple curated category rows instead of one flat list:
+  *Available now* (materialised / high-confidence), *Popular on Phantom* (TMDB
+  rating proxy), *New releases* (recently catalogued), *Trending this week*
+  (recent + well-rated), *More like your favourites / Recommended for you*
+  (per-user affinity when available, else global popularity), one row per genre
+  above a min-items threshold, and *Leaving soon* (eviction-pending). Rows
+  surface as browsable channel folders (`__row_<movies|shows>_<key>__`). Each
+  row is derived purely from the already-pruned (p10-prune-nonplayable-browse),
+  relevance-ordered (p10-relevance-sort) flat browse list and capped by
+  `PluginConfiguration.CuratedRowSize`, so a Home-screen load stays
+  O(row-size)/O(recent) — never an O(catalogue) enumeration. Controlled by
+  `CuratedRowsEnabled` (default on); an explicit sort request bypasses rows and
+  returns the flat list. No schema change; no operator action beyond the next
+  install.
+
 - **Parallel indexer probe fan-out (ttfb-parallel-indexer-probe).** ROI
   Priority 9. `MagnetSelector.ProbeCoreAsync` now fans out to every enabled
   `IIndexerClient` concurrently (`Task.WhenAll`) instead of a sequential

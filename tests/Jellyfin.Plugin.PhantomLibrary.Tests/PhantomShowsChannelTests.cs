@@ -5,6 +5,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Channels;
+using Jellyfin.Plugin.PhantomLibrary.Configuration;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
 using Jellyfin.Plugin.PhantomLibrary.Clients.Models;
 using Jellyfin.Plugin.PhantomLibrary.State;
@@ -51,6 +52,9 @@ public class PhantomShowsChannelTests : IDisposable
             _db, _tmdb.Object, _splash, _state, _enumerator,
             NullLogger<PhantomShowsChannel>.Instance,
             () => null);
+        // Existing tests assert the flat series list; the curated-row surface
+        // (p10-netflix-style-rows) has its own dedicated tests, so disable it here.
+        _channel.SetConfigurationProviderForTests(() => new PluginConfiguration { CuratedRowsEnabled = false });
     }
 
     public void Dispose()
@@ -953,6 +957,7 @@ public class PhantomShowsChannelTests : IDisposable
         GostreamFilesystemEnumerator.ResetForTests();
         var cold = new PhantomShowsChannel(_db, _tmdb.Object, _splash, _state, _enumerator,
             NullLogger<PhantomShowsChannel>.Instance, () => null);
+        cold.SetConfigurationProviderForTests(() => new PluginConfiguration { CuratedRowsEnabled = false });
         var second = await cold.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
         var series = Assert.Single(second.Items, i => i.Id == "series_99056001");
         Assert.Equal("Renamed", series.Name);

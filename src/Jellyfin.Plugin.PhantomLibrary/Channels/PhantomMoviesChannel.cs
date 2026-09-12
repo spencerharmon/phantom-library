@@ -51,7 +51,16 @@ public sealed class PhantomMoviesChannel
     private readonly ITmdbClient _tmdbClient;
     private readonly IMediaEncoder? _mediaEncoder;
     private readonly ILogger<PhantomMoviesChannel> _logger;
+    private Func<Configuration.PluginConfiguration> _configProvider;
     private readonly Dictionary<string, int> _gostreamMovieTmdbByPath = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Test seam (p10-netflix-style-rows): overrides the configuration source so
+    /// tests can toggle <see cref="Configuration.PluginConfiguration.CuratedRowsEnabled"/>
+    /// without a live <c>Plugin.Instance</c>.
+    /// </summary>
+    internal void SetConfigurationProviderForTests(Func<Configuration.PluginConfiguration> provider)
+        => _configProvider = provider ?? throw new ArgumentNullException(nameof(provider));
 
     public PhantomMoviesChannel(
         PhantomDb db,
@@ -80,6 +89,7 @@ public sealed class PhantomMoviesChannel
         _tmdbClient = tmdbClient ?? throw new ArgumentNullException(nameof(tmdbClient));
         _mediaEncoder = mediaEncoder;
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _configProvider = () => Plugin.Instance?.Configuration ?? new Configuration.PluginConfiguration();
     }
 
     /// <inheritdoc />
@@ -149,7 +159,22 @@ public sealed class PhantomMoviesChannel
             return await GetSearchSyncItemsAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        // Movies channel is flat: no folder navigation.
+        var config = _configProvider();
+
+        // p10-netflix-style-rows: curated-row dispatch. A row folder was emitted
+        // at the root (below) as a category folder; opening it re-derives that
+        // one row's members from the same bounded flat list.
+        if (config.CuratedRowsEnabled
+            && CuratedRows.TryParseRowFolderId(query.FolderId, RowChannelScope, out var rowKey))
+        {
+            var rowItems = await BuildFlatMovieItemsAsync(query.UserId, cancellationToken).ConfigureAwait(false);
+            var rows = BuildCuratedRows(rowItems, config);
+            var row = CuratedRows.Find(rows, rowKey);
+            var items = row?.Items ?? (IReadOnlyList<ChannelItemInfo>)Array.Empty<ChannelItemInfo>();
+            return new ChannelItemResult { Items = items.ToList(), TotalRecordCount = items.Count };
+        }
+
+        // Movies channel is otherwise flat: no folder navigation.
         if (!string.IsNullOrEmpty(query.FolderId))
         {
             return new ChannelItemResult
@@ -159,11 +184,84 @@ public sealed class PhantomMoviesChannel
             };
         }
 
+        var flatItems = await BuildFlatMovieItemsAsync(query.UserId, cancellationToken).ConfigureAwait(false);
+
+        // p10-relevance-sort: the list is already in the default blended
+        // (materialised/available-first, then relevance_score, then
+        // recency) order; an explicit query.SortBy request re-sorts the whole
+        // thing (see ChannelSortHelper for the field-mapping rationale).
+        ChannelSortHelper.ApplyExplicitSort(flatItems, query.SortBy, query.SortDescending);
+
+        // p10-netflix-style-rows: when curated rows are enabled AND an explicit
+        // sort was NOT requested, present the top level as category-row folders
+        // instead of the flat list (an explicit sort is a flat-list intent, so
+        // honour it verbatim). If categorisation yields no rows (e.g. empty
+        // catalogue), fall back to the flat list so the surface is never blank.
+        var noExplicitSort = query.SortBy is null;
+        if (config.CuratedRowsEnabled && noExplicitSort)
+        {
+            var rows = BuildCuratedRows(flatItems, config);
+            var folders = CuratedRows.ToFolderItems(rows, RowChannelScope);
+            if (folders.Count > 0)
+            {
+                return new ChannelItemResult
+                {
+                    Items = folders.ToList(),
+                    TotalRecordCount = folders.Count,
+                };
+            }
+        }
+
+        return new ChannelItemResult
+        {
+            Items = flatItems,
+            TotalRecordCount = flatItems.Count,
+        };
+    }
+
+    /// <summary>The row-FolderId channel scope for this channel (see <see cref="CuratedRows"/>).</summary>
+    private const string RowChannelScope = "movies";
+
+    /// <summary>
+    /// p10-netflix-style-rows: categorise the built flat list into curated rows.
+    /// Bounded — operates purely over the already-pruned, relevance-ordered flat
+    /// list (never an O(catalogue) DB scan) and caps each row via config.
+    /// </summary>
+    private static IReadOnlyList<CuratedRow> BuildCuratedRows(
+        List<ChannelItemInfo> flatItems,
+        Configuration.PluginConfiguration config)
+    {
+        var candidates = new List<RowCandidate>(flatItems.Count);
+        foreach (var item in flatItems)
+        {
+            // Only true leaf movie items are row members; orphan-folder items
+            // (if any) are skipped from rows.
+            if (item.Type != ChannelItemType.Media)
+            {
+                continue;
+            }
+
+            candidates.Add(CuratedRows.Classify(item));
+        }
+
+        return CuratedRows.Build(
+            candidates,
+            new CuratedRowConfig(config.CuratedRowSize, config.CuratedGenreRowMinItems, DateTime.UtcNow));
+    }
+
+    /// <summary>
+    /// Build the flat, pruned, relevance-ordered movie browse list (the legacy
+    /// single-list body). Curated rows are derived from this exact list, so
+    /// pruning (p10-prune-nonplayable-browse) and default ordering
+    /// (p10-relevance-sort) are inherited by every row.
+    /// </summary>
+    private async Task<List<ChannelItemInfo>> BuildFlatMovieItemsAsync(Guid userId, CancellationToken cancellationToken)
+    {
         // P5 baseline: time the list-view load. Guid.Empty is the
         // materialised-only enumeration path (system/refresh callers); a real
         // user id is the interactive list-view load.
         using var flowScope = PhantomFlowMetrics.Time(
-            query.UserId == Guid.Empty
+            userId == Guid.Empty
                 ? PhantomFlowMetrics.FlowMaterialisedListing
                 : PhantomFlowMetrics.FlowListView,
             _db.Backend);
@@ -214,7 +312,6 @@ public sealed class PhantomMoviesChannel
         // subtracts that user's hidden set (REQ-M14-PER-USER Surface 3); Guid.Empty
         // (system/anonymous callers, e.g. GetLatestMedia's materialised-only path)
         // gets the server-wide list unchanged. ---
-        var userId = query.UserId;
         var visible = userId == Guid.Empty
             ? await _db.ListVisibleMovieRowsAsync(cancellationToken).ConfigureAwait(false)
             : await _db.ListVisibleMovieRowsAsync(userId, cancellationToken).ConfigureAwait(false);
@@ -286,15 +383,9 @@ public sealed class PhantomMoviesChannel
         // p10-relevance-sort: the list is already in the default blended
         // (materialised/available-first, then relevance_score, then
         // recency) order from step 1's DB query, with steps 2/3 appended
-        // after it; an explicit query.SortBy request re-sorts the whole
-        // thing (see ChannelSortHelper for the field-mapping rationale and
-        // which of the ROI's five named options this can actually honor).
-        ChannelSortHelper.ApplyExplicitSort(items, query.SortBy, query.SortDescending);
-        return new ChannelItemResult
-        {
-            Items = items,
-            TotalRecordCount = items.Count,
-        };
+        // after it. The caller applies any explicit query.SortBy re-sort and/or
+        // the p10-netflix-style-rows categorisation on top of this order.
+        return items;
     }
 
     /// <summary>

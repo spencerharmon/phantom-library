@@ -76,6 +76,21 @@ public sealed partial class PhantomShowsChannel
     private readonly Func<string?> _languageProvider;
     private readonly Func<PluginConfiguration> _configProvider;
 
+    /// <summary>
+    /// Test seam (p10-netflix-style-rows): overrides the configuration source so
+    /// tests can toggle <see cref="PluginConfiguration.CuratedRowsEnabled"/>
+    /// without a live <c>Plugin.Instance</c>. Unlike the movies channel the base
+    /// field must stay <c>readonly</c> for its language-provider callers, so the
+    /// override is a separate nullable field consulted first.
+    /// </summary>
+    private Func<PluginConfiguration>? _configProviderOverride;
+
+    internal void SetConfigurationProviderForTests(Func<PluginConfiguration> provider)
+        => _configProviderOverride = provider ?? throw new ArgumentNullException(nameof(provider));
+
+    private PluginConfiguration CurrentConfiguration()
+        => (_configProviderOverride ?? _configProvider)();
+
     public PhantomShowsChannel(
         PhantomDb db,
         ITmdbClient tmdb,
@@ -195,9 +210,43 @@ public sealed partial class PhantomShowsChannel
             return await GetSearchSyncItemsAsync(cancellationToken).ConfigureAwait(false);
         }
 
+        var config = CurrentConfiguration();
+
+        // p10-netflix-style-rows: opening a curated-row category folder re-emits
+        // that row's member series (each still a normal series_<tmdb> folder, so
+        // navigation into seasons/episodes is unchanged).
+        if (config.CuratedRowsEnabled
+            && CuratedRows.TryParseRowFolderId(query.FolderId, RowChannelScope, out var rowKey))
+        {
+            var flat = await BuildTopLevelSeriesItemsAsync(userId, cancellationToken).ConfigureAwait(false);
+            var rows = BuildCuratedRows(flat, config);
+            var row = CuratedRows.Find(rows, rowKey);
+            var members = row?.Items ?? (IReadOnlyList<ChannelItemInfo>)Array.Empty<ChannelItemInfo>();
+            return new ChannelItemResult { Items = members.ToList(), TotalRecordCount = members.Count };
+        }
+
         if (string.IsNullOrEmpty(query.FolderId))
         {
-            return await GetTopLevelSeriesAsync(userId, query.SortBy, query.SortDescending, cancellationToken).ConfigureAwait(false);
+            var flat = await BuildTopLevelSeriesItemsAsync(userId, cancellationToken).ConfigureAwait(false);
+
+            // p10-relevance-sort: default blended order comes from the DB query;
+            // an explicit sort re-sorts the whole list.
+            ChannelSortHelper.ApplyExplicitSort(flat, query.SortBy, query.SortDescending);
+
+            // p10-netflix-style-rows: present curated category rows at the top
+            // level unless an explicit sort was requested (a flat-list intent).
+            // Fall back to the flat list if categorisation yields no rows.
+            if (config.CuratedRowsEnabled && query.SortBy is null)
+            {
+                var rows = BuildCuratedRows(flat, config);
+                var folders = CuratedRows.ToFolderItems(rows, RowChannelScope);
+                if (folders.Count > 0)
+                {
+                    return new ChannelItemResult { Items = folders.ToList(), TotalRecordCount = folders.Count };
+                }
+            }
+
+            return new ChannelItemResult { Items = flat, TotalRecordCount = flat.Count };
         }
 
         if (TryParseOrphanSeriesId(query.FolderId, out var orphanSeriesHash))
@@ -370,7 +419,7 @@ public sealed partial class PhantomShowsChannel
     // Browse paths
     // ----------------------------------------------------------------
 
-    private async Task<ChannelItemResult> GetTopLevelSeriesAsync(Guid userId, ChannelItemSortField? sortBy, bool sortDescending, CancellationToken ct)
+    private async Task<List<ChannelItemInfo>> BuildTopLevelSeriesItemsAsync(Guid userId, CancellationToken ct)
     {
         using var flowScope = PhantomFlowMetrics.Time(PhantomFlowMetrics.FlowListView, _db.Backend);
         var seen = new HashSet<int>();
@@ -441,14 +490,34 @@ public sealed partial class PhantomShowsChannel
 
         // p10-relevance-sort: default order is materialised/available-first +
         // relevance_score + recency from ListVisibleSeriesRowsAsync, with
-        // orphan-only series appended after it; an explicit query.SortBy
-        // request re-sorts the whole list (see ChannelSortHelper).
-        ChannelSortHelper.ApplyExplicitSort(items, sortBy, sortDescending);
-        return new ChannelItemResult
+        // orphan-only series appended after it. The caller applies any explicit
+        // sort and/or p10-netflix-style-rows categorisation on top.
+        return items;
+    }
+
+    /// <summary>The row-FolderId channel scope for this channel (see <see cref="CuratedRows"/>).</summary>
+    private const string RowChannelScope = "shows";
+
+    /// <summary>
+    /// p10-netflix-style-rows: categorise the built top-level series folders
+    /// into curated rows. Bounded — derived purely from the already-pruned,
+    /// relevance-ordered series list (no O(catalogue) DB scan), capped per row
+    /// by config. Series items are folders; their own fields (DateCreated =
+    /// fetched_at, CommunityRating, Genres, phantom tag) drive classification.
+    /// </summary>
+    private static IReadOnlyList<CuratedRow> BuildCuratedRows(
+        List<ChannelItemInfo> seriesItems,
+        Configuration.PluginConfiguration config)
+    {
+        var candidates = new List<RowCandidate>(seriesItems.Count);
+        foreach (var item in seriesItems)
         {
-            Items = items,
-            TotalRecordCount = items.Count,
-        };
+            candidates.Add(CuratedRows.Classify(item));
+        }
+
+        return CuratedRows.Build(
+            candidates,
+            new CuratedRowConfig(config.CuratedRowSize, config.CuratedGenreRowMinItems, DateTime.UtcNow));
     }
 
     /// <summary>
