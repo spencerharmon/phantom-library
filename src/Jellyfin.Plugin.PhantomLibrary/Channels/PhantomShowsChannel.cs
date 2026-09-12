@@ -163,6 +163,8 @@ public sealed partial class PhantomShowsChannel
         {
             ContentTypes = new List<ChannelMediaContentType> { ChannelMediaContentType.Episode },
             MediaTypes = new List<ChannelMediaType> { ChannelMediaType.Video },
+            DefaultSortFields = new List<ChannelItemSortField>(ChannelSortHelper.SupportedSortFields),
+            SupportsSortOrderToggle = true,
         };
     }
 
@@ -195,7 +197,7 @@ public sealed partial class PhantomShowsChannel
 
         if (string.IsNullOrEmpty(query.FolderId))
         {
-            return await GetTopLevelSeriesAsync(userId, cancellationToken).ConfigureAwait(false);
+            return await GetTopLevelSeriesAsync(userId, query.SortBy, query.SortDescending, cancellationToken).ConfigureAwait(false);
         }
 
         if (TryParseOrphanSeriesId(query.FolderId, out var orphanSeriesHash))
@@ -368,7 +370,7 @@ public sealed partial class PhantomShowsChannel
     // Browse paths
     // ----------------------------------------------------------------
 
-    private async Task<ChannelItemResult> GetTopLevelSeriesAsync(Guid userId, CancellationToken ct)
+    private async Task<ChannelItemResult> GetTopLevelSeriesAsync(Guid userId, ChannelItemSortField? sortBy, bool sortDescending, CancellationToken ct)
     {
         using var flowScope = PhantomFlowMetrics.Time(PhantomFlowMetrics.FlowListView, _db.Backend);
         var seen = new HashSet<int>();
@@ -437,6 +439,11 @@ public sealed partial class PhantomShowsChannel
             items.Add(BuildOrphanSeriesItem(series));
         }
 
+        // p10-relevance-sort: default order is materialised/available-first +
+        // relevance_score + recency from ListVisibleSeriesRowsAsync, with
+        // orphan-only series appended after it; an explicit query.SortBy
+        // request re-sorts the whole list (see ChannelSortHelper).
+        ChannelSortHelper.ApplyExplicitSort(items, sortBy, sortDescending);
         return new ChannelItemResult
         {
             Items = items,
@@ -892,6 +899,9 @@ public sealed partial class PhantomShowsChannel
             ImageUrl = meta.PosterUrl,
             ProductionYear = meta.Year,
             PremiereDate = meta.Year is { } y ? new DateTime(y, 1, 1, 0, 0, 0, DateTimeKind.Utc) : null,
+            // p10-relevance-sort: "Recently added" sort proxy — when this
+            // title first entered the plugin's own catalogue.
+            DateCreated = meta.FetchedAt.UtcDateTime,
             CommunityRating = meta.CommunityRating is { } cr ? (float)cr : null,
             OfficialRating = meta.OfficialRating,
             Tags = new List<string>(),

@@ -48,6 +48,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per p6-search-list-surface-split). No schema change. See
   `docs/tasks/p10-prune-nonplayable-browse.md`.
 
+- **Relevance-blended default browse ordering + explicit sort options
+  (p10-relevance-sort). BREAKING: requires wipe.** ROI Priority 10, item 2.
+  `PhantomDb` schema v20 adds a stored, cheap-to-read
+  `tmdb_metadata.relevance_score` column, refreshed in-place (O(1) per
+  touched title, never an O(catalogue) scan) by the availability sweep's
+  write paths (`CompleteAvailabilityProbeAsync` /
+  `MarkAvailabilityAvailableAsync`) whenever an item's availability status
+  changes. The score blends availability confidence (dominant), a 90-day
+  linear newness decay off `fetched_at`, and a TMDB community-rating
+  popularity proxy. The Movies/Shows browse LIST default ordering
+  (`ListVisibleMovieRowsAsync` / `ListVisibleSeriesRowsAsync`) now ranks
+  materialised-first (ties still break toward the more-playable item), then
+  by this score, then by the previous recency tie-breaker. Both channels
+  also now declare and honor a subset of Jellyfin's native channel-sort
+  fields (`PremiereDate`≈Newest, `DateCreated`≈Recently added,
+  `CommunityRating`≈Trending/Popular proxy, `Name`) via the new
+  `ChannelSortHelper`; per-user favourites/recently-played/genre-affinity
+  signals and TMDB's actual `popularity` field are explicitly out of scope
+  for this pass (see `docs/tasks/p10-relevance-sort.md` for the full
+  rationale). Movie AND TV/episode parity. **Schema bump 19→20 — wipe
+  required** (`scripts/phantom-wipe.sh --commit`) before installing this
+  build. See `docs/tasks/p10-relevance-sort.md`.
+
 - **Magnet-cache background sweep (p6-magnet-cache-background-sweep).** ROI
   Priority 6, revised architecture item 2b. The lowest-priority magnet-cache
   lane: a new `MagnetCacheBackgroundSweepWorker` hosted service mirrors
