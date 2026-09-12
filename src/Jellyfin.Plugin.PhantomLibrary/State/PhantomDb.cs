@@ -11,6 +11,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Channels;
 using Jellyfin.Plugin.PhantomLibrary.State.Db;
+using Npgsql;
 
 namespace Jellyfin.Plugin.PhantomLibrary.State;
 
@@ -343,14 +344,53 @@ public sealed record HiddenItemRow(int TmdbId, string Type, DateTimeOffset Hidde
 /// availability status changes — an O(1) write per touched item, never a
 /// bulk recompute. This is a PURELY ADDITIVE delta (one new column + index
 /// on the existing table, backfilled to 0 for every pre-existing row by
-/// <c>EnsureSchemaAsync</c>'s from-scratch CREATE); per AGENTS.md it is a
-/// schema-version bump — pre-v20 databases are HARD-REFUSED and the
-/// operator must wipe (<c>scripts/phantom-wipe.sh --commit</c>) before
-/// restart.
+/// <c>EnsureSchemaAsync</c>'s from-scratch CREATE). Per
+/// <c>p7-additive-expand-relevance-score-and-gate</c>, a v19 Postgres database
+/// is no longer HARD-REFUSED for this bump: <see cref="EnsureSchemaOnceAsync"/>
+/// self-applies the v19-&gt;v20 EXPAND migration (registered in
+/// <see cref="ExpandMigrations"/>, additive/idempotent/advisory-locked via
+/// <see cref="SchemaExpandMigrator"/>) so an older-build blue color and a
+/// newer-build green color can share one logical Postgres DB across the bump
+/// without an operator hand-applying DDL. A v19 SQLite database (single-
+/// writer, no blue/green) still hard-refuses and requires
+/// <c>scripts/phantom-wipe.sh --commit</c>, as does ANY database more than
+/// one schema version behind (no registered migration path covers a gap
+/// wider than what <see cref="ExpandMigrations"/> lists).
 /// </summary>
 public sealed class PhantomDb : IDisposable
 {
     public const int CurrentSchemaVersion = 20;
+
+    /// <summary>
+    /// Ordered registry of additive, idempotent EXPAND migrations
+    /// (<c>p7-additive-expand-relevance-score-and-gate</c>) that
+    /// <see cref="EnsureSchemaOnceAsync"/> self-applies (via
+    /// <see cref="SchemaExpandMigrator"/>, advisory-locked) when it finds a
+    /// Postgres database behind <see cref="CurrentSchemaVersion"/>, instead of
+    /// hard-refusing and forcing an operator wipe. Each entry's
+    /// <c>Statements</c> MUST reproduce, column-for-column, the corresponding
+    /// slice of a fresh <see cref="SchemaV10Sql"/> install — kept in sync by
+    /// the fresh==expanded parity test
+    /// (<c>PhantomDbPostgresIntegrationTests.FreshSchema_MatchesExpandedSchema_ForRelevanceScore</c>).
+    /// SQLite is never a target here: it is single-writer/single-color, so a
+    /// pre-v1.0 SQLite database behind version stays hard-refused (see the
+    /// AGENTS.md "no migrations until v1.0" policy) — this registry exists
+    /// purely for the shared-Postgres blue/green topology where the OLDER
+    /// color's build must keep working against a NEWER color's already-bumped
+    /// database rather than disabling itself.
+    /// </summary>
+    private static readonly IReadOnlyList<(int FromVersion, int ToVersion, string Name, string[] Statements)> ExpandMigrations = new[]
+    {
+        (
+            19,
+            20,
+            "v19_v20_tmdb_metadata_relevance_score",
+            new[]
+            {
+                "ALTER TABLE tmdb_metadata ADD COLUMN IF NOT EXISTS relevance_score REAL NOT NULL DEFAULT 0;",
+                "CREATE INDEX IF NOT EXISTS idx_tmdb_metadata_relevance ON tmdb_metadata(type, relevance_score DESC);",
+            }),
+    };
 
     private readonly IPhantomDbProvider _provider;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
@@ -473,13 +513,51 @@ public sealed class PhantomDb : IDisposable
 
         if (version > 0 && version < CurrentSchemaVersion)
         {
-            // HARD-REFUSE: pre-v1.0 = wipe-and-rebuild, no migrations. This is
-            // the genuinely-missing-structure case (the DB predates a
-            // structure this build's queries assume exists) — the one case
-            // forward tolerance must NOT paper over.
+            // Behind-version DB. Per p7-additive-expand-relevance-score-and-gate:
+            // a behind-version Postgres database is NOT automatically a
+            // "genuinely missing structure" case — most schema bumps to date
+            // (v17 owner column, v19 magnet_cache_jobs table, v20 relevance_score
+            // column+index) are PURELY ADDITIVE, and blue/green shares one
+            // Postgres logical DB, so hard-refusing here disables the older
+            // color the instant the newer color's migration lands. Self-apply
+            // every registered additive EXPAND migration that covers the gap,
+            // advisory-locked and idempotent via SchemaExpandMigrator, and only
+            // fall through to the hard refuse below if the gap is NOT fully
+            // covered by known-additive migrations (a genuine pre-migration
+            // structural gap, or a SQLite database — SQLite has no advisory-lock
+            // primitive and is single-writer/single-color, so it stays on the
+            // original hard-refuse-and-wipe contract).
+            if (_provider.Backend == PhantomDbBackend.Postgres && conn is NpgsqlConnection npgsqlConn)
+            {
+                var applied = version;
+                foreach (var migration in ExpandMigrations)
+                {
+                    if (migration.FromVersion != applied)
+                    {
+                        continue;
+                    }
+
+                    await SchemaExpandMigrator.ApplyAsync(npgsqlConn, migration.Name, migration.Statements, ct)
+                        .ConfigureAwait(false);
+                    applied = migration.ToVersion;
+                }
+
+                if (applied >= CurrentSchemaVersion)
+                {
+                    await using var expandTx = await conn.BeginTransactionAsync(ct).ConfigureAwait(false);
+                    await _provider.WriteSchemaVersionAsync(conn, expandTx, applied, ct).ConfigureAwait(false);
+                    await expandTx.CommitAsync(ct).ConfigureAwait(false);
+                    return;
+                }
+            }
+
+            // HARD-REFUSE: the gap is not (fully) covered by a registered
+            // additive expand migration — this is the genuinely-missing-
+            // structure case (the DB predates a structure this build's queries
+            // assume exists) that forward tolerance must NOT paper over.
             throw new InvalidOperationException(
                 $"Phantom Library schema is at version {version}; this build requires" + Environment.NewLine
-                + $"version {CurrentSchemaVersion}. Pre-v1.0 has no migrations." + Environment.NewLine
+                + $"version {CurrentSchemaVersion}, and no additive expand migration path covers the gap." + Environment.NewLine
                 + "Stop Jellyfin, run" + Environment.NewLine
                 + "`sudo bash scripts/phantom-wipe.sh --commit`, then restart.");
         }

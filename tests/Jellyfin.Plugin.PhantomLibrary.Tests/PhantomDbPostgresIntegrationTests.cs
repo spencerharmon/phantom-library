@@ -356,4 +356,139 @@ public sealed class PhantomDbPostgresIntegrationTests : IAsyncLifetime
         var final = await replicaA.GetUserPrefsAsync(userId, default);
         Assert.NotNull(final);
     }
+
+    // ---- p7-additive-expand-relevance-score-and-gate: self-apply, don't hard-refuse ----
+
+    private async Task<List<string>> ListColumnsAsync(string table)
+    {
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText =
+            "SELECT column_name FROM information_schema.columns WHERE table_name = @t ORDER BY column_name;";
+        cmd.Parameters.AddWithValue("t", table);
+        var columns = new List<string>();
+        await using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            columns.Add(reader.GetString(0));
+        }
+
+        return columns;
+    }
+
+    private async Task<bool> IndexExistsAsync(string indexName)
+    {
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT 1 FROM pg_indexes WHERE indexname = @n;";
+        cmd.Parameters.AddWithValue("n", indexName);
+        var result = await cmd.ExecuteScalarAsync();
+        return result is not null;
+    }
+
+    /// <summary>
+    /// A Postgres database left at v19 (the shape p10-relevance-sort's schema
+    /// bump found in the shared phantom_dev DB before the operator hand-applied
+    /// the DDL) must be SELF-HEALED by <c>EnsureSchemaOnceAsync</c> — the
+    /// additive v19-&gt;v20 expand migration applies automatically — rather than
+    /// hard-refusing and disabling the plugin. This is the exact regression
+    /// p7-additive-expand-relevance-score-and-gate exists to prevent.
+    /// </summary>
+    [Fact]
+    public async Task BehindVersionDb_SelfAppliesRelevanceScoreExpand_InsteadOfHardRefusing()
+    {
+        if (!Enabled)
+        {
+            return;
+        }
+
+        // Get to a fresh, fully-installed (v20) schema first...
+        using (var seed = NewDb())
+        {
+            await seed.CountCatalogueItemsAsync("movie", null, default);
+        }
+
+        // ...then roll it BACK to the v19 shape by hand (drop the v20 column +
+        // index and rewind the recorded version), simulating exactly the
+        // "db_version behind build version" state EnsureSchemaOnceAsync must
+        // tolerate.
+        await using (var conn = new NpgsqlConnection(_connectionString))
+        {
+            await conn.OpenAsync();
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+ALTER TABLE tmdb_metadata DROP COLUMN IF EXISTS relevance_score;
+DROP INDEX IF EXISTS idx_tmdb_metadata_relevance;
+UPDATE phantom_schema_meta SET version = 19;";
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        Assert.DoesNotContain("relevance_score", await ListColumnsAsync("tmdb_metadata"));
+
+        // A NEW PhantomDb instance (fresh _schemaEnsured gate) opening against
+        // this behind-version database must NOT throw — it self-applies the
+        // registered expand migration instead of hard-refusing.
+        using var db = NewDb();
+        var count = await db.CountCatalogueItemsAsync("movie", null, default);
+        Assert.Equal(0, count);
+
+        Assert.Contains("relevance_score", await ListColumnsAsync("tmdb_metadata"));
+        Assert.True(await IndexExistsAsync("idx_tmdb_metadata_relevance"));
+
+        await using var verify = new NpgsqlConnection(_connectionString);
+        await verify.OpenAsync();
+        await using var readVersion = verify.CreateCommand();
+        readVersion.CommandText = "SELECT version FROM phantom_schema_meta LIMIT 1;";
+        var version = Convert.ToInt32(await readVersion.ExecuteScalarAsync(), CultureInfo.InvariantCulture);
+        Assert.Equal(20, version);
+    }
+
+    /// <summary>
+    /// Fresh==expanded parity: the <c>tmdb_metadata</c> column set produced by a
+    /// from-scratch v20 install must be IDENTICAL to the column set produced by
+    /// expanding a v19 database via the registered migration — the "keep
+    /// fresh-install DDL and the expand list in sync" requirement.
+    /// </summary>
+    [Fact]
+    public async Task FreshSchema_MatchesExpandedSchema_ForRelevanceScore()
+    {
+        if (!Enabled)
+        {
+            return;
+        }
+
+        using (var fresh = NewDb())
+        {
+            await fresh.CountCatalogueItemsAsync("movie", null, default);
+        }
+
+        var freshColumns = await ListColumnsAsync("tmdb_metadata");
+        var freshHasIndex = await IndexExistsAsync("idx_tmdb_metadata_relevance");
+
+        // Roll back to v19 and let a fresh PhantomDb instance re-expand it.
+        await using (var conn = new NpgsqlConnection(_connectionString))
+        {
+            await conn.OpenAsync();
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+ALTER TABLE tmdb_metadata DROP COLUMN IF EXISTS relevance_score;
+DROP INDEX IF EXISTS idx_tmdb_metadata_relevance;
+UPDATE phantom_schema_meta SET version = 19;";
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        using (var expanded = NewDb())
+        {
+            await expanded.CountCatalogueItemsAsync("movie", null, default);
+        }
+
+        var expandedColumns = await ListColumnsAsync("tmdb_metadata");
+        var expandedHasIndex = await IndexExistsAsync("idx_tmdb_metadata_relevance");
+
+        Assert.Equal(freshColumns, expandedColumns);
+        Assert.Equal(freshHasIndex, expandedHasIndex);
+        Assert.True(expandedHasIndex);
+    }
 }
