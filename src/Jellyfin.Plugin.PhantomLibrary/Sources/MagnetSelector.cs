@@ -250,37 +250,96 @@ public sealed class MagnetSelector
         var aggregated = new List<IndexerCandidate>();
         var failures = new List<string>();
         var abstentions = new List<string>();
-        foreach (var indexer in enabled)
+
+        // Concurrent probe fan-out (ROI Priority 9, ttfb-parallel-indexer-probe):
+        // start every enabled indexer's SearchAsync immediately and await them
+        // together rather than in a sequential foreach, so a slow indexer
+        // (notably Prowlarr's server-side multi-indexer meta-search) no longer
+        // serialises ahead of the others. Each indexer is wrapped in its own
+        // try/catch with the SAME outcome classification as the previous
+        // sequential loop, so one indexer's exception/abstention/timeout never
+        // blocks or drops another's results. A bounded per-indexer timeout
+        // (IndexerProbeTimeoutSeconds) is enforced via a linked
+        // CancellationTokenSource so a single slow indexer cannot inflate the
+        // whole probe past a fixed ceiling; its cancellation is surfaced as a
+        // per-indexer transient failure, exactly like any other failure.
+        ct.ThrowIfCancellationRequested();
+        var perIndexerTimeout = TimeSpan.FromSeconds(_configProvider().IndexerProbeTimeoutSeconds);
+
+        // Per-indexer scratch results keyed by list index so aggregation order
+        // is deterministic (enabled-list order), independent of completion order.
+        var results = new (List<IndexerCandidate> Hits, string? Failure, string? Abstention)[enabled.Count];
+
+        var tasks = new Task[enabled.Count];
+        for (var i = 0; i < enabled.Count; i++)
         {
-            ct.ThrowIfCancellationRequested();
-            try
+            var slot = i;
+            var indexer = enabled[slot];
+            tasks[slot] = Task.Run(async () =>
             {
-                var hits = await indexer.SearchAsync(query, ct).ConfigureAwait(false);
-                if (hits is { Count: > 0 })
+                using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                timeoutCts.CancelAfter(perIndexerTimeout);
+                try
                 {
-                    aggregated.AddRange(hits);
+                    var hits = await indexer.SearchAsync(query, timeoutCts.Token).ConfigureAwait(false);
+                    if (hits is { Count: > 0 })
+                    {
+                        results[slot].Hits = new List<IndexerCandidate>(hits);
+                    }
                 }
-            }
-            catch (OperationCanceledException)
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    // The CALLER cancelled the whole probe — propagate, don't
+                    // reclassify as a per-indexer failure.
+                    throw;
+                }
+                catch (OperationCanceledException ex)
+                {
+                    // Per-indexer timeout only (timeoutCts fired, caller ct did not):
+                    // isolate as a transient failure so peers still count.
+                    results[slot].Failure = $"{indexer.Name}:timeout";
+                    _logger.LogWarning(ex, "Indexer {Indexer} timed out after {Timeout}s for {Type}/{Tmdb}", indexer.Name, perIndexerTimeout.TotalSeconds, type, tmdbId);
+                }
+                catch (IndexerNotApplicableException ex)
+                {
+                    // Abstention: the indexer cannot serve this query as-is (e.g. Torrentio
+                    // with no IMDB id). Not a failure and not transient — do not count it.
+                    results[slot].Abstention = indexer.Name;
+                    _logger.LogDebug(ex, "Indexer {Indexer} abstained (not applicable) for {Type}/{Tmdb}", indexer.Name, type, tmdbId);
+                }
+                catch (IndexerAuthException ex)
+                {
+                    results[slot].Failure = $"{indexer.Name}:auth";
+                    _logger.LogWarning(ex, "Indexer {Indexer} returned auth failure for {Type}/{Tmdb}", indexer.Name, type, tmdbId);
+                }
+                catch (Exception ex)
+                {
+                    results[slot].Failure = $"{indexer.Name}:transient";
+                    _logger.LogWarning(ex, "Indexer {Indexer} failed for {Type}/{Tmdb}", indexer.Name, type, tmdbId);
+                }
+            });
+        }
+
+        // Await the whole fan-out. A caller-driven cancellation surfaces as an
+        // OperationCanceledException from at least one task and propagates here.
+        await Task.WhenAll(tasks).ConfigureAwait(false);
+
+        // Aggregate in deterministic enabled-list order.
+        foreach (var r in results)
+        {
+            if (r.Hits is { Count: > 0 })
             {
-                throw;
+                aggregated.AddRange(r.Hits);
             }
-            catch (IndexerNotApplicableException ex)
+
+            if (r.Failure is not null)
             {
-                // Abstention: the indexer cannot serve this query as-is (e.g. Torrentio
-                // with no IMDB id). Not a failure and not transient — do not count it.
-                abstentions.Add(indexer.Name);
-                _logger.LogDebug(ex, "Indexer {Indexer} abstained (not applicable) for {Type}/{Tmdb}", indexer.Name, type, tmdbId);
+                failures.Add(r.Failure);
             }
-            catch (IndexerAuthException ex)
+
+            if (r.Abstention is not null)
             {
-                failures.Add($"{indexer.Name}:auth");
-                _logger.LogWarning(ex, "Indexer {Indexer} returned auth failure for {Type}/{Tmdb}", indexer.Name, type, tmdbId);
-            }
-            catch (Exception ex)
-            {
-                failures.Add($"{indexer.Name}:transient");
-                _logger.LogWarning(ex, "Indexer {Indexer} failed for {Type}/{Tmdb}", indexer.Name, type, tmdbId);
+                abstentions.Add(r.Abstention);
             }
         }
 

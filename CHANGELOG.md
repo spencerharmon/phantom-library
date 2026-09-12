@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Parallel indexer probe fan-out (ttfb-parallel-indexer-probe).** ROI
+  Priority 9. `MagnetSelector.ProbeCoreAsync` now fans out to every enabled
+  `IIndexerClient` concurrently (`Task.WhenAll`) instead of a sequential
+  `foreach`+`await`, so a slow indexer (notably Prowlarr's server-side
+  multi-indexer meta-search) no longer serialises ahead of the others — the
+  dominant contributor to the measured 64.72s cold-movie materialise. Each
+  indexer keeps its own try/catch and identical outcome classification
+  (abstention vs auth-failure vs transient-failure vs available), and a new
+  bounded per-indexer timeout (`PluginConfiguration.IndexerProbeTimeoutSeconds`,
+  default 20s, clamped [5,120]) enforced via a linked
+  `CancellationTokenSource` prevents any single slow indexer from inflating
+  the whole probe past a fixed ceiling; a timeout is surfaced as a per-indexer
+  transient failure without blocking or dropping peers' results. Aggregation,
+  scoring, episode-specificity re-rank, and the cache-first contract (a cache
+  HIT still runs zero probes) are unchanged. Movie and episode paths both flow
+  through the same method, so both benefit. No operator steps needed.
+
 - **Magnet-cache background sweep (p6-magnet-cache-background-sweep).** ROI
   Priority 6, revised architecture item 2b. The lowest-priority magnet-cache
   lane: a new `MagnetCacheBackgroundSweepWorker` hosted service mirrors

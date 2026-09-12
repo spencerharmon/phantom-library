@@ -26,6 +26,7 @@ public class PluginConfiguration : BasePluginConfiguration
     private int _bulkMaterialiseWorkerCount;
     private int _bulkMaterialiseMaxAttempts;
     private int _gostreamHeavyConcurrency;
+    private int _indexerProbeTimeoutSeconds;
     private string _sourceValidationPolicyVersion = "sv14-parser-audio-v1";
     private string _allowedVideoContainers = "mkv";
 
@@ -137,6 +138,7 @@ public class PluginConfiguration : BasePluginConfiguration
         BulkMaterialiseMaxAttempts = 5;
         SourceValidationPolicyVersion = "sv14-parser-audio-v1";
         GostreamHeavyConcurrency = 2;
+        IndexerProbeTimeoutSeconds = 20;
         GostreamToken = string.Empty;
 
         MetricsOtlpEnabled = false;
@@ -688,13 +690,26 @@ public class PluginConfiguration : BasePluginConfiguration
     public int GostreamHeavyConcurrency
     {
         get => _gostreamHeavyConcurrency;
-        set => _gostreamHeavyConcurrency = Math.Clamp(value, 1, 4);
+                set => _gostreamHeavyConcurrency = Math.Clamp(value, 1, 4);
     }
 
+    /// <summary>
+    /// Bounded per-indexer timeout (seconds) for a single indexer's
+    /// <c>SearchAsync</c> during the concurrent probe fan-out in
+    /// <c>MagnetSelector.ProbeCoreAsync</c>. A single slow indexer cannot
+    /// inflate the whole probe past this ceiling: its own task is cancelled
+    /// via a linked <see cref="System.Threading.CancellationTokenSource"/>
+    /// when the timeout elapses, surfaced as a per-indexer transient failure
+    /// exactly like any other indexer exception, without blocking or dropping
+    /// the other indexers' results. Clamped to [5, 120].
+    /// </summary>
+    public int IndexerProbeTimeoutSeconds
+    {
+        get => _indexerProbeTimeoutSeconds;
+        set => _indexerProbeTimeoutSeconds = Math.Clamp(value, 5, 120);
+    }
     /// <summary>Optional shared secret sent to gostream mutation/validation endpoints.</summary>
-    public string GostreamToken { get; set; }
-
-    /// <summary>Normalizes a comma-separated video-container allow-list.</summary>
+    public string GostreamToken { get; set; }    /// <summary>Normalizes a comma-separated video-container allow-list.</summary>
     public static string NormalizeAllowedVideoContainers(string? value)
     {
         if (string.IsNullOrWhiteSpace(value))

@@ -649,4 +649,119 @@ public class MagnetSelectorTests
 
         Assert.True(sel.HasCapableAvailabilityIndexer("tt1234567"));
     }
+
+    // ------------------------------------------------------------------
+    // ttfb-parallel-indexer-probe: concurrent fan-out + per-indexer timeout.
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task ProbeFanOut_RunsIndexersConcurrently_NotSequentially()
+    {
+        // Two indexers each block on a barrier until BOTH have entered
+        // SearchAsync. A sequential foreach+await can never satisfy this
+        // (the second indexer is not started until the first completes),
+        // so completion of this probe proves concurrent fan-out. A short
+        // guard timeout makes the test fail fast rather than hang if the
+        // fan-out ever regresses to sequential.
+        var entered = new CountdownEvent(2);
+        var release = new TaskCompletionSource();
+
+        IReadOnlyList<IndexerCandidate> Gate(string title)
+        {
+            entered.Signal();
+            // Wait until both indexers are concurrently in-flight.
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            release.Task.Wait(TimeSpan.FromSeconds(10));
+            return new[] { MakeCandidate(title, 5, 20) };
+        }
+
+        var ix1 = new Mock<IIndexerClient>(MockBehavior.Strict);
+        ix1.SetupGet(i => i.IsEnabled).Returns(true);
+        ix1.SetupGet(i => i.Name).Returns("ix1");
+        ix1.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .Returns(() => Task.Run(() => Gate("Movie A 1080p")));
+
+        var ix2 = new Mock<IIndexerClient>(MockBehavior.Strict);
+        ix2.SetupGet(i => i.IsEnabled).Returns(true);
+        ix2.SetupGet(i => i.Name).Returns("ix2");
+        ix2.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .Returns(() => Task.Run(() => Gate("Movie B 1080p")));
+
+        var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
+        var sel = new MagnetSelector(new[] { ix1.Object, ix2.Object }, scorer, NullLogger<MagnetSelector>.Instance, TestConfig);
+
+        var probeTask = sel.ProbeAsync(1, "tt1", "movie", null, null, "Movie", 2020, CancellationToken.None);
+
+        // Both indexers must be concurrently in-flight within the barrier
+        // wait; only then release them.
+        Assert.True(entered.Wait(TimeSpan.FromSeconds(10)), "both indexers were not concurrently in-flight — fan-out is sequential");
+        release.SetResult();
+
+        var completed = await Task.WhenAny(probeTask, Task.Delay(TimeSpan.FromSeconds(10)));
+        Assert.Same(probeTask, completed);
+        var probe = await probeTask;
+        Assert.Equal(MagnetProbeOutcome.Available, probe.Outcome);
+        Assert.Equal(2, probe.Candidates.Count);
+    }
+
+    [Fact]
+    public async Task SlowIndexerTimesOut_FastIndexerResultStillReturned()
+    {
+        // A slow indexer that never returns within the per-indexer timeout
+        // must be isolated (cancelled) without blocking or dropping the fast
+        // indexer's real candidate.
+        var cfg = TestConfig();
+        cfg.IndexerProbeTimeoutSeconds = 5; // clamp floor; still fast in test
+
+        var slow = new Mock<IIndexerClient>(MockBehavior.Strict);
+        slow.SetupGet(i => i.IsEnabled).Returns(true);
+        slow.SetupGet(i => i.Name).Returns("slow");
+        slow.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .Returns(async (IndexerQuery _, CancellationToken t) =>
+            {
+                // Block until the linked per-indexer timeout cancels us.
+                await Task.Delay(Timeout.Infinite, t).ConfigureAwait(false);
+                return (IReadOnlyList<IndexerCandidate>)Array.Empty<IndexerCandidate>();
+            });
+
+        var fast = new Mock<IIndexerClient>(MockBehavior.Strict);
+        fast.SetupGet(i => i.IsEnabled).Returns(true);
+        fast.SetupGet(i => i.Name).Returns("fast");
+        fast.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { MakeCandidate("Movie 1080p", 5, 30) });
+
+        var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
+        var sel = new MagnetSelector(new[] { slow.Object, fast.Object }, scorer, NullLogger<MagnetSelector>.Instance, () => cfg);
+
+        var probe = await sel.ProbeAsync(1, "tt1", "movie", null, null, "Movie", 2020, CancellationToken.None);
+
+        // The fast indexer's candidate is returned; the slow indexer's timeout
+        // did not block or drop it.
+        Assert.Equal(MagnetProbeOutcome.Available, probe.Outcome);
+        Assert.Single(probe.Candidates);
+        Assert.Equal(30, probe.Candidates[0].Seeders);
+    }
+
+    [Fact]
+    public async Task CallerCancellation_PropagatesFromFanOut()
+    {
+        var ix = new Mock<IIndexerClient>(MockBehavior.Strict);
+        ix.SetupGet(i => i.IsEnabled).Returns(true);
+        ix.SetupGet(i => i.Name).Returns("ix");
+        ix.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .Returns(async (IndexerQuery _, CancellationToken t) =>
+            {
+                await Task.Delay(Timeout.Infinite, t).ConfigureAwait(false);
+                return (IReadOnlyList<IndexerCandidate>)Array.Empty<IndexerCandidate>();
+            });
+
+        var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
+        var sel = new MagnetSelector(new[] { ix.Object }, scorer, NullLogger<MagnetSelector>.Instance, TestConfig);
+
+        using var cts = new CancellationTokenSource();
+        var probeTask = sel.ProbeAsync(1, "tt1", "movie", null, null, "Movie", 2020, cts.Token);
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => probeTask);
+    }
 }
