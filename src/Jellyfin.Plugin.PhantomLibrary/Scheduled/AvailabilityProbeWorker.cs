@@ -94,7 +94,12 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
         _state = state ?? throw new ArgumentNullException(nameof(state));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _configProvider = configProvider ?? throw new ArgumentNullException(nameof(configProvider));
-        _probe = probe ?? _selector.ProbeAvailabilityAsync;
+        // availability-signal-prowlarr-fallback: the sweep's default probe is
+        // the fallback-aware variant (bounded retry against the Torrentio
+        // availability oracle, then a Prowlarr-backed confirm on a persistent
+        // serving failure) rather than the raw Torrentio-only oracle probe —
+        // see MagnetSelector.ProbeAvailabilityWithFallbackAsync.
+        _probe = probe ?? _selector.ProbeAvailabilityWithFallbackAsync;
     }
 
     public Task StartAsync(CancellationToken cancellationToken)

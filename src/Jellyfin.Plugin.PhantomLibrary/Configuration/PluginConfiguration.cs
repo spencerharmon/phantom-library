@@ -106,6 +106,8 @@ public class PluginConfiguration : BasePluginConfiguration
         AvailabilityYieldToUserSeconds = 20;
         AvailabilityTransientMaxAttempts = 8;
         AvailabilityTransientEscalatedRetryHours = 24;
+        AvailabilityOracleFailureRetries = 1;
+        AvailabilityOracleRetryDelayMilliseconds = 250;
         SeriesExpansionTtlDays = 7;
         SeriesExpansionTransientRetryMinutes = 60;
         EpisodeReleaseDelayHours = 12;
@@ -489,6 +491,30 @@ public class PluginConfiguration : BasePluginConfiguration
     /// than looping on the short interval forever.
     /// </summary>
     public int AvailabilityTransientEscalatedRetryHours { get; set; }
+
+    /// <summary>
+    /// availability-signal-prowlarr-fallback: bounded number of IMMEDIATE
+    /// retries against the availability-oracle indexer (Torrentio) when it
+    /// itself reports a serving failure (HTTP error / transport failure —
+    /// <see cref="Sources.MagnetSelector.ProbeAvailabilityWithFallbackAsync"/>'s
+    /// <c>indexer_partial_or_total_failure</c> kind), BEFORE falling back to a
+    /// Prowlarr-backed confirm. Distinguishes a real short-lived throttle
+    /// (which a retry can ride out) from a per-id abstention Torrentio maps
+    /// to the same HTTP-failure shape (a retry will not help, so the bounded
+    /// retry budget is spent quickly and the Prowlarr fallback engages).
+    /// Default 1 (a single immediate retry). This never runs for a title
+    /// Torrentio actually serves (200) — only on-failure, so the mainstream/
+    /// mostly-Torrentio-served hot loop never triggers the heavier Prowlarr
+    /// path.
+    /// </summary>
+    public int AvailabilityOracleFailureRetries { get; set; }
+
+    /// <summary>
+    /// Delay before each bounded <see cref="AvailabilityOracleFailureRetries"/>
+    /// retry. Default 250ms — enough to distinguish an instantaneous blip
+    /// from a sustained failure without materially slowing the sweep.
+    /// </summary>
+    public int AvailabilityOracleRetryDelayMilliseconds { get; set; }
 
     /// <summary>TTL for TV series expansion passes.</summary>
     public int SeriesExpansionTtlDays { get; set; }

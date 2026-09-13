@@ -207,13 +207,132 @@ public sealed class MagnetSelector
         string title,
         int? year,
         CancellationToken ct)
-        => ProbeCoreAsync(tmdbId, imdbId, type, season, episode, title, year, availabilityOracleOnly: true, ct);
+        => ProbeCoreAsync(tmdbId, imdbId, type, season, episode, title, year, IndexerScope.OracleOnly, ct);
+
+    /// <summary>
+    /// availability-signal-prowlarr-fallback: the availability sweep's actual
+    /// entry point. Wraps <see cref="ProbeAvailabilityAsync"/> (Torrentio-only,
+    /// unchanged) with a BOUNDED, gated fallback to a Prowlarr-backed confirm
+    /// so a title Torrentio cannot serve (it returns HTTP 429 for any id it
+    /// does not recognise — proven live to NOT be a rate limit: 15 rapid
+    /// good-id requests all returned 200) is not stuck
+    /// <see cref="MagnetProbeOutcome.IndeterminateTransient"/> forever when
+    /// Prowlarr actually has coverage.
+    ///
+    /// Gating (so this NEVER runs the heavy Prowlarr fan-out for a mainstream,
+    /// Torrentio-served title): the fallback triggers ONLY when the oracle
+    /// probe itself comes back <see cref="MagnetProbeOutcome.IndeterminateTransient"/>
+    /// with <c>ErrorKind == "indexer_partial_or_total_failure"</c> — i.e. Torrentio
+    /// itself failed/errored the request. A title Torrentio actually serves
+    /// (HTTP 200, even a definitive-empty response) never reaches this branch.
+    /// <see cref="MagnetProbeOutcome.NoCapableIndexer"/> (no imdb id / all
+    /// indexers abstained) is untouched — no retry, no fallback, same as before.
+    ///
+    /// Real-throttle vs unknown-id disambiguation: before falling back, retries
+    /// the oracle itself up to <see cref="PluginConfiguration.AvailabilityOracleFailureRetries"/>
+    /// times (small, bounded — default 1) with a short delay
+    /// (<see cref="PluginConfiguration.AvailabilityOracleRetryDelayMilliseconds"/>).
+    /// A genuine short-lived throttle is expected to clear within that budget;
+    /// an unknown/unservable id fails the same way every time, so the retry
+    /// budget is spent quickly and the Prowlarr fallback engages.
+    ///
+    /// If the Prowlarr fallback itself is inconclusive (transient failure or
+    /// no capable indexer), the ORIGINAL oracle transient outcome is returned
+    /// so the caller's existing transient-backoff cadence still applies —
+    /// this method only ever ADDS a path to Available/DefinitiveUnavailable,
+    /// never removes the existing safety net.
+    /// </summary>
+    public async Task<MagnetProbeResult> ProbeAvailabilityWithFallbackAsync(
+        int tmdbId,
+        string? imdbId,
+        string type,
+        int? season,
+        int? episode,
+        string title,
+        int? year,
+        CancellationToken ct)
+    {
+        var oracleResult = await ProbeAvailabilityAsync(tmdbId, imdbId, type, season, episode, title, year, ct)
+            .ConfigureAwait(false);
+
+        var cfg = _configProvider();
+        var retries = Math.Max(0, cfg.AvailabilityOracleFailureRetries);
+        var attempt = 0;
+        while (IsOracleServingFailure(oracleResult) && attempt < retries)
+        {
+            attempt++;
+            var delayMs = Math.Max(0, cfg.AvailabilityOracleRetryDelayMilliseconds);
+            if (delayMs > 0)
+            {
+                await Task.Delay(delayMs, ct).ConfigureAwait(false);
+            }
+
+            oracleResult = await ProbeAvailabilityAsync(tmdbId, imdbId, type, season, episode, title, year, ct)
+                .ConfigureAwait(false);
+        }
+
+        if (!IsOracleServingFailure(oracleResult))
+        {
+            return oracleResult;
+        }
+
+        _logger.LogInformation(
+            "Availability oracle (Torrentio) serving failure persisted through {Retries} bounded retr{Plural} for {Type}/{Tmdb}; falling back to Prowlarr-backed confirm",
+            attempt,
+            attempt == 1 ? "y" : "ies",
+            type,
+            tmdbId);
+
+        var fallback = await ProbeCoreAsync(tmdbId, imdbId, type, season, episode, title, year, IndexerScope.NonOracleOnly, ct)
+            .ConfigureAwait(false);
+
+        if (fallback.Outcome == MagnetProbeOutcome.Available || fallback.Outcome == MagnetProbeOutcome.DefinitiveUnavailable)
+        {
+            return fallback;
+        }
+
+        // Fallback was itself inconclusive (no Prowlarr configured, or
+        // Prowlarr also failed) — preserve the original oracle transient
+        // outcome so the existing transient-backoff cadence still applies.
+        return oracleResult;
+    }
+
+    private static bool IsOracleServingFailure(MagnetProbeResult result)
+        => result.Outcome == MagnetProbeOutcome.IndeterminateTransient
+            && string.Equals(result.ErrorKind, "indexer_partial_or_total_failure", StringComparison.Ordinal);
+
+    private enum IndexerScope
+    {
+        All,
+        OracleOnly,
+        NonOracleOnly,
+    }
 
     private List<IIndexerClient> EnabledIndexers(bool availabilityOracleOnly)
+        => EnabledIndexers(availabilityOracleOnly ? IndexerScope.OracleOnly : IndexerScope.All);
+
+    private List<IIndexerClient> EnabledIndexers(IndexerScope scope)
     {
-        var candidates = availabilityOracleOnly ? _indexers.Where(i => i.IsAvailabilityOracle) : _indexers;
+        IEnumerable<IIndexerClient> candidates = scope switch
+        {
+            IndexerScope.OracleOnly => _indexers.Where(i => i.IsAvailabilityOracle),
+            IndexerScope.NonOracleOnly => _indexers.Where(i => !i.IsAvailabilityOracle),
+            _ => _indexers,
+        };
         return candidates.Where(i => i.IsEnabled).ToList();
     }
+
+    private Task<MagnetProbeResult> ProbeCoreAsync(
+        int tmdbId,
+        string? imdbId,
+        string type,
+        int? season,
+        int? episode,
+        string title,
+        int? year,
+        bool availabilityOracleOnly,
+        CancellationToken ct)
+        => ProbeCoreAsync(tmdbId, imdbId, type, season, episode, title, year, availabilityOracleOnly ? IndexerScope.OracleOnly : IndexerScope.All, ct);
 
     private async Task<MagnetProbeResult> ProbeCoreAsync(
         int tmdbId,
@@ -223,7 +342,7 @@ public sealed class MagnetSelector
         int? episode,
         string title,
         int? year,
-        bool availabilityOracleOnly,
+        IndexerScope scope,
         CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(type);
@@ -241,7 +360,7 @@ public sealed class MagnetSelector
             Episode = episode,
         };
 
-        var enabled = EnabledIndexers(availabilityOracleOnly);
+        var enabled = EnabledIndexers(scope);
         if (enabled.Count == 0)
         {
             return MagnetProbeResult.Transient("no_enabled_indexers", "No enabled indexers are configured");
