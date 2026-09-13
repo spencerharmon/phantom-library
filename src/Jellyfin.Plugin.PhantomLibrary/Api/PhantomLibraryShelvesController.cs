@@ -85,7 +85,7 @@ public sealed class PhantomLibraryShelvesController : ControllerBase
 
     // Display order for well-known rows; genre_* rows sort after these (alpha),
     // leaving_soon last. Unlisted keys fall between the two via a large default.
-    private static readonly IReadOnlyDictionary<string, int> RowOrder = new Dictionary<string, int>(StringComparer.Ordinal)
+    private static readonly Dictionary<string, int> RowOrder = new Dictionary<string, int>(StringComparer.Ordinal)
     {
         [CuratedRows.KeyAvailableNow] = 0,
         [CuratedRows.KeyNewReleases] = 1,
