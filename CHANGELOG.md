@@ -8,8 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Curated "Netflix-style" browse rows (p10-netflix-style-rows).** ROI
-  Priority 10, item 3. The Phantom Movies and Phantom Shows channels now present
+- **Restore the Home "Latest" row; drop category folders
+  (restore-latest-row-and-drop-folders).** Vanilla `jellyfin-web` cannot
+  render `ChannelItemType.Folder` category tiles as Netflix-style horizontal
+  shelves — they only ever showed up as plain folder tiles the operator
+  rejected — so curated-row FOLDER emission (the `p10-netflix-style-rows`
+  root/folder-dispatch presentation) is removed from both channels; the
+  channel root is flat, playable-first movies/episodes again. In its place,
+  `ISupportsLatestMedia`/`GetLatestMedia` are re-added to both channels (they
+  were dropped 2026-06-28 because core's `RefreshLatestChannelItems`
+  deep-enumerates the whole channel — including recursing into every
+  category folder it found at the root — to populate the Home "Latest in
+  Phantom Movies/Shows" row, hanging Home load on production-shaped data).
+  This is now safe: with folders gone there is nothing left to recurse into,
+  and the `Guid.Empty`/no-`FolderId` root query core's refresh path issues
+  now hits a new O(recent) fast path (`BuildLatestMovieItemsAsync` /
+  `BuildLatestEpisodeItemsAsync`) that reads only `materialised_state`
+  (already ordered `materialised_at DESC`, capped at 20 items) instead of the
+  full orphan-enumerating, TMDB-calling catalogue build. No schema change; no
+  operator action beyond the next install.
+
+- **Curated "Netflix-style" browse rows (p10-netflix-style-rows).**
+  *(Superseded — see "Restore the Home Latest row; drop category folders"
+  above: the folder presentation described below is removed; the
+  classification/row-derivation logic itself is unused but left in place.)*
+  ROI Priority 10, item 3. The Phantom Movies and Phantom Shows channels now present
   their top level as multiple curated category rows instead of one flat list:
   *Available now* (materialised / high-confidence), *Popular on Phantom* (TMDB
   rating proxy), *New releases* (recently catalogued), *Trending this week*

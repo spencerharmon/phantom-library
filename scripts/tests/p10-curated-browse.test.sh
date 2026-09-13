@@ -19,8 +19,11 @@
 #   C. It actually exercises all four proof points the task requires:
 #      pruning + search-sync reachability, default order, all four explicit
 #      sort options (PremiereDate/DateCreated/CommunityRating/Name), the
-#      curated-row folder presentation, and a live list_load/sort_change
-#      latency check against the P8 ratchet (tools/perf/loadtime-guard.sh).
+#      no-category-folders assertion (restore-latest-row-and-drop-folders
+#      superseded the original folder presentation — see
+#      scripts/tests/latest-media-home-load.test.sh for its Latest-row
+#      replacement proof), and a live list_load/sort_change latency check
+#      against the P8 ratchet (tools/perf/loadtime-guard.sh).
 #   D. The underlying unit-level coverage for the same three behaviors the
 #      rig asserts live — pruning (PhantomDbTests' ListVisibleMovieRows/
 #      ListVisibleSeriesRows exclusion-on-all-invalid-candidates cases),
@@ -150,10 +153,10 @@ if grep -q 'relevance_score' "$SCENARIO" || grep -q 'default order' "$SCENARIO";
 else
     bad "scenario does not exercise the default order"
 fi
-if grep -q '__row_movies_genre_' "$SCENARIO" && grep -q '__row_shows_genre_' "$SCENARIO"; then
-    ok "scenario exercises curated-row (Netflix-style rows) folder derivation for both channels"
+if grep -q 'assert not folders' "$SCENARIO" && grep -q '3(movie)' "$SCENARIO" && grep -q '3(tv)' "$SCENARIO"; then
+    ok "scenario exercises the no-category-folders assertion for both channels (restore-latest-row-and-drop-folders)"
 else
-    bad "scenario does not exercise curated-row folder derivation for both channels"
+    bad "scenario does not exercise the no-category-folders assertion for both channels"
 fi
 if grep -q 'tools/perf/loadtime-guard.sh' "$SCENARIO" && grep -q "list_load" "$SCENARIO" && grep -q "sort_change" "$SCENARIO"; then
     ok "scenario checks list_load/sort_change latency against the P8 ratchet guard"

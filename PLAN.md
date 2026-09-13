@@ -190,6 +190,32 @@ by tests, not re-defer it.
   single-flight FUSE-walk cache keyed on `MoviesVersion()`/`ShowsVersion()`.
   BREAKING: schema bump v14→v15 requires wipe (no migration).
 
+- **Home "Latest in Phantom Movies/Shows" rows are restored**
+  (restore-latest-row-and-drop-folders, superseding the 2026-06-28
+  Option-3 suppression below). Category-FOLDER emission (the
+  `p10-netflix-style-rows` root/folder presentation) is removed
+  outright — vanilla `jellyfin-web` cannot render a folder tile as a
+  Netflix-style shelf, so it was pure downside. With folders gone,
+  `ISupportsLatestMedia`/`GetLatestMedia` are re-added to both
+  channels (Option 2, as originally deferred below): the
+  `Guid.Empty`/no-`FolderId` root query core's
+  `RefreshLatestChannelItems` issues now hits a new O(recent)
+  fast-path (`BuildLatestMovieItemsAsync` / `BuildLatestEpisodeItemsAsync`)
+  reading only `materialised_state` (capped at 20 items) instead of
+  the full orphan-enumerating, TMDB-calling catalogue build — and
+  every item it returns is `Type=Media` (never `Folder`), so core's
+  per-folder recursion in `RefreshLatestChannelItems` has nothing left
+  to recurse into. `tools/rig-scenarios/40-channel-latest-suppressed.sh`
+  is updated to assert the Latest call stays fast AND now populated
+  (previously it asserted fast-and-empty); the folder-presentation
+  proof in `tools/rig-scenarios/49-curated-browse.sh` is replaced with
+  a no-folders assertion; the Latest-row proof itself is
+  `tools/rig-scenarios/50-latest-media-home-load.sh`. No schema
+  change; no operator action beyond the next install.
+
+  <details>
+  <summary>Original 2026-06-28 suppression (superseded above)</summary>
+
 - **Home "Latest in Phantom Movies/Shows" rows are suppressed**
   (operator decision 2026-06-28, Option 3). Phantom channels no
   longer implement `ISupportsLatestMedia`, because Jellyfin core's
@@ -208,6 +234,9 @@ by tests, not re-defer it.
   Latest call stays fast + empty until Option 2 lands). See the
   `TODO(operator-approved):` markers in `PhantomMoviesChannel.cs` /
   `PhantomShowsChannel.cs`.
+
+  </details>
+
 
 - **Custom `QualityPreset` falls back to `GostreamDefault`** with a
   warning log (M4 decision). Revisit when a real custom-scoring use

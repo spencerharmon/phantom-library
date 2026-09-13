@@ -25,6 +25,14 @@ namespace Jellyfin.Plugin.PhantomLibrary.Tests;
 
 public class PhantomMoviesChannelTests : IDisposable
 {
+    // restore-latest-row-and-drop-folders: Guid.Empty + no FolderId is now
+    // the reserved O(recent) latest-refresh-root fast-path shape (see
+    // GetChannelItems_LatestRefreshRootQuery below and GetLatestMedia). Every
+    // test in this file that exercises the NORMAL flat-browse behaviour uses
+    // this fixed real user id instead of the default (Guid.Empty) query so it
+    // is unambiguously routed to the full BuildFlatMovieItemsAsync path.
+    private static readonly Guid TestUserId = Guid.NewGuid();
+
     private readonly string _dbPath;
     private readonly string _moviesRoot;
     private readonly string _showsRoot;
@@ -127,7 +135,7 @@ public class PhantomMoviesChannelTests : IDisposable
     [Fact]
     public async Task GetChannelItems_AllEmpty_ReturnsEmpty()
     {
-        var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
         Assert.Empty(result.Items);
         Assert.Equal(0, result.TotalRecordCount);
     }
@@ -138,7 +146,7 @@ public class PhantomMoviesChannelTests : IDisposable
         await SeedMetaAsync(101, "Discovery Movie");
         await SeedAvailableMovieAsync(101);
 
-        var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
 
         Assert.Single(result.Items);
         var item = result.Items[0];
@@ -158,7 +166,7 @@ public class PhantomMoviesChannelTests : IDisposable
         File.WriteAllText(fusePath, string.Empty);
         await _db.InsertMaterialisedStateAsync(202, "movie", -1, -1, "/stub/x.mkv", fusePath, CancellationToken.None);
 
-        var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
 
         Assert.Single(result.Items);
         var item = result.Items[0];
@@ -193,7 +201,7 @@ public class PhantomMoviesChannelTests : IDisposable
             NullLogger<PhantomMoviesChannel>.Instance);
         channel.SetConfigurationProviderForTests(() => new Configuration.PluginConfiguration { CuratedRowsEnabled = false });
 
-        var result = await channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var result = await channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
 
         Assert.Equal(3, result.Items.Count);
         Assert.Equal(
@@ -208,7 +216,7 @@ public class PhantomMoviesChannelTests : IDisposable
         await SeedMetaAsync(202, "Materialised Movie");
         await _db.InsertMaterialisedStateAsync(202, "movie", -1, -1, "/stub/x.mkv", Path.Combine(_moviesRoot, "missing-x.mkv"), CancellationToken.None);
 
-        var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
 
         var item = Assert.Single(result.Items);
         Assert.Equal("movie_202", item.Id);
@@ -229,7 +237,7 @@ public class PhantomMoviesChannelTests : IDisposable
         File.WriteAllText(fusePath, string.Empty);
         await _db.InsertMaterialisedStateAsync(42, "movie", -1, -1, "/stub", fusePath, CancellationToken.None);
 
-        var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
 
         var item = Assert.Single(result.Items);
         Assert.Equal("movie_42", item.Id);
@@ -247,14 +255,14 @@ public class PhantomMoviesChannelTests : IDisposable
         await SeedMetaAsync(99, "Stable Id Movie");
         await SeedAvailableMovieAsync(99);
 
-        var before = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var before = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
         var beforeId = before.Items.Single().Id;
 
         var fusePath = Path.Combine(_moviesRoot, "99.mkv");
         File.WriteAllText(fusePath, string.Empty);
         await _db.InsertMaterialisedStateAsync(99, "movie", -1, -1, "/stub", fusePath, CancellationToken.None);
 
-        var after = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var after = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
         var afterId = after.Items.Single().Id;
 
         Assert.Equal("movie_99", beforeId);
@@ -275,7 +283,7 @@ public class PhantomMoviesChannelTests : IDisposable
             .ReturnsAsync(new TmdbMovieDetails(4242, "Some Movie", "Some Movie", "overview", "/poster.jpg", null,
                 "2026-01-01", 8.1, 10, 100, new[] { "Drama" }, "Released", null, "tt4242", null, null));
 
-        var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
 
         var item = Assert.Single(result.Items);
         Assert.Equal("movie_4242", item.Id);
@@ -305,7 +313,7 @@ public class PhantomMoviesChannelTests : IDisposable
             .ReturnsAsync(new TmdbMovieDetails(1318447, "Apex", "Apex", "overview", "/poster.jpg", null,
                 "2026-01-01", 8.1, 10, 100, new[] { "Action" }, "Released", null, "tt1318447", null, null));
 
-        var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
 
         var item = Assert.Single(result.Items);
         Assert.Equal("movie_1318447", item.Id);
@@ -330,7 +338,7 @@ public class PhantomMoviesChannelTests : IDisposable
                 new TmdbSearchHit(1318447, "Apex", "Apex", "hit", null, null, "2026-01-01", 8.1, 10),
             });
 
-        var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
 
         var item = Assert.Single(result.Items);
         Assert.Equal("movie_1318447", item.Id);
@@ -353,7 +361,7 @@ public class PhantomMoviesChannelTests : IDisposable
                 new TmdbSearchHit(4243, "Discovery Copy", "Discovery Copy", "hit", null, null, "2020-01-01", 8.1, 10),
             });
 
-        var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
 
         var item = Assert.Single(result.Items, i => i.Id == "movie_4243");
         Assert.Equal(path, item.MediaSources[0].Path);
@@ -370,7 +378,7 @@ public class PhantomMoviesChannelTests : IDisposable
         _tmdb.Setup(t => t.SearchMoviesAsync("Some Unknown Movie", null, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(Array.Empty<TmdbSearchHit>());
 
-        var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
 
         var item = Assert.Single(result.Items);
         Assert.StartsWith("orphan_", item.Id, StringComparison.Ordinal);
@@ -391,7 +399,7 @@ public class PhantomMoviesChannelTests : IDisposable
             .ReturnsAsync(new TmdbMovieDetails(1318447, "Apex", "Apex", "overview", "/poster.jpg", null,
                 "2026-01-01", 8.1, 10, 100, new[] { "Action" }, "Released", null, "tt1318447", null, null));
 
-        var first = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var first = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
         Assert.Equal("movie_1318447", Assert.Single(first.Items).Id);
         _tmdb.Verify(t => t.SearchMoviesAsync("Apex", 2026, It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Once);
 
@@ -402,7 +410,7 @@ public class PhantomMoviesChannelTests : IDisposable
         var cold = new PhantomMoviesChannel(_db, _enumerator, _splash, _state, _tmdb.Object,
             NullLogger<PhantomMoviesChannel>.Instance);
         cold.SetConfigurationProviderForTests(() => new Configuration.PluginConfiguration { CuratedRowsEnabled = false });
-        var second = await cold.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var second = await cold.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
         Assert.Equal("movie_1318447", Assert.Single(second.Items).Id);
         _tmdb.Verify(t => t.SearchMoviesAsync("Apex", 2026, It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Once);
     }
@@ -427,7 +435,7 @@ public class PhantomMoviesChannelTests : IDisposable
         // warms it).
         await SeedAvailableMovieAsync(777);
 
-        var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
 
         Assert.Empty(result.Items);
     }
@@ -447,7 +455,7 @@ public class PhantomMoviesChannelTests : IDisposable
 
         var hiderResult = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = hider }, CancellationToken.None);
         var otherResult = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = other }, CancellationToken.None);
-        var anonymousResult = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var anonymousResult = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
 
         Assert.Empty(hiderResult.Items);
         Assert.Single(otherResult.Items);
@@ -604,16 +612,53 @@ public class PhantomMoviesChannelTests : IDisposable
     }
 
     [Fact]
-    public void Channel_DoesNotImplementISupportsLatestMedia()
+    public void Channel_ImplementsISupportsLatestMedia()
     {
-        // Implementing ISupportsLatestMedia makes Jellyfin core's
-        // RefreshLatestChannelItems deep-enumerate the whole channel to
-        // populate the "Latest in Phantom Movies" Home row, hanging the Home
-        // screen on every client on production-shaped data. Keep it off until
-        // the O(latest) Option 2 fast-path exists.
-        Assert.DoesNotContain(
+        // restore-latest-row-and-drop-folders: ISupportsLatestMedia is back —
+        // the channel is now flat (no folder tiles) and the Guid.Empty/no-
+        // FolderId root query core's RefreshLatestChannelItems issues hits the
+        // O(recent) materialised_state-only fast path, not the full
+        // orphan-enumerating, TMDB-calling catalogue build.
+        Assert.Contains(
             typeof(MediaBrowser.Controller.Channels.ISupportsLatestMedia),
             _channel.GetType().GetInterfaces());
+    }
+
+    [Fact]
+    public async Task GetChannelItems_LatestRefreshRootQuery_ReturnsOnlyMaterialisedItems()
+    {
+        // The Guid.Empty + no-FolderId shape core's RefreshLatestChannelItems
+        // issues must be O(recent): only materialised_state rows, never an
+        // unmaterialised/available-only phantom (that would require the full
+        // BuildFlatMovieItemsAsync catalogue scan).
+        await SeedMetaAsync(202, "Materialised Movie");
+        var fusePath = Path.Combine(_moviesRoot, "202.mkv");
+        File.WriteAllText(fusePath, string.Empty);
+        await _db.InsertMaterialisedStateAsync(202, "movie", -1, -1, "/stub/202.mkv", fusePath, CancellationToken.None);
+
+        await SeedMetaAsync(203, "Available Only Movie");
+        await SeedAvailableMovieAsync(203);
+
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+
+        var item = Assert.Single(result.Items);
+        Assert.Equal("movie_202", item.Id);
+        Assert.Equal(fusePath, item.MediaSources[0].Path);
+    }
+
+    [Fact]
+    public async Task GetLatestMedia_ReturnsMaterialisedItems()
+    {
+        await SeedMetaAsync(202, "Materialised Movie");
+        var fusePath = Path.Combine(_moviesRoot, "202.mkv");
+        File.WriteAllText(fusePath, string.Empty);
+        await _db.InsertMaterialisedStateAsync(202, "movie", -1, -1, "/stub/202.mkv", fusePath, CancellationToken.None);
+
+        var latestMedia = (MediaBrowser.Controller.Channels.ISupportsLatestMedia)_channel;
+        var items = (await latestMedia.GetLatestMedia(new ChannelLatestMediaSearch(), CancellationToken.None)).ToList();
+
+        var item = Assert.Single(items);
+        Assert.Equal("movie_202", item.Id);
     }
 
     // ------------------------------------------------------------
@@ -626,7 +671,7 @@ public class PhantomMoviesChannelTests : IDisposable
         await SeedMetaAsync(301, "Never Materialised Movie");
         await SeedUnavailableMovieAsync(301);
 
-        var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
 
         Assert.Empty(result.Items);
     }
@@ -651,47 +696,23 @@ public class PhantomMoviesChannelTests : IDisposable
 
         // And the root browse LIST must still exclude the unavailable one —
         // confirming the two emission paths are genuinely split.
-        var rootResult = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var rootResult = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
         Assert.DoesNotContain(rootResult.Items, i => i.Id == "movie_301");
         Assert.Contains(rootResult.Items, i => i.Id == "movie_302");
     }
 
     [Fact]
-    public async Task GetChannelItems_CuratedRowsEnabled_RootReturnsRowFolders_AndRowDrilldownReturnsMovie()
+    public async Task GetChannelItems_CuratedRowsEnabledConfig_HasNoEffect_RootStaysFlat()
     {
-        _channel.SetConfigurationProviderForTests(() => new PluginConfiguration { CuratedRowsEnabled = true });
-        await SeedMetaAsync(550, "Fight Club");
-        await SeedAvailableMovieAsync(550);
-        // Materialise it so it renders as a real (non-phantom) "Available now" title.
-        var fusePath = Path.Combine(_moviesRoot, "550.mkv");
-        File.WriteAllText(fusePath, string.Empty);
-        await _db.InsertMaterialisedStateAsync(550, "movie", -1, -1, "/stub/550.mkv", fusePath, CancellationToken.None);
-
-        // Root now returns curated-row category folders, not the flat leaf list.
-        var root = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
-        Assert.NotEmpty(root.Items);
-        Assert.All(root.Items, i => Assert.Equal(ChannelItemType.Folder, i.Type));
-        Assert.Contains(root.Items, i => CuratedRows.TryParseRowFolderId(i.Id, "movies", out var k) && k == CuratedRows.KeyAvailableNow);
-
-        // Drilling into the "Available now" row returns the seeded movie leaf.
-        var rowId = CuratedRows.BuildRowFolderId("movies", CuratedRows.KeyAvailableNow);
-        var rowItems = await _channel.GetChannelItems(new InternalChannelItemQuery { FolderId = rowId }, CancellationToken.None);
-        var movie = Assert.Single(rowItems.Items);
-        Assert.Equal("movie_550", movie.Id);
-        Assert.Equal(ChannelItemType.Media, movie.Type);
-    }
-
-    [Fact]
-    public async Task GetChannelItems_CuratedRowsEnabled_ExplicitSortStillReturnsFlatList()
-    {
+        // restore-latest-row-and-drop-folders: category-folder emission was
+        // removed outright (operator-rejected UX vanilla jellyfin-web cannot
+        // render as shelves) — the now-inert CuratedRowsEnabled config flag
+        // must not resurrect folder tiles at the root.
         _channel.SetConfigurationProviderForTests(() => new PluginConfiguration { CuratedRowsEnabled = true });
         await SeedMetaAsync(550, "Fight Club");
         await SeedAvailableMovieAsync(550);
 
-        // An explicit sort is a flat-list intent — rows are bypassed.
-        var result = await _channel.GetChannelItems(
-            new InternalChannelItemQuery { SortBy = ChannelItemSortField.Name },
-            CancellationToken.None);
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
 
         var movie = Assert.Single(result.Items);
         Assert.Equal("movie_550", movie.Id);
