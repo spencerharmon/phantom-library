@@ -233,19 +233,10 @@ public sealed partial class PhantomShowsChannel
             // an explicit sort re-sorts the whole list.
             ChannelSortHelper.ApplyExplicitSort(flat, query.SortBy, query.SortDescending);
 
-            // p10-netflix-style-rows: present curated category rows at the top
-            // level unless an explicit sort was requested (a flat-list intent).
-            // Fall back to the flat list if categorisation yields no rows.
-            if (config.CuratedRowsEnabled && query.SortBy is null)
-            {
-                var rows = BuildCuratedRows(flat, config);
-                var folders = CuratedRows.ToFolderItems(rows, RowChannelScope);
-                if (folders.Count > 0)
-                {
-                    return new ChannelItemResult { Items = folders.ToList(), TotalRecordCount = folders.Count };
-                }
-            }
-
+            // home-shelves-web-shim: the channel root is ALWAYS the flat series
+            // list now. Curated categories are surfaced as Netflix-style titled
+            // horizontal shelves on the Home screen (phantomShelves.js +
+            // PhantomLibraryShelvesController), not as clickable folder tiles.
             return new ChannelItemResult { Items = flat, TotalRecordCount = flat.Count };
         }
 
@@ -518,6 +509,22 @@ public sealed partial class PhantomShowsChannel
         return CuratedRows.Build(
             candidates,
             new CuratedRowConfig(config.CuratedRowSize, config.CuratedGenreRowMinItems, DateTime.UtcNow));
+    }
+
+    /// <summary>
+    /// home-shelves-web-shim: build the curated rows for the Home-screen
+    /// shelves surface (served by <c>PhantomLibraryShelvesController</c> and
+    /// rendered by the injected <c>phantomShelves.js</c>). Reuses the exact
+    /// bounded top-level-series build and tested <see cref="CuratedRows"/>
+    /// categorisation the old folder view used, so shelves stay O(recent)/
+    /// O(row-size). Each member is a <c>series_&lt;tmdb&gt;</c> item; the
+    /// controller maps it to its navigable Jellyfin Series guid.
+    /// </summary>
+    internal async Task<IReadOnlyList<CuratedRow>> BuildShelfRowsAsync(Guid userId, CancellationToken cancellationToken)
+    {
+        var config = CurrentConfiguration();
+        var flat = await BuildTopLevelSeriesItemsAsync(userId, cancellationToken).ConfigureAwait(false);
+        return BuildCuratedRows(flat, config);
     }
 
     /// <summary>

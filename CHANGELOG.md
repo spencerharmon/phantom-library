@@ -22,6 +22,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Home-screen "Netflix-style" shelves (home-shelves-web-shim).** The curated
+  categories are now surfaced as titled horizontal scroll rows on the Jellyfin
+  **Home** screen instead of clickable category FOLDERS inside the channels. A
+  new plugin-served browser shim (`/Plugins/PhantomLibrary/shelves.js`, injected
+  into `jellyfin-web/index.html` by the fork image exactly like
+  `phantomKebab.js`/`phantomBadges.js`) fetches
+  `GET /Plugins/PhantomLibrary/Shelves` and renders each curated row as a
+  horizontal poster rail; cards open the native `#/details?id=<guid>` page (Play
+  drives the usual materialise-on-play path). The `/Shelves` endpoint reuses the
+  SAME tested `CuratedRows` categorisation over the bounded flat movie +
+  top-level-series lists (O(recent)/O(row-size) — never an O(catalogue) Home
+  scan), resolving each member to its navigable Jellyfin guid via the derivation
+  verified against 10.11.9's ChannelManager and validating it with
+  `GetItemById` (non-resolving members are dropped, never placeheld).
+
+### Changed
+
+- **Dropped the curated-row category FOLDERS from the channel grid.** The
+  Phantom Movies / Phantom Shows channel root is now always the flat
+  (relevance-ordered) list; the curated categories live on the Home screen as
+  shelves (above). Removed the `ChannelItemType.Folder` category-tile emission
+  from both channels' `GetChannelItems`.
+
+### Added (prior, p10-netflix-style-rows)
+
 - **Curated "Netflix-style" browse rows (p10-netflix-style-rows).** ROI
   Priority 10, item 3. The Phantom Movies and Phantom Shows channels now present
   their top level as multiple curated category rows instead of one flat list:

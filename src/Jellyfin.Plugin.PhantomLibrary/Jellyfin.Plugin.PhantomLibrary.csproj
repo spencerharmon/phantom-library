@@ -91,6 +91,7 @@
     <EmbeddedResource Include="Configuration\userPrefsPage.html" />
     <EmbeddedResource Include="Configuration\phantomKebab.js" />
     <EmbeddedResource Include="Configuration\phantomBadges.js" />
+    <EmbeddedResource Include="Configuration\phantomShelves.js" />
     <EmbeddedResource Include="Assets\splash.mp4" />
   </ItemGroup>
 

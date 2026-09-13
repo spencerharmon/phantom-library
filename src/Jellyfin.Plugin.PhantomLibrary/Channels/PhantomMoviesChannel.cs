@@ -192,31 +192,34 @@ public sealed class PhantomMoviesChannel
         // thing (see ChannelSortHelper for the field-mapping rationale).
         ChannelSortHelper.ApplyExplicitSort(flatItems, query.SortBy, query.SortDescending);
 
-        // p10-netflix-style-rows: when curated rows are enabled AND an explicit
-        // sort was NOT requested, present the top level as category-row folders
-        // instead of the flat list (an explicit sort is a flat-list intent, so
-        // honour it verbatim). If categorisation yields no rows (e.g. empty
-        // catalogue), fall back to the flat list so the surface is never blank.
-        var noExplicitSort = query.SortBy is null;
-        if (config.CuratedRowsEnabled && noExplicitSort)
-        {
-            var rows = BuildCuratedRows(flatItems, config);
-            var folders = CuratedRows.ToFolderItems(rows, RowChannelScope);
-            if (folders.Count > 0)
-            {
-                return new ChannelItemResult
-                {
-                    Items = folders.ToList(),
-                    TotalRecordCount = folders.Count,
-                };
-            }
-        }
-
+        // home-shelves-web-shim: the channel root is ALWAYS the flat list now.
+        // The curated categories are no longer surfaced as clickable
+        // ChannelItemType.Folder tiles inside the channel grid (the operator
+        // rejected the folder UX); they are presented as Netflix-style titled
+        // horizontal shelves on the Home screen by phantomShelves.js, fed by
+        // PhantomLibraryShelvesController (which calls BuildShelfRowsAsync).
         return new ChannelItemResult
         {
             Items = flatItems,
             TotalRecordCount = flatItems.Count,
         };
+    }
+
+    /// <summary>
+    /// home-shelves-web-shim: build the curated rows for the Home-screen
+    /// shelves surface (served by <c>PhantomLibraryShelvesController</c> and
+    /// rendered by the injected <c>phantomShelves.js</c>). Reuses the exact
+    /// bounded, pruned, relevance-ordered flat build and the tested
+    /// <see cref="CuratedRows"/> categorisation the old folder view used, so the
+    /// shelves inherit O(recent)/O(row-size) boundedness (never an O(catalogue)
+    /// Home-load scan). The controller maps each member to its navigable Jellyfin
+    /// item guid.
+    /// </summary>
+    internal async Task<IReadOnlyList<CuratedRow>> BuildShelfRowsAsync(Guid userId, CancellationToken cancellationToken)
+    {
+        var config = _configProvider();
+        var flatItems = await BuildFlatMovieItemsAsync(userId, cancellationToken).ConfigureAwait(false);
+        return BuildCuratedRows(flatItems, config);
     }
 
     /// <summary>The row-FolderId channel scope for this channel (see <see cref="CuratedRows"/>).</summary>
