@@ -492,7 +492,6 @@ public class PluginConfiguration : BasePluginConfiguration
     public int AvailabilityTransientEscalatedRetryHours { get; set; }
 
     /// <summary>
-    /// <summary>
     /// Availability-signal Prowlarr fallback (availability-signal-prowlarr-fallback):
     /// the high-frequency availability sweep is Torrentio-only, and Torrentio
     /// returns an HTTP failure (429) for any id it cannot serve. Left alone
