@@ -106,8 +106,7 @@ public class PluginConfiguration : BasePluginConfiguration
         AvailabilityYieldToUserSeconds = 20;
         AvailabilityTransientMaxAttempts = 8;
         AvailabilityTransientEscalatedRetryHours = 24;
-        AvailabilityOracleFailureRetries = 1;
-        AvailabilityOracleRetryDelayMilliseconds = 250;
+        AvailabilityProwlarrFallbackAfterAttempts = 1;
         SeriesExpansionTtlDays = 7;
         SeriesExpansionTransientRetryMinutes = 60;
         EpisodeReleaseDelayHours = 12;
@@ -493,28 +492,26 @@ public class PluginConfiguration : BasePluginConfiguration
     public int AvailabilityTransientEscalatedRetryHours { get; set; }
 
     /// <summary>
-    /// availability-signal-prowlarr-fallback: bounded number of IMMEDIATE
-    /// retries against the availability-oracle indexer (Torrentio) when it
-    /// itself reports a serving failure (HTTP error / transport failure —
-    /// <see cref="Sources.MagnetSelector.ProbeAvailabilityWithFallbackAsync"/>'s
-    /// <c>indexer_partial_or_total_failure</c> kind), BEFORE falling back to a
-    /// Prowlarr-backed confirm. Distinguishes a real short-lived throttle
-    /// (which a retry can ride out) from a per-id abstention Torrentio maps
-    /// to the same HTTP-failure shape (a retry will not help, so the bounded
-    /// retry budget is spent quickly and the Prowlarr fallback engages).
-    /// Default 1 (a single immediate retry). This never runs for a title
-    /// Torrentio actually serves (200) — only on-failure, so the mainstream/
-    /// mostly-Torrentio-served hot loop never triggers the heavier Prowlarr
-    /// path.
-    /// </summary>
-    public int AvailabilityOracleFailureRetries { get; set; }
-
     /// <summary>
-    /// Delay before each bounded <see cref="AvailabilityOracleFailureRetries"/>
-    /// retry. Default 250ms — enough to distinguish an instantaneous blip
-    /// from a sustained failure without materially slowing the sweep.
+    /// Availability-signal Prowlarr fallback (availability-signal-prowlarr-fallback):
+    /// the high-frequency availability sweep is Torrentio-only, and Torrentio
+    /// returns an HTTP failure (429) for any id it cannot serve. Left alone
+    /// that maps to an IndeterminateTransient outcome and loops to the long
+    /// escalated backoff, so a title Torrentio cannot serve but Prowlarr HAS
+    /// (obscure/anime/series-as-movie) never confirms available and sinks in
+    /// the playable-first sort. When enabled (a Prowlarr base URL is
+    /// configured) and an item's consecutive-transient <c>attempt_count</c>
+    /// reaches this threshold on a Torrentio HTTP-failure transient, the sweep
+    /// makes ONE bounded fall-through to the full multi-indexer probe (which
+    /// includes Prowlarr) to confirm availability + cache the magnet, instead
+    /// of deferring again. Gating on attempt_count keeps mainstream
+    /// Torrentio-served titles (which resolve on their first probe) off the
+    /// heavy path entirely. Default 1: the fallback is considered starting
+    /// from the first re-probe after an initial Torrentio HTTP failure, but a
+    /// title Torrentio serves cleanly never reaches a transient at all so
+    /// never triggers it. Set to 0 to disable the fallback.
     /// </summary>
-    public int AvailabilityOracleRetryDelayMilliseconds { get; set; }
+    public int AvailabilityProwlarrFallbackAfterAttempts { get; set; }
 
     /// <summary>TTL for TV series expansion passes.</summary>
     public int SeriesExpansionTtlDays { get; set; }
