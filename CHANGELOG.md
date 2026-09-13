@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Availability signal ignores Prowlarr coverage (availability-signal-prowlarr-fallback).**
+  The high-frequency availability sweep is Torrentio-only
+  (`IsAvailabilityOracle`); Torrentio returns HTTP 429 both for a genuine
+  rate-limit AND, indistinguishably, for any id it cannot serve at all
+  (series-as-movie / obscure / anime / unknown ids) — 15 rapid good-id
+  requests all returned 200, proving a bare 429 is NOT proof of throttling.
+  Previously this mapped to `IndeterminateTransient` and sank a
+  Prowlarr-servable title into a 24h transient backoff forever, even though
+  `Materialiser.ProbeAsync` (which DOES use Prowlarr) would succeed. Now,
+  when the availability-oracle probe reports the Torrentio-side
+  `indexer_partial_or_total_failure` kind, `AvailabilityProbeWorker` performs
+  a small bounded same-oracle retry (`AvailabilityTransientOracleRetryAttempts`
+  / `AvailabilityTransientOracleRetryDelayMs`) to distinguish a real,
+  self-clearing throttle from a per-id 429; if it still fails, it falls back
+  to a single bounded Prowlarr-backed confirm
+  (`MagnetSelector.ProbeAvailabilityFallbackAsync`, scoped to non-oracle
+  indexers) and marks the title available + caches the magnet when Prowlarr
+  has it. Mainstream Torrentio-served titles are unaffected — they resolve
+  Available on the very first probe and never reach the bounded-retry/
+  fallback path at all. Gated behind `AvailabilityProwlarrFallbackEnabled`
+  (default on).
+
 - **gostream library token env fallback (gostream-token-durable-wiring).**
   Durable fix for the outage where an empty (hand-set, never-templated)
   `GostreamApiToken` plugin config value produced a gostream 401

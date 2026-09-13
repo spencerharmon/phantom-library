@@ -276,6 +276,108 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
         Assert.Equal("no_capable_indexer", error);
     }
 
+    // ---- availability-signal-prowlarr-fallback ----
+    // Torrentio returns HTTP 429 both for a real rate-limit AND, indistinguishably,
+    // for an id it simply cannot serve. These tests prove the bounded fallback: after
+    // a small bounded same-oracle retry still fails, the sweep falls back to a single
+    // Prowlarr-backed confirm and marks the title available + caches the magnet when
+    // Prowlarr has it, instead of sinking into the long transient backoff.
+
+    [Fact]
+    public async Task Fallback_TorrentioAlways429_ProwlarrHasIt_MarksAvailableAndCachesMagnet()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 99001000);
+        await db.SetImdbIdAsync(99001000, "movie", "tt99001000", CancellationToken.None);
+        var cfg = Config();
+        cfg.AvailabilityProwlarrFallbackEnabled = true;
+        cfg.AvailabilityTransientOracleRetryAttempts = 2;
+        cfg.AvailabilityTransientOracleRetryDelayMs = 1;
+        var torrentio = new TorrentioAlways429Indexer();
+        var prowlarr = new ProwlarrConfirmsAvailableIndexer();
+        var worker = BuildWorker(db, cfg, torrentio, prowlarr);
+
+        var didWork = await InvokeProbeOneAsync(worker, cfg);
+
+        Assert.True(didWork);
+        // Original probe + bounded retries: 1 + 2 = 3 Torrentio calls; Prowlarr
+        // invoked exactly once as the bounded fallback confirm.
+        Assert.Equal(3, torrentio.SearchCallCount);
+        Assert.Equal(1, prowlarr.SearchCallCount);
+        var (status, error) = await ReadAvailabilityAsync(99001000);
+        Assert.Equal("available", status);
+        Assert.Null(error);
+        Assert.Equal(1, await CountRowsAsync("magnet_cache"));
+    }
+
+    [Fact]
+    public async Task Fallback_TorrentioAlways429_ProwlarrAlsoFails_StaysTransientNotAvailable()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 99001010);
+        await db.SetImdbIdAsync(99001010, "movie", "tt99001010", CancellationToken.None);
+        var cfg = Config();
+        cfg.AvailabilityProwlarrFallbackEnabled = true;
+        cfg.AvailabilityTransientOracleRetryAttempts = 1;
+        cfg.AvailabilityTransientOracleRetryDelayMs = 1;
+        var torrentio = new TorrentioAlways429Indexer();
+        var prowlarr = new ProwlarrLikeIndexer(); // enabled, non-oracle, returns nothing
+        var worker = BuildWorker(db, cfg, torrentio, prowlarr);
+
+        var didWork = await InvokeProbeOneAsync(worker, cfg);
+
+        Assert.True(didWork);
+        Assert.True(prowlarr.SearchCallCount >= 1);
+        var (status, error) = await ReadAvailabilityAsync(99001010);
+        Assert.Equal("unknown", status);
+        Assert.NotNull(error);
+    }
+
+    [Fact]
+    public async Task Fallback_DisabledByConfig_NeverInvokesProwlarrEvenOnTorrentio429()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 99001020);
+        await db.SetImdbIdAsync(99001020, "movie", "tt99001020", CancellationToken.None);
+        var cfg = Config();
+        cfg.AvailabilityProwlarrFallbackEnabled = false;
+        var torrentio = new TorrentioAlways429Indexer();
+        var prowlarr = new ProwlarrConfirmsAvailableIndexer();
+        var worker = BuildWorker(db, cfg, torrentio, prowlarr);
+
+        var didWork = await InvokeProbeOneAsync(worker, cfg);
+
+        Assert.True(didWork);
+        Assert.Equal(0, prowlarr.SearchCallCount);
+        var (status, error) = await ReadAvailabilityAsync(99001020);
+        Assert.Equal("unknown", status);
+        Assert.Equal("indexer_partial_or_total_failure", error);
+    }
+
+    [Fact]
+    public async Task Fallback_MainstreamTorrentioServedTitle_NeverEngagesHeavyFallbackPath()
+    {
+        // Gate-cadence guarantee: a title Torrentio serves successfully on the
+        // FIRST probe must never trigger the bounded-retry/Prowlarr-fallback
+        // machinery at all — Prowlarr's SearchAsync must not be invoked.
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 99001030);
+        await db.SetImdbIdAsync(99001030, "movie", "tt99001030", CancellationToken.None);
+        var cfg = Config();
+        cfg.AvailabilityProwlarrFallbackEnabled = true;
+        var torrentio = new TorrentioLikeAvailableIndexer();
+        var prowlarr = new ProwlarrConfirmsAvailableIndexer();
+        var worker = BuildWorker(db, cfg, torrentio, prowlarr);
+
+        var didWork = await InvokeProbeOneAsync(worker, cfg);
+
+        Assert.True(didWork);
+        Assert.Equal(1, torrentio.SearchCallCount);
+        Assert.Equal(0, prowlarr.SearchCallCount);
+        var (status, _) = await ReadAvailabilityAsync(99001030);
+        Assert.Equal("available", status);
+    }
+
     // ---- p6-availability-convergence: no-forever-churn + TTL reprobe ----
 
     [Fact]
@@ -961,6 +1063,59 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
         {
             SearchCallCount++;
             return Task.FromResult<IReadOnlyList<IndexerCandidate>>(Array.Empty<IndexerCandidate>());
+        }
+    }
+
+    // ---- availability-signal-prowlarr-fallback ----
+
+    /// <summary>
+    /// Torrentio-shaped fake that ALWAYS throws a generic (non-abstention)
+    /// exception — the shape of Torrentio's HTTP 429 for an id it cannot serve,
+    /// which <see cref="MagnetSelector"/> classifies as the SAME
+    /// <c>indexer_partial_or_total_failure</c> kind as a real rate-limit throttle.
+    /// Counts invocations so a test can assert the bounded retry count.
+    /// </summary>
+    private sealed class TorrentioAlways429Indexer : IIndexerClient
+    {
+        public int SearchCallCount { get; private set; }
+        public string Name => "Torrentio";
+        public bool IsEnabled => true;
+        public bool RequiresImdb => true;
+        public bool IsAvailabilityOracle => true;
+        public Task<IReadOnlyList<IndexerCandidate>> SearchAsync(IndexerQuery query, CancellationToken ct)
+        {
+            SearchCallCount++;
+            throw new InvalidOperationException("HTTP 429");
+        }
+    }
+
+    /// <summary>
+    /// Prowlarr-shaped fake that HAS the content: returns a real candidate. Used to
+    /// prove the fallback confirm marks the title available and caches the magnet.
+    /// </summary>
+    private sealed class ProwlarrConfirmsAvailableIndexer : IIndexerClient
+    {
+        public int SearchCallCount { get; private set; }
+        public string Name => "Prowlarr";
+        public bool IsEnabled => true;
+        public bool RequiresImdb => false;
+        public bool IsAvailabilityOracle => false;
+        public Task<IReadOnlyList<IndexerCandidate>> SearchAsync(IndexerQuery query, CancellationToken ct)
+        {
+            SearchCallCount++;
+            IReadOnlyList<IndexerCandidate> hits = new[]
+            {
+                new IndexerCandidate
+                {
+                    Title = "Prowlarr candidate",
+                    Magnet = "magnet:?xt=urn:btih:" + Guid.NewGuid().ToString("N"),
+                    InfoHash = Guid.NewGuid().ToString("N"),
+                    Size = 5L * 1024 * 1024 * 1024,
+                    Seeders = 300,
+                    IndexerName = "Prowlarr",
+                },
+            };
+            return Task.FromResult(hits);
         }
     }
 }

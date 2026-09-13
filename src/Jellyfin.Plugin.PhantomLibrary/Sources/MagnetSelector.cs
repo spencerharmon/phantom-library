@@ -166,7 +166,7 @@ public sealed class MagnetSelector
 
     private bool HasCapableIndexer(string? imdbId, bool availabilityOracleOnly)
     {
-        var enabled = EnabledIndexers(availabilityOracleOnly);
+        var enabled = EnabledIndexers(availabilityOracleOnly ? ProbeScope.AvailabilityOracleOnly : ProbeScope.All);
         if (enabled.Count == 0)
         {
             return true;
@@ -184,7 +184,7 @@ public sealed class MagnetSelector
         string title,
         int? year,
         CancellationToken ct)
-        => ProbeCoreAsync(tmdbId, imdbId, type, season, episode, title, year, availabilityOracleOnly: false, ct);
+        => ProbeCoreAsync(tmdbId, imdbId, type, season, episode, title, year, ProbeScope.All, ct);
 
     /// <summary>
     /// Availability-oracle probe (ROI Priority 6, revised architecture item 1 —
@@ -207,11 +207,44 @@ public sealed class MagnetSelector
         string title,
         int? year,
         CancellationToken ct)
-        => ProbeCoreAsync(tmdbId, imdbId, type, season, episode, title, year, availabilityOracleOnly: true, ct);
+        => ProbeCoreAsync(tmdbId, imdbId, type, season, episode, title, year, ProbeScope.AvailabilityOracleOnly, ct);
 
-    private List<IIndexerClient> EnabledIndexers(bool availabilityOracleOnly)
+    /// <summary>
+    /// availability-signal-prowlarr-fallback: a bounded fallback confirm used ONLY
+    /// after <see cref="ProbeAvailabilityAsync"/> reports a Torrentio-side transient
+    /// failure that survives a small bounded retry (see
+    /// <c>AvailabilityProbeWorker</c>'s <c>IndeterminateTransient</c> handling).
+    /// Scoped to enabled indexers that are NOT the availability oracle (i.e.
+    /// Prowlarr, never Torrentio again) so a per-id Torrentio failure is not simply
+    /// repeated, and so this heavier multi-indexer path never substitutes for the
+    /// cheap oracle hot loop.
+    /// </summary>
+    public Task<MagnetProbeResult> ProbeAvailabilityFallbackAsync(
+        int tmdbId,
+        string? imdbId,
+        string type,
+        int? season,
+        int? episode,
+        string title,
+        int? year,
+        CancellationToken ct)
+        => ProbeCoreAsync(tmdbId, imdbId, type, season, episode, title, year, ProbeScope.NonOracleOnly, ct);
+
+    private enum ProbeScope
     {
-        var candidates = availabilityOracleOnly ? _indexers.Where(i => i.IsAvailabilityOracle) : _indexers;
+        All,
+        AvailabilityOracleOnly,
+        NonOracleOnly,
+    }
+
+    private List<IIndexerClient> EnabledIndexers(ProbeScope scope)
+    {
+        IEnumerable<IIndexerClient> candidates = scope switch
+        {
+            ProbeScope.AvailabilityOracleOnly => _indexers.Where(i => i.IsAvailabilityOracle),
+            ProbeScope.NonOracleOnly => _indexers.Where(i => !i.IsAvailabilityOracle),
+            _ => _indexers,
+        };
         return candidates.Where(i => i.IsEnabled).ToList();
     }
 
@@ -223,7 +256,7 @@ public sealed class MagnetSelector
         int? episode,
         string title,
         int? year,
-        bool availabilityOracleOnly,
+        ProbeScope scope,
         CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(type);
@@ -241,7 +274,7 @@ public sealed class MagnetSelector
             Episode = episode,
         };
 
-        var enabled = EnabledIndexers(availabilityOracleOnly);
+        var enabled = EnabledIndexers(scope);
         if (enabled.Count == 0)
         {
             return MagnetProbeResult.Transient("no_enabled_indexers", "No enabled indexers are configured");

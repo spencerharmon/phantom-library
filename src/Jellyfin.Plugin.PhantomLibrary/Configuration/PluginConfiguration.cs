@@ -106,6 +106,9 @@ public class PluginConfiguration : BasePluginConfiguration
         AvailabilityYieldToUserSeconds = 20;
         AvailabilityTransientMaxAttempts = 8;
         AvailabilityTransientEscalatedRetryHours = 24;
+        AvailabilityProwlarrFallbackEnabled = true;
+        AvailabilityTransientOracleRetryAttempts = 2;
+        AvailabilityTransientOracleRetryDelayMs = 500;
         SeriesExpansionTtlDays = 7;
         SeriesExpansionTransientRetryMinutes = 60;
         EpisodeReleaseDelayHours = 12;
@@ -485,6 +488,35 @@ public class PluginConfiguration : BasePluginConfiguration
     /// than looping on the short interval forever.
     /// </summary>
     public int AvailabilityTransientEscalatedRetryHours { get; set; }
+
+    /// <summary>
+    /// availability-signal-prowlarr-fallback: whether the availability sweep may
+    /// fall back to a bounded Prowlarr-backed confirm when the availability-oracle
+    /// indexer (Torrentio) reports an indexer-level transient failure
+    /// (<c>indexer_partial_or_total_failure</c>) that survives
+    /// <see cref="AvailabilityTransientOracleRetryAttempts"/> bounded retries.
+    /// Root cause: Torrentio returns HTTP 429 both for a genuine rate-limit AND,
+    /// indistinguishably, for any id it cannot serve at all — without this
+    /// fallback a Prowlarr-servable title sinks into the long transient backoff
+    /// forever. Default enabled; set false to fully disable the fallback (e.g. no
+    /// Prowlarr configured).
+    /// </summary>
+    public bool AvailabilityProwlarrFallbackEnabled { get; set; }
+
+    /// <summary>
+    /// Small bounded number of same-oracle retries attempted before treating a
+    /// Torrentio <c>indexer_partial_or_total_failure</c> as "cannot serve this id"
+    /// (and engaging the Prowlarr fallback) rather than a live rate-limit that
+    /// will clear on its own. Kept small so the hot per-item availability loop
+    /// stays cheap; a real throttle usually clears within a couple of retries,
+    /// while a per-id 429 keeps failing every attempt.
+    /// </summary>
+    public int AvailabilityTransientOracleRetryAttempts { get; set; }
+
+    /// <summary>
+    /// Delay between the bounded same-oracle retries above, in milliseconds.
+    /// </summary>
+    public int AvailabilityTransientOracleRetryDelayMs { get; set; }
 
     /// <summary>TTL for TV series expansion passes.</summary>
     public int SeriesExpansionTtlDays { get; set; }
