@@ -95,6 +95,11 @@ for ln in text.splitlines():
     ln = ln.strip()
     if not ln or ln.startswith('#'):
         continue
+    # The engine also emits the phantom_playback_outcome_total family
+    # (playback-outcome-instrumentation-001) in the same exposition; this P8
+    # harness asserts only the load-time records, so skip other metric families.
+    if not ln.startswith('phantom_loadtime_'):
+        continue
     m = line_re.match(ln)
     if not m:
         print(f"malformed exposition line: {ln!r}", file=sys.stderr)

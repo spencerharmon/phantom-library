@@ -188,9 +188,96 @@ public sealed class PhantomMaterialisingMediaSourceProvider : IMediaSourceProvid
             _ => throw new InvalidOperationException("Unsupported Phantom open token kind: " + parsed.Kind),
         };
 
+        // item_type tag for the definitive per-attempt playback-outcome metric
+        // (movie AND episode parity — every terminal path records exactly once).
+        var itemTypeTag = type == "episode"
+            ? Diagnostics.PhantomFlowMetrics.ItemTypeEpisode
+            : Diagnostics.PhantomFlowMetrics.ItemTypeMovie;
+
         var (seasonKey, episodeKey) = ChannelItemId.ToSentinels(season, episode);
         var existing = await _db.GetMaterialisedStateAsync(parsed.TmdbId!.Value, type, seasonKey, episodeKey, cancellationToken)
             .ConfigureAwait(false);
+
+        // flow tag: an item already materialised on disk is play_already_materialised;
+        // otherwise this attempt materialises then plays. Resolved here (before the
+        // stale-file re-materialise below) so the flow reflects the attempt's real shape.
+        var alreadyMaterialised = existing is not null && File.Exists(ResolveMaterialisedPath(type, existing));
+        var flowTag = alreadyMaterialised
+            ? Diagnostics.PhantomFlowMetrics.PlaybackFlowPlayAlreadyMaterialised
+            : Diagnostics.PhantomFlowMetrics.PlaybackFlowMaterialiseThenPlay;
+
+        try
+        {
+            var stream = await OpenMediaSourceCore(parsed, type, season, episode, seasonKey, episodeKey, existing, flowTag, itemTypeTag, cancellationToken)
+                .ConfigureAwait(false);
+            Diagnostics.PhantomFlowMetrics.RecordPlaybackOutcome(
+                flowTag, itemTypeTag, Diagnostics.PhantomFlowMetrics.CauseSuccess);
+            return stream;
+        }
+        catch (MaterialiseOutcomeSignal signal)
+        {
+            // A classified materialise-side failure: record the definitive cause,
+            // then surface the original failure to the caller unchanged.
+            Diagnostics.PhantomFlowMetrics.RecordPlaybackOutcome(flowTag, itemTypeTag, signal.Cause);
+            throw new InvalidOperationException(signal.Message);
+        }
+        catch (TimeoutException)
+        {
+            Diagnostics.PhantomFlowMetrics.RecordPlaybackOutcome(
+                flowTag, itemTypeTag, Diagnostics.PhantomFlowMetrics.CauseFirstByteTimeout);
+            throw;
+        }
+        catch (FileNotFoundException)
+        {
+            Diagnostics.PhantomFlowMetrics.RecordPlaybackOutcome(
+                flowTag, itemTypeTag, Diagnostics.PhantomFlowMetrics.CauseGostreamCannotFetch);
+            throw;
+        }
+        catch (Exception)
+        {
+            // catch-all: any other host-path failure is plugin_host_error so no
+            // attempt is ever silently unclassified.
+            Diagnostics.PhantomFlowMetrics.RecordPlaybackOutcome(
+                flowTag, itemTypeTag, Diagnostics.PhantomFlowMetrics.CausePluginHostError);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Internal signal carrying a classified materialise-side playback-outcome
+    /// <c>cause</c> from <see cref="OpenMediaSourceCore"/> up to
+    /// <see cref="OpenMediaSource"/>, which records the outcome and re-throws the
+    /// failure to the caller. Never escapes this class.
+    /// </summary>
+#pragma warning disable CA1064 // internal-only control signal, deliberately not public
+#pragma warning disable CA1032 // only the (cause) form is ever constructed
+    private sealed class MaterialiseOutcomeSignal : Exception
+    {
+        public MaterialiseOutcomeSignal(string cause, string message)
+            : base(message)
+        {
+            Cause = cause;
+        }
+
+        public string Cause { get; }
+    }
+#pragma warning restore CA1032
+#pragma warning restore CA1064
+
+    private async Task<ILiveStream> OpenMediaSourceCore(
+        ChannelItemId parsed,
+        string type,
+        int? season,
+        int? episode,
+        int seasonKey,
+        int episodeKey,
+        MaterialisedStateRow? existing,
+        string flowTag,
+        string itemTypeTag,
+        CancellationToken cancellationToken)
+    {
+        _ = flowTag;
+        _ = itemTypeTag;
         if (existing is not null)
         {
             var existingPath = ResolveMaterialisedPath(type, existing);
@@ -203,7 +290,7 @@ public sealed class PhantomMaterialisingMediaSourceProvider : IMediaSourceProvid
                     season,
                     episode,
                     existingPath);
-                await _db.DeleteMaterialisedStateAsync(parsed.TmdbId.Value, type, seasonKey, episodeKey, cancellationToken)
+                await _db.DeleteMaterialisedStateAsync(parsed.TmdbId!.Value, type, seasonKey, episodeKey, cancellationToken)
                     .ConfigureAwait(false);
                 existing = null;
             }
@@ -212,7 +299,7 @@ public sealed class PhantomMaterialisingMediaSourceProvider : IMediaSourceProvid
         if (existing is null)
         {
             var outcome = await _materialiser.MaterialiseAsync(
-                parsed.TmdbId.Value,
+                parsed.TmdbId!.Value,
                 type,
                 season,
                 episode,
@@ -231,11 +318,13 @@ public sealed class PhantomMaterialisingMediaSourceProvider : IMediaSourceProvid
             }
             else
             {
-                throw new InvalidOperationException(outcome.Error ?? ("Materialise failed with status " + outcome.Status));
+                throw new MaterialiseOutcomeSignal(
+                    ClassifyMaterialiseFailure(outcome),
+                    outcome.Error ?? ("Materialise failed with status " + outcome.Status));
             }
         }
 
-        existing ??= await WaitForMaterialisedStateAsync(parsed.TmdbId.Value, type, seasonKey, episodeKey, cancellationToken)
+        existing ??= await WaitForMaterialisedStateAsync(parsed.TmdbId!.Value, type, seasonKey, episodeKey, cancellationToken)
             .ConfigureAwait(false);
 
         if (existing is null)
@@ -252,6 +341,50 @@ public sealed class PhantomMaterialisingMediaSourceProvider : IMediaSourceProvid
         var source = await FuseMediaSourceAsync(path, parsed.Encode(), cancellationToken).ConfigureAwait(false);
         return new PhantomOpenedLiveStream(source);
     }
+
+    /// <summary>
+    /// Maps a failed <see cref="MaterialisationOutcome"/> to a single definitive
+    /// playback-outcome cause. A materialise that produced no usable candidate is
+    /// <c>no_candidate</c>; the availability oracle abstaining is
+    /// <c>availability_abstain</c>; a resolved-but-unfetchable candidate is
+    /// <c>magnet_dead_stale</c>; a gostream register failure is
+    /// <c>gostream_register_fail</c>; anything else is <c>plugin_host_error</c>.
+    /// </summary>
+    private static string ClassifyMaterialiseFailure(MaterialisationOutcome outcome)
+    {
+        var err = (outcome.Error ?? string.Empty).ToUpperInvariant();
+        if (outcome.Status == MaterialisationStatus.Unavailable
+            || err.Contains("ABSTAIN", StringComparison.Ordinal)
+            || err.Contains("NOT AVAILABLE", StringComparison.Ordinal)
+            || err.Contains("AVAILABILITY", StringComparison.Ordinal))
+        {
+            return Diagnostics.PhantomFlowMetrics.CauseAvailabilityAbstain;
+        }
+
+        if (err.Contains("NO CANDIDATE", StringComparison.Ordinal)
+            || err.Contains("NO SOURCE", StringComparison.Ordinal)
+            || err.Contains("NO SURVIVING", StringComparison.Ordinal)
+            || err.Contains("INVALID", StringComparison.Ordinal))
+        {
+            return Diagnostics.PhantomFlowMetrics.CauseNoCandidate;
+        }
+
+        if (err.Contains("REGISTER", StringComparison.Ordinal))
+        {
+            return Diagnostics.PhantomFlowMetrics.CauseGostreamRegisterFail;
+        }
+
+        if (err.Contains("MAGNET", StringComparison.Ordinal)
+            || err.Contains("DEAD", StringComparison.Ordinal)
+            || err.Contains("STALE", StringComparison.Ordinal)
+            || err.Contains("FETCH", StringComparison.Ordinal))
+        {
+            return Diagnostics.PhantomFlowMetrics.CauseMagnetDeadStale;
+        }
+
+        return Diagnostics.PhantomFlowMetrics.CausePluginHostError;
+    }
+
 
     private bool IsConfiguredGostreamPath(string? path, string kind)
     {

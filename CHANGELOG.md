@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Playback-outcome instrumentation (playback-outcome-instrumentation-001).**
+  Every native-open playback attempt now records exactly one definitive outcome
+  — success or a single failure cause — on the OTLP-native `Phantom.Flows` meter
+  via `PhantomFlowMetrics.RecordPlaybackOutcome`, as
+  `phantom_playback_outcome_total{flow,item_type,cause}` (flow ∈
+  materialise_then_play / play_already_materialised; item_type movie AND episode;
+  cause ∈ success, availability_abstain, no_candidate, magnet_dead_stale,
+  gostream_register_fail, gostream_cannot_fetch, first_byte_timeout,
+  plugin_host_error). The playback-error series ranks causes from this. The rig
+  engine (`47-loadtime-flows.sh`) emits the same metric family and the P8
+  Pushgateway emitter mirrors it verbatim to Mimir alongside the load-time flows.
+  MEASUREMENT only — no playback behaviour change.
 - Home shelves: each curated category now yields **separate Movie and TV rails**
   instead of one mixed rail (home-shelves-split-tv-movie). Every rail carries a
   `MediaType` and a persistent Movies/TV pill in its heading.

@@ -21,10 +21,17 @@
 #   phantom_loadtime_seconds{flow=…,item_type=movie|episode,color=…}   <secs>
 #   phantom_loadtime_runs_total{flow=…,item_type=…,color=…}            <runs>
 #   phantom_loadtime_errors_total{flow=…,item_type=…,color=…}          <errors>
+# and — since playback-outcome-instrumentation-001 — the definitive per-attempt
+# playback-outcome family emitted in the SAME exposition:
+#   phantom_playback_outcome_total{flow=…,item_type=movie|episode,cause=…}  1
 # read from a FILE (arg or PHANTOM_LOADTIME_RECORDS env) or, absent both, from
 # stdin. This script does not re-derive or reshape those records — it PASSES
 # THEM THROUGH to the Pushgateway verbatim (the label set is already the
-# metric contract p8-loadtime-rig-flows established).
+# metric contract p8-loadtime-rig-flows established), so the playback-outcome
+# family requires NO special handling here: its flow/item_type/cause are METRIC
+# labels carried in the exposition text, mirrored under the same `honor_labels`
+# scrape-config rule documented below (the Prometheus config keeps the metrics'
+# OWN labels rather than overwriting them with the pushgateway job/instance).
 #
 # GROUPING KEY: PUT'd under Pushgateway job="phantom-loadtime" (no `instance`
 # grouping label) — the per-flow identity (flow/item_type/color) lives as

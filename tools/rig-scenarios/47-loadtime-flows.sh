@@ -40,6 +40,18 @@
 # often fails today per P6 — still emits a duration record for the attempt AND
 # errors_total 1, so the failure RATE is recorded, never silently dropped.)
 #
+# It ALSO emits the DEFINITIVE per-attempt playback-outcome metric
+# (playback-outcome-instrumentation-001) the playback-error-reduction series
+# ranks causes from — the SAME metric the OTLP-native Phantom.Flows meter
+# records live via PhantomFlowMetrics.RecordPlaybackOutcome, mirrored here into
+# Mimir via the P8 Pushgateway emitter precedent:
+#   phantom_playback_outcome_total{flow="<materialise_then_play|play_already_materialised>",item_type="<movie|episode>",cause="<cause>"} 1
+# where cause ∈ {success, availability_abstain, no_candidate, magnet_dead_stale,
+# gostream_register_fail, gostream_cannot_fetch, first_byte_timeout,
+# plugin_host_error}. A success attempt carries cause="success"; a failed flow
+# emits its definitive cause, never a silently-dropped failure. NO Mimir/
+# Pushgateway/observe host is baked here (infra-identifier rule).
+#
 # Output goes to stdout AND, if PHANTOM_LOADTIME_OUT is set, to that file.
 # rig `:18096`, never prod; trap-clean.
 #
@@ -171,6 +183,26 @@ EOF
 "
 }
 
+# --- playback-outcome emission (playback-outcome-instrumentation-001) --------
+# The playback-error-reduction series ranks causes from a DEFINITIVE per-attempt
+# outcome metric. Alongside the load-time record above, a materialise/get_sources/
+# play flow ALSO emits exactly one `phantom_playback_outcome_total{flow,item_type,
+# cause}` record: a success carries cause="success"; a failed flow emits its
+# definitive cause, never a silently-dropped failure. `flow` here is the playback
+# flow vocabulary the C# PhantomFlowMetrics.RecordPlaybackOutcome tags
+# (materialise_then_play vs play_already_materialised), NOT the load-time flow
+# label — this is the same metric the OTLP meter emits, mirrored to Mimir.
+PLAYBACK_FLOWS=(materialise_then_play play_already_materialised)
+PLAYBACK_CAUSES=(success availability_abstain no_candidate magnet_dead_stale \
+    gostream_register_fail gostream_cannot_fetch first_byte_timeout plugin_host_error)
+_outcome_records=""
+# emit_playback_outcome <flow> <item_type> <cause>
+emit_playback_outcome() {
+    local flow="$1" item_type="$2" cause="$3"
+    _outcome_records="${_outcome_records}phantom_playback_outcome_total{flow=\"$flow\",item_type=\"$item_type\",cause=\"$cause\"} 1
+"
+}
+
 flush_records() {
     local header
     header="$(cat <<'EOF'
@@ -180,11 +212,13 @@ flush_records() {
 # TYPE phantom_loadtime_runs_total counter
 # HELP phantom_loadtime_errors_total Number of runs of a flow that returned an error in this batch.
 # TYPE phantom_loadtime_errors_total counter
+# HELP phantom_playback_outcome_total Definitive per-attempt phantom playback outcome, split by flow/item_type/cause.
+# TYPE phantom_playback_outcome_total counter
 EOF
 )"
-    printf '%s\n%s' "$header" "$_records"
+    printf '%s\n%s%s' "$header" "$_records" "$_outcome_records"
     if [ -n "$OUT" ]; then
-        { printf '%s\n%s' "$header" "$_records"; } > "$OUT"
+        { printf '%s\n%s%s' "$header" "$_records" "$_outcome_records"; } > "$OUT"
         log "wrote exposition to $OUT"
     fi
 }
@@ -244,6 +278,21 @@ if [ "$DRYRUN" = 1 ]; then
             esac
             emit_record "$flow" "$it" "$dur" 1 "$errors"
         done
+        # --- definitive per-attempt playback outcome, movie AND episode -------
+        # Every playback flow records exactly one definitive cause. In DRYRUN the
+        # already-materialised flow is a clean success; the materialise-then-play
+        # flow is a success UNLESS a failure cause is forced (proving a failed
+        # flow emits its definitive cause, never a silently-dropped success).
+        emit_playback_outcome play_already_materialised "$it" success
+        force_cause="${PHANTOM_LOADTIME_FORCE_PLAYBACK_FAIL_CAUSE:-}"
+        if [ "$force_mat_fail" = 1 ] && [ -z "$force_cause" ]; then
+            force_cause=gostream_register_fail
+        fi
+        if [ -n "$force_cause" ]; then
+            emit_playback_outcome materialise_then_play "$it" "$force_cause"
+        else
+            emit_playback_outcome materialise_then_play "$it" success
+        fi
     done
     flush_records
     exit 0
@@ -274,6 +323,9 @@ CH_SHOWS="$(printf '%s' "$CH_JSON" | python3 -c "import json,sys; d=json.load(sy
 # time_flow <flow> <item_type> <curl-cmd...>
 # Runs the command, times it, and emits a record; a non-zero command marks the
 # error but never aborts the batch (a flow error is DATA, not a harness fault).
+# Sets the global LAST_FLOW_ERRORS to this flow's error marker so the caller can
+# derive the definitive playback outcome for the materialise/play flows.
+LAST_FLOW_ERRORS=0
 time_flow() {
     local flow="$1" item_type="$2"; shift 2
     local start errors=0 dur
@@ -281,6 +333,7 @@ time_flow() {
     if "$@" >/dev/null 2>&1; then errors=0; else errors=1; fi
     dur="$(elapsed "$start")"
     emit_record "$flow" "$item_type" "$dur" 1 "$errors"
+    LAST_FLOW_ERRORS="$errors"
     log "flow=$flow item_type=$item_type duration_s=$dur errors=$errors"
 }
 
@@ -349,7 +402,24 @@ for spec in "movie:$CH_MOVIES:$MOVIE_ID" "episode:$CH_SHOWS:$EPISODE_ID"; do
     time_flow get_sources      "$it" api "$API/Items/$id/PlaybackInfo"
     gid="$(hyphen "$id")"
     time_flow materialise      "$it" json_post -d '{"AutoOpenLiveStream":true}' "$API/Items/$gid/PlaybackInfo?AutoOpenLiveStream=true"
+    mat_errors="$LAST_FLOW_ERRORS"
     time_flow play_materialised "$it" curl -sS --fail -L --max-time 30 -H "X-Emby-Token: $TOK" -H 'Range: bytes=0-4095' -o /dev/null "$API/Videos/$gid/stream.mkv?static=true"
+    play_errors="$LAST_FLOW_ERRORS"
+
+    # --- definitive per-attempt playback outcome (movie AND episode) ---------
+    # This driver exercises a fresh materialise-then-play attempt. A clean run is
+    # cause="success"; a materialise error is a definitive materialise-side cause
+    # (the register handoff), a play-side error after a good materialise is a
+    # fetch-side cause — never a silently-dropped failure. (The C# meter records
+    # the fine-grained cause live per attempt; the rig maps its coarse
+    # materialise/play error markers to the same cause vocabulary for the mirror.)
+    if [ "$mat_errors" = 1 ]; then
+        emit_playback_outcome materialise_then_play "$it" gostream_register_fail
+    elif [ "$play_errors" = 1 ]; then
+        emit_playback_outcome materialise_then_play "$it" gostream_cannot_fetch
+    else
+        emit_playback_outcome materialise_then_play "$it" success
+    fi
 done
 
 flush_records

@@ -50,7 +50,58 @@ internal static class PhantomFlowMetrics
     /// <summary>Flow tag: materialised-only enumeration.</summary>
     public const string FlowMaterialisedListing = "materialised_listing";
 
+    // -----------------------------------------------------------------------
+    // Playback-outcome instrumentation (playback-outcome-instrumentation-001).
+    //
+    // Every playback ATTEMPT records exactly one definitive outcome — success or
+    // a single failure cause — split by flow × item_type × cause, on the same
+    // OTLP-native Phantom.Flows meter (PhantomMetricsExporter already subscribes
+    // to it, so no wiring change). The playback-error-rate series ranks causes
+    // from these numbers; this is MEASUREMENT only (no behaviour change).
+    // -----------------------------------------------------------------------
+
+    /// <summary>Playback flow: a fresh materialise then play in the same attempt.</summary>
+    public const string PlaybackFlowMaterialiseThenPlay = "materialise_then_play";
+
+    /// <summary>Playback flow: play of an already-materialised item.</summary>
+    public const string PlaybackFlowPlayAlreadyMaterialised = "play_already_materialised";
+
+    /// <summary>Item type tag: a movie.</summary>
+    public const string ItemTypeMovie = "movie";
+
+    /// <summary>Item type tag: an episode.</summary>
+    public const string ItemTypeEpisode = "episode";
+
+    /// <summary>Definitive outcome cause: the attempt produced a playable stream.</summary>
+    public const string CauseSuccess = "success";
+
+    /// <summary>Cause: the availability oracle abstained / gave no definitive available verdict.</summary>
+    public const string CauseAvailabilityAbstain = "availability_abstain";
+
+    /// <summary>Cause: no surviving source candidate (none, or all invalid).</summary>
+    public const string CauseNoCandidate = "no_candidate";
+
+    /// <summary>Cause: a candidate resolved but nothing was fetchable (dead/stale magnet).</summary>
+    public const string CauseMagnetDeadStale = "magnet_dead_stale";
+
+    /// <summary>Cause: gostream register handoff failed.</summary>
+    public const string CauseGostreamRegisterFail = "gostream_register_fail";
+
+    /// <summary>Cause: gostream registered but could not fetch the media.</summary>
+    public const string CauseGostreamCannotFetch = "gostream_cannot_fetch";
+
+    /// <summary>Cause: first-byte handoff timed out.</summary>
+    public const string CauseFirstByteTimeout = "first_byte_timeout";
+
+    /// <summary>Cause: catch-all for any other plugin-host-path exception.</summary>
+    public const string CausePluginHostError = "plugin_host_error";
+
     private static readonly Meter Meter = new(MeterName, "1.0.0");
+
+    private static readonly Counter<long> PlaybackOutcomes = Meter.CreateCounter<long>(
+        "phantom_playback_outcome_total",
+        unit: "{attempt}",
+        description: "Definitive per-attempt phantom playback outcome, split by flow/item_type/cause.");
 
     private static readonly Histogram<double> FlowDurationMs = Meter.CreateHistogram<double>(
         "phantom_flow_duration_ms",
@@ -78,6 +129,30 @@ internal static class PhantomFlowMetrics
         {
             FlowItems.Add(count, flowTag, backendTag);
         }
+    }
+
+    /// <summary>
+    /// Records ONE definitive playback-attempt outcome on the <c>phantom_playback_outcome_total</c>
+    /// counter. Every playback attempt calls this exactly once with either
+    /// <see cref="CauseSuccess"/> or a single failure cause, tagged by
+    /// <paramref name="flow"/> (materialise_then_play vs play_already_materialised) and
+    /// <paramref name="itemType"/> (movie vs episode — parity is mandatory: every call site
+    /// tags the real item type). The playback error rate the series ratchets is
+    /// <c>sum(cause!="success") / sum(all)</c>, sliceable by flow/item_type/cause.
+    /// The <c>Phantom.Flows</c> meter is OTLP-native (see <see cref="PhantomMetricsExporter"/>),
+    /// so this record is shipped over OTLP with no extra wiring, and is mirrored into Mimir by
+    /// the rig/emitter path (<c>47-loadtime-flows.sh</c> + <c>phantom-loadtime-push.sh</c>).
+    /// </summary>
+    /// <param name="flow">One of the <c>PlaybackFlow*</c> constants.</param>
+    /// <param name="itemType">One of <see cref="ItemTypeMovie"/> / <see cref="ItemTypeEpisode"/>.</param>
+    /// <param name="cause">One of the <c>Cause*</c> constants.</param>
+    public static void RecordPlaybackOutcome(string flow, string itemType, string cause)
+    {
+        PlaybackOutcomes.Add(
+            1,
+            new KeyValuePair<string, object?>("flow", flow),
+            new KeyValuePair<string, object?>("item_type", itemType),
+            new KeyValuePair<string, object?>("cause", cause));
     }
 
     /// <summary>

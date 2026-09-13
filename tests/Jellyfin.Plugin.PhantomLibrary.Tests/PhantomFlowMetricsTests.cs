@@ -126,6 +126,72 @@ public sealed class PhantomFlowMetricsTests
     }
 
     [Fact]
+    public void RecordPlaybackOutcome_EmitsCounter_WithFlowItemTypeAndCauseTags()
+    {
+        var (measurements, listener) = StartListener();
+        using (listener)
+        {
+            PhantomFlowMetrics.RecordPlaybackOutcome(
+                PhantomFlowMetrics.PlaybackFlowMaterialiseThenPlay,
+                PhantomFlowMetrics.ItemTypeEpisode,
+                PhantomFlowMetrics.CauseGostreamRegisterFail);
+        }
+
+        var outcome = Assert.Single(measurements, m => m.Instrument == "phantom_playback_outcome_total");
+        Assert.Equal(1d, outcome.Value);
+        Assert.Equal(PhantomFlowMetrics.PlaybackFlowMaterialiseThenPlay, outcome.Tags["flow"]);
+        Assert.Equal(PhantomFlowMetrics.ItemTypeEpisode, outcome.Tags["item_type"]);
+        Assert.Equal(PhantomFlowMetrics.CauseGostreamRegisterFail, outcome.Tags["cause"]);
+    }
+
+    [Fact]
+    public void RecordPlaybackOutcome_MovieSuccess_TagsCauseSuccess()
+    {
+        var (measurements, listener) = StartListener();
+        using (listener)
+        {
+            PhantomFlowMetrics.RecordPlaybackOutcome(
+                PhantomFlowMetrics.PlaybackFlowPlayAlreadyMaterialised,
+                PhantomFlowMetrics.ItemTypeMovie,
+                PhantomFlowMetrics.CauseSuccess);
+        }
+
+        var outcome = Assert.Single(measurements, m => m.Instrument == "phantom_playback_outcome_total");
+        Assert.Equal(PhantomFlowMetrics.ItemTypeMovie, outcome.Tags["item_type"]);
+        Assert.Equal(PhantomFlowMetrics.CauseSuccess, outcome.Tags["cause"]);
+    }
+
+    [Fact]
+    public void PlaybackOutcomeCauseConstants_AreEightDistinct()
+    {
+        var causes = new[]
+        {
+            PhantomFlowMetrics.CauseSuccess,
+            PhantomFlowMetrics.CauseAvailabilityAbstain,
+            PhantomFlowMetrics.CauseNoCandidate,
+            PhantomFlowMetrics.CauseMagnetDeadStale,
+            PhantomFlowMetrics.CauseGostreamRegisterFail,
+            PhantomFlowMetrics.CauseGostreamCannotFetch,
+            PhantomFlowMetrics.CauseFirstByteTimeout,
+            PhantomFlowMetrics.CausePluginHostError,
+        };
+
+        Assert.Equal(8, causes.Distinct(StringComparer.Ordinal).Count());
+    }
+
+    [Fact]
+    public void PlaybackFlowConstants_AreTwoDistinct()
+    {
+        var flows = new[]
+        {
+            PhantomFlowMetrics.PlaybackFlowMaterialiseThenPlay,
+            PhantomFlowMetrics.PlaybackFlowPlayAlreadyMaterialised,
+        };
+
+        Assert.Equal(2, flows.Distinct(StringComparer.Ordinal).Count());
+    }
+
+    [Fact]
     public void ResolveEndpoint_PrefersConfigOverEnvironment()
     {
         var config = new PluginConfiguration { MetricsOtlpEndpoint = "http://collector.example:4317" };
