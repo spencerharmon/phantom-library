@@ -153,6 +153,7 @@ public class PluginConfiguration : BasePluginConfiguration
         CuratedRowsEnabled = true;
         CuratedRowSize = 40;
         CuratedGenreRowMinItems = 3;
+        CuratedHomeMaxRails = 14;
     }
 
     /// <summary>
@@ -180,6 +181,16 @@ public class PluginConfiguration : BasePluginConfiguration
     /// surfacing a near-empty row. Clamped to at least 1.
     /// </summary>
     public int CuratedGenreRowMinItems { get; set; }
+
+    /// <summary>
+    /// Gets or sets the maximum number of Home-screen shelves (rails) returned
+    /// by <c>/Plugins/PhantomLibrary/Shelves</c> for a single user
+    /// (home-shelves-per-user-curation). Each category now yields a separate
+    /// Movie and TV rail, so the full candidate set is large; this bounds how
+    /// many the per-user curator keeps, ranked by the user's watch history
+    /// (genre affinity × movie/TV share). Clamped to at least 1.
+    /// </summary>
+    public int CuratedHomeMaxRails { get; set; }
 
     /// <summary>
     /// Gets or sets a value indicating whether the plugin pushes its

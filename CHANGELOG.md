@@ -6,6 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Home shelves: each curated category now yields **separate Movie and TV rails**
+  instead of one mixed rail (home-shelves-split-tv-movie). Every rail carries a
+  `MediaType` and a persistent Movies/TV pill in its heading.
+- Home shelves: **per-user curation** — `/Plugins/PhantomLibrary/Shelves` now
+  returns a bounded, ranked SUBSET of rails chosen from the user's recent
+  play-history (genre affinity × movie/TV share), via the new pure
+  `HomeRailSelector`. Cold-start users get a sensible default subset. New config
+  knob `CuratedHomeMaxRails` (default 14). Play-history sampling is bounded
+  (O(recent), cap 250) — never an O(catalogue) scan.
+- Home shelves: **Movies / TV filter toggle** on the Home page (persisted per
+  browser); hides the non-selected media type's rails. Hidden automatically when
+  only one media type is present.
+
 ### Fixed
 
 - **gostream library token env fallback (gostream-token-durable-wiring).**

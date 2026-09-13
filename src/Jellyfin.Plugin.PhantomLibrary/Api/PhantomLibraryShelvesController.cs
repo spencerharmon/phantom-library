@@ -2,12 +2,15 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
-using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
+using Jellyfin.Data.Enums;
+using Jellyfin.Database.Implementations.Enums;
 using Jellyfin.Plugin.PhantomLibrary.Channels;
 using MediaBrowser.Controller.Channels;
+using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
+using MediaBrowser.Model.Entities;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
@@ -37,11 +40,17 @@ public sealed class ShelfItem
 /// <summary>A titled Home-screen shelf (curated row) with its ordered members.</summary>
 public sealed class ShelfRow
 {
-    /// <summary>Stable row key (e.g. <c>available_now</c>, <c>genre_action</c>).</summary>
+    /// <summary>Unique row key (<c>{category}::{movie|tv}</c>, e.g. <c>genre_action::movie</c>).</summary>
     public required string Key { get; init; }
 
-    /// <summary>Human title (e.g. "Available now").</summary>
+    /// <summary>Base curated category key (e.g. <c>available_now</c>, <c>genre_action</c>) — shared by the Movie and TV variants.</summary>
+    public required string Category { get; init; }
+
+    /// <summary>Human category title (e.g. "Available now", "Action").</summary>
     public required string Title { get; init; }
+
+    /// <summary>"Movie" or "Series" — the single media type of every member; drives the Home Movies/TV filter toggle.</summary>
+    public required string MediaType { get; init; }
 
     /// <summary>Ordered, navigable members.</summary>
     public required IReadOnlyList<ShelfItem> Items { get; init; }
@@ -83,6 +92,10 @@ public sealed class PhantomLibraryShelvesController : ControllerBase
 {
     private const string ShelvesScriptResource = "Jellyfin.Plugin.PhantomLibrary.Configuration.phantomShelves.js";
 
+    // Hard cap on the recent-play-history sample the per-user taste profile is
+    // built from — keeps the profile query O(recent), never O(catalogue).
+    private const int PlayHistorySampleCap = 250;
+
     // Display order for well-known rows; genre_* rows sort after these (alpha),
     // leaving_soon last. Unlisted keys fall between the two via a large default.
     private static readonly Dictionary<string, int> RowOrder = new Dictionary<string, int>(StringComparer.Ordinal)
@@ -98,19 +111,23 @@ public sealed class PhantomLibraryShelvesController : ControllerBase
     private readonly PhantomMoviesChannel? _movies;
     private readonly PhantomShowsChannel? _shows;
     private readonly ILibraryManager _libraryManager;
+    private readonly IUserManager _userManager;
     private readonly ILogger<PhantomLibraryShelvesController> _logger;
 
     /// <summary>Initializes a new instance of the <see cref="PhantomLibraryShelvesController"/> class.</summary>
     /// <param name="channels">All registered channels; the phantom movie/show channels are selected out.</param>
     /// <param name="libraryManager">Library manager for channel-item guid derivation + validation.</param>
+    /// <param name="userManager">User manager for resolving the acting user's watch history.</param>
     /// <param name="logger">Logger.</param>
     public PhantomLibraryShelvesController(
         IEnumerable<IChannel> channels,
         ILibraryManager libraryManager,
+        IUserManager userManager,
         ILogger<PhantomLibraryShelvesController> logger)
     {
         ArgumentNullException.ThrowIfNull(channels);
         _libraryManager = libraryManager ?? throw new ArgumentNullException(nameof(libraryManager));
+        _userManager = userManager ?? throw new ArgumentNullException(nameof(userManager));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         var list = channels as IReadOnlyList<IChannel> ?? channels.ToList();
         _movies = list.OfType<PhantomMoviesChannel>().FirstOrDefault();
@@ -136,7 +153,7 @@ public sealed class PhantomLibraryShelvesController : ControllerBase
         return File(stream, "text/javascript");
     }
 
-    /// <summary>Builds the curated Home-screen shelves (movies + shows, merged by row).</summary>
+    /// <summary>Builds the curated, per-user Home-screen shelves (separate Movie and TV rails).</summary>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>The ordered shelves.</returns>
     [HttpGet("Shelves")]
@@ -156,50 +173,191 @@ public sealed class PhantomLibraryShelvesController : ControllerBase
             ? await _shows.BuildShelfRowsAsync(userId, ct).ConfigureAwait(false)
             : (IReadOnlyList<CuratedRow>)Array.Empty<CuratedRow>();
 
-        // Merge movie + show rows sharing a key into one shelf (movies first,
-        // then shows, preserving each channel's relevance order). The title comes
-        // from whichever channel produced the row first.
-        var merged = new Dictionary<string, (string Title, List<ShelfItem> Items)>(StringComparer.Ordinal);
-        var keyOrder = new List<string>();
+        // home-shelves-split-tv-movie: do NOT merge the two channels' rows. Each
+        // (category, media-type) pairing becomes its own rail so a category like
+        // "Available now" or "Action" yields a separate Movie rail and TV rail.
+        var rails = new List<RailCandidate>();
 
-        void Absorb(IReadOnlyList<CuratedRow> rows)
+        void Collect(IReadOnlyList<CuratedRow> rows, string mediaType, string typeSlug)
         {
             foreach (var row in rows)
             {
-                if (!merged.TryGetValue(row.Key, out var bucket))
-                {
-                    bucket = (row.Title, new List<ShelfItem>());
-                    merged[row.Key] = bucket;
-                    keyOrder.Add(row.Key);
-                }
-
+                var items = new List<ShelfItem>();
                 foreach (var item in row.Items)
                 {
                     var shelfItem = ToShelfItem(item);
                     if (shelfItem is not null)
                     {
-                        bucket.Items.Add(shelfItem);
+                        items.Add(shelfItem);
                     }
                 }
+
+                if (items.Count == 0)
+                {
+                    continue;
+                }
+
+                rails.Add(new RailCandidate(
+                    Key: row.Key + "::" + typeSlug,
+                    Category: row.Key,
+                    Title: row.Title,
+                    MediaType: mediaType,
+                    Items: items));
             }
         }
 
-        Absorb(movieRows);
-        Absorb(showRows);
+        Collect(movieRows, "Movie", "movie");
+        Collect(showRows, "Series", "tv");
 
-        var ordered = keyOrder
-            .Where(k => merged[k].Items.Count > 0)
-            .OrderBy(k => RowOrder.TryGetValue(k, out var o) ? o : 50)
-            .ThenBy(k => k, StringComparer.Ordinal)
-            .Select(k => new ShelfRow
+        // home-shelves-per-user-curation: rank + trim the candidate rails to the
+        // subset that best matches what this user actually watches (genre
+        // affinity × movie/TV share), bounded by config. Cold-start users get a
+        // sensible default subset from the same selector.
+        var maxRails = Math.Max(1, Plugin.Instance?.Configuration.CuratedHomeMaxRails ?? 14);
+        var profile = BuildTasteProfile(userId, ct);
+        var selected = HomeRailSelector.Select(rails, profile, maxRails, RowOrder);
+
+        var ordered = selected
+            .Select(r => new ShelfRow
             {
-                Key = k,
-                Title = merged[k].Title,
-                Items = merged[k].Items,
+                Key = r.Key,
+                Category = r.Category,
+                Title = r.Title,
+                MediaType = r.MediaType,
+                Items = r.Items,
             })
             .ToList();
 
         return Ok(new ShelvesResponse { Rows = ordered });
+    }
+
+    /// <summary>
+    /// Build the acting user's <see cref="TasteProfile"/> from a BOUNDED recent
+    /// play-history query (movies + episodes, capped by <see cref="PlayHistorySampleCap"/>,
+    /// most-recently-played first) — never an O(catalogue) scan. Movie genres come
+    /// from the item; episode genres are resolved from the parent series (bounded,
+    /// cached distinct lookups). Genre weights decay with recency and are
+    /// normalized so the top genre = 1.0. Guid.Empty / an unknown user / no
+    /// history all yield <see cref="TasteProfile.Empty"/> (cold start).
+    /// </summary>
+    private TasteProfile BuildTasteProfile(Guid userId, CancellationToken ct)
+    {
+        if (userId == Guid.Empty)
+        {
+            return TasteProfile.Empty;
+        }
+
+        var user = _userManager.GetUserById(userId);
+        if (user is null)
+        {
+            return TasteProfile.Empty;
+        }
+
+        IReadOnlyList<BaseItem> played;
+        try
+        {
+            played = _libraryManager.GetItemList(new InternalItemsQuery(user)
+            {
+                IsPlayed = true,
+                IncludeItemTypes = new[] { BaseItemKind.Movie, BaseItemKind.Episode },
+                Recursive = true,
+                Limit = PlayHistorySampleCap,
+                OrderBy = new[] { (ItemSortBy.DatePlayed, SortOrder.Descending) },
+                EnableTotalRecordCount = false,
+            }) ?? (IReadOnlyList<BaseItem>)Array.Empty<BaseItem>();
+        }
+        catch (Exception ex)
+        {
+            // A history-query failure must never break the Home screen: fall back
+            // to the cold-start default subset rather than erroring the endpoint.
+            _logger.LogWarning(ex, "taste-profile play-history query failed for user {UserId}; using cold-start default", userId);
+            return TasteProfile.Empty;
+        }
+
+        var genreRaw = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+        var seriesGenreCache = new Dictionary<Guid, string[]>();
+        int movieCount = 0;
+        int tvCount = 0;
+        var n = played.Count;
+
+        for (var i = 0; i < n; i++)
+        {
+            ct.ThrowIfCancellationRequested();
+            var item = played[i];
+
+            // Recency decay: most-recent play weighs 1.0, oldest in the sample 0.4.
+            var recency = 1.0 - (0.6 * i / Math.Max(1, n - 1));
+
+            string[] genres;
+            if (item is Episode episode)
+            {
+                tvCount++;
+                genres = ResolveSeriesGenres(episode, seriesGenreCache);
+            }
+            else
+            {
+                movieCount++;
+                genres = item.Genres ?? Array.Empty<string>();
+            }
+
+            foreach (var genre in genres)
+            {
+                if (string.IsNullOrWhiteSpace(genre))
+                {
+                    continue;
+                }
+
+                genreRaw[genre] = genreRaw.TryGetValue(genre, out var w) ? w + recency : recency;
+            }
+        }
+
+        var total = movieCount + tvCount;
+        if (total == 0)
+        {
+            return TasteProfile.Empty;
+        }
+
+        var maxWeight = genreRaw.Count > 0 ? genreRaw.Values.Max() : 0d;
+        var normalized = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+        if (maxWeight > 0)
+        {
+            foreach (var kvp in genreRaw)
+            {
+                normalized[kvp.Key] = kvp.Value / maxWeight;
+            }
+        }
+
+        var movieShare = (double)movieCount / total;
+        return new TasteProfile(normalized, movieShare, 1d - movieShare, total);
+    }
+
+    /// <summary>
+    /// Resolve an episode's genres from its parent series (episodes rarely carry
+    /// their own genres). Bounded + cached by series id so a long play history
+    /// costs at most one lookup per distinct watched series.
+    /// </summary>
+    private string[] ResolveSeriesGenres(Episode episode, Dictionary<Guid, string[]> cache)
+    {
+        var ownGenres = episode.Genres;
+        if (ownGenres is { Length: > 0 })
+        {
+            return ownGenres;
+        }
+
+        var seriesId = episode.SeriesId;
+        if (seriesId == Guid.Empty)
+        {
+            return Array.Empty<string>();
+        }
+
+        if (cache.TryGetValue(seriesId, out var cached))
+        {
+            return cached;
+        }
+
+        var genres = _libraryManager.GetItemById(seriesId)?.Genres ?? Array.Empty<string>();
+        cache[seriesId] = genres;
+        return genres;
     }
 
     /// <summary>
