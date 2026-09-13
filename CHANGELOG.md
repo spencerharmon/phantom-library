@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Availability signal Prowlarr fallback (availability-signal-prowlarr-fallback).**
+  The high-frequency availability sweep is Torrentio-only, and Torrentio returns
+  HTTP 429 for any id it cannot serve (obscure/anime/series-as-movie), which
+  mapped to an `IndeterminateTransient` outcome and looped to the 24h escalated
+  backoff — so a title Torrentio cannot serve but Prowlarr HAS (e.g. *Adventure
+  Time: Fionna & Cake*) never confirmed available and sank in the playable-first
+  sort, even though `Materialiser.ProbeAsync` (Prowlarr-backed) could find it.
+  `AvailabilityProbeWorker` now, on a Torrentio HTTP-failure transient in the
+  sweep, makes ONE bounded fall-through to the full multi-indexer probe (Prowlarr
+  included) once the item has churned past `AvailabilityProwlarrFallbackAfterAttempts`
+  (default 1) consecutive transient attempts; if that confirms the content it
+  marks the item available and caches the magnet instead of deferring. The
+  fallback is gated on a configured `ProwlarrBaseUrl`, on the Torrentio
+  HTTP-failure error-kind (not a `no_enabled_indexers` config gap), and on
+  `attempt_count`, so mainstream Torrentio-served titles (Available on their
+  first probe, never a transient) never trigger the heavy Prowlarr path. Movie
+  and episode parity. No schema change; no operator action beyond the next
+  install.
+
 - **Curated "Netflix-style" browse rows (p10-netflix-style-rows).** ROI
   Priority 10, item 3. The Phantom Movies and Phantom Shows channels now present
   their top level as multiple curated category rows instead of one flat list:

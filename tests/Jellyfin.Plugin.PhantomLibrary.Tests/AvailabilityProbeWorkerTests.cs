@@ -586,6 +586,231 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
         Assert.Equal("unknown", status);
     }
 
+    // ---- availability-signal-prowlarr-fallback: Torrentio-429 -> Prowlarr confirm ----
+    // The high-frequency availability sweep is Torrentio-only; Torrentio returns an
+    // HTTP failure (429) for any id it cannot serve, which surfaces as an
+    // IndeterminateTransient (kind indexer_partial_or_total_failure). Left alone the
+    // item loops to the escalated backoff and NEVER confirms available even when
+    // Prowlarr HAS the content. These tests exercise the bounded Prowlarr fall-through.
+
+    [Fact]
+    public async Task ProwlarrFallback_TorrentioHttpFailureButProwlarrHasIt_BecomesAvailable_Movie()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 99001000);
+        await db.SetImdbIdAsync(99001000, "movie", "tt99001000", CancellationToken.None);
+        await InsertMovieAvailabilityAsync(db, 99001000, status: "unknown", nextCheckAt: DateTimeOffset.UtcNow.AddHours(-1), priority: 0);
+        var cfg = Config();
+        cfg.ProwlarrBaseUrl = "http://prowlarr.example:9696";
+        cfg.AvailabilityProwlarrFallbackAfterAttempts = 1;
+
+        var prowlarrCandidate = new MagnetCandidate(
+            "magnet:?xt=urn:btih:" + Guid.NewGuid().ToString("N"),
+            Guid.NewGuid().ToString("N"),
+            5L * 1024 * 1024 * 1024,
+            338,
+            "Prowlarr");
+        var fallbackCalled = false;
+        var worker = BuildWorkerWithFallback(
+            db,
+            cfg,
+            availabilityProbe: (_, _, _, _, _, _, _, _) => Task.FromResult(
+                MagnetProbeResult.Transient("indexer_partial_or_total_failure", "Torrentio:transient")),
+            fullProbe: (_, _, _, _, _, _, _, _) =>
+            {
+                fallbackCalled = true;
+                return Task.FromResult(MagnetProbeResult.Available(new[] { prowlarrCandidate }));
+            });
+
+        var didWork = await InvokeProbeOneAsync(worker, cfg);
+
+        Assert.True(didWork);
+        Assert.True(fallbackCalled, "Prowlarr fallback must run for a churned Torrentio HTTP-failure transient");
+        var (status, _) = await ReadAvailabilityAsync(99001000);
+        Assert.Equal("available", status);
+        Assert.True(await db.IsMarkedUnavailableAsync(new UnavailableKey(99001000, "tt99001000", "movie", null, null), CancellationToken.None) is null);
+    }
+
+    [Fact]
+    public async Task ProwlarrFallback_TorrentioHttpFailureButProwlarrHasIt_BecomesAvailable_Episode()
+    {
+        using var db = await NewDbAsync();
+        await SeedSeriesAsync(db, 99001001);
+        await InsertEpisodeCatalogueAsync(db, 99001001, 1, 1, "2020-01-01");
+        await InsertEpisodeAvailabilityAsync(db, 99001001, 1, 1, "unknown", DateTimeOffset.UtcNow.AddHours(-1));
+        await db.SetImdbIdAsync(99001001, "series", "tt99001001", CancellationToken.None);
+        var cfg = Config();
+        cfg.ProwlarrBaseUrl = "http://prowlarr.example:9696";
+        cfg.AvailabilityProwlarrFallbackAfterAttempts = 1;
+
+        var prowlarrCandidate = new MagnetCandidate(
+            "magnet:?xt=urn:btih:" + Guid.NewGuid().ToString("N"),
+            Guid.NewGuid().ToString("N"),
+            5L * 1024 * 1024 * 1024,
+            338,
+            "Prowlarr");
+        var fallbackCalled = false;
+        var worker = BuildWorkerWithFallback(
+            db,
+            cfg,
+            availabilityProbe: (_, _, _, _, _, _, _, _) => Task.FromResult(
+                MagnetProbeResult.Transient("indexer_partial_or_total_failure", "Torrentio:transient")),
+            fullProbe: (_, _, _, _, _, _, _, _) =>
+            {
+                fallbackCalled = true;
+                return Task.FromResult(MagnetProbeResult.Available(new[] { prowlarrCandidate }));
+            });
+
+        var didWork = await InvokeProbeOneAsync(worker, cfg);
+
+        Assert.True(didWork);
+        Assert.True(fallbackCalled, "Prowlarr fallback must run for a churned Torrentio HTTP-failure transient (episode)");
+        var (status, _, _) = await ReadAvailabilityFullAsync(99001001, "episode", 1, 1);
+        Assert.Equal("available", status);
+    }
+
+    [Fact]
+    public async Task ProwlarrFallback_NeitherSourceServes_StaysUnavailable()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 99001002);
+        await db.SetImdbIdAsync(99001002, "movie", "tt99001002", CancellationToken.None);
+        await InsertMovieAvailabilityAsync(db, 99001002, status: "unknown", nextCheckAt: DateTimeOffset.UtcNow.AddHours(-1), priority: 0);
+        var cfg = Config();
+        cfg.ProwlarrBaseUrl = "http://prowlarr.example:9696";
+        cfg.AvailabilityProwlarrFallbackAfterAttempts = 1;
+
+        var worker = BuildWorkerWithFallback(
+            db,
+            cfg,
+            availabilityProbe: (_, _, _, _, _, _, _, _) => Task.FromResult(
+                MagnetProbeResult.Transient("indexer_partial_or_total_failure", "Torrentio:transient")),
+            fullProbe: (_, _, _, _, _, _, _, _) => Task.FromResult(MagnetProbeResult.DefinitiveUnavailable()));
+
+        var didWork = await InvokeProbeOneAsync(worker, cfg);
+
+        Assert.True(didWork);
+        var (status, _) = await ReadAvailabilityAsync(99001002);
+        Assert.Equal("unavailable", status);
+    }
+
+    [Fact]
+    public async Task ProwlarrFallback_MainstreamTorrentioServed_NeverRunsHeavyPath()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 99001003);
+        await db.SetImdbIdAsync(99001003, "movie", "tt99001003", CancellationToken.None);
+        await InsertMovieAvailabilityAsync(db, 99001003, status: "unknown", nextCheckAt: DateTimeOffset.UtcNow.AddHours(-1), priority: 0);
+        var cfg = Config();
+        cfg.ProwlarrBaseUrl = "http://prowlarr.example:9696";
+        cfg.AvailabilityProwlarrFallbackAfterAttempts = 1;
+
+        var torrentioCandidate = new MagnetCandidate(
+            "magnet:?xt=urn:btih:" + Guid.NewGuid().ToString("N"),
+            Guid.NewGuid().ToString("N"),
+            5L * 1024 * 1024 * 1024,
+            120,
+            "Torrentio");
+        var fallbackCalled = false;
+        var worker = BuildWorkerWithFallback(
+            db,
+            cfg,
+            availabilityProbe: (_, _, _, _, _, _, _, _) => Task.FromResult(
+                MagnetProbeResult.Available(new[] { torrentioCandidate })),
+            fullProbe: (_, _, _, _, _, _, _, _) =>
+            {
+                fallbackCalled = true;
+                return Task.FromResult(MagnetProbeResult.DefinitiveUnavailable());
+            });
+
+        var didWork = await InvokeProbeOneAsync(worker, cfg);
+
+        Assert.True(didWork);
+        Assert.False(fallbackCalled, "the heavy Prowlarr path must NOT run for a mainstream Torrentio-served title");
+        var (status, _) = await ReadAvailabilityAsync(99001003);
+        Assert.Equal("available", status);
+    }
+
+    [Fact]
+    public async Task ProwlarrFallback_Disabled_WhenNoProwlarrConfigured_DefersTransient()
+    {
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 99001004);
+        await db.SetImdbIdAsync(99001004, "movie", "tt99001004", CancellationToken.None);
+        await InsertMovieAvailabilityAsync(db, 99001004, status: "unknown", nextCheckAt: DateTimeOffset.UtcNow.AddHours(-1), priority: 0);
+        var cfg = Config();
+        cfg.ProwlarrBaseUrl = string.Empty;
+        cfg.AvailabilityProwlarrFallbackAfterAttempts = 1;
+
+        var fallbackCalled = false;
+        var worker = BuildWorkerWithFallback(
+            db,
+            cfg,
+            availabilityProbe: (_, _, _, _, _, _, _, _) => Task.FromResult(
+                MagnetProbeResult.Transient("indexer_partial_or_total_failure", "Torrentio:transient")),
+            fullProbe: (_, _, _, _, _, _, _, _) =>
+            {
+                fallbackCalled = true;
+                return Task.FromResult(MagnetProbeResult.Available(Array.Empty<MagnetCandidate>()));
+            });
+
+        var didWork = await InvokeProbeOneAsync(worker, cfg);
+
+        Assert.True(didWork);
+        Assert.False(fallbackCalled, "no Prowlarr configured -> no fall-through");
+        var (status, error) = await ReadAvailabilityAsync(99001004);
+        Assert.Equal("unknown", status);
+        Assert.Equal("indexer_partial_or_total_failure", error);
+    }
+
+    [Fact]
+    public void ShouldProwlarrFallback_GateMatrix()
+    {
+        var baseCfg = Config();
+        baseCfg.ProwlarrBaseUrl = "http://prowlarr.example:9696";
+        baseCfg.AvailabilityProwlarrFallbackAfterAttempts = 1;
+        var httpFail = MagnetProbeResult.Transient("indexer_partial_or_total_failure", "t");
+        var noIndexers = MagnetProbeResult.Transient("no_enabled_indexers", "t");
+        AvailabilityItemRow Row(int attempts) => new(
+            1, "movie", -1, -1, "unknown", null, DateTimeOffset.UtcNow, null, null, null, null, null, null, 0, null, attempts);
+
+        Assert.True(AvailabilityProbeWorker.ShouldProwlarrFallback(baseCfg, Row(1), httpFail));
+        Assert.False(AvailabilityProbeWorker.ShouldProwlarrFallback(baseCfg, Row(0), httpFail));
+        Assert.False(AvailabilityProbeWorker.ShouldProwlarrFallback(baseCfg, Row(3), noIndexers));
+
+        var noProwlarr = Config();
+        noProwlarr.AvailabilityProwlarrFallbackAfterAttempts = 1;
+        Assert.False(AvailabilityProbeWorker.ShouldProwlarrFallback(noProwlarr, Row(3), httpFail));
+
+        var off = Config();
+        off.ProwlarrBaseUrl = "http://prowlarr.example:9696";
+        off.AvailabilityProwlarrFallbackAfterAttempts = 0;
+        Assert.False(AvailabilityProbeWorker.ShouldProwlarrFallback(off, Row(3), httpFail));
+    }
+
+    private static AvailabilityProbeWorker BuildWorkerWithFallback(
+        PhantomDb db,
+        PluginConfiguration cfg,
+        AvailabilityProbeWorker.ProbeDelegate availabilityProbe,
+        AvailabilityProbeWorker.ProbeDelegate fullProbe)
+    {
+        var tmdb = new Mock<ITmdbClient>(MockBehavior.Loose).Object;
+        var externalIds = new TmdbExternalIdResolver(db, tmdb, NullLogger<TmdbExternalIdResolver>.Instance);
+        var scorer = new QualityScorer(NullLogger<QualityScorer>.Instance);
+        var selector = new MagnetSelector(new[] { new EmptyIndexer() }, scorer, NullLogger<MagnetSelector>.Instance, () => cfg);
+        var worker = new AvailabilityProbeWorker(
+            db,
+            selector,
+            externalIds,
+            tmdb,
+            new ChannelStateProvider(db),
+            NullLogger<AvailabilityProbeWorker>.Instance,
+            () => cfg,
+            availabilityProbe);
+        worker.SetProwlarrFallbackProbe(fullProbe);
+        return worker;
+    }
+
     private async Task<PhantomDb> NewDbAsync()
     {
         var db = new PhantomDb(_dbPath);

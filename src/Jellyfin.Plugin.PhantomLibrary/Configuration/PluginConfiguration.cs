@@ -106,6 +106,7 @@ public class PluginConfiguration : BasePluginConfiguration
         AvailabilityYieldToUserSeconds = 20;
         AvailabilityTransientMaxAttempts = 8;
         AvailabilityTransientEscalatedRetryHours = 24;
+        AvailabilityProwlarrFallbackAfterAttempts = 1;
         SeriesExpansionTtlDays = 7;
         SeriesExpansionTransientRetryMinutes = 60;
         EpisodeReleaseDelayHours = 12;
@@ -485,6 +486,27 @@ public class PluginConfiguration : BasePluginConfiguration
     /// than looping on the short interval forever.
     /// </summary>
     public int AvailabilityTransientEscalatedRetryHours { get; set; }
+
+    /// <summary>
+    /// Availability-signal Prowlarr fallback (availability-signal-prowlarr-fallback):
+    /// the high-frequency availability sweep is Torrentio-only, and Torrentio
+    /// returns an HTTP failure (429) for any id it cannot serve. Left alone
+    /// that maps to an IndeterminateTransient outcome and loops to the long
+    /// escalated backoff, so a title Torrentio cannot serve but Prowlarr HAS
+    /// (obscure/anime/series-as-movie) never confirms available and sinks in
+    /// the playable-first sort. When enabled (a Prowlarr base URL is
+    /// configured) and an item's consecutive-transient <c>attempt_count</c>
+    /// reaches this threshold on a Torrentio HTTP-failure transient, the sweep
+    /// makes ONE bounded fall-through to the full multi-indexer probe (which
+    /// includes Prowlarr) to confirm availability + cache the magnet, instead
+    /// of deferring again. Gating on attempt_count keeps mainstream
+    /// Torrentio-served titles (which resolve on their first probe) off the
+    /// heavy path entirely. Default 1: the fallback is considered starting
+    /// from the first re-probe after an initial Torrentio HTTP failure, but a
+    /// title Torrentio serves cleanly never reaches a transient at all so
+    /// never triggers it. Set to 0 to disable the fallback.
+    /// </summary>
+    public int AvailabilityProwlarrFallbackAfterAttempts { get; set; }
 
     /// <summary>TTL for TV series expansion passes.</summary>
     public int SeriesExpansionTtlDays { get; set; }

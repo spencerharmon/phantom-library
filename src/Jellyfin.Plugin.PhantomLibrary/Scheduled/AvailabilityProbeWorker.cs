@@ -32,6 +32,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
     private readonly ILogger<AvailabilityProbeWorker> _logger;
     private readonly Func<PluginConfiguration> _configProvider;
     private readonly ProbeDelegate _probe;
+    private ProbeDelegate _probeFull;
     private readonly string _owner = $"availability-{Environment.MachineName}-{Guid.NewGuid():N}";
     private Timer? _timer;
     private CancellationTokenSource? _stopping;
@@ -95,7 +96,23 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _configProvider = configProvider ?? throw new ArgumentNullException(nameof(configProvider));
         _probe = probe ?? _selector.ProbeAvailabilityAsync;
+
+        // availability-signal-prowlarr-fallback: the FULL multi-indexer probe
+        // (Prowlarr included) used as the bounded fall-through when the
+        // Torrentio-only availability oracle returns an HTTP-failure transient.
+        // When a synthetic availability-probe is injected for tests, mirror it
+        // as the full probe too unless a distinct one is supplied — the test
+        // seam wires _probeFull explicitly via the internal setter below.
+        _probeFull = _selector.ProbeAsync;
     }
+
+    /// <summary>
+    /// Test seam: overrides the FULL multi-indexer probe used by the Prowlarr
+    /// fallback path (availability-signal-prowlarr-fallback) so a test can
+    /// assert the fallback confirms availability without a live Prowlarr.
+    /// </summary>
+    internal void SetProwlarrFallbackProbe(ProbeDelegate probeFull)
+        => _probeFull = probeFull ?? throw new ArgumentNullException(nameof(probeFull));
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
@@ -322,53 +339,8 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
             {
                 case MagnetProbeOutcome.Available:
                     {
-                        await _db.UpsertSourceCandidatesAsync(
-                            lease.TmdbId,
-                            lease.Type,
-                            lease.Season,
-                            lease.Episode,
-                            cfg.SourcePickerPreset,
-                            probe.Candidates,
-                            "availability_probe",
-                            TimeSpan.FromHours(Math.Max(1, cfg.MagnetCacheTtlHours)),
-                            ct).ConfigureAwait(false);
+                        await MarkAvailableAsync(cfg, lease, imdb, probe.Candidates, now, policyHash, ct).ConfigureAwait(false);
                         var picked = probe.Candidates[0];
-                        var entry = new MagnetCacheEntry
-                        {
-                            Magnet = picked.Magnet,
-                            InfoHash = picked.InfoHash,
-                            Size = picked.Size,
-                            Seeders = picked.Seeders,
-                            Indexer = picked.Indexer,
-                            CachedAt = now,
-                            Ttl = TimeSpan.FromHours(Math.Max(1, cfg.MagnetCacheTtlHours)),
-                            Source = "availability",
-                        };
-                        var magnetKey = new MagnetCacheKey(lease.TmdbId, imdb, lease.Type,
-                            lease.Type == "episode" ? lease.Season : null,
-                            lease.Type == "episode" ? lease.Episode : null,
-                            cfg.SourcePickerPreset);
-                        await _db.PutCachedMagnetAsync(magnetKey, entry, ct).ConfigureAwait(false);
-                        await _db.DeleteUnavailableAsync(
-                            new UnavailableKey(lease.TmdbId, imdb, lease.Type,
-                                lease.Type == "episode" ? lease.Season : null,
-                                lease.Type == "episode" ? lease.Episode : null),
-                            ct).ConfigureAwait(false);
-                        await _db.CompleteAvailabilityProbeAsync(
-                            lease,
-                            "available",
-                            now,
-                            now.AddDays(Math.Max(1, cfg.AvailabilityAvailableTtlDays)),
-                            policyHash,
-                            entry,
-                            null,
-                            null,
-                            ct).ConfigureAwait(false);
-                        if (lease.Status != "available")
-                        {
-                            BumpFor(lease.Type);
-                        }
-
                         PhantomMetrics.AvailabilityProbe(lease.Type, "available");
                         _logger.LogInformation("Availability available {Type}/{Tmdb} s{Season}e{Episode} via {Indexer}", lease.Type, lease.TmdbId, lease.Season, lease.Episode, picked.Indexer);
                         return true;
@@ -395,6 +367,71 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
                     return true;
 
                 case MagnetProbeOutcome.IndeterminateTransient:
+                    // availability-signal-prowlarr-fallback: a Torrentio HTTP
+                    // failure (429 for an id it cannot serve) surfaces here as
+                    // an IndeterminateTransient. Left alone the item loops to
+                    // the escalated long backoff and NEVER confirms available,
+                    // even when Prowlarr HAS the content. On such a transient,
+                    // once the item has churned at least
+                    // AvailabilityProwlarrFallbackAfterAttempts consecutive
+                    // transient attempts (so mainstream Torrentio-served titles
+                    // — which resolve on their first probe and never reach a
+                    // transient — never trigger the heavy path), make ONE
+                    // bounded fall-through to the full multi-indexer probe
+                    // (which includes Prowlarr) to confirm availability and
+                    // cache the magnet.
+                    if (ShouldProwlarrFallback(cfg, lease, probe))
+                    {
+                        var fallback = await _probeFull(
+                            lease.TmdbId,
+                            imdb,
+                            lease.Type,
+                            lease.Type == "episode" ? lease.Season : null,
+                            lease.Type == "episode" ? lease.Episode : null,
+                            meta.Title,
+                            meta.Year,
+                            ct).ConfigureAwait(false);
+                        if (fallback.Outcome == MagnetProbeOutcome.Available && fallback.Candidates.Count > 0)
+                        {
+                            await MarkAvailableAsync(cfg, lease, imdb, fallback.Candidates, now, policyHash, ct).ConfigureAwait(false);
+                            PhantomMetrics.AvailabilityProbe(lease.Type, "available_prowlarr_fallback");
+                            _logger.LogInformation(
+                                "Availability confirmed via Prowlarr fallback {Type}/{Tmdb} s{Season}e{Episode} via {Indexer} (Torrentio transient {Kind})",
+                                lease.Type, lease.TmdbId, lease.Season, lease.Episode, fallback.Candidates[0].Indexer, probe.ErrorKind);
+                            return true;
+                        }
+
+                        if (fallback.Outcome == MagnetProbeOutcome.DefinitiveUnavailable)
+                        {
+                            await _db.CompleteAvailabilityProbeAsync(
+                                lease,
+                                "unavailable",
+                                now,
+                                now.AddDays(Math.Max(1, cfg.AvailabilityUnavailableTtlDays)),
+                                policyHash,
+                                candidate: null,
+                                errorKind: null,
+                                errorMessage: null,
+                                ct).ConfigureAwait(false);
+                            if (lease.Status == "available")
+                            {
+                                BumpFor(lease.Type);
+                            }
+
+                            PhantomMetrics.AvailabilityProbe(lease.Type, "unavailable");
+                            _logger.LogInformation(
+                                "Availability unavailable (Prowlarr fallback confirmed neither source serves) {Type}/{Tmdb} s{Season}e{Episode}",
+                                lease.Type, lease.TmdbId, lease.Season, lease.Episode);
+                            return true;
+                        }
+
+                        // Prowlarr fallback itself was transient/no-capable: fall
+                        // through to the ordinary transient reschedule below.
+                        _logger.LogInformation(
+                            "Prowlarr fallback did not resolve {Type}/{Tmdb} s{Season}e{Episode} (outcome {Outcome}); rescheduling transient",
+                            lease.Type, lease.TmdbId, lease.Season, lease.Episode, fallback.Outcome);
+                    }
+
                     await _db.RescheduleAvailabilityTransientAsync(
                         lease,
                         ComputeTransientRetryAt(cfg, lease, now),
@@ -570,6 +607,103 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
 
         return now.AddMinutes(Math.Max(1, cfg.AvailabilityTransientRetryMinutes));
     }
+
+    private async Task MarkAvailableAsync(
+        PluginConfiguration cfg,
+        AvailabilityItemRow lease,
+        string? imdb,
+        IReadOnlyList<MagnetCandidate> candidates,
+        DateTimeOffset now,
+        string policyHash,
+        CancellationToken ct)
+    {
+        await _db.UpsertSourceCandidatesAsync(
+            lease.TmdbId,
+            lease.Type,
+            lease.Season,
+            lease.Episode,
+            cfg.SourcePickerPreset,
+            candidates,
+            "availability_probe",
+            TimeSpan.FromHours(Math.Max(1, cfg.MagnetCacheTtlHours)),
+            ct).ConfigureAwait(false);
+        var picked = candidates[0];
+        var entry = new MagnetCacheEntry
+        {
+            Magnet = picked.Magnet,
+            InfoHash = picked.InfoHash,
+            Size = picked.Size,
+            Seeders = picked.Seeders,
+            Indexer = picked.Indexer,
+            CachedAt = now,
+            Ttl = TimeSpan.FromHours(Math.Max(1, cfg.MagnetCacheTtlHours)),
+            Source = "availability",
+        };
+        var magnetKey = new MagnetCacheKey(lease.TmdbId, imdb, lease.Type,
+            lease.Type == "episode" ? lease.Season : null,
+            lease.Type == "episode" ? lease.Episode : null,
+            cfg.SourcePickerPreset);
+        await _db.PutCachedMagnetAsync(magnetKey, entry, ct).ConfigureAwait(false);
+        await _db.DeleteUnavailableAsync(
+            new UnavailableKey(lease.TmdbId, imdb, lease.Type,
+                lease.Type == "episode" ? lease.Season : null,
+                lease.Type == "episode" ? lease.Episode : null),
+            ct).ConfigureAwait(false);
+        await _db.CompleteAvailabilityProbeAsync(
+            lease,
+            "available",
+            now,
+            now.AddDays(Math.Max(1, cfg.AvailabilityAvailableTtlDays)),
+            policyHash,
+            entry,
+            null,
+            null,
+            ct).ConfigureAwait(false);
+        if (lease.Status != "available")
+        {
+            BumpFor(lease.Type);
+        }
+    }
+
+    /// <summary>
+    /// availability-signal-prowlarr-fallback: decides whether a Torrentio-only
+    /// IndeterminateTransient outcome warrants ONE bounded fall-through to the
+    /// full Prowlarr-backed probe. Gated so the heavy path stays rare:
+    /// (1) the fallback is enabled (a Prowlarr base URL is configured and the
+    /// after-attempts knob &gt; 0); (2) the transient is a Torrentio HTTP/indexer
+    /// FAILURE (the 429-for-an-unknown-id shape), not a "no enabled indexers"
+    /// configuration gap; (3) the item has churned at least the configured
+    /// number of consecutive transient attempts — mainstream titles Torrentio
+    /// serves on their first probe never reach a transient, so never trigger it.
+    /// </summary>
+    internal static bool ShouldProwlarrFallback(PluginConfiguration cfg, AvailabilityItemRow lease, MagnetProbeResult probe)
+    {
+        if (cfg.AvailabilityProwlarrFallbackAfterAttempts <= 0
+            || string.IsNullOrWhiteSpace(cfg.ProwlarrBaseUrl))
+        {
+            return false;
+        }
+
+        if (!IsTorrentioHttpFailure(probe.ErrorKind))
+        {
+            return false;
+        }
+
+        return lease.AttemptCount >= cfg.AvailabilityProwlarrFallbackAfterAttempts;
+    }
+
+    /// <summary>
+    /// Classifies an availability-oracle (Torrentio) transient error-kind as an
+    /// HTTP/indexer FAILURE (the 429-for-an-unknown-id or timeout shape) that
+    /// Prowlarr may still be able to serve, as opposed to a "no enabled
+    /// indexers" configuration gap. The failure kinds are produced by
+    /// <see cref="Sources.MagnetSelector"/>:
+    /// <c>indexer_partial_or_total_failure</c> and
+    /// <c>indexer_partial_failure_all_candidates_rejected</c>.
+    /// </summary>
+    internal static bool IsTorrentioHttpFailure(string? errorKind)
+        => errorKind is "indexer_partial_or_total_failure"
+            or "indexer_partial_failure_all_candidates_rejected";
 
     private void BumpFor(string type)
     {
