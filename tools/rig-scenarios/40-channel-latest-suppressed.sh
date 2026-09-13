@@ -1,16 +1,25 @@
 #!/usr/bin/env bash
-# Regression test: the Home "Latest in Phantom <X>" rows must not deep-enumerate
-# the phantom channels. Phantom channels intentionally do NOT implement
-# ISupportsLatestMedia (operator decision 2026-06-28, Option 3), so
-# GET /Users/{uid}/Items/Latest?ParentId=<phantomChannel> short-circuits in
-# Jellyfin core's GetLatestChannelItemsInternal to an empty result instantly.
+# Regression test: the Home "Latest in Phantom <X>" rows must populate FAST
+# (bounded, O(recent)) and must NOT deep-enumerate the phantom channels.
 #
-# Catches the 2026-06-28 regression where implementing ISupportsLatestMedia made
-# RefreshLatestChannelItems call the channel's full GetChannelItems
-# (series -> season -> build) on every Home load, hanging the Home screen on
-# every client (web AND Xbox/native) for seconds-to-minutes on production data.
+# restore-latest-row-and-drop-folders (task) reversed the 2026-06-28 Option-3
+# decision this scenario originally guarded (phantom channels used to NOT
+# implement ISupportsLatestMedia at all, so Users/{uid}/Items/Latest?ParentId=
+# always came back empty). The channels now implement ISupportsLatestMedia +
+# GetLatestMedia again, backed by an O(recent) materialised_state-only query
+# (never the full orphan-enumerating, TMDB-calling catalogue build) — see
+# PhantomMoviesChannel/PhantomShowsChannel's BuildLatestMovieItemsAsync /
+# BuildLatestEpisodeItemsAsync. This scenario now asserts the Users/{uid}/
+# Items/Latest?ParentId=<phantomChannel> surface (the per-parent Home "Latest"
+# widget — a different endpoint than /Channels/Items/Latest, which
+# tools/rig-scenarios/50-latest-media-home-load.sh covers) returns the seeded
+# materialised item FAST, for both channels (movie/TV parity).
 #
-# Movie/TV parity: asserts both Phantom Movies and Phantom Shows channels.
+# Catches a regression on EITHER side: (a) the Latest row silently going
+# empty again (Option-3 style suppression creeping back in), or (b) the old
+# 2026-06-28 hang reappearing (RefreshLatestChannelItems deep-enumerating the
+# whole channel on every Home load) — both are asserted via the same bounded
+# timeout + non-empty-result check.
 set -euo pipefail
 
 ROOT=${PHANTOM_REPO_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}
@@ -24,7 +33,8 @@ PLUGIN_DIR=$JF_DATA/plugins/Jellyfin.Plugin.PhantomLibrary_$PLUGIN_VERSION
 DLL=$ROOT/src/Jellyfin.Plugin.PhantomLibrary/bin/Release/net9.0/Jellyfin.Plugin.PhantomLibrary.dll
 JF_DLL=$ROOT/jellyfin/Jellyfin.Server/bin/Release/net9.0/jellyfin.dll
 PLUGIN_CFG=${PHANTOM_PLUGIN_CONFIG:-/var/lib/jellyfin/plugins/configurations/Jellyfin.Plugin.PhantomLibrary.xml}
-# Suppressed Latest returns instantly; pre-fix it hung for seconds-to-minutes.
+# O(recent) Latest returns fast; the old O(catalogue) deep-enumeration hung
+# for seconds-to-minutes on production-shaped data.
 LATEST_MAX_SECONDS=${PHANTOM_LATEST_MAX_SECONDS:-3}
 LOG_FILE=/tmp/phantom-channel-latest-suppressed.log
 
@@ -101,27 +111,50 @@ PHM=$(python3 -c 'import json;print(next(i["Id"] for i in json.load(open("/tmp/l
 PHS=$(python3 -c 'import json;print(next(i["Id"] for i in json.load(open("/tmp/latest-channels.json"))["Items"] if i["Name"]=="Phantom Shows"))')
 echo "  user=$JUID movies=$PHM shows=$PHS"
 
-echo '[4] /Items/Latest per phantom channel must be fast + empty (suppressed)'
+echo '[3.5] seed one materialised movie + episode so the Latest row has something to return'
+PHDB="$JF_DATA/plugins/configurations/PhantomLibrary/phantom.db"
+now=$(date +%s)
+touch "$RIG/tmp/latest40-movie.mkv" "$RIG/tmp/latest40-episode.mkv"
+sqlite3 "$PHDB" "INSERT OR REPLACE INTO tmdb_metadata
+    (tmdb_id,type,title,year,overview,poster_url,backdrop_url,genres_json,original_title,community_rating,fetched_at,runtime_minutes)
+  VALUES (99400001,'movie','Latest40 Movie',2026,'ov','','','[]','Latest40 Movie',7.0,$now,100);"
+sqlite3 "$PHDB" "INSERT OR REPLACE INTO tmdb_metadata
+    (tmdb_id,type,title,year,overview,poster_url,backdrop_url,genres_json,original_title,community_rating,fetched_at,runtime_minutes)
+  VALUES (99400002,'series','Latest40 Series',2026,'ov','','','[]','Latest40 Series',7.0,$now,null);"
+sqlite3 "$PHDB" "INSERT OR REPLACE INTO tmdb_episode_cache
+    (series_tmdb_id,season,episode,title,overview,still_url,air_date,runtime_minutes,fetched_at)
+  VALUES (99400002,1,1,'Latest40 Pilot','ov','','2026-01-01',30,$now);"
+sqlite3 "$PHDB" "INSERT OR REPLACE INTO materialised_state
+    (tmdb_id,type,season,episode,stub_path,fuse_path,materialised_at)
+  VALUES (99400001,'movie',-1,-1,'/stub/latest40-movie.mkv','$RIG/tmp/latest40-movie.mkv',$now);"
+sqlite3 "$PHDB" "INSERT OR REPLACE INTO materialised_state
+    (tmdb_id,type,season,episode,stub_path,fuse_path,materialised_at)
+  VALUES (99400002,'episode',1,1,'/stub/latest40-episode.mkv','$RIG/tmp/latest40-episode.mkv',$now);"
+
+echo '[4] /Items/Latest per phantom channel must be fast AND populated (O(recent), not suppressed, not O(catalogue))'
 check_latest() {
-  local label=$1 pid=$2 out=/tmp/latest-$1.json meta=/tmp/latest-$1.meta code time
+  local label=$1 pid=$2 expect_name=$3 out=/tmp/latest-$1.json meta=/tmp/latest-$1.meta code time
   curl -sS --max-time "$((LATEST_MAX_SECONDS + 30))" -H "X-Emby-Token: $TOK" \
     "$API/Users/$JUID/Items/Latest?ParentId=$pid&Limit=16&Fields=PrimaryImageAspectRatio" \
-    -o "$out" -w '%{http_code} %{time_total}' > "$meta" || fail "$label Latest request failed (likely still deep-enumerating -> ISupportsLatestMedia re-added?)"
+    -o "$out" -w '%{http_code} %{time_total}' > "$meta" || fail "$label Latest request failed"
   code=$(cut -d' ' -f1 "$meta"); time=$(cut -d' ' -f2 "$meta")
   echo "  $label http=$code time=${time}s budget=${LATEST_MAX_SECONDS}s bytes=$(wc -c < "$out" 2>/dev/null || echo 0)"
   [ "$code" = 200 ] || fail "$label Latest HTTP $code"
-  python3 -c "import sys;t=$time;m=$LATEST_MAX_SECONDS;sys.exit(f'$label Latest exceeded budget: {t}s > {m}s (channel still being deep-enumerated -> ISupportsLatestMedia re-added?)' if t>m else 0)"
-  python3 - "$out" "$label" <<'PY'
+  python3 -c "import sys;t=$time;m=$LATEST_MAX_SECONDS;sys.exit(f'$label Latest exceeded budget: {t}s > {m}s (O(catalogue) deep-enumeration regression)' if t>m else 0)"
+  python3 - "$out" "$label" "$expect_name" <<'PY'
 import json,sys
-path,label=sys.argv[1],sys.argv[2]
+path,label,expect=sys.argv[1],sys.argv[2],sys.argv[3]
 d=json.load(open(path))
 items=d if isinstance(d,list) else d.get('Items',[])
-if items:
-    sys.exit(f'{label} Latest must be empty (phantom channels suppressed from Latest) but returned {len(items)} items')
-print(f'  {label} suppressed OK (0 items)')
+names=[i.get('Name') for i in items]
+if not items:
+    sys.exit(f'{label} Latest must be POPULATED (ISupportsLatestMedia restored) but returned 0 items')
+if not any(expect in (n or '') for n in names):
+    sys.exit(f'{label} Latest missing expected seeded title {expect!r}: {names}')
+print(f'  {label} Latest populated OK ({len(items)} items, includes {expect!r})')
 PY
 }
-check_latest movies "$PHM"
-check_latest shows "$PHS"
+check_latest movies "$PHM" "Latest40 Movie"
+check_latest shows "$PHS" "Latest40 Pilot"
 
-echo 'CHANNEL_LATEST_SUPPRESSED_OK'
+echo 'CHANNEL_LATEST_POPULATED_OK'

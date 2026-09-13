@@ -42,7 +42,7 @@ namespace Jellyfin.Plugin.PhantomLibrary.Channels;
 /// filtered result is never served to another.
 /// </summary>
 public sealed class PhantomMoviesChannel
-    : IChannel, IChannelItemRefresh, ISupportsMediaProbe, IHasCacheKey
+    : IChannel, IChannelItemRefresh, ISupportsMediaProbe, IHasCacheKey, ISupportsLatestMedia
 {
     private readonly PhantomDb _db;
     private readonly GostreamFilesystemEnumerator _enumerator;
@@ -159,22 +159,14 @@ public sealed class PhantomMoviesChannel
             return await GetSearchSyncItemsAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        var config = _configProvider();
-
-        // p10-netflix-style-rows: curated-row dispatch. A row folder was emitted
-        // at the root (below) as a category folder; opening it re-derives that
-        // one row's members from the same bounded flat list.
-        if (config.CuratedRowsEnabled
-            && CuratedRows.TryParseRowFolderId(query.FolderId, RowChannelScope, out var rowKey))
-        {
-            var rowItems = await BuildFlatMovieItemsAsync(query.UserId, cancellationToken).ConfigureAwait(false);
-            var rows = BuildCuratedRows(rowItems, config);
-            var row = CuratedRows.Find(rows, rowKey);
-            var items = row?.Items ?? (IReadOnlyList<ChannelItemInfo>)Array.Empty<ChannelItemInfo>();
-            return new ChannelItemResult { Items = items.ToList(), TotalRecordCount = items.Count };
-        }
-
-        // Movies channel is otherwise flat: no folder navigation.
+        // restore-latest-row-and-drop-folders: category FOLDERS are gone.
+        // Previously CuratedRowsEnabled emitted/handled clickable curated-row
+        // category FOLDER tiles here (opening one re-derived that row's
+        // members). Vanilla jellyfin-web renders such a tile as a plain folder,
+        // never a Netflix-style horizontal shelf — pure operator-rejected UX.
+        // The curated categories now surface ONLY as Home-screen shelves via
+        // PhantomLibraryShelvesController (BuildShelfRowsAsync); the channel
+        // itself is flat with no folder navigation.
         if (!string.IsNullOrEmpty(query.FolderId))
         {
             return new ChannelItemResult
@@ -182,6 +174,22 @@ public sealed class PhantomMoviesChannel
                 Items = Array.Empty<ChannelItemInfo>(),
                 TotalRecordCount = 0,
             };
+        }
+
+        // restore-latest-row-and-drop-folders: Guid.Empty + no FolderId is
+        // exactly the shape core's ChannelManager.RefreshLatestChannelItems
+        // issues to populate the Home "Latest in Phantom Movies" row (see
+        // GetLatestMedia below) — it never sets InternalItemsQuery.User, so the
+        // InternalChannelItemQuery reaching us has UserId=Guid.Empty; a real
+        // interactive Home/browse load always carries the authenticated user's
+        // id. Keep this path O(recent): a bounded materialised_state read, never
+        // the full orphan-enumerating, TMDB-calling BuildFlatMovieItemsAsync
+        // build — that O(catalogue) cost on every Home load, for every client,
+        // is exactly what forced ISupportsLatestMedia off in the first place.
+        if (query.UserId == Guid.Empty)
+        {
+            var latest = await BuildLatestMovieItemsAsync(cancellationToken).ConfigureAwait(false);
+            return new ChannelItemResult { Items = latest, TotalRecordCount = latest.Count };
         }
 
         var flatItems = await BuildFlatMovieItemsAsync(query.UserId, cancellationToken).ConfigureAwait(false);
@@ -222,8 +230,57 @@ public sealed class PhantomMoviesChannel
         return BuildCuratedRows(flatItems, config);
     }
 
-    /// <summary>The row-FolderId channel scope for this channel (see <see cref="CuratedRows"/>).</summary>
-    private const string RowChannelScope = "movies";
+    /// <summary>
+    /// Cap on the number of items <see cref="BuildLatestMovieItemsAsync"/> /
+    /// <see cref="GetLatestMedia"/> return — keeps the Home "Latest in Phantom
+    /// Movies" row bounded even if the materialised set grows large.
+    /// </summary>
+    private const int LatestItemLimit = 20;
+
+    /// <summary>
+    /// restore-latest-row-and-drop-folders: the O(recent) fast-path body.
+    /// Reads only <c>materialised_state</c> (already indexed/ordered by
+    /// <c>materialised_at DESC</c> — see <see cref="PhantomDb.ListMaterialisedStateAsync"/>)
+    /// and the already-cached <c>tmdb_metadata</c> row per hit — no gostream
+    /// FUSE-mount orphan enumeration, no TMDB network calls. Bounded by
+    /// <see cref="LatestItemLimit"/> regardless of catalogue size. Every
+    /// returned item is <see cref="ChannelItemType.Media"/> (never a Folder),
+    /// so core's per-folder recursion in RefreshLatestChannelItems has nothing
+    /// to recurse into.
+    /// </summary>
+    private async Task<List<ChannelItemInfo>> BuildLatestMovieItemsAsync(CancellationToken ct)
+    {
+        using var flowScope = PhantomFlowMetrics.Time(PhantomFlowMetrics.FlowMaterialisedListing, _db.Backend);
+        var recent = await _db.ListMaterialisedStateAsync("movie", ct).ConfigureAwait(false);
+        var items = new List<ChannelItemInfo>();
+        foreach (var state in recent.Take(LatestItemLimit))
+        {
+            ct.ThrowIfCancellationRequested();
+            var meta = await _db.GetTmdbMetadataAsync(state.TmdbId, "movie", ct).ConfigureAwait(false);
+            if (meta is null)
+            {
+                continue;
+            }
+
+            var materialisedPath = GostreamPathResolver.ResolveMoviePath(state.FusePath);
+            var sources = new List<MediaSourceInfo>();
+            var tags = new List<string>();
+            if (File.Exists(materialisedPath))
+            {
+                sources.Add(await FuseMediaSourceAsync(materialisedPath, ct).ConfigureAwait(false));
+            }
+            else
+            {
+                sources.Add(PhantomMaterialisingMediaSourceProvider.CreateOpeningMediaSource(ChannelItemId.ForMovie(state.TmdbId), prefixedToken: true));
+                tags.Add("phantom");
+            }
+
+            items.Add(BuildMovieItemFromMetadata(meta, sources, tags));
+        }
+
+        flowScope.ItemCount = items.Count;
+        return items;
+    }
 
     /// <summary>
     /// p10-netflix-style-rows: categorise the built flat list into curated rows.
@@ -497,22 +554,21 @@ public sealed class PhantomMoviesChannel
     }
 
     /// <inheritdoc />
-    // ISupportsLatestMedia / GetLatestMedia deliberately removed (operator
-    // decision, 2026-06-28). Jellyfin core's RefreshLatestChannelItems ignores
-    // GetLatestMedia and instead deep-enumerates the whole channel via
-    // GetChannelItems (series -> season -> build) to populate the Home "Latest
-    // in Phantom Movies" row. On production-shaped data that enumeration runs
-    // for seconds-to-minutes on every Home load, on every client (the spinner
-    // never clears). Dropping ISupportsLatestMedia makes
-    // GetLatestChannelItemsInternal short-circuit to an empty result instantly
-    // (ChannelManager.cs: GetAllChannels().Where(i => i is ISupportsLatestMedia)).
-    //
-    // Tradeoff: the "Latest in Phantom Movies" Home row is gone for now.
-    // TODO(operator-approved): restore the Latest row cheaply (Option 2) by
-    // making the latest-refresh root enumeration O(latest) instead of
-    // O(catalogue) -- e.g. a cheap GetChannelItems fast-path for the
-    // refresh-root query backed by materialised_state -- then re-add
-    // ISupportsLatestMedia. Tracked in PLAN.md "Deferred".
+    // restore-latest-row-and-drop-folders: ISupportsLatestMedia re-added.
+    // It was dropped 2026-06-28 because core's RefreshLatestChannelItems
+    // (ChannelManager.cs) uses `is ISupportsLatestMedia` only as a marker to
+    // pick channels to refresh, then deep-enumerates them via GetChannelItems
+    // (recursing into every folder found at the root) — which on production-
+    // shaped data hung the Home screen. That enumeration is now safe: (1) the
+    // channel is flat (no folder tiles to recurse into — see the top of
+    // GetChannelItems above) and (2) the root query it issues (UserId=
+    // Guid.Empty, FolderId=null) hits the O(recent) BuildLatestMovieItemsAsync
+    // fast-path above instead of the full catalogue build. GetLatestMedia
+    // itself is implemented too (a future/patched core or another consumer
+    // reasonably expects a real ISupportsLatestMedia to answer it) using the
+    // exact same bounded, Media-only query.
+    public async Task<IEnumerable<ChannelItemInfo>> GetLatestMedia(ChannelLatestMediaSearch request, CancellationToken cancellationToken)
+        => await BuildLatestMovieItemsAsync(cancellationToken).ConfigureAwait(false);
 
     /// <inheritdoc />
     public Task<DynamicImageResponse> GetChannelImage(ImageType type, CancellationToken cancellationToken)

@@ -54,7 +54,7 @@ namespace Jellyfin.Plugin.PhantomLibrary.Channels;
 /// per user (see <see cref="PhantomMoviesChannel"/> for why).
 /// </summary>
 public sealed partial class PhantomShowsChannel
-    : IChannel, IChannelItemRefresh, ISupportsMediaProbe, IHasCacheKey
+    : IChannel, IChannelItemRefresh, ISupportsMediaProbe, IHasCacheKey, ISupportsLatestMedia
 {
     private const string OrphanSeriesPrefix = "orphanseries_";
     private const string OrphanSeasonPrefix = "orphanseason_";
@@ -210,19 +210,24 @@ public sealed partial class PhantomShowsChannel
             return await GetSearchSyncItemsAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        var config = CurrentConfiguration();
-
-        // p10-netflix-style-rows: opening a curated-row category folder re-emits
-        // that row's member series (each still a normal series_<tmdb> folder, so
-        // navigation into seasons/episodes is unchanged).
-        if (config.CuratedRowsEnabled
-            && CuratedRows.TryParseRowFolderId(query.FolderId, RowChannelScope, out var rowKey))
+        // restore-latest-row-and-drop-folders: Guid.Empty + no FolderId is
+        // exactly the shape core's ChannelManager.RefreshLatestChannelItems
+        // issues to populate the Home "Latest in Phantom Shows" row (see
+        // GetLatestMedia below) — it never sets InternalItemsQuery.User, so the
+        // query reaching us has UserId=Guid.Empty; a real interactive Home/
+        // browse load always carries the authenticated user's id. Category
+        // FOLDERS are gone (curated-row tiles are now Home shelves only, via
+        // PhantomLibraryShelvesController/BuildShelfRowsAsync). Unlike movies,
+        // series items are inherently ChannelItemType.Folder (the whole point
+        // of series -> season -> episode navigation), so core's per-folder
+        // recursion would deep-enumerate every visible series's seasons/
+        // episodes on every Home load. Route this shape to a flat, bounded,
+        // Media-typed (never Folder) episode list instead — nothing in it is a
+        // Folder, so core never recurses into it.
+        if (string.IsNullOrEmpty(query.FolderId) && userId == Guid.Empty)
         {
-            var flat = await BuildTopLevelSeriesItemsAsync(userId, cancellationToken).ConfigureAwait(false);
-            var rows = BuildCuratedRows(flat, config);
-            var row = CuratedRows.Find(rows, rowKey);
-            var members = row?.Items ?? (IReadOnlyList<ChannelItemInfo>)Array.Empty<ChannelItemInfo>();
-            return new ChannelItemResult { Items = members.ToList(), TotalRecordCount = members.Count };
+            var latestEpisodes = await BuildLatestEpisodeItemsAsync(cancellationToken).ConfigureAwait(false);
+            return new ChannelItemResult { Items = latestEpisodes, TotalRecordCount = latestEpisodes.Count };
         }
 
         if (string.IsNullOrEmpty(query.FolderId))
@@ -303,17 +308,15 @@ public sealed partial class PhantomShowsChannel
     }
 
     /// <inheritdoc />
-    // ISupportsLatestMedia / GetLatestMedia deliberately removed (operator
-    // decision, 2026-06-28). See the matching note in PhantomMoviesChannel:
-    // core's RefreshLatestChannelItems deep-enumerates the channel
-    // (series -> season -> build) to populate the Home "Latest in Phantom
-    // Shows" row, which on production-shaped data hangs the Home screen on
-    // every client. Dropping the interface short-circuits the Latest query.
-    //
-    // Tradeoff: the "Latest in Phantom Shows" Home row is gone for now.
-    // TODO(operator-approved): restore cheaply (Option 2) via an O(latest)
-    // latest-refresh-root fast-path, then re-add ISupportsLatestMedia.
-    // Tracked in PLAN.md "Deferred".
+    // restore-latest-row-and-drop-folders: ISupportsLatestMedia re-added —
+    // see the matching (fuller) note in PhantomMoviesChannel. Series folders
+    // are no longer reachable from the Guid.Empty/no-FolderId root query core's
+    // RefreshLatestChannelItems issues (it now hits the flat, bounded,
+    // Media-only BuildLatestEpisodeItemsAsync fast-path above), so the
+    // per-folder recursion that used to deep-enumerate every series's
+    // seasons/episodes on every Home load no longer triggers.
+    public async Task<IEnumerable<ChannelItemInfo>> GetLatestMedia(ChannelLatestMediaSearch request, CancellationToken cancellationToken)
+        => await BuildLatestEpisodeItemsAsync(cancellationToken).ConfigureAwait(false);
 
     /// <inheritdoc />
     public Task<DynamicImageResponse> GetChannelImage(ImageType type, CancellationToken cancellationToken)
@@ -486,8 +489,44 @@ public sealed partial class PhantomShowsChannel
         return items;
     }
 
-    /// <summary>The row-FolderId channel scope for this channel (see <see cref="CuratedRows"/>).</summary>
-    private const string RowChannelScope = "shows";
+    /// <summary>
+    /// Cap on the number of items <see cref="BuildLatestEpisodeItemsAsync"/> /
+    /// <see cref="GetLatestMedia"/> return — keeps the Home "Latest in Phantom
+    /// Shows" row bounded even if the materialised set grows large.
+    /// </summary>
+    private const int LatestItemLimit = 20;
+
+    /// <summary>
+    /// restore-latest-row-and-drop-folders: the O(recent) fast-path body for
+    /// the Shows channel. Reads only <c>materialised_state</c> (type=episode,
+    /// already ordered by <c>materialised_at DESC</c> — see
+    /// <see cref="PhantomDb.ListMaterialisedStateAsync"/>), bounded by
+    /// <see cref="LatestItemLimit"/> — never the full series catalogue scan
+    /// <see cref="BuildTopLevelSeriesItemsAsync"/> does (gostream orphan
+    /// enumeration + per-series TMDB lookups). Every returned item is a plain
+    /// <see cref="ChannelItemType.Media"/> episode (via the existing
+    /// <see cref="BuildEpisodeItemAsync"/> builder) — never a Folder — so core's
+    /// per-folder recursion in RefreshLatestChannelItems has nothing to recurse
+    /// into.
+    /// </summary>
+    private async Task<List<ChannelItemInfo>> BuildLatestEpisodeItemsAsync(CancellationToken ct)
+    {
+        using var flowScope = PhantomFlowMetrics.Time(PhantomFlowMetrics.FlowEpisodeListing, _db.Backend);
+        var recent = await _db.ListMaterialisedStateAsync("episode", ct).ConfigureAwait(false);
+        var items = new List<ChannelItemInfo>();
+        foreach (var state in recent.Take(LatestItemLimit))
+        {
+            ct.ThrowIfCancellationRequested();
+            var item = await BuildEpisodeItemAsync(state.TmdbId, state.Season, state.Episode, state, ct).ConfigureAwait(false);
+            if (item is not null)
+            {
+                items.Add(item);
+            }
+        }
+
+        flowScope.ItemCount = items.Count;
+        return items;
+    }
 
     /// <summary>
     /// p10-netflix-style-rows: categorise the built top-level series folders

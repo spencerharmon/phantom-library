@@ -19,10 +19,12 @@
 #      order ranks by descending relevance_score, and each of the four
 #      channel-honoured explicit sort options (PremiereDate, DateCreated,
 #      CommunityRating, Name) re-orders the SAME set as expected.
-#   3. NETFLIX-STYLE ROWS (p10-netflix-style-rows): with no explicit sort,
-#      the channel root emits curated-row category folders (not a flat list),
-#      and the "Available now" row's members are exactly the browse-visible,
-#      available subset (bounded, cheap — no O(catalogue) surprises).
+#   3. NO CATEGORY FOLDERS (restore-latest-row-and-drop-folders, superseding
+#      the original p10-netflix-style-rows folder presentation): the root
+#      emits only flat, playable-first leaf items for both channels — never
+#      a Folder tile. (The Home "Latest" row this superseding task restores
+#      instead is proven live by tools/rig-scenarios/50-latest-media-home-
+#      load.sh.)
 #   4. LATENCY NON-REGRESSION: list_load / sort_change (the P8-timed flows)
 #      measured live against this same rig do not exceed the currently-
 #      ratcheted threshold in tools/perf/loadtime-thresholds.json (via
@@ -281,54 +283,40 @@ assert_order_prefix /tmp/rig49-tsort-name.json "P10 TSort " "P10 TSort A" "P10 T
 log "2(tv) OK: default + all four explicit sort options produced the expected order"
 
 # ===========================================================================
-# 3. NETFLIX-STYLE ROWS — movie + TV
+# 3. NO CATEGORY FOLDERS — movie + TV
 # ===========================================================================
-log "3(movie): root emits curated-row folders; the genre row is exactly the browse-visible, pruning-respecting subset"
+# restore-latest-row-and-drop-folders (task, superseding p10-netflix-style-
+# rows): the operator rejected category-FOLDER tiles outright (vanilla
+# jellyfin-web cannot render a folder as a Netflix-style titled shelf, so the
+# tiles were pure downside for zero shelf benefit) — curated-row FOLDER
+# emission was removed from both channels' GetChannelItems. This section now
+# asserts the negative instead of the old row-folder-derivation positive; see
+# tools/rig-scenarios/50-latest-media-home-load.sh for the live "Latest" row
+# replacement proof (ISupportsLatestMedia + GetLatestMedia, O(recent)).
+log "3(movie): root no longer emits curated-row (or any) folders — flat playable-first list only"
 api GET "/Channels/$CH_MOVIES/Items" >/tmp/rig49-movies-root.json
 python3 -c "
 import json
 j=json.load(open('/tmp/rig49-movies-root.json'))
 items=j.get('Items', [])
-assert len(items) > 0, 'no curated-row folders emitted at movies root'
-assert all(x.get('Type') == 'Folder' for x in items), f'root did not emit category folders: {items}'
-names=[x.get('Name') for x in items]
-assert 'P10RigGenre' in names, f\"'P10RigGenre' genre row missing: {names}\"
-print(f'3(movie) OK: root emits {len(items)} curated-row folders incl. the P10RigGenre genre row')
-"
-# The genre row is built from the SAME pruned, relevance-ordered flat list
-# every other row derives from — a pruned item (which also carries this
-# genre) can therefore never leak into ANY row, genre rows included.
-api GET "/Channels/$CH_MOVIES/Items?FolderId=__row_movies_genre_p10riggenre__" >/tmp/rig49-movies-genre-row.json
-python3 -c "
-import json
-j=json.load(open('/tmp/rig49-movies-genre-row.json'))
-names=[x.get('Name') for x in j.get('Items', [])]
-assert 'P10 Pruned Movie' not in names, f'pruned movie leaked into the genre row: {names}'
-assert names == ['P10 Sort A', 'P10 Sort B', 'P10 Sort C'], f'genre row content/order unexpected: {names}'
-print('3(movie) OK: genre-row content bounded to the browse-visible set, in default relevance order, pruned item absent')
+assert len(items) > 0, 'movies root returned no items'
+folders=[x for x in items if x.get('Type') == 'Folder' or x.get('IsFolder')]
+assert not folders, f'movies root still emits folder tiles: {folders}'
+print(f'3(movie) OK: root emits {len(items)} flat leaf items, no folders')
 "
 
-log "3(tv): root emits curated-row folders; the genre row is exactly the browse-visible, pruning-respecting subset"
+log "3(tv): root no longer emits series/curated-row folders — flat playable-first episode list only"
 api GET "/Channels/$CH_SHOWS/Items" >/tmp/rig49-shows-root.json
 python3 -c "
 import json
 j=json.load(open('/tmp/rig49-shows-root.json'))
 items=j.get('Items', [])
-assert len(items) > 0, 'no curated-row folders emitted at shows root'
-assert all(x.get('Type') == 'Folder' for x in items), f'root did not emit category folders: {items}'
-names=[x.get('Name') for x in items]
-assert 'P10RigGenre' in names, f\"'P10RigGenre' genre row missing: {names}\"
-print(f'3(tv) OK: root emits {len(items)} curated-row folders incl. the P10RigGenre genre row')
+assert len(items) > 0, 'shows root returned no items'
+folders=[x for x in items if x.get('Type') == 'Folder' or x.get('IsFolder')]
+assert not folders, f'shows root still emits folder tiles: {folders}'
+print(f'3(tv) OK: root emits {len(items)} flat leaf items, no folders')
 "
-api GET "/Channels/$CH_SHOWS/Items?FolderId=__row_shows_genre_p10riggenre__" >/tmp/rig49-shows-genre-row.json
-python3 -c "
-import json
-j=json.load(open('/tmp/rig49-shows-genre-row.json'))
-names=[x.get('Name') for x in j.get('Items', [])]
-assert 'P10 Pruned Series' not in names, f'pruned series leaked into the genre row: {names}'
-assert names == ['P10 TSort A', 'P10 TSort B', 'P10 TSort C'], f'genre row content/order unexpected: {names}'
-print('3(tv) OK: genre-row content bounded to the browse-visible set, in default relevance order, pruned item absent')
-"
+
 
 # ===========================================================================
 # 4. LATENCY NON-REGRESSION — list_load/sort_change vs the P8 ratchet

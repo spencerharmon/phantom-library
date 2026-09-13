@@ -25,6 +25,15 @@ namespace Jellyfin.Plugin.PhantomLibrary.Tests;
 
 public class PhantomShowsChannelTests : IDisposable
 {
+    // restore-latest-row-and-drop-folders: Guid.Empty + no FolderId is now
+    // the reserved O(recent) latest-refresh-root fast-path shape (see
+    // GetChannelItems_LatestRefreshRootQuery below and GetLatestMedia). Every
+    // test in this file that exercises the NORMAL top-level series-folder
+    // browse uses this fixed real user id instead of the default (Guid.Empty)
+    // query so it is unambiguously routed to the full
+    // BuildTopLevelSeriesItemsAsync path.
+    private static readonly Guid TestUserId = Guid.NewGuid();
+
     private readonly string _dbPath;
     private readonly string _splashHome;
     private readonly PhantomDb _db;
@@ -161,7 +170,7 @@ public class PhantomShowsChannelTests : IDisposable
     [Fact]
     public async Task GetChannelItems_AllEmpty_ReturnsEmpty()
     {
-        var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
         Assert.Empty(result.Items);
         Assert.Equal(0, result.TotalRecordCount);
     }
@@ -172,7 +181,7 @@ public class PhantomShowsChannelTests : IDisposable
         await SeedSeriesMetaAsync(1399, "Game of Thrones");
         await SeedAvailableEpisodeAsync(1399, 1, 1);
 
-        var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
 
         var item = Assert.Single(result.Items);
         Assert.Equal("series_1399", item.Id);
@@ -189,7 +198,7 @@ public class PhantomShowsChannelTests : IDisposable
         // Discovery row absent; only a materialised episode for the series.
         await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 1, "/stub", "/fuse/ep.mkv", CancellationToken.None);
 
-        var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
 
         var item = Assert.Single(result.Items);
         Assert.Equal("series_1399", item.Id);
@@ -202,7 +211,7 @@ public class PhantomShowsChannelTests : IDisposable
         await _db.UpsertDiscoveryCacheAsync(1399, "series", CancellationToken.None);
         await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 1, "/stub", "/fuse/ep.mkv", CancellationToken.None);
 
-        var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
 
         var item = Assert.Single(result.Items);
         Assert.Equal("series_1399", item.Id);
@@ -214,7 +223,7 @@ public class PhantomShowsChannelTests : IDisposable
         // Cold-cache miss: discovery row exists, tmdb_metadata absent.
         await _db.UpsertDiscoveryCacheAsync(777, "series", CancellationToken.None);
 
-        var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
 
         Assert.Empty(result.Items);
     }
@@ -239,7 +248,7 @@ public class PhantomShowsChannelTests : IDisposable
         await SeedSeriesMetaAsync(1400, "Visible Series");
         await SeedAvailableEpisodeAsync(1400, 1, 1);
 
-        var topLevel = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var topLevel = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
         Assert.Single(topLevel.Items);
         Assert.Equal("series_1400", topLevel.Items[0].Id);
 
@@ -389,7 +398,7 @@ public class PhantomShowsChannelTests : IDisposable
 
         // Confirm the premise: this series has zero available/materialised
         // episodes, so it is excluded from the top-level list.
-        var topLevel = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var topLevel = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
         Assert.Empty(topLevel.Items);
 
         var result = await _channel.GetChannelItems(
@@ -534,7 +543,7 @@ public class PhantomShowsChannelTests : IDisposable
 
         var hiderResult = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = hider }, CancellationToken.None);
         var otherResult = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = other }, CancellationToken.None);
-        var anonymousResult = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var anonymousResult = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
 
         Assert.Empty(hiderResult.Items);
         Assert.Single(otherResult.Items);
@@ -863,17 +872,58 @@ public class PhantomShowsChannelTests : IDisposable
     // ----------------------------------------------------------------
 
     [Fact]
-    public void Channel_DoesNotImplementISupportsLatestMedia()
+    public void Channel_ImplementsISupportsLatestMedia()
     {
-        // Implementing ISupportsLatestMedia makes Jellyfin core's
-        // RefreshLatestChannelItems deep-enumerate the whole channel
-        // (series -> season -> build) on every Home load to populate the
-        // "Latest in Phantom Shows" row, hanging the Home screen on every
-        // client. The interface must stay off until the O(latest) Option 2
-        // fast-path exists.
-        Assert.DoesNotContain(
+        // restore-latest-row-and-drop-folders: ISupportsLatestMedia is back —
+        // core's RefreshLatestChannelItems no longer deep-enumerates every
+        // series's seasons/episodes on every Home load, because the
+        // Guid.Empty/no-FolderId root query it issues now hits the flat,
+        // bounded, Media-only (never Folder) BuildLatestEpisodeItemsAsync
+        // fast path instead of the series-folder catalogue build.
+        Assert.Contains(
             typeof(MediaBrowser.Controller.Channels.ISupportsLatestMedia),
             _channel.GetType().GetInterfaces());
+    }
+
+    [Fact]
+    public async Task GetChannelItems_LatestRefreshRootQuery_ReturnsFlatMaterialisedEpisodes_NeverFolders()
+    {
+        // The Guid.Empty + no-FolderId shape core's RefreshLatestChannelItems
+        // issues must be O(recent): only materialised_state episodes, and
+        // every returned item is Type=Media (never Folder), so core's
+        // per-folder recursion has nothing to recurse into.
+        await SeedSeriesMetaAsync(1399, "Game of Thrones");
+        await _db.UpsertTmdbEpisodeAsync(
+            new TmdbEpisodeRow(1399, 1, 1, "Winter Is Coming", "Pilot synopsis", null, null, 50, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        var fusePath = Path.Combine(_splashHome, "s01e01.mkv");
+        File.WriteAllText(fusePath, string.Empty);
+        await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 1, "/stub/e1", fusePath, CancellationToken.None);
+
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+
+        var item = Assert.Single(result.Items);
+        Assert.Equal("episode_1399_s01e01", item.Id);
+        Assert.Equal(ChannelItemType.Media, item.Type);
+        Assert.Equal(fusePath, item.MediaSources[0].Path);
+    }
+
+    [Fact]
+    public async Task GetLatestMedia_ReturnsMaterialisedEpisodes()
+    {
+        await SeedSeriesMetaAsync(1399, "Game of Thrones");
+        await _db.UpsertTmdbEpisodeAsync(
+            new TmdbEpisodeRow(1399, 1, 1, "Winter Is Coming", "Pilot synopsis", null, null, 50, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        var fusePath = Path.Combine(_splashHome, "s01e01.mkv");
+        File.WriteAllText(fusePath, string.Empty);
+        await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 1, "/stub/e1", fusePath, CancellationToken.None);
+
+        var latestMedia = (MediaBrowser.Controller.Channels.ISupportsLatestMedia)_channel;
+        var items = (await latestMedia.GetLatestMedia(new ChannelLatestMediaSearch(), CancellationToken.None)).ToList();
+
+        var item = Assert.Single(items);
+        Assert.Equal("episode_1399_s01e01", item.Id);
     }
 
     [Fact]
@@ -887,7 +937,7 @@ public class PhantomShowsChannelTests : IDisposable
         var noToken = Path.Combine(seasonDir, "Special Feature cccccccc.mkv");
         await File.WriteAllTextAsync(noToken, "x", CancellationToken.None);
 
-        var top = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var top = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
         var series = Assert.Single(top.Items, i => string.Equals(i.Name, "Variant Show", StringComparison.Ordinal));
         var seasons = await _channel.GetChannelItems(new InternalChannelItemQuery { FolderId = series.Id }, CancellationToken.None);
         var season = Assert.Single(seasons.Items);
@@ -923,7 +973,7 @@ public class PhantomShowsChannelTests : IDisposable
                 DateTimeOffset.UtcNow),
             CancellationToken.None);
 
-        var top = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var top = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
 
         var series = Assert.Single(top.Items, i => string.Equals(i.Name, "56 Days From TMDB", StringComparison.Ordinal));
         Assert.Equal("series_99056001", series.Id);
@@ -944,7 +994,7 @@ public class PhantomShowsChannelTests : IDisposable
                 "https://img/p.jpg", "https://img/b.jpg", new[] { "Drama" }, null, 8.1, "56 Days", DateTimeOffset.UtcNow),
             CancellationToken.None);
 
-        var first = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var first = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
         Assert.Single(first.Items, i => i.Id == "series_99056001");
         Assert.Equal(99056001, await _db.GetGostreamPathTmdbAsync(Path.Combine(_enumerator.ShowsRootOverride!, "56_Days (2026)"), "series", CancellationToken.None));
 
@@ -958,7 +1008,7 @@ public class PhantomShowsChannelTests : IDisposable
         var cold = new PhantomShowsChannel(_db, _tmdb.Object, _splash, _state, _enumerator,
             NullLogger<PhantomShowsChannel>.Instance, () => null);
         cold.SetConfigurationProviderForTests(() => new PluginConfiguration { CuratedRowsEnabled = false });
-        var second = await cold.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var second = await cold.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
         var series = Assert.Single(second.Items, i => i.Id == "series_99056001");
         Assert.Equal("Renamed", series.Name);
     }
@@ -971,7 +1021,7 @@ public class PhantomShowsChannelTests : IDisposable
         var episodePath = Path.Combine(seasonDir, "56_Days_S01E01_72a275d4.mkv");
         await File.WriteAllTextAsync(episodePath, "x", CancellationToken.None);
 
-        var top = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        var top = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
         var series = Assert.Single(top.Items, i => string.Equals(i.Name, "56 Days", StringComparison.Ordinal));
         Assert.StartsWith("orphanseries_", series.Id, StringComparison.Ordinal);
         Assert.Equal(2026, series.ProductionYear);
