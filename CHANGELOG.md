@@ -6,6 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **gostream library token env fallback (gostream-token-durable-wiring).**
+  Durable fix for the outage where an empty (hand-set, never-templated)
+  `GostreamApiToken` plugin config value produced a gostream 401
+  `missing_or_invalid_token` on every materialise validation, breaking all new
+  materialisation. `GostreamClient` now resolves the library token via
+  `ResolveGostreamToken`: the live config value when set, otherwise the
+  `GOSTREAM_LIBRARY_TOKEN` environment variable. The Helm chart wires that env
+  onto the jellyfin container from a `secretKeyRef` (new
+  `gostream.libraryToken.secretName`/`secretKey` values; the concrete secret is
+  supplied per-deployment from the GitOps layer), so a fresh pod with an empty
+  config value still authenticates without an operator hand-set.
+
 ### Added
 
 - **Curated "Netflix-style" browse rows (p10-netflix-style-rows).** ROI

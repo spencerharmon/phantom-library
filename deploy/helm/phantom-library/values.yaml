@@ -142,6 +142,17 @@ gostream:
   resources:
     requests: { cpu: "500m", memory: 1Gi }
     limits: { cpu: "2", memory: 3Gi }
+  # Library-API token the plugin sends as X-Gostream-Token on every gostream
+  # /api/library/* call. Wired onto the jellyfin container env as
+  # GOSTREAM_LIBRARY_TOKEN via secretKeyRef; the plugin's
+  # GostreamClient.ResolveGostreamToken uses it as the fallback when the
+  # PVC-persisted GostreamApiToken config value is empty (fresh/never-templated
+  # pod). Leave secretName empty to omit the env (plugin then relies solely on
+  # the dashboard-set config value). The concrete secret name/key are supplied
+  # per-deployment from the infrastructure (GitOps) layer — never baked here.
+  libraryToken:
+    secretName: ""
+    secretKey: token
 
 # ------------------------------------------------------------------ jellyfin (per Pod) --
 jellyfin:

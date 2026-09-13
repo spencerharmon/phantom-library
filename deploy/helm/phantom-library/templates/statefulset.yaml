@@ -145,6 +145,19 @@ spec:
               value: {{ .Values.jellyfin.metadataGeneration.personImageMaxDownloadsPerRefresh | quote }}
             - name: PHANTOM_JELLYFIN_ARTWORK_MAX_RESOLUTION_PX
               value: {{ .Values.jellyfin.metadataGeneration.artworkMaxResolutionPx | quote }}
+            # ----- gostream library token (plugin -> gostream /api/library/* auth) -----
+            # Consumed by the plugin's GostreamClient.ResolveGostreamToken as the env
+            # fallback when the PVC-persisted GostreamApiToken config value is empty
+            # (fresh/never-templated pod). Chart-driven secretKeyRef — never a baked
+            # config file — so a fresh pod authenticates without an operator hand-set.
+            # See values.yaml `gostream.libraryToken` for the source-of-truth wiring.
+            {{- if .Values.gostream.libraryToken.secretName }}
+            - name: GOSTREAM_LIBRARY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.gostream.libraryToken.secretName | quote }}
+                  key: {{ .Values.gostream.libraryToken.secretKey | quote }}
+            {{- end }}
             {{- if .Values.postgres.enabled }}
             # ----- Jellyfin.Pgsql provider (Jellyfin's own jellyfin.db -> shared PostgreSQL) -----
             # Env-var contract owned by the Jellyfin.Pgsql (JPVenson) image/provider itself, not

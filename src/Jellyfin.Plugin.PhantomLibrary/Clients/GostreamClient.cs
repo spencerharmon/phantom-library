@@ -31,13 +31,43 @@ public sealed class GostreamClient : IGostreamClient
     private Lazy<Task<bool>>? _vaultModeProbe;
     private readonly object _vaultProbeLock = new();
 
+    /// <summary>
+    /// Environment variable consulted for the gostream library token when the
+    /// live plugin configuration leaves <c>GostreamApiToken</c> empty. Wired onto
+    /// the jellyfin container (both colors) from the <c>gostream-library-token</c>
+    /// secret so a fresh pod authenticates even before the operator hand-sets the
+    /// PVC-persisted config value.
+    /// </summary>
+    internal const string TokenEnvVar = "GOSTREAM_LIBRARY_TOKEN";
+
     public GostreamClient(HttpClient http, ILogger<GostreamClient> logger)
         : this(
             http,
             logger,
             () => Plugin.Instance?.Configuration.GostreamBaseUrl ?? string.Empty,
-            () => Plugin.Instance?.Configuration.GostreamApiToken ?? string.Empty)
+            () => ResolveGostreamToken(Plugin.Instance?.Configuration.GostreamApiToken))
     {
+    }
+
+    /// <summary>
+    /// Resolves the gostream library token: the live config value when it is set,
+    /// otherwise the <see cref="TokenEnvVar"/> environment variable. This makes a
+    /// fresh pod with an empty (never-templated) PVC config value still
+    /// authenticate against gostream, closing the outage where an empty
+    /// <c>GostreamApiToken</c> produced a 401 <c>missing_or_invalid_token</c> on
+    /// every materialise validation.
+    /// </summary>
+    /// <param name="configToken">The token from live plugin configuration, if any.</param>
+    /// <returns>The resolved token, or empty string when neither source provides one.</returns>
+    internal static string ResolveGostreamToken(string? configToken)
+    {
+        if (!string.IsNullOrWhiteSpace(configToken))
+        {
+            return configToken;
+        }
+
+        var envToken = Environment.GetEnvironmentVariable(TokenEnvVar);
+        return string.IsNullOrWhiteSpace(envToken) ? string.Empty : envToken;
     }
 
     // Test-friendly ctor: internal so ActivatorUtilities ignores it during DI resolution.

@@ -1,3 +1,4 @@
+using System;
 using System.Net;
 using System.Net.Http;
 using System.Threading;
@@ -16,6 +17,61 @@ public class GostreamClientTests
     }
 
     private const string OkBody = "{\"stub_path\":\"/r/x.mkv\",\"fuse_path\":\"/f/x.mkv\",\"hash\":\"abc\",\"size\":123}";
+
+    // ---- ResolveGostreamToken: config value wins, else GOSTREAM_LIBRARY_TOKEN env fallback ----
+    // Regression for the gostream-token outage: the hand-set PVC config value was empty on
+    // both colors, so every materialise validation hit gostream 401 missing_or_invalid_token.
+    // The env fallback lets a fresh pod authenticate from the GOSTREAM_LIBRARY_TOKEN secret.
+
+    [Fact]
+    public void ResolveGostreamToken_Prefers_NonEmpty_Config_Value()
+    {
+        var prev = Environment.GetEnvironmentVariable(GostreamClient.TokenEnvVar);
+        try
+        {
+            Environment.SetEnvironmentVariable(GostreamClient.TokenEnvVar, "env-token");
+            Assert.Equal("config-token", GostreamClient.ResolveGostreamToken("config-token"));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(GostreamClient.TokenEnvVar, prev);
+        }
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void ResolveGostreamToken_Falls_Back_To_Env_When_Config_Empty(string? configToken)
+    {
+        var prev = Environment.GetEnvironmentVariable(GostreamClient.TokenEnvVar);
+        try
+        {
+            Environment.SetEnvironmentVariable(GostreamClient.TokenEnvVar, "env-token");
+            Assert.Equal("env-token", GostreamClient.ResolveGostreamToken(configToken));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(GostreamClient.TokenEnvVar, prev);
+        }
+    }
+
+    [Fact]
+    public void ResolveGostreamToken_Returns_Empty_When_Neither_Source_Set()
+    {
+        var prev = Environment.GetEnvironmentVariable(GostreamClient.TokenEnvVar);
+        try
+        {
+            Environment.SetEnvironmentVariable(GostreamClient.TokenEnvVar, null);
+            Assert.Equal(string.Empty, GostreamClient.ResolveGostreamToken(null));
+            Assert.Equal(string.Empty, GostreamClient.ResolveGostreamToken(""));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(GostreamClient.TokenEnvVar, prev);
+        }
+    }
+
 
     [Fact]
     public async Task Add_Returns_Parsed_Result_On_200()
