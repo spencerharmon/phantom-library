@@ -108,6 +108,11 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         serviceCollection.AddHostedService<EvictionSweeper>();
         serviceCollection.AddHostedService<AvailabilityProbeWorker>();
         serviceCollection.AddHostedService<MagnetCacheBackgroundSweepWorker>();
+        // The CONSUMER that drains magnet_cache_jobs in priority order
+        // (ttfb-magnet-cache-drain-worker): without it both producers above
+        // enqueue rows nothing ever processes, so opportunistic prefetch has
+        // zero effect on materialise TTFB.
+        serviceCollection.AddHostedService<MagnetCacheDrainWorker>();
 
         // SeriesAutopilot (stage-2.1 stub; rewritten in Stage 5.2).
         serviceCollection.AddSingleton<SeriesAutopilot>();

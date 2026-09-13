@@ -120,6 +120,10 @@ public class PluginConfiguration : BasePluginConfiguration
         MagnetCacheSweepMinIntervalSeconds = 15;
         MagnetCacheSweepMaxIntervalSeconds = 120;
         MagnetCacheSweepBatchSize = 5;
+        MagnetCacheDrainEnabled = true;
+        MagnetCacheDrainMinIntervalSeconds = 5;
+        MagnetCacheDrainMaxIntervalSeconds = 60;
+        MagnetCacheDrainMaxJobsPerTick = 3;
         MaterialiseInFlightStaleMinutes = 10;
         MaterialiseInFlightForeignOwnerHardTtlMinutes = 60;
         GostreamMinQuality = string.Empty;
@@ -585,6 +589,35 @@ public class PluginConfiguration : BasePluginConfiguration
     /// considers per tick.
     /// </summary>
     public int MagnetCacheSweepBatchSize { get; set; }
+
+    /// <summary>
+    /// Master switch for <c>MagnetCacheDrainWorker</c>
+    /// (ttfb-magnet-cache-drain-worker): the timer-driven CONSUMER that
+    /// drains the <c>magnet_cache_jobs</c> queue in priority order by
+    /// looping <see cref="Sources.MagnetCacheBuilder.ProcessNextAsync"/>.
+    /// Without it, opportunistic and background enqueues never build a
+    /// cache entry and materialise always pays the full synchronous probe.
+    /// </summary>
+    public bool MagnetCacheDrainEnabled { get; set; }
+
+    /// <summary>
+    /// Fast tick interval (seconds) for the magnet-cache drain worker while
+    /// it is finding claimable jobs to process.
+    /// </summary>
+    public int MagnetCacheDrainMinIntervalSeconds { get; set; }
+
+    /// <summary>
+    /// Slow tick interval (seconds) for the magnet-cache drain worker once
+    /// the queue is empty, or when it yields to recent user activity.
+    /// </summary>
+    public int MagnetCacheDrainMaxIntervalSeconds { get; set; }
+
+    /// <summary>
+    /// Maximum number of <c>magnet_cache_jobs</c> rows the drain worker
+    /// claims and processes per tick (bounded so one tick never monopolises
+    /// the Prowlarr fan-out or the DB write lock).
+    /// </summary>
+    public int MagnetCacheDrainMaxJobsPerTick { get; set; }
 
     /// <summary>
     /// Age threshold (minutes) above which a row in
