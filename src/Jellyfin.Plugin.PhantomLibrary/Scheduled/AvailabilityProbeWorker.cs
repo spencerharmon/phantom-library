@@ -379,7 +379,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
                         lease,
                         "unavailable",
                         now,
-                        now.AddDays(Math.Max(1, cfg.AvailabilityUnavailableTtlDays)),
+                        now.Add(ComputeNegativeCacheTtl(cfg, lease)),
                         policyHash,
                         candidate: null,
                         errorKind: null,
@@ -569,6 +569,34 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
         }
 
         return now.AddMinutes(Math.Max(1, cfg.AvailabilityTransientRetryMinutes));
+    }
+
+    /// <summary>
+    /// Bounded exponential negative-cache backoff (availability-probe-
+    /// reconcile-001 item 3): the effective TTL for a confirmed-negative
+    /// (definitive unavailable) probe DOUBLES for every additional
+    /// CONSECUTIVE confirmed-negative outcome already recorded on
+    /// <paramref name="lease"/> (<see cref="AvailabilityItemRow.NegativeStreak"/>,
+    /// which is only incremented by a confirmed negative and reset to 0 by
+    /// any positive outcome — see <see cref="PhantomDb.CompleteAvailabilityProbeAsync"/>),
+    /// capped at <see cref="PluginConfiguration.AvailabilityUnavailableMaxTtlDays"/>
+    /// so a genuinely-unavailable item is not re-probed every attempt yet is
+    /// still eventually re-checked rather than backed off forever. The FIRST
+    /// confirmed negative (streak 0 going into this probe) uses the plain
+    /// base TTL — identical to the pre-existing fixed-TTL behaviour — so this
+    /// only changes behaviour once an item has been confirmed negative more
+    /// than once in a row.
+    /// </summary>
+    internal static TimeSpan ComputeNegativeCacheTtl(PluginConfiguration cfg, AvailabilityItemRow lease)
+    {
+        var baseDays = Math.Max(1, cfg.AvailabilityUnavailableTtlDays);
+        var maxDays = Math.Max(baseDays, cfg.AvailabilityUnavailableMaxTtlDays);
+        var streak = Math.Max(0, lease.NegativeStreak);
+        // streak is the count BEFORE this probe's confirmed-negative is
+        // recorded, so the first confirmed negative (streak=0) is 2^0 = base.
+        var multiplier = 1L << Math.Min(streak, 30);
+        var days = Math.Min(maxDays, (long)baseDays * multiplier);
+        return TimeSpan.FromDays(Math.Max(1, days));
     }
 
     private void BumpFor(string type)

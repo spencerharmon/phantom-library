@@ -165,7 +165,8 @@ public sealed record AvailabilityItemRow(
     string? CandidateSource,
     int ProbeGeneration,
     string? LeaseOwner,
-    int AttemptCount = 0);
+    int AttemptCount = 0,
+    int NegativeStreak = 0);
 
 public sealed record VisibleMovieRow(
     TmdbMetadataRow Metadata,
@@ -356,10 +357,28 @@ public sealed record HiddenItemRow(int TmdbId, string Type, DateTimeOffset Hidde
 /// <c>scripts/phantom-wipe.sh --commit</c>, as does ANY database more than
 /// one schema version behind (no registered migration path covers a gap
 /// wider than what <see cref="ExpandMigrations"/> lists).
+/// v21 adds an <c>availability_items.negative_streak</c> column (INTEGER NOT
+/// NULL DEFAULT 0) for availability-probe-reconcile-001 item 3: the count of
+/// CONSECUTIVE confirmed-negative (definitive unavailable) probe outcomes for
+/// this item, reset to 0 on any positive (available) outcome and left
+/// UNCHANGED by a merely transient/indeterminate outcome (only a definitive
+/// negative grows it). <see cref="AvailabilityProbeWorker"/> uses it to
+/// compute a bounded EXPONENTIAL negative-cache backoff
+/// (<see cref="Configuration.PluginConfiguration.AvailabilityUnavailableTtlDays"/>
+/// doubled per streak, capped at
+/// <see cref="Configuration.PluginConfiguration.AvailabilityUnavailableMaxTtlDays"/>)
+/// instead of the previous fixed TTL, so a genuinely-unavailable item is not
+/// re-probed every attempt yet still converges back eventually. This is a
+/// PURELY ADDITIVE delta (one new column, no existing column/row semantics
+/// touched); per AGENTS.md it is a schema-version bump — pre-v21 SQLite
+/// databases are HARD-REFUSED and the operator must wipe
+/// (<c>scripts/phantom-wipe.sh --commit</c>) before restart, while a shared
+/// Postgres blue/green topology self-applies the v20-&gt;v21 EXPAND migration
+/// registered in <see cref="ExpandMigrations"/>.
 /// </summary>
 public sealed class PhantomDb : IDisposable
 {
-    public const int CurrentSchemaVersion = 20;
+    public const int CurrentSchemaVersion = 21;
 
     /// <summary>
     /// Ordered registry of additive, idempotent EXPAND migrations
@@ -389,6 +408,14 @@ public sealed class PhantomDb : IDisposable
             {
                 "ALTER TABLE tmdb_metadata ADD COLUMN IF NOT EXISTS relevance_score REAL NOT NULL DEFAULT 0;",
                 "CREATE INDEX IF NOT EXISTS idx_tmdb_metadata_relevance ON tmdb_metadata(type, relevance_score DESC);",
+            }),
+        (
+            20,
+            21,
+            "v20_v21_availability_items_negative_streak",
+            new[]
+            {
+                "ALTER TABLE availability_items ADD COLUMN IF NOT EXISTS negative_streak INTEGER NOT NULL DEFAULT 0;",
             }),
     };
 
@@ -659,6 +686,7 @@ CREATE TABLE IF NOT EXISTS availability_items (
     lease_until INTEGER,
     probe_generation INTEGER NOT NULL DEFAULT 0,
     attempt_count INTEGER NOT NULL DEFAULT 0,
+    negative_streak INTEGER NOT NULL DEFAULT 0,
     CHECK ((type='movie' AND season=-1 AND episode=-1) OR (type='episode' AND season>=0 AND episode>0)),
     PRIMARY KEY (tmdb_id, type, season, episode)
 );
@@ -2394,7 +2422,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         cmd.Transaction = tx;
         cmd.CommandText = @"SELECT tmdb_id,type,season,episode,status,checked_at,next_check_at,
                    candidate_magnet,candidate_info_hash,candidate_size,candidate_seeders,
-                   candidate_indexer,candidate_source,probe_generation,lease_owner,attempt_count
+                   candidate_indexer,candidate_source,probe_generation,lease_owner,attempt_count,negative_streak
             FROM availability_items
             WHERE (next_check_at <= @now OR probe_policy_hash IS NULL OR probe_policy_hash <> @policy)
               AND (lease_until IS NULL OR lease_until < @now)
@@ -2422,7 +2450,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         cmd.Transaction = tx;
         cmd.CommandText = @"SELECT tmdb_id,type,season,episode,status,checked_at,next_check_at,
                    candidate_magnet,candidate_info_hash,candidate_size,candidate_seeders,
-                   candidate_indexer,candidate_source,probe_generation,lease_owner,attempt_count
+                   candidate_indexer,candidate_source,probe_generation,lease_owner,attempt_count,negative_streak
             FROM availability_items
             WHERE type='episode'
               AND (@cursor IS NULL OR tmdb_id > @cursor)
@@ -2611,7 +2639,8 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                     last_error_message=@errMsg,
                     lease_owner=NULL,
                     lease_until=NULL,
-                    attempt_count=0
+                    attempt_count=0,
+                    negative_streak=CASE WHEN @status='unavailable' THEN negative_streak+1 ELSE 0 END
                 WHERE tmdb_id=@tmdb AND type=@type AND season=@season AND episode=@episode
                   AND lease_owner=@owner AND probe_generation=@generation;";
             cmd.AddWithValue("@status", status);
@@ -2676,7 +2705,8 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                     last_error_message=NULL,
                     lease_owner=NULL,
                     lease_until=NULL,
-                    attempt_count=0;";
+                    attempt_count=0,
+                    negative_streak=0;";
             cmd.AddWithValue("@tmdb", tmdbId);
             cmd.AddWithValue("@type", type);
             cmd.AddWithValue("@season", season);
@@ -3196,7 +3226,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                    ms.tmdb_id,ms.type,ms.season,ms.episode,ms.stub_path,ms.fuse_path,ms.materialised_at,
                    a.tmdb_id,a.type,a.season,a.episode,a.status,a.checked_at,a.next_check_at,
                    a.candidate_magnet,a.candidate_info_hash,a.candidate_size,a.candidate_seeders,
-                   a.candidate_indexer,a.candidate_source,a.probe_generation,a.lease_owner,a.attempt_count
+                   a.candidate_indexer,a.candidate_source,a.probe_generation,a.lease_owner,a.attempt_count,a.negative_streak
             FROM tmdb_metadata m
             LEFT JOIN materialised_state ms ON ms.tmdb_id=m.tmdb_id AND ms.type='movie'
             LEFT JOIN availability_items a ON a.tmdb_id=m.tmdb_id AND a.type='movie' AND a.season=-1 AND a.episode=-1
@@ -3248,7 +3278,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                    ms.tmdb_id,ms.type,ms.season,ms.episode,ms.stub_path,ms.fuse_path,ms.materialised_at,
                    a.tmdb_id,a.type,a.season,a.episode,a.status,a.checked_at,a.next_check_at,
                    a.candidate_magnet,a.candidate_info_hash,a.candidate_size,a.candidate_seeders,
-                   a.candidate_indexer,a.candidate_source,a.probe_generation,a.lease_owner,a.attempt_count
+                   a.candidate_indexer,a.candidate_source,a.probe_generation,a.lease_owner,a.attempt_count,a.negative_streak
             FROM tmdb_metadata m
             LEFT JOIN materialised_state ms ON ms.tmdb_id=m.tmdb_id AND ms.type='movie'
             LEFT JOIN availability_items a ON a.tmdb_id=m.tmdb_id AND a.type='movie' AND a.season=-1 AND a.episode=-1
@@ -3540,7 +3570,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = @"SELECT tmdb_id,type,season,episode,status,checked_at,next_check_at,
                    candidate_magnet,candidate_info_hash,candidate_size,candidate_seeders,
-                   candidate_indexer,candidate_source,probe_generation,lease_owner,attempt_count
+                   candidate_indexer,candidate_source,probe_generation,lease_owner,attempt_count,negative_streak
             FROM availability_items
             WHERE tmdb_id=@tmdb AND type=@type AND season=@season AND episode=@episode
             LIMIT 1;";
@@ -3884,7 +3914,8 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
             r.IsDBNull(offset + 12) ? null : r.GetString(offset + 12),
             r.GetInt32(offset + 13),
             r.IsDBNull(offset + 14) ? null : r.GetString(offset + 14),
-            r.GetInt32(offset + 15));
+            r.GetInt32(offset + 15),
+            r.GetInt32(offset + 16));
 
     // ---- materialise_in_flight ----
 

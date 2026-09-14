@@ -155,22 +155,28 @@ public sealed class MagnetSelector
 
     /// <summary>
     /// Availability-sweep variant of <see cref="HasCapableIndexer"/>: pre-classifies
-    /// "no capable indexer" scoped to ONLY the indexers eligible for the
-    /// high-frequency availability-oracle hot loop (Torrentio) — see
-    /// <see cref="ProbeAvailabilityAsync"/>. A Prowlarr-only configuration (which
-    /// can serve without an IMDB id) must NOT be counted here: Prowlarr is not
-    /// invoked by the availability sweep, so its presence must not mask a
-    /// no-IMDB item as "capable" when only Torrentio actually runs.
+    /// "no capable indexer" scoped to the indexers eligible for the
+    /// high-frequency availability-oracle hot loop (Torrentio) PLUS any
+    /// enabled RECONCILE-capable indexer (a non-oracle indexer — e.g.
+    /// Prowlarr — that can serve this title without an IMDB id or already
+    /// has one). This is the abstain-reconcile pre-filter counterpart of
+    /// <see cref="ProbeAvailabilityAsync"/>'s in-probe reconcile
+    /// (availability-probe-reconcile-001 item 1): a no-IMDB title must NOT be
+    /// deep-deferred as "no capable indexer" purely because the oracle
+    /// (Torrentio) would abstain, when a title-based indexer can still reach
+    /// a definitive verdict for it. Only when NEITHER an oracle indexer NOR a
+    /// reconcile-capable indexer can serve the query does this return false.
     /// </summary>
     public bool HasCapableAvailabilityIndexer(string? imdbId)
-        => HasCapableIndexer(imdbId, availabilityOracleOnly: true);
+        => HasCapableIndexer(imdbId, availabilityOracleOnly: true)
+            || HasCapableIndexer(imdbId, availabilityOracleOnly: false, nonOracleOnly: true);
 
-    private bool HasCapableIndexer(string? imdbId, bool availabilityOracleOnly)
+    private bool HasCapableIndexer(string? imdbId, bool availabilityOracleOnly, bool nonOracleOnly = false)
     {
-        var enabled = EnabledIndexers(availabilityOracleOnly);
+        var enabled = nonOracleOnly ? EnabledIndexers(i => !i.IsAvailabilityOracle) : EnabledIndexers(availabilityOracleOnly);
         if (enabled.Count == 0)
         {
-            return true;
+            return !nonOracleOnly;
         }
 
         return enabled.Any(i => !i.RequiresImdb || !string.IsNullOrWhiteSpace(imdbId));
@@ -199,7 +205,7 @@ public sealed class MagnetSelector
     /// the existing no-capable-indexer deep-defer rather than an inline heavy
     /// Prowlarr search.
     /// </summary>
-    public Task<MagnetProbeResult> ProbeAvailabilityAsync(
+    public async Task<MagnetProbeResult> ProbeAvailabilityAsync(
         int tmdbId,
         string? imdbId,
         string type,
@@ -208,13 +214,53 @@ public sealed class MagnetSelector
         string title,
         int? year,
         CancellationToken ct)
-        => ProbeCoreAsync(tmdbId, imdbId, type, season, episode, title, year, availabilityOracleOnly: true, ct);
+    {
+        var primary = await ProbeCoreAsync(tmdbId, imdbId, type, season, episode, title, year, availabilityOracleOnly: true, ct)
+            .ConfigureAwait(false);
+        if (primary.Outcome != MagnetProbeOutcome.NoCapableIndexer)
+        {
+            return primary;
+        }
+
+        // Reconcile (availability-probe-reconcile-001 item 1): the availability
+        // oracle (Torrentio) abstained entirely (e.g. a no-IMDB title). Before
+        // surfacing a bare "no capable indexer"/availability_abstain outcome,
+        // check whether a title-based indexer OUTSIDE the oracle set (e.g.
+        // Prowlarr) can reach a DEFINITIVE verdict for this exact query using
+        // the SAME quality/seeder/size bar the oracle path would have applied
+        // (QualityScorer.RankCandidates, unchanged) — never a lowered bar. This
+        // never re-invokes Torrentio (the reconcile indexer set explicitly
+        // excludes IsAvailabilityOracle indexers) so it costs at most one extra
+        // fan-out, only on the abstain path, never on the hot per-tick loop for
+        // an item that already has a capable oracle indexer.
+        if (EnabledIndexers(i => !i.IsAvailabilityOracle).Count == 0)
+        {
+            return primary;
+        }
+
+        var reconciled = await ProbeCoreAsync(tmdbId, imdbId, type, season, episode, title, year, availabilityOracleOnly: false, ct, oracleExcluded: true)
+            .ConfigureAwait(false);
+        if (reconciled.Outcome == MagnetProbeOutcome.Available)
+        {
+            _logger.LogInformation(
+                "Availability reconcile: oracle indexer(s) abstained but a non-oracle indexer resolved a definitive available verdict for {Type}/{Tmdb}",
+                type,
+                tmdbId);
+            return reconciled;
+        }
+
+        // No reconcile win: preserve the ORIGINAL abstain classification (and
+        // therefore the caller's existing no-capable-indexer deep-defer/backoff)
+        // rather than substituting a DIFFERENT non-definitive outcome, so
+        // behaviour is unchanged whenever reconciliation cannot help.
+        return primary;
+    }
 
     private List<IIndexerClient> EnabledIndexers(bool availabilityOracleOnly)
-    {
-        var candidates = availabilityOracleOnly ? _indexers.Where(i => i.IsAvailabilityOracle) : _indexers;
-        return candidates.Where(i => i.IsEnabled).ToList();
-    }
+        => EnabledIndexers(availabilityOracleOnly ? (i => i.IsAvailabilityOracle) : (i => true));
+
+    private List<IIndexerClient> EnabledIndexers(Func<IIndexerClient, bool> predicate)
+        => _indexers.Where(predicate).Where(i => i.IsEnabled).ToList();
 
     private async Task<MagnetProbeResult> ProbeCoreAsync(
         int tmdbId,
@@ -225,7 +271,8 @@ public sealed class MagnetSelector
         string title,
         int? year,
         bool availabilityOracleOnly,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool oracleExcluded = false)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(type);
         ArgumentException.ThrowIfNullOrWhiteSpace(title);
@@ -242,7 +289,11 @@ public sealed class MagnetSelector
             Episode = episode,
         };
 
-        var enabled = EnabledIndexers(availabilityOracleOnly);
+        var enabled = availabilityOracleOnly
+            ? EnabledIndexers(availabilityOracleOnly: true)
+            : oracleExcluded
+                ? EnabledIndexers(i => !i.IsAvailabilityOracle)
+                : EnabledIndexers(availabilityOracleOnly: false);
         if (enabled.Count == 0)
         {
             return MagnetProbeResult.Transient("no_enabled_indexers", "No enabled indexers are configured");

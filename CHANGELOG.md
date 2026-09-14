@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Availability-probe reconcile, TTL re-probe, and bounded negative-cache
+  backoff (availability-probe-reconcile-001).** ROI Priority 12 dial #1 —
+  raises the availability-probe success rate at cold
+  (`materialise_then_play`) attempt time without weakening an `available`
+  verdict or hammering upstream oracles:
+  1. **Torrentio/Prowlarr reconcile.** When the availability oracle
+     (Torrentio) abstains for a title (e.g. no IMDB id yet) —
+     `MagnetSelector.ProbeAvailabilityAsync` and the sweep's
+     `HasCapableAvailabilityIndexer` pre-filter — a non-oracle indexer (e.g.
+     Prowlarr) is now consulted for a DEFINITIVE verdict using the exact same
+     quality/seeder/size bar (`QualityScorer`, unchanged). If it clears the
+     bar, the sweep records `available` instead of surfacing
+     `availability_abstain`/`no_capable_indexer`. When the oracle itself
+     already resolves definitively, the reconcile fan-out never fires (zero
+     added cost on the ordinary hot-loop path).
+  2. **TTL re-probe** (already-converging behaviour, now explicitly
+     regression-tested): a row whose `next_check_at` TTL has expired is
+     re-claimed and re-probed on the very next tick rather than served as a
+     stale `available`/`unavailable` verdict forever.
+  3. **Bounded exponential negative-cache backoff.** A new
+     `availability_items.negative_streak` column (schema v21, additive)
+     counts CONSECUTIVE confirmed-negative (`unavailable`) outcomes, reset to
+     0 by any positive outcome. `AvailabilityProbeWorker.ComputeNegativeCacheTtl`
+     doubles the effective TTL (`AvailabilityUnavailableTtlDays`) per
+     consecutive negative, capped at the new
+     `AvailabilityUnavailableMaxTtlDays` (default 56 days) — so a
+     genuinely-unavailable item is probed less and less often yet is still
+     eventually re-checked, rather than being re-probed every attempt or
+     backed off forever.
+
+  Movie AND episode parity exercised throughout (reconcile, TTL re-probe,
+  negative-cache growth/reset). **BREAKING: requires wipe** — schema bumped
+  to v21 (additive `availability_items.negative_streak` column only; no
+  existing column/row semantics touched). Pre-v21 SQLite installs must run
+  `sudo bash scripts/phantom-wipe.sh --commit` before restarting with this
+  build; a shared-Postgres blue/green topology self-applies the v20→v21
+  EXPAND migration.
+
 - **Bounded fast-indexer early return for the magnet probe
   (ttfb-fast-indexer-early-return).** `MagnetSelector.ProbeCoreAsync`'s
   concurrent indexer fan-out (ttfb-parallel-indexer-probe) previously always

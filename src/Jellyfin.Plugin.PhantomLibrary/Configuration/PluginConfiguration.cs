@@ -99,6 +99,7 @@ public class PluginConfiguration : BasePluginConfiguration
         AvailabilityProbeMaxIntervalSeconds = 28;
         AvailabilityAvailableTtlDays = 7;
         AvailabilityUnavailableTtlDays = 7;
+        AvailabilityUnavailableMaxTtlDays = 56;
         AvailabilityTransientRetryMinutes = 30;
         AvailabilityMaxBatchSize = 1;
         AvailabilityLeaseMinutes = 15;
@@ -438,8 +439,26 @@ public class PluginConfiguration : BasePluginConfiguration
     /// <summary>TTL for available phantom source probes.</summary>
     public int AvailabilityAvailableTtlDays { get; set; }
 
-    /// <summary>TTL for unavailable phantom source probes.</summary>
+    /// <summary>
+    /// Base TTL for a FIRST confirmed-negative (definitive unavailable)
+    /// probe. Every additional CONSECUTIVE confirmed-negative outcome for
+    /// the same item doubles the effective TTL (bounded exponential
+    /// backoff — availability-probe-reconcile-001 item 3), so a
+    /// genuinely-unavailable item is not re-probed every attempt; any
+    /// positive (available) outcome resets the streak and the TTL back to
+    /// this base value. See <see cref="AvailabilityUnavailableMaxTtlDays"/>
+    /// for the growth cap.
+    /// </summary>
     public int AvailabilityUnavailableTtlDays { get; set; }
+
+    /// <summary>
+    /// Upper bound (days) on the exponential negative-cache backoff driven
+    /// by <see cref="AvailabilityUnavailableTtlDays"/>. The effective TTL is
+    /// <c>min(BaseTtl * 2^(negative_streak-1), MaxTtl)</c> so a permanently
+    /// unavailable item still gets re-checked eventually rather than being
+    /// backed off forever.
+    /// </summary>
+    public int AvailabilityUnavailableMaxTtlDays { get; set; }
 
     /// <summary>Retry delay after transient probe failures that must not change visibility.</summary>
     public int AvailabilityTransientRetryMinutes { get; set; }

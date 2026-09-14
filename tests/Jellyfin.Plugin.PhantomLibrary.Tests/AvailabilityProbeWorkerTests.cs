@@ -252,12 +252,16 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
     }
 
     [Fact]
-    public async Task Sweep_NoImdb_DeepDefersWithoutInvokingProwlarrFanOut()
+    public async Task Sweep_NoImdb_ReconcilesWithProwlarr_NoHighConfidenceMagnet_StillDeepDefers()
     {
-        // No-IMDB movie: the pre-classification (HasCapableAvailabilityIndexer,
-        // scoped to Torrentio only) must deep-defer before the probe layer is
-        // reached at all, even though a Prowlarr-shaped indexer is enabled and
-        // could otherwise serve the query.
+        // No-IMDB movie, availability-probe-reconcile-001 item 1: unlike the
+        // OLD pre-p6-reconcile behaviour (Prowlarr never invoked), the sweep
+        // must now attempt a Prowlarr RECONCILE before deep-deferring the
+        // abstained oracle (Torrentio) verdict, since Prowlarr does not
+        // require an IMDB id and could still resolve a definitive verdict.
+        // Here Prowlarr returns zero candidates too, so the final outcome is
+        // still the same "no_capable_indexer" deep defer as before — the
+        // reconcile attempt happened (SearchCallCount>0) but found nothing.
         using var db = await NewDbAsync();
         await SeedMovieAsync(db, 99000950);
         // Deliberately no imdb id set.
@@ -270,10 +274,58 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
         var didWork = await InvokeProbeOneAsync(worker, cfg);
 
         Assert.True(didWork);
-        Assert.Equal(0, prowlarr.SearchCallCount);
+        Assert.Equal(1, prowlarr.SearchCallCount);
         var (status, error) = await ReadAvailabilityAsync(99000950);
         Assert.Equal("unknown", status);
         Assert.Equal("no_capable_indexer", error);
+    }
+
+    [Fact]
+    public async Task Sweep_NoImdb_TorrentioAbstains_ProwlarrHighConfidenceMagnet_ReconcilesToAvailable()
+    {
+        // availability-probe-reconcile-001 item 1, the positive case: Torrentio
+        // abstains (no IMDB id) but Prowlarr holds a magnet clearing the SAME
+        // high-confidence (MinSeeders/size) bar the oracle path would have
+        // applied — the sweep must reach a DEFINITIVE "available" verdict from
+        // Prowlarr rather than surfacing availability_abstain/no_capable_indexer.
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 99000951);
+        // Deliberately no imdb id set.
+        var cfg = Config();
+        var torrentio = new TorrentioLikeIndexer();
+        var prowlarr = new ProwlarrHighConfidenceIndexer();
+        var worker = BuildWorker(db, cfg, torrentio, prowlarr);
+
+        var didWork = await InvokeProbeOneAsync(worker, cfg);
+
+        Assert.True(didWork);
+        Assert.Equal(1, prowlarr.SearchCallCount);
+        var (status, error) = await ReadAvailabilityAsync(99000951);
+        Assert.Equal("available", status);
+        Assert.Null(error);
+    }
+
+    [Fact]
+    public async Task Sweep_ImdbBearingMovie_TorrentioAvailable_NeverReconcilesWithProwlarr()
+    {
+        // Parity guard: when the oracle (Torrentio) itself already reaches a
+        // definitive Available verdict, the reconcile fan-out to Prowlarr must
+        // never fire — reconcile is strictly an abstain-only fallback, never an
+        // extra cost on the ordinary hot-loop path.
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 99000952);
+        await db.SetImdbIdAsync(99000952, "movie", "tt99000952", CancellationToken.None);
+        var cfg = Config();
+        var torrentio = new TorrentioLikeAvailableIndexer();
+        var prowlarr = new ProwlarrLikeIndexer();
+        var worker = BuildWorker(db, cfg, torrentio, prowlarr);
+
+        var didWork = await InvokeProbeOneAsync(worker, cfg);
+
+        Assert.True(didWork);
+        Assert.Equal(0, prowlarr.SearchCallCount);
+        var (status, _) = await ReadAvailabilityAsync(99000952);
+        Assert.Equal("available", status);
     }
 
     // ---- p6-availability-convergence: no-forever-churn + TTL reprobe ----
@@ -375,6 +427,158 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
         Assert.Equal("unavailable", status);
         Assert.Equal(0, await ReadAttemptCountAsync(99000702, "movie", -1, -1));
     }
+
+    // ---- availability-probe-reconcile-001 item 2: TTL re-probe (never stale forever) ----
+
+    [Fact]
+    public async Task AvailableRow_PastNextCheckAt_IsClaimedAndReProbedOnTtlExpiry()
+    {
+        // A row previously marked "available" whose TTL (next_check_at) has
+        // already passed must be re-claimed and re-probed on the next tick —
+        // never served as a stale verdict forever. Here the source has since
+        // gone away (EmptyIndexer), so the re-probe must flip it to unavailable.
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 99000703);
+        await db.SetImdbIdAsync(99000703, "movie", "tt99000703", CancellationToken.None);
+        await InsertMovieAvailabilityAsync(db, 99000703, status: "available", nextCheckAt: DateTimeOffset.UtcNow.AddSeconds(-1), priority: 0);
+        var cfg = Config();
+        var worker = BuildWorker(db, cfg, new EmptyIndexer());
+
+        var didWork = await InvokeProbeOneAsync(worker, cfg);
+
+        Assert.True(didWork);
+        var (status, _) = await ReadAvailabilityAsync(99000703);
+        Assert.Equal("unavailable", status);
+    }
+
+    [Fact]
+    public async Task UnavailableRow_PastNextCheckAt_IsClaimedAndReProbedOnTtlExpiry()
+    {
+        // Negative-cache counterpart: an expired "unavailable" TTL must also
+        // be re-claimed rather than served stale forever. Here the source has
+        // since appeared, so the re-probe must flip it to available.
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 99000704);
+        await db.SetImdbIdAsync(99000704, "movie", "tt99000704", CancellationToken.None);
+        await InsertMovieAvailabilityAsync(db, 99000704, status: "unavailable", nextCheckAt: DateTimeOffset.UtcNow.AddSeconds(-1), priority: 0);
+        var cfg = Config();
+        var worker = BuildWorker(db, cfg, new TorrentioLikeAvailableIndexer());
+
+        var didWork = await InvokeProbeOneAsync(worker, cfg);
+
+        Assert.True(didWork);
+        var (status, _) = await ReadAvailabilityAsync(99000704);
+        Assert.Equal("available", status);
+    }
+
+    // ---- availability-probe-reconcile-001 item 3: bounded exponential negative-cache backoff ----
+
+    [Fact]
+    public void ComputeNegativeCacheTtl_FirstConfirmedNegative_UsesBaseTtl()
+    {
+        var cfg = Config();
+        cfg.AvailabilityUnavailableTtlDays = 7;
+        cfg.AvailabilityUnavailableMaxTtlDays = 56;
+        var lease = MakeLease(negativeStreak: 0);
+
+        var ttl = AvailabilityProbeWorker.ComputeNegativeCacheTtl(cfg, lease);
+
+        Assert.Equal(TimeSpan.FromDays(7), ttl);
+    }
+
+    [Fact]
+    public void ComputeNegativeCacheTtl_RepeatedConfirmedNegatives_GrowsExponentially()
+    {
+        var cfg = Config();
+        cfg.AvailabilityUnavailableTtlDays = 7;
+        cfg.AvailabilityUnavailableMaxTtlDays = 1000;
+
+        Assert.Equal(TimeSpan.FromDays(7), AvailabilityProbeWorker.ComputeNegativeCacheTtl(cfg, MakeLease(0)));
+        Assert.Equal(TimeSpan.FromDays(14), AvailabilityProbeWorker.ComputeNegativeCacheTtl(cfg, MakeLease(1)));
+        Assert.Equal(TimeSpan.FromDays(28), AvailabilityProbeWorker.ComputeNegativeCacheTtl(cfg, MakeLease(2)));
+        Assert.Equal(TimeSpan.FromDays(56), AvailabilityProbeWorker.ComputeNegativeCacheTtl(cfg, MakeLease(3)));
+    }
+
+    [Fact]
+    public void ComputeNegativeCacheTtl_IsBoundedByConfiguredMax()
+    {
+        var cfg = Config();
+        cfg.AvailabilityUnavailableTtlDays = 7;
+        cfg.AvailabilityUnavailableMaxTtlDays = 30;
+
+        // Streak large enough that the unbounded doubling would blow far past
+        // the cap; the result must never exceed AvailabilityUnavailableMaxTtlDays.
+        var ttl = AvailabilityProbeWorker.ComputeNegativeCacheTtl(cfg, MakeLease(10));
+
+        Assert.Equal(TimeSpan.FromDays(30), ttl);
+    }
+
+    [Fact]
+    public async Task RepeatedConfirmedNegative_GrowsBackoff_ThenResetsOnPositive()
+    {
+        // End-to-end: three consecutive confirmed-negative probes must grow the
+        // effective TTL each time (bounded exponential backoff), and a
+        // subsequent positive probe must reset both status and the streak.
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 99000705);
+        await db.SetImdbIdAsync(99000705, "movie", "tt99000705", CancellationToken.None);
+        var cfg = Config();
+        cfg.AvailabilityUnavailableTtlDays = 1;
+        cfg.AvailabilityUnavailableMaxTtlDays = 100;
+        var negativeWorker = BuildWorker(db, cfg, new EmptyIndexer());
+
+        var delays = new List<TimeSpan>();
+        for (var i = 0; i < 3; i++)
+        {
+            await InsertMovieAvailabilityAsync(db, 99000705, status: "unknown", nextCheckAt: DateTimeOffset.UtcNow.AddHours(-1), priority: 0);
+            var before = DateTimeOffset.UtcNow;
+            Assert.True(await InvokeProbeOneAsync(negativeWorker, cfg));
+            var (status, _, nextCheck) = await ReadAvailabilityFullAsync(99000705, "movie", -1, -1);
+            Assert.Equal("unavailable", status);
+            delays.Add(DateTimeOffset.FromUnixTimeSeconds(nextCheck) - before);
+        }
+
+        // Each successive confirmed-negative backoff must be strictly longer
+        // than the previous (bounded exponential growth), never flat/fixed.
+        Assert.True(delays[1] > delays[0] + TimeSpan.FromHours(1), $"expected delay[1] ({delays[1]}) > delay[0] ({delays[0]}) + slack");
+        Assert.True(delays[2] > delays[1] + TimeSpan.FromHours(1), $"expected delay[2] ({delays[2]}) > delay[1] ({delays[1]}) + slack");
+
+        // Now the source resolves positively -> status flips and the negative
+        // streak resets (proven indirectly: a subsequent confirmed negative
+        // reverts to the base TTL, not a continuation of the prior escalation).
+        await InsertMovieAvailabilityAsync(db, 99000705, status: "unknown", nextCheckAt: DateTimeOffset.UtcNow.AddHours(-1), priority: 0);
+        var positiveWorker = BuildWorker(db, cfg, new TorrentioLikeAvailableIndexer());
+        Assert.True(await InvokeProbeOneAsync(positiveWorker, cfg));
+        var (availStatus, _) = await ReadAvailabilityAsync(99000705);
+        Assert.Equal("available", availStatus);
+
+        await InsertMovieAvailabilityAsync(db, 99000705, status: "unknown", nextCheckAt: DateTimeOffset.UtcNow.AddHours(-1), priority: 0);
+        var beforeReset = DateTimeOffset.UtcNow;
+        Assert.True(await InvokeProbeOneAsync(negativeWorker, cfg));
+        var (resetStatus, _, resetNextCheck) = await ReadAvailabilityFullAsync(99000705, "movie", -1, -1);
+        Assert.Equal("unavailable", resetStatus);
+        var resetDelay = DateTimeOffset.FromUnixTimeSeconds(resetNextCheck) - beforeReset;
+        Assert.True(resetDelay < delays[0] + TimeSpan.FromHours(1), $"expected reset delay ({resetDelay}) back near the base TTL, not a continuation of the prior escalation ({delays[0]})");
+    }
+
+    private static AvailabilityItemRow MakeLease(int negativeStreak) => new(
+        TmdbId: 1,
+        Type: "movie",
+        Season: -1,
+        Episode: -1,
+        Status: "unknown",
+        CheckedAt: null,
+        NextCheckAt: DateTimeOffset.UtcNow,
+        CandidateMagnet: null,
+        CandidateInfoHash: null,
+        CandidateSize: null,
+        CandidateSeeders: null,
+        CandidateIndexer: null,
+        CandidateSource: null,
+        ProbeGeneration: 0,
+        LeaseOwner: null,
+        AttemptCount: 0,
+        NegativeStreak: negativeStreak);
 
     [Fact]
     public async Task PreFilter_ProwlarrCapable_NoImdb_DoesNotDeepDeferAndReachesProbe()
@@ -947,8 +1151,11 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
     /// <summary>
     /// Prowlarr-shaped fake: does NOT require an IMDB id and is NOT an
     /// availability-oracle indexer (ROI Priority 6, revised architecture item 1).
-    /// Any invocation of <see cref="SearchAsync"/> is a bug in the availability-sweep
-    /// path — Prowlarr's heavy fan-out must never be called there.
+    /// It must never be invoked while the oracle (Torrentio) itself can reach a
+    /// definitive verdict; it IS invoked as the availability-probe-reconcile-001
+    /// item 1 reconcile fallback when the oracle abstains. This fake returns no
+    /// candidates (a reconcile attempt that finds nothing); see
+    /// <see cref="ProwlarrHighConfidenceIndexer"/> for the reconcile-succeeds case.
     /// </summary>
     private sealed class ProwlarrLikeIndexer : IIndexerClient
     {
@@ -961,6 +1168,37 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
         {
             SearchCallCount++;
             return Task.FromResult<IReadOnlyList<IndexerCandidate>>(Array.Empty<IndexerCandidate>());
+        }
+    }
+
+    /// <summary>
+    /// Prowlarr-shaped fake that RETURNS a high-confidence candidate (clears the
+    /// same MinSeeders/size bar the oracle path enforces) — the reconcile-
+    /// succeeds case of availability-probe-reconcile-001 item 1.
+    /// </summary>
+    private sealed class ProwlarrHighConfidenceIndexer : IIndexerClient
+    {
+        public int SearchCallCount { get; private set; }
+        public string Name => "Prowlarr";
+        public bool IsEnabled => true;
+        public bool RequiresImdb => false;
+        public bool IsAvailabilityOracle => false;
+        public Task<IReadOnlyList<IndexerCandidate>> SearchAsync(IndexerQuery query, CancellationToken ct)
+        {
+            SearchCallCount++;
+            IReadOnlyList<IndexerCandidate> hits = new[]
+            {
+                new IndexerCandidate
+                {
+                    Title = "Prowlarr high-confidence candidate",
+                    Magnet = "magnet:?xt=urn:btih:" + Guid.NewGuid().ToString("N"),
+                    InfoHash = Guid.NewGuid().ToString("N"),
+                    Size = 5L * 1024 * 1024 * 1024,
+                    Seeders = 40,
+                    IndexerName = "Prowlarr",
+                },
+            };
+            return Task.FromResult(hits);
         }
     }
 }
