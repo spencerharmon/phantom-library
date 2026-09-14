@@ -252,12 +252,16 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
     }
 
     [Fact]
-    public async Task Sweep_NoImdb_DeepDefersWithoutInvokingProwlarrFanOut()
+    public async Task Sweep_NoImdb_ReconciledAgainstProwlarr_ThenDeepDefersWhenProwlarrAlsoFindsNothing()
     {
         // No-IMDB movie: the pre-classification (HasCapableAvailabilityIndexer,
-        // scoped to Torrentio only) must deep-defer before the probe layer is
-        // reached at all, even though a Prowlarr-shaped indexer is enabled and
-        // could otherwise serve the query.
+        // scoped to Torrentio only) still short-circuits the ordinary
+        // Torrentio-only ProbeAvailabilityAsync path. But
+        // availability-probe-reconcile-001 item 1 means a Torrentio abstain is no
+        // longer accepted as final without FIRST reconciling against the full
+        // indexer set (Prowlarr included) — so Prowlarr's SearchAsync IS now
+        // invoked once as the reconcile attempt. When that reconcile also finds
+        // nothing (as here), the item still deep-defers exactly as before.
         using var db = await NewDbAsync();
         await SeedMovieAsync(db, 99000950);
         // Deliberately no imdb id set.
@@ -270,10 +274,124 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
         var didWork = await InvokeProbeOneAsync(worker, cfg);
 
         Assert.True(didWork);
-        Assert.Equal(0, prowlarr.SearchCallCount);
+        Assert.Equal(1, prowlarr.SearchCallCount);
         var (status, error) = await ReadAvailabilityAsync(99000950);
         Assert.Equal("unknown", status);
         Assert.Equal("no_capable_indexer", error);
+    }
+
+    [Fact]
+    public async Task Sweep_NoImdb_TorrentioAbstains_ProwlarrHighConfidenceMagnet_ReconciledToAvailable()
+    {
+        // availability-probe-reconcile-001 item 1 — the task's headline
+        // reconcile case: a no-IMDB movie whose Torrentio-only oracle probe
+        // would otherwise deep-defer/abstain, but Prowlarr (queried via the
+        // full indexer fan-out reconcile) holds a candidate that clears the
+        // SAME high-confidence bar (MinSeeders/MinSizeGb1080p) every other
+        // candidate path enforces. The reconcile must reach a definitive
+        // `available` verdict from Prowlarr rather than surfacing
+        // availability_abstain/no_capable_indexer.
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 99000960);
+        // Deliberately no imdb id set — this is exactly the abstain trigger.
+        var cfg = Config();
+        cfg.AvailabilityNoIndexerRetryHours = 24;
+        var torrentio = new TorrentioLikeIndexer();
+        var prowlarr = new ProwlarrHighConfidenceIndexer();
+        var worker = BuildWorker(db, cfg, torrentio, prowlarr);
+
+        var didWork = await InvokeProbeOneAsync(worker, cfg);
+
+        Assert.True(didWork);
+        Assert.Equal(1, prowlarr.SearchCallCount);
+        var (status, _) = await ReadAvailabilityAsync(99000960);
+        Assert.Equal("available", status);
+    }
+
+    [Fact]
+    public async Task Sweep_TorrentioAbstainsPostProbe_ProwlarrHighConfidenceMagnet_ReconciledToAvailable()
+    {
+        // Same reconcile, but reached via the POST-probe NoCapableIndexer
+        // switch case (an imdb id IS present so the pre-filter passes, but
+        // Torrentio's own probe still abstains for this exact query) rather
+        // than the pre-filter short-circuit — movie AND episode parity
+        // requires both entry points to reconcile identically.
+        using var db = await NewDbAsync();
+        await SeedSeriesAsync(db, 99000970);
+        await InsertEpisodeCatalogueAsync(db, 99000970, 1, 1, "2020-01-01");
+        await InsertEpisodeAvailabilityAsync(db, 99000970, 1, 1, "unknown", DateTimeOffset.UtcNow.AddHours(-1));
+        await db.SetImdbIdAsync(99000970, "series", "tt99000970", CancellationToken.None);
+        var cfg = Config();
+        cfg.AvailabilityNoIndexerRetryHours = 24;
+        var torrentio = new TorrentioLikeIndexer();
+        var prowlarr = new ProwlarrHighConfidenceIndexer();
+        var worker = BuildWorker(db, cfg, torrentio, prowlarr);
+
+        var didWork = await InvokeProbeOneAsync(worker, cfg);
+
+        Assert.True(didWork);
+        Assert.Equal(1, prowlarr.SearchCallCount);
+        var (status, _) = await ReadAvailabilityAsync(99000970, season: 1, episode: 1);
+        Assert.Equal("available", status);
+    }
+
+    [Fact]
+    public async Task Sweep_DefinitiveUnavailable_NegativeStreakBackoffGrowsExponentiallyAndResetsOnPositive()
+    {
+        // availability-probe-reconcile-001 item 3 — bounded exponential negative
+        // backoff: a confirmed-negative item's next_check_at interval doubles
+        // per consecutive confirmed-negative probe (capped by
+        // AvailabilityUnavailableMaxTtlDays), and resets to the base TTL the
+        // moment a subsequent probe finds it available.
+        using var db = await NewDbAsync();
+        await SeedMovieAsync(db, 99000980);
+        await db.SetImdbIdAsync(99000980, "movie", "tt99000980", CancellationToken.None);
+        var cfg = Config();
+        cfg.AvailabilityUnavailableTtlDays = 2;
+        cfg.AvailabilityUnavailableMaxTtlDays = 10;
+        var torrentio = new EmptyIndexer(); // definitive-unavailable: no hits, no failures, no abstentions
+        var worker = BuildWorker(db, cfg, torrentio, new ProwlarrLikeIndexer());
+
+        var before1 = DateTimeOffset.UtcNow;
+        Assert.True(await InvokeProbeOneAsync(worker, cfg));
+        var next1 = await ReadNextCheckAtAsync(99000980);
+        Assert.InRange((next1 - before1).TotalDays, 1.9, 2.5); // ~base TTL (streak=1)
+
+        await ForceDueNowAsync(99000980);
+        var before2 = DateTimeOffset.UtcNow;
+        Assert.True(await InvokeProbeOneAsync(worker, cfg));
+        var next2 = await ReadNextCheckAtAsync(99000980);
+        Assert.InRange((next2 - before2).TotalDays, 3.9, 4.5); // ~2x base (streak=2)
+
+        await ForceDueNowAsync(99000980);
+        var before3 = DateTimeOffset.UtcNow;
+        Assert.True(await InvokeProbeOneAsync(worker, cfg));
+        var next3 = await ReadNextCheckAtAsync(99000980);
+        Assert.InRange((next3 - before3).TotalDays, 7.9, 8.5); // ~4x base (streak=3)
+
+        await ForceDueNowAsync(99000980);
+        var before4 = DateTimeOffset.UtcNow;
+        Assert.True(await InvokeProbeOneAsync(worker, cfg));
+        var next4 = await ReadNextCheckAtAsync(99000980);
+        Assert.InRange((next4 - before4).TotalDays, 9.5, 10.5); // capped at MaxTtlDays (would be 16x uncapped)
+
+        // Now a positive probe must reset the streak.
+        var available = new AvailableFirstCallIndexer();
+        var recoveredWorker = BuildWorker(db, cfg, available, new ProwlarrLikeIndexer());
+        await ForceDueNowAsync(99000980);
+        Assert.True(await InvokeProbeOneAsync(recoveredWorker, cfg));
+        var (recoveredStatus, _) = await ReadAvailabilityAsync(99000980);
+        Assert.Equal("available", recoveredStatus);
+
+        // A subsequent negative probe must be back to the BASE ttl (streak
+        // reset to 0 by the positive completion above), not still escalated.
+        var again = new EmptyIndexer();
+        var afterRecoveryWorker = BuildWorker(db, cfg, again, new ProwlarrLikeIndexer());
+        await ForceDueNowAsync(99000980);
+        var before5 = DateTimeOffset.UtcNow;
+        Assert.True(await InvokeProbeOneAsync(afterRecoveryWorker, cfg));
+        var next5 = await ReadNextCheckAtAsync(99000980);
+        Assert.InRange((next5 - before5).TotalDays, 1.9, 2.5);
     }
 
     // ---- p6-availability-convergence: no-forever-churn + TTL reprobe ----
@@ -626,6 +744,7 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
         AvailabilityTransientRetryMinutes = 5,
         AvailabilityAvailableTtlDays = 7,
         AvailabilityUnavailableTtlDays = 7,
+        AvailabilityUnavailableMaxTtlDays = 56,
         MagnetCacheTtlHours = 24,
         SourcePickerPreset = "test",
         MinSeeders = 1,
@@ -873,6 +992,52 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
         return (r.GetString(0), r.IsDBNull(1) ? null : r.GetString(1));
     }
 
+    private async Task<(string Status, string? ErrorKind)> ReadAvailabilityAsync(int tmdbId, int season, int episode)
+    {
+        await using var conn = new SqliteConnection("Data Source=" + _dbPath);
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT status,last_error_kind FROM availability_items WHERE tmdb_id=$tmdb AND type='episode' AND season=$season AND episode=$episode;";
+        cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+        cmd.Parameters.AddWithValue("$season", season);
+        cmd.Parameters.AddWithValue("$episode", episode);
+        await using var r = await cmd.ExecuteReaderAsync();
+        Assert.True(await r.ReadAsync());
+        return (r.GetString(0), r.IsDBNull(1) ? null : r.GetString(1));
+    }
+
+    /// <summary>
+    /// availability-probe-reconcile-001 item 3 test helper: reads the raw
+    /// <c>next_check_at</c> boundary the negative-backoff computation wrote,
+    /// for a movie row.
+    /// </summary>
+    private async Task<DateTimeOffset> ReadNextCheckAtAsync(int tmdbId)
+    {
+        await using var conn = new SqliteConnection("Data Source=" + _dbPath);
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT next_check_at FROM availability_items WHERE tmdb_id=$tmdb AND type='movie' AND season=-1 AND episode=-1;";
+        cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+        var v = await cmd.ExecuteScalarAsync();
+        return DateTimeOffset.FromUnixTimeSeconds(Convert.ToInt64(v, System.Globalization.CultureInfo.InvariantCulture));
+    }
+
+    /// <summary>
+    /// Forces a movie's availability row due for immediate re-claim by the
+    /// sweep (mirrors what the real backoff-expiry passage of wall-clock time
+    /// would do, without a test having to sleep for days).
+    /// </summary>
+    private async Task ForceDueNowAsync(int tmdbId)
+    {
+        await using var conn = new SqliteConnection("Data Source=" + _dbPath);
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "UPDATE availability_items SET next_check_at=$now, lease_owner=NULL, lease_until=NULL WHERE tmdb_id=$tmdb AND type='movie' AND season=-1 AND episode=-1;";
+        cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.AddSeconds(-1).ToUnixTimeSeconds());
+        cmd.Parameters.AddWithValue("$tmdb", tmdbId);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
     private sealed class TransientIndexer(string message) : IIndexerClient
     {
         public string Name => "transient";
@@ -947,8 +1112,13 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
     /// <summary>
     /// Prowlarr-shaped fake: does NOT require an IMDB id and is NOT an
     /// availability-oracle indexer (ROI Priority 6, revised architecture item 1).
-    /// Any invocation of <see cref="SearchAsync"/> is a bug in the availability-sweep
-    /// path — Prowlarr's heavy fan-out must never be called there.
+    /// Returns no candidates — used where the ordinary Torrentio-only path
+    /// resolves directly (no reconcile fan-out reached) so a nonzero
+    /// <see cref="SearchCallCount"/> is still a bug there, and also as the
+    /// "reconcile also finds nothing" half of the reconcile tests
+    /// (availability-probe-reconcile-001 item 1); see
+    /// <see cref="ProwlarrHighConfidenceIndexer"/> for the "reconcile finds a
+    /// high-confidence magnet" half.
     /// </summary>
     private sealed class ProwlarrLikeIndexer : IIndexerClient
     {
@@ -961,6 +1131,68 @@ public sealed class AvailabilityProbeWorkerTests : IDisposable
         {
             SearchCallCount++;
             return Task.FromResult<IReadOnlyList<IndexerCandidate>>(Array.Empty<IndexerCandidate>());
+        }
+    }
+
+    /// <summary>
+    /// Prowlarr-shaped fake that, unlike <see cref="ProwlarrLikeIndexer"/>,
+    /// RETURNS a candidate clearing the standard high-confidence bar
+    /// (MinSeeders/MinSizeGb1080p per <c>Config()</c>) — used to prove the
+    /// Torrentio↔Prowlarr reconcile (availability-probe-reconcile-001 item 1)
+    /// reaches a definitive available verdict from Prowlarr when Torrentio
+    /// abstains, without relaxing the bar.
+    /// </summary>
+    private sealed class ProwlarrHighConfidenceIndexer : IIndexerClient
+    {
+        public int SearchCallCount { get; private set; }
+        public string Name => "Prowlarr";
+        public bool IsEnabled => true;
+        public bool RequiresImdb => false;
+        public bool IsAvailabilityOracle => false;
+        public Task<IReadOnlyList<IndexerCandidate>> SearchAsync(IndexerQuery query, CancellationToken ct)
+        {
+            SearchCallCount++;
+            IReadOnlyList<IndexerCandidate> hits = new[]
+            {
+                new IndexerCandidate
+                {
+                    Title = "Prowlarr high-confidence candidate",
+                    Magnet = "magnet:?xt=urn:btih:" + Guid.NewGuid().ToString("N"),
+                    InfoHash = Guid.NewGuid().ToString("N"),
+                    Size = 5L * 1024 * 1024 * 1024,
+                    Seeders = 40,
+                    IndexerName = "Prowlarr",
+                },
+            };
+            return Task.FromResult(hits);
+        }
+    }
+
+    /// <summary>
+    /// Single indexer that returns a high-confidence candidate on every call —
+    /// used to model the "item recovers" half of the negative-backoff-reset
+    /// test (availability-probe-reconcile-001 item 3).
+    /// </summary>
+    private sealed class AvailableFirstCallIndexer : IIndexerClient
+    {
+        public string Name => "recovered";
+        public bool IsEnabled => true;
+        public bool IsAvailabilityOracle => true;
+        public Task<IReadOnlyList<IndexerCandidate>> SearchAsync(IndexerQuery query, CancellationToken ct)
+        {
+            IReadOnlyList<IndexerCandidate> hits = new[]
+            {
+                new IndexerCandidate
+                {
+                    Title = "Recovered candidate",
+                    Magnet = "magnet:?xt=urn:btih:" + Guid.NewGuid().ToString("N"),
+                    InfoHash = Guid.NewGuid().ToString("N"),
+                    Size = 5L * 1024 * 1024 * 1024,
+                    Seeders = 40,
+                    IndexerName = "recovered",
+                },
+            };
+            return Task.FromResult(hits);
         }
     }
 }

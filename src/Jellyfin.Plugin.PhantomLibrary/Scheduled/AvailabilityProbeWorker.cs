@@ -32,6 +32,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
     private readonly ILogger<AvailabilityProbeWorker> _logger;
     private readonly Func<PluginConfiguration> _configProvider;
     private readonly ProbeDelegate _probe;
+    private readonly ProbeDelegate _reconcileProbe;
     private readonly string _owner = $"availability-{Environment.MachineName}-{Guid.NewGuid():N}";
     private Timer? _timer;
     private CancellationTokenSource? _stopping;
@@ -57,7 +58,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
         ChannelStateProvider state,
         ILogger<AvailabilityProbeWorker> logger,
         Func<PluginConfiguration> configProvider)
-        : this(db, selector, externalIds, tmdb, state, logger, configProvider, probe: null)
+        : this(db, selector, externalIds, tmdb, state, logger, configProvider, probe: null, reconcileProbe: null)
     {
     }
 
@@ -85,7 +86,8 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
         ChannelStateProvider state,
         ILogger<AvailabilityProbeWorker> logger,
         Func<PluginConfiguration> configProvider,
-        ProbeDelegate? probe)
+        ProbeDelegate? probe,
+        ProbeDelegate? reconcileProbe = null)
     {
         _db = db ?? throw new ArgumentNullException(nameof(db));
         _selector = selector ?? throw new ArgumentNullException(nameof(selector));
@@ -95,6 +97,13 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _configProvider = configProvider ?? throw new ArgumentNullException(nameof(configProvider));
         _probe = probe ?? _selector.ProbeAvailabilityAsync;
+        // Reconcile probe (availability-probe-reconcile-001 item 1): the FULL
+        // indexer fan-out (all enabled indexers, including Prowlarr), used
+        // ONLY as a fallback when the Torrentio-only availability oracle
+        // abstains. Same MagnetSelector.ProbeAsync the manual/details-probe
+        // path already uses, so the SAME quality scorer + high-confidence bar
+        // applies — never a relaxed bar.
+        _reconcileProbe = reconcileProbe ?? _selector.ProbeAsync;
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -252,8 +261,21 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
             // 30-minute transient — churning the queue at that cadence on a
             // permanent (or long-lived) no-op wastes cycles that should go to
             // items where availability is plausible. Deep-defer both instead.
+            //
+            // Reconcile first (availability-probe-reconcile-001 item 1): the
+            // availability-oracle hot loop is Torrentio-only and requires an
+            // imdb id, so a no-IMDB title is pre-filtered here BEFORE Torrentio
+            // ever runs. That is exactly the "Torrentio abstains" case the task
+            // targets — reach for the Prowlarr high-confidence magnet set (via
+            // the FULL indexer fan-out, same scorer/high-confidence bar) before
+            // accepting the long no-capable-indexer backoff.
             if (!_selector.HasCapableAvailabilityIndexer(imdb))
             {
+                if (await TryReconcileWithFullIndexerSetAsync(lease, cfg, imdb, meta, policyHash, now, ct).ConfigureAwait(false))
+                {
+                    return true;
+                }
+
                 var backoff = now.AddHours(Math.Max(1, cfg.AvailabilityNoIndexerRetryHours));
                 await _db.RescheduleAvailabilityTransientAsync(
                     lease,
@@ -322,77 +344,38 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
             {
                 case MagnetProbeOutcome.Available:
                     {
-                        await _db.UpsertSourceCandidatesAsync(
-                            lease.TmdbId,
-                            lease.Type,
-                            lease.Season,
-                            lease.Episode,
-                            cfg.SourcePickerPreset,
-                            probe.Candidates,
-                            "availability_probe",
-                            TimeSpan.FromHours(Math.Max(1, cfg.MagnetCacheTtlHours)),
-                            ct).ConfigureAwait(false);
-                        var picked = probe.Candidates[0];
-                        var entry = new MagnetCacheEntry
-                        {
-                            Magnet = picked.Magnet,
-                            InfoHash = picked.InfoHash,
-                            Size = picked.Size,
-                            Seeders = picked.Seeders,
-                            Indexer = picked.Indexer,
-                            CachedAt = now,
-                            Ttl = TimeSpan.FromHours(Math.Max(1, cfg.MagnetCacheTtlHours)),
-                            Source = "availability",
-                        };
-                        var magnetKey = new MagnetCacheKey(lease.TmdbId, imdb, lease.Type,
-                            lease.Type == "episode" ? lease.Season : null,
-                            lease.Type == "episode" ? lease.Episode : null,
-                            cfg.SourcePickerPreset);
-                        await _db.PutCachedMagnetAsync(magnetKey, entry, ct).ConfigureAwait(false);
-                        await _db.DeleteUnavailableAsync(
-                            new UnavailableKey(lease.TmdbId, imdb, lease.Type,
-                                lease.Type == "episode" ? lease.Season : null,
-                                lease.Type == "episode" ? lease.Episode : null),
-                            ct).ConfigureAwait(false);
-                        await _db.CompleteAvailabilityProbeAsync(
-                            lease,
-                            "available",
-                            now,
-                            now.AddDays(Math.Max(1, cfg.AvailabilityAvailableTtlDays)),
-                            policyHash,
-                            entry,
-                            null,
-                            null,
-                            ct).ConfigureAwait(false);
-                        if (lease.Status != "available")
-                        {
-                            BumpFor(lease.Type);
-                        }
-
-                        PhantomMetrics.AvailabilityProbe(lease.Type, "available");
-                        _logger.LogInformation("Availability available {Type}/{Tmdb} s{Season}e{Episode} via {Indexer}", lease.Type, lease.TmdbId, lease.Season, lease.Episode, picked.Indexer);
+                        await CompleteAvailableAsync(lease, cfg, imdb, meta, policyHash, now, probe, ct).ConfigureAwait(false);
                         return true;
                     }
 
                 case MagnetProbeOutcome.DefinitiveUnavailable:
-                    await _db.CompleteAvailabilityProbeAsync(
-                        lease,
-                        "unavailable",
-                        now,
-                        now.AddDays(Math.Max(1, cfg.AvailabilityUnavailableTtlDays)),
-                        policyHash,
-                        candidate: null,
-                        errorKind: null,
-                        errorMessage: null,
-                        ct).ConfigureAwait(false);
-                    if (lease.Status == "available")
                     {
-                        BumpFor(lease.Type);
-                    }
+                        var negativeStreak = lease.NegativeStreak + 1;
+                        var backoffDays = Math.Min(
+                            Math.Max(1, cfg.AvailabilityUnavailableTtlDays) * (1L << Math.Min(negativeStreak - 1, 20)),
+                            Math.Max(1, cfg.AvailabilityUnavailableMaxTtlDays));
+                        await _db.CompleteAvailabilityProbeAsync(
+                            lease,
+                            "unavailable",
+                            now,
+                            now.AddDays(backoffDays),
+                            policyHash,
+                            candidate: null,
+                            errorKind: null,
+                            errorMessage: null,
+                            ct,
+                            negativeStreak: negativeStreak).ConfigureAwait(false);
+                        if (lease.Status == "available")
+                        {
+                            BumpFor(lease.Type);
+                        }
 
-                    PhantomMetrics.AvailabilityProbe(lease.Type, "unavailable");
-                    _logger.LogInformation("Availability unavailable {Type}/{Tmdb} s{Season}e{Episode}", lease.Type, lease.TmdbId, lease.Season, lease.Episode);
-                    return true;
+                        PhantomMetrics.AvailabilityProbe(lease.Type, "unavailable");
+                        _logger.LogInformation(
+                            "Availability unavailable {Type}/{Tmdb} s{Season}e{Episode}; negative streak={Streak} backoff={Days}d",
+                            lease.Type, lease.TmdbId, lease.Season, lease.Episode, negativeStreak, backoffDays);
+                        return true;
+                    }
 
                 case MagnetProbeOutcome.IndeterminateTransient:
                     await _db.RescheduleAvailabilityTransientAsync(
@@ -407,6 +390,17 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
 
                 case MagnetProbeOutcome.NoCapableIndexer:
                     {
+                        // Torrentio (the availability oracle) abstained even
+                        // though the pre-filter thought an imdb id was present
+                        // (e.g. a series-only imdb resolved but Torrentio still
+                        // could not serve the exact query). Reconcile against
+                        // the full indexer set (Prowlarr) before accepting the
+                        // long no-capable-indexer backoff (item 1).
+                        if (await TryReconcileWithFullIndexerSetAsync(lease, cfg, imdb, meta, policyHash, now, ct).ConfigureAwait(false))
+                        {
+                            return true;
+                        }
+
                         // No enabled indexer can serve this query as-is (e.g. no
                         // resolvable imdb id and Prowlarr disabled). This is NOT a
                         // 30-minute transient: retrying at that cadence just churns
@@ -448,6 +442,137 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
             _logger.LogWarning(ex, "Availability probe exception for {Type}/{Tmdb}", lease.Type, lease.TmdbId);
             return true;
         }
+    }
+
+    /// <summary>
+    /// Reconcile step (availability-probe-reconcile-001 item 1): the
+    /// Torrentio-only availability oracle abstained for this item (typically
+    /// a no-IMDB title triggering <c>IndexerNotApplicableException</c>, or a
+    /// per-title miss). Before accepting the long no-capable-indexer backoff,
+    /// run the FULL indexer fan-out — <see cref="MagnetSelector.ProbeAsync"/>,
+    /// which also queries Prowlarr — and if it clears a definitive
+    /// <see cref="MagnetProbeOutcome.Available"/> verdict (the SAME quality
+    /// scorer + high-confidence bar as every other candidate path; never
+    /// relaxed here), complete the probe as available from that result
+    /// instead of surfacing an avoidable <c>availability_abstain</c>. Returns
+    /// <see langword="false"/> (no completion performed) for any other
+    /// outcome so the caller falls through to its existing backoff.
+    /// </summary>
+    private async Task<bool> TryReconcileWithFullIndexerSetAsync(
+        AvailabilityItemRow lease,
+        PluginConfiguration cfg,
+        string? imdb,
+        TmdbMetadataRow meta,
+        string policyHash,
+        DateTimeOffset now,
+        CancellationToken ct)
+    {
+        MagnetProbeResult reconciled;
+        try
+        {
+            reconciled = await _reconcileProbe(
+                lease.TmdbId,
+                imdb,
+                lease.Type,
+                lease.Type == "episode" ? lease.Season : null,
+                lease.Type == "episode" ? lease.Episode : null,
+                meta.Title,
+                meta.Year,
+                ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // Reconcile is a best-effort improvement over the existing
+            // no-capable-indexer backoff, never a new failure mode: if the
+            // full fan-out itself throws, fall back to the caller's existing
+            // (already-safe) backoff path rather than propagating.
+            _logger.LogWarning(ex, "Availability reconcile probe failed for {Type}/{Tmdb}; falling back to no-capable-indexer backoff", lease.Type, lease.TmdbId);
+            return false;
+        }
+
+        if (reconciled.Outcome != MagnetProbeOutcome.Available)
+        {
+            return false;
+        }
+
+        await CompleteAvailableAsync(lease, cfg, imdb, meta, policyHash, now, reconciled, ct).ConfigureAwait(false);
+        _logger.LogInformation(
+            "Availability reconciled {Type}/{Tmdb} s{Season}e{Episode} via full indexer fan-out (Torrentio abstained, Prowlarr high-confidence magnet found)",
+            lease.Type, lease.TmdbId, lease.Season, lease.Episode);
+        return true;
+    }
+
+    /// <summary>
+    /// Completes an availability probe as a definitive <c>available</c>
+    /// verdict — shared by the ordinary availability-oracle probe and the
+    /// Torrentio↔Prowlarr reconcile fallback above so both paths cache/store
+    /// the winning candidate and reset the negative-result streak (item 3)
+    /// identically.
+    /// </summary>
+    private async Task CompleteAvailableAsync(
+        AvailabilityItemRow lease,
+        PluginConfiguration cfg,
+        string? imdb,
+        TmdbMetadataRow meta,
+        string policyHash,
+        DateTimeOffset now,
+        MagnetProbeResult probe,
+        CancellationToken ct)
+    {
+        await _db.UpsertSourceCandidatesAsync(
+            lease.TmdbId,
+            lease.Type,
+            lease.Season,
+            lease.Episode,
+            cfg.SourcePickerPreset,
+            probe.Candidates,
+            "availability_probe",
+            TimeSpan.FromHours(Math.Max(1, cfg.MagnetCacheTtlHours)),
+            ct).ConfigureAwait(false);
+        var picked = probe.Candidates[0];
+        var entry = new MagnetCacheEntry
+        {
+            Magnet = picked.Magnet,
+            InfoHash = picked.InfoHash,
+            Size = picked.Size,
+            Seeders = picked.Seeders,
+            Indexer = picked.Indexer,
+            CachedAt = now,
+            Ttl = TimeSpan.FromHours(Math.Max(1, cfg.MagnetCacheTtlHours)),
+            Source = "availability",
+        };
+        var magnetKey = new MagnetCacheKey(lease.TmdbId, imdb, lease.Type,
+            lease.Type == "episode" ? lease.Season : null,
+            lease.Type == "episode" ? lease.Episode : null,
+            cfg.SourcePickerPreset);
+        await _db.PutCachedMagnetAsync(magnetKey, entry, ct).ConfigureAwait(false);
+        await _db.DeleteUnavailableAsync(
+            new UnavailableKey(lease.TmdbId, imdb, lease.Type,
+                lease.Type == "episode" ? lease.Season : null,
+                lease.Type == "episode" ? lease.Episode : null),
+            ct).ConfigureAwait(false);
+        await _db.CompleteAvailabilityProbeAsync(
+            lease,
+            "available",
+            now,
+            now.AddDays(Math.Max(1, cfg.AvailabilityAvailableTtlDays)),
+            policyHash,
+            entry,
+            null,
+            null,
+            ct,
+            negativeStreak: 0).ConfigureAwait(false);
+        if (lease.Status != "available")
+        {
+            BumpFor(lease.Type);
+        }
+
+        PhantomMetrics.AvailabilityProbe(lease.Type, "available");
+        _logger.LogInformation("Availability available {Type}/{Tmdb} s{Season}e{Episode} via {Indexer}", lease.Type, lease.TmdbId, lease.Season, lease.Episode, picked.Indexer);
     }
 
     private async Task<bool> ExpandOneSeriesAsync(PluginConfiguration cfg, CancellationToken ct)

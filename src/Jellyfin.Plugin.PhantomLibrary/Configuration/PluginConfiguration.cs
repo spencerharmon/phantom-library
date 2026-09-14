@@ -99,6 +99,7 @@ public class PluginConfiguration : BasePluginConfiguration
         AvailabilityProbeMaxIntervalSeconds = 28;
         AvailabilityAvailableTtlDays = 7;
         AvailabilityUnavailableTtlDays = 7;
+        AvailabilityUnavailableMaxTtlDays = 56;
         AvailabilityTransientRetryMinutes = 30;
         AvailabilityMaxBatchSize = 1;
         AvailabilityLeaseMinutes = 15;
@@ -440,6 +441,16 @@ public class PluginConfiguration : BasePluginConfiguration
 
     /// <summary>TTL for unavailable phantom source probes.</summary>
     public int AvailabilityUnavailableTtlDays { get; set; }
+
+    /// <summary>
+    /// Bounded ceiling (days) for the exponential negative-result backoff
+    /// (availability-probe-reconcile-001 item 3): the effective re-probe
+    /// interval for a repeatedly-confirmed-negative item is
+    /// <c>AvailabilityUnavailableTtlDays * 2^negative_streak</c>, capped at
+    /// this value so a genuinely unavailable item is still eventually
+    /// re-checked rather than backed off forever.
+    /// </summary>
+    public int AvailabilityUnavailableMaxTtlDays { get; set; }
 
     /// <summary>Retry delay after transient probe failures that must not change visibility.</summary>
     public int AvailabilityTransientRetryMinutes { get; set; }

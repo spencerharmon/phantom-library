@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Availability-probe reconcile + bounded negative backoff
+  (availability-probe-reconcile-001).** Three coordinated moves to raise the
+  cold (`materialise_then_play`) availability-probe success rate without
+  weakening an `available` verdict or hammering the upstream oracles:
+  (1) **Torrentio↔Prowlarr reconcile** — when the Torrentio-only availability
+  oracle abstains (a no-IMDB title, or a per-title miss even with an imdb id
+  present), `AvailabilityProbeWorker` now falls back to the FULL indexer
+  fan-out (`MagnetSelector.ProbeAsync`, Prowlarr included) BEFORE accepting
+  the long no-capable-indexer backoff. A Prowlarr candidate clearing the SAME
+  high-confidence bar (`MinSeeders`/`MinSizeGb1080p`/`MinSizeGb4K`) every
+  other candidate path enforces now resolves to a definitive `available`
+  verdict instead of surfacing an avoidable `availability_abstain`/
+  `no_capable_indexer`. Wired at both entry points — the pre-filter
+  short-circuit and the post-probe `NoCapableIndexer` case — for movie AND
+  episode parity. (2) TTL re-probe on expiry is unchanged (pre-existing
+  `next_check_at`/TTL mechanism). (3) **Bounded exponential negative-result
+  backoff** — a new `availability_items.negative_streak` column tracks
+  consecutive confirmed-negative probes; each `DefinitiveUnavailable`
+  completion doubles the next re-probe interval from
+  `AvailabilityUnavailableTtlDays`, capped at the new
+  `AvailabilityUnavailableMaxTtlDays` (default 56 days), and any subsequent
+  `available` completion resets the streak to 0. A genuinely unavailable
+  item is now probed ever less often yet is still eventually re-checked,
+  cutting needless load on Torrentio/Prowlarr.
+  - **BREAKING: requires wipe.** Schema bumped 20 → 21 (adds
+    `availability_items.negative_streak`). Per AGENTS.md "No database
+    migrations until v1.0", an existing pre-v21 DB is hard-refused at
+    startup. Stop Jellyfin, run `sudo bash scripts/phantom-wipe.sh --commit`,
+    then restart. Both SQLite and Postgres build the new column from the
+    shared schema DDL; no ALTER path.
 - **Bounded fast-indexer early return for the magnet probe
   (ttfb-fast-indexer-early-return).** `MagnetSelector.ProbeCoreAsync`'s
   concurrent indexer fan-out (ttfb-parallel-indexer-probe) previously always

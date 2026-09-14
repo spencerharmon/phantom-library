@@ -242,7 +242,7 @@ public class PhantomDbTests : IDisposable
         {
             await conn.OpenAsync();
             await using var cmd = conn.CreateCommand();
-            cmd.CommandText = "PRAGMA user_version = 20;";
+            cmd.CommandText = $"PRAGMA user_version = {PhantomDb.CurrentSchemaVersion + 1};";
             await cmd.ExecuteNonQueryAsync();
         }
 
@@ -291,7 +291,7 @@ public class PhantomDbTests : IDisposable
             }
 
             await using var bump = conn.CreateCommand();
-            bump.CommandText = "PRAGMA user_version = 20;";
+            bump.CommandText = $"PRAGMA user_version = {PhantomDb.CurrentSchemaVersion + 1};";
             await bump.ExecuteNonQueryAsync();
         }
 
