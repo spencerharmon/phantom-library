@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Bounded fast-indexer early return for the magnet probe
+  (ttfb-fast-indexer-early-return).** `MagnetSelector.ProbeCoreAsync`'s
+  concurrent indexer fan-out (ttfb-parallel-indexer-probe) previously always
+  `Task.WhenAll`'d every enabled indexer, so the probe's wall-clock cost was
+  the SLOWEST indexer even when a faster one had already returned a usable
+  candidate. Behind a new `FastIndexerEarlyReturnEnabled` toggle (default
+  `false`), the probe now returns as soon as at least
+  `MinEarlyReturnCandidates` (default 1) MinSeeders-passing candidates have
+  been aggregated from ANY completed indexer(s) — never a hardcoded specific
+  indexer — AND at least `EarlyReturnMinElapsedMs` (default 250ms) has
+  elapsed since the fan-out started. Still-running slower indexer(s) are
+  NOT cancelled; they keep running in the background. Every existing
+  outcome classification (`Transient`, `NoCapableIndexer`,
+  `DefinitiveUnavailable`) is unchanged as the fallback when no indexer
+  reaches the early-return bar, and movie/episode parity is preserved (both
+  flows share `ProbeCoreAsync`). Default behavior (full wait) is unchanged
+  until an operator explicitly enables the toggle.
 - **Playback-outcome instrumentation (playback-outcome-instrumentation-001).**
   Every native-open playback attempt now records exactly one definitive outcome
   — success or a single failure cause — on the OTLP-native `Phantom.Flows` meter

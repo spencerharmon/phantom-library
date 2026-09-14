@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
 using System.Text.RegularExpressions;
@@ -322,7 +323,11 @@ public sealed class MagnetSelector
 
         // Await the whole fan-out. A caller-driven cancellation surfaces as an
         // OperationCanceledException from at least one task and propagates here.
-        await Task.WhenAll(tasks).ConfigureAwait(false);
+        // ROI Priority 9 (ttfb-fast-indexer-early-return): when enabled, race
+        // the fan-out instead of always waiting for the slowest indexer — see
+        // AwaitFanOutAsync for the bounded early-return rule.
+        var cfgForEarlyReturn = _configProvider();
+        await AwaitFanOutAsync(tasks, results, cfgForEarlyReturn, ct).ConfigureAwait(false);
 
         // Aggregate in deterministic enabled-list order.
         foreach (var r in results)
@@ -410,6 +415,86 @@ public sealed class MagnetSelector
         }).ToList();
 
         return MagnetProbeResult.Available(candidates);
+    }
+
+    /// <summary>
+    /// Awaits the per-indexer probe fan-out tasks. When
+    /// <see cref="PluginConfiguration.FastIndexerEarlyReturnEnabled"/> is off
+    /// (the default), this is exactly <c>Task.WhenAll(tasks)</c> — full-wait
+    /// behavior is byte-for-byte unchanged. When enabled, this races the
+    /// fan-out: after each indexer completes, if at least
+    /// <see cref="PluginConfiguration.MinEarlyReturnCandidates"/>
+    /// MinSeeders-passing candidates have been aggregated so far from ANY
+    /// completed indexer(s) (never a hardcoded specific indexer) AND at least
+    /// <see cref="PluginConfiguration.EarlyReturnMinElapsedMs"/> has elapsed
+    /// since the fan-out started, this method returns immediately WITHOUT
+    /// awaiting the still-pending indexer task(s). Those pending tasks are
+    /// deliberately NOT cancelled — they keep running in the background
+    /// (e.g. so their result can still populate the shared magnet cache for
+    /// a future hit); this method only observes their eventual
+    /// faults/results via a fire-and-forget continuation so a background
+    /// failure never surfaces as an unobserved task exception. A caller-driven
+    /// cancellation (the outer <paramref name="ct"/>) still propagates as an
+    /// <see cref="OperationCanceledException"/> exactly as the plain
+    /// <c>Task.WhenAll</c> path would.
+    /// </summary>
+    private static async Task AwaitFanOutAsync(
+        Task[] tasks,
+        (List<IndexerCandidate> Hits, string? Failure, string? Abstention)[] results,
+        PluginConfiguration cfg,
+        CancellationToken ct)
+    {
+        if (!cfg.FastIndexerEarlyReturnEnabled || tasks.Length <= 1)
+        {
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+            return;
+        }
+
+        var stopwatch = Stopwatch.StartNew();
+        var pending = new List<Task>(tasks);
+
+        while (pending.Count > 0)
+        {
+            var completed = await Task.WhenAny(pending).ConfigureAwait(false);
+            pending.Remove(completed);
+
+            // Rethrows a caller-driven OperationCanceledException exactly as
+            // Task.WhenAll would; per-indexer failures/timeouts/abstentions
+            // were already caught and classified inside the task itself, so
+            // this never throws for those cases.
+            await completed.ConfigureAwait(false);
+
+            if (stopwatch.ElapsedMilliseconds < cfg.EarlyReturnMinElapsedMs)
+            {
+                continue;
+            }
+
+            var passingCandidates = 0;
+            foreach (var r in results)
+            {
+                if (r.Hits is { Count: > 0 })
+                {
+                    passingCandidates += r.Hits.Count(h => h.Seeders >= cfg.MinSeeders);
+                }
+            }
+
+            if (passingCandidates >= cfg.MinEarlyReturnCandidates)
+            {
+                // Let the remaining slower indexer(s) keep running in the
+                // background (never cancelled); just observe their
+                // fault/result so it never becomes an unobserved exception.
+                foreach (var remaining in pending)
+                {
+                    _ = remaining.ContinueWith(
+                        static t => _ = t.Exception,
+                        CancellationToken.None,
+                        TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                        TaskScheduler.Default);
+                }
+
+                return;
+            }
+        }
     }
 
     internal static int EpisodeSpecificityScore(string? title, int season, int episode)

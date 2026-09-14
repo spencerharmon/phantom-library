@@ -27,6 +27,8 @@ public class PluginConfiguration : BasePluginConfiguration
     private int _bulkMaterialiseMaxAttempts;
     private int _gostreamHeavyConcurrency;
     private int _indexerProbeTimeoutSeconds;
+    private int _minEarlyReturnCandidates;
+    private int _earlyReturnMinElapsedMs;
     private string _sourceValidationPolicyVersion = "sv14-parser-audio-v1";
     private string _allowedVideoContainers = "mkv";
 
@@ -143,6 +145,9 @@ public class PluginConfiguration : BasePluginConfiguration
         SourceValidationPolicyVersion = "sv14-parser-audio-v1";
         GostreamHeavyConcurrency = 2;
         IndexerProbeTimeoutSeconds = 20;
+        FastIndexerEarlyReturnEnabled = false;
+        MinEarlyReturnCandidates = 1;
+        EarlyReturnMinElapsedMs = 250;
         GostreamToken = string.Empty;
 
         MetricsOtlpEnabled = false;
@@ -783,6 +788,52 @@ public class PluginConfiguration : BasePluginConfiguration
         get => _indexerProbeTimeoutSeconds;
         set => _indexerProbeTimeoutSeconds = Math.Clamp(value, 5, 120);
     }
+
+    /// <summary>
+    /// ROI Priority 9 (ttfb-fast-indexer-early-return): when enabled, the probe
+    /// fan-out in <c>MagnetSelector.ProbeCoreAsync</c> returns as soon as the
+    /// candidates aggregated so far from ANY completed indexer (never
+    /// hardcoded to a specific indexer) satisfy <see cref="MinEarlyReturnCandidates"/>
+    /// scorer-passing candidates AND <see cref="EarlyReturnMinElapsedMs"/> has
+    /// elapsed since the fan-out started, instead of waiting for every enabled
+    /// indexer via <c>Task.WhenAll</c>. Still-running slower indexers are NOT
+    /// cancelled — they keep running in the background so their result still
+    /// lands in the shared magnet cache for future hits; only the caller stops
+    /// waiting on them. Default <c>false</c> (conservative rollout): today's
+    /// full-wait behavior is unchanged until an operator explicitly enables
+    /// this.
+    /// </summary>
+    public bool FastIndexerEarlyReturnEnabled { get; set; }
+
+    /// <summary>
+    /// Minimum number of scorer-passing (<see cref="MinSeeders"/> floor, etc.)
+    /// candidates required from already-completed indexers before
+    /// <see cref="FastIndexerEarlyReturnEnabled"/> may return early. A
+    /// conservative default of 1 favours returning as soon as a single usable
+    /// candidate exists. Clamped to [1, 50].
+    /// </summary>
+    public int MinEarlyReturnCandidates
+    {
+        get => _minEarlyReturnCandidates;
+        set => _minEarlyReturnCandidates = Math.Clamp(value, 1, 50);
+    }
+
+    /// <summary>
+    /// Minimum wall-clock time (milliseconds) that must elapse since the probe
+    /// fan-out started before <see cref="FastIndexerEarlyReturnEnabled"/> may
+    /// trigger an early return, even if <see cref="MinEarlyReturnCandidates"/>
+    /// is already satisfied. This floor exists so a near-instant
+    /// abstention/failure from a fast-but-unhelpful indexer combined with a
+    /// coincidentally-already-cached fast hit can never short-circuit the
+    /// probe before OTHER indexers have had a fair chance to start and
+    /// contribute. Clamped to [0, 10000].
+    /// </summary>
+    public int EarlyReturnMinElapsedMs
+    {
+        get => _earlyReturnMinElapsedMs;
+        set => _earlyReturnMinElapsedMs = Math.Clamp(value, 0, 10000);
+    }
+
     /// <summary>Optional shared secret sent to gostream mutation/validation endpoints.</summary>
     public string GostreamToken { get; set; }    /// <summary>Normalizes a comma-separated video-container allow-list.</summary>
     public static string NormalizeAllowedVideoContainers(string? value)
