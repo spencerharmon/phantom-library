@@ -373,8 +373,8 @@ public sealed class PhantomMoviesChannel
         // (system/anonymous callers, e.g. GetLatestMedia's materialised-only path)
         // gets the server-wide list unchanged. ---
         var visible = userId == Guid.Empty
-            ? await _db.ListVisibleMovieRowsAsync(cancellationToken).ConfigureAwait(false)
-            : await _db.ListVisibleMovieRowsAsync(userId, cancellationToken).ConfigureAwait(false);
+            ? await _db.ListVisibleMovieRowsAsync(_configProvider().DeadSwarmBrowsePruneThreshold, cancellationToken).ConfigureAwait(false)
+            : await _db.ListVisibleMovieRowsAsync(userId, _configProvider().DeadSwarmBrowsePruneThreshold, cancellationToken).ConfigureAwait(false);
         foreach (var row in visible)
         {
             cancellationToken.ThrowIfCancellationRequested();

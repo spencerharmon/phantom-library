@@ -360,7 +360,7 @@ public sealed record HiddenItemRow(int TmdbId, string Type, DateTimeOffset Hidde
 /// </summary>
 public sealed class PhantomDb : IDisposable
 {
-    public const int CurrentSchemaVersion = 21;
+    public const int CurrentSchemaVersion = 22;
 
     /// <summary>
     /// Ordered registry of additive, idempotent EXPAND migrations
@@ -390,6 +390,15 @@ public sealed class PhantomDb : IDisposable
             {
                 "ALTER TABLE tmdb_metadata ADD COLUMN IF NOT EXISTS relevance_score REAL NOT NULL DEFAULT 0;",
                 "CREATE INDEX IF NOT EXISTS idx_tmdb_metadata_relevance ON tmdb_metadata(type, relevance_score DESC);",
+            }),
+        (
+            21,
+            22,
+            "v21_v22_dead_swarm_confirmations",
+            new[]
+            {
+                "CREATE TABLE IF NOT EXISTS dead_swarm_confirmations (tmdb_id INTEGER NOT NULL, type TEXT NOT NULL, season INTEGER NOT NULL DEFAULT -1, episode INTEGER NOT NULL DEFAULT -1, preset TEXT NOT NULL DEFAULT '', magnet TEXT NOT NULL, confirmations INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL, PRIMARY KEY (tmdb_id, type, season, episode, preset, magnet));",
+                "CREATE INDEX IF NOT EXISTS idx_dead_swarm_confirmations_item ON dead_swarm_confirmations(tmdb_id, type, season, episode, preset);",
             }),
     };
 
@@ -825,6 +834,28 @@ CREATE INDEX IF NOT EXISTS idx_source_candidates_expiry
     ON source_candidates(expires_at);
 CREATE INDEX IF NOT EXISTS idx_source_candidates_hash
     ON source_candidates(info_hash);
+
+-- browse-prune-dead-swarm-001 (ROI P12 dial #2): per-candidate count of how
+-- many times a candidate has been re-confirmed as a dead/stale swarm (a
+-- magnet_dead_stale-family transient validation failure). Purely-additive new
+-- table (keyed by the same stable candidate tuple as source_candidates); it is
+-- consulted by ListVisible*RowsAsync so an available item whose every candidate
+-- is either invalid OR a threshold-exceeded dead swarm is pruned from default
+-- browse while staying searchable/badged, and reset to zero when a fresh
+-- non-dead candidate validates. No existing table is touched.
+CREATE TABLE IF NOT EXISTS dead_swarm_confirmations (
+    tmdb_id       INTEGER NOT NULL,
+    type          TEXT NOT NULL,
+    season        INTEGER NOT NULL DEFAULT -1,
+    episode       INTEGER NOT NULL DEFAULT -1,
+    preset        TEXT NOT NULL DEFAULT '',
+    magnet        TEXT NOT NULL,
+    confirmations INTEGER NOT NULL DEFAULT 0,
+    updated_at    INTEGER NOT NULL,
+    PRIMARY KEY (tmdb_id, type, season, episode, preset, magnet)
+);
+CREATE INDEX IF NOT EXISTS idx_dead_swarm_confirmations_item
+    ON dead_swarm_confirmations(tmdb_id, type, season, episode, preset);
 
 -- Surviving table from v1: indexers returned nothing for a key; back
 -- off until retry_after.
@@ -1505,6 +1536,141 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
             cmd.AddWithValue("@episode", episode);
             cmd.AddWithValue("@preset", preset);
             return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    // ---- dead-swarm confirmation bookkeeping (browse-prune-dead-swarm-001) ----
+
+    /// <summary>
+    /// The stable, enumerated set of candidate <c>validation_reason</c> strings
+    /// that the <see cref="Materialiser"/> writes when a candidate resolves and
+    /// then dies/stalls at the swarm — the <c>magnet_dead_stale</c>-family
+    /// transient failures. These are SOFT/transient failures (the candidate
+    /// stays <c>validation_status</c> transient/unknown, never <c>invalid</c>),
+    /// so P10's all-invalid prune leaves them visible; this set is what
+    /// browse-prune-dead-swarm-001 counts re-confirmations of. Matched exactly
+    /// (never a free-text substring) so an unrelated reason can never be
+    /// misclassified as a dead swarm.
+    /// </summary>
+    public static readonly IReadOnlyList<string> DeadSwarmReasons = new[]
+    {
+        "metadata_timeout",
+        "validation_transient",
+    };
+
+    private static readonly string DeadSwarmReasonSqlList =
+        string.Join(",", DeadSwarmReasons.Select(r => "'" + r.Replace("'", "''", StringComparison.Ordinal) + "'"));
+
+    /// <summary>
+    /// Builds the correlated SQL predicate "this <paramref name="scAlias"/>
+    /// source_candidates row is a THRESHOLD-EXCEEDED dead swarm" — i.e. its
+    /// <c>validation_reason</c> is in the enumerated <see cref="DeadSwarmReasons"/>
+    /// set AND it has been re-confirmed dead at least <paramref name="thresholdParam"/>
+    /// times (per its <c>dead_swarm_confirmations</c> row). A candidate with no
+    /// confirmations row, or a below-threshold count, is NOT a threshold dead
+    /// swarm, so a single transient blip never evicts an item. Used to subtract
+    /// such candidates from the "viable candidate exists" browse predicate.
+    /// </summary>
+    private static string CandidateIsThresholdDeadSwarmSql(string scAlias, string thresholdParam)
+        => $@"{scAlias}.validation_reason IN ({DeadSwarmReasonSqlList})
+              AND EXISTS (
+                  SELECT 1 FROM dead_swarm_confirmations dsc
+                  WHERE dsc.tmdb_id={scAlias}.tmdb_id AND dsc.type={scAlias}.type
+                    AND dsc.season={scAlias}.season AND dsc.episode={scAlias}.episode
+                    AND dsc.preset={scAlias}.preset AND dsc.magnet={scAlias}.magnet
+                    AND dsc.confirmations >= {thresholdParam}
+              )";
+
+    /// <summary>
+    /// Records one more dead/stale-swarm re-confirmation for a candidate,
+    /// upserting its <c>dead_swarm_confirmations</c> row (+1). Returns the new
+    /// confirmation count. Purely-additive: touches no existing table.
+    /// </summary>
+    public async Task<int> IncrementDeadSwarmConfirmationAsync(
+        int tmdbId,
+        string type,
+        int season,
+        int episode,
+        string preset,
+        string magnet,
+        CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        ArgumentNullException.ThrowIfNull(preset);
+        ArgumentException.ThrowIfNullOrWhiteSpace(magnet);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"INSERT INTO dead_swarm_confirmations
+                    (tmdb_id,type,season,episode,preset,magnet,confirmations,updated_at)
+                VALUES (@tmdb,@type,@season,@episode,@preset,@magnet,1,@now)
+                ON CONFLICT (tmdb_id,type,season,episode,preset,magnet)
+                DO UPDATE SET confirmations = dead_swarm_confirmations.confirmations + 1,
+                              updated_at = @now;";
+            cmd.AddWithValue("@tmdb", tmdbId);
+            cmd.AddWithValue("@type", type);
+            cmd.AddWithValue("@season", season);
+            cmd.AddWithValue("@episode", episode);
+            cmd.AddWithValue("@preset", preset);
+            cmd.AddWithValue("@magnet", magnet);
+            cmd.AddWithValue("@now", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+
+            await using var read = conn.CreateCommand();
+            read.CommandText = @"SELECT confirmations FROM dead_swarm_confirmations
+                WHERE tmdb_id=@tmdb AND type=@type AND season=@season AND episode=@episode AND preset=@preset AND magnet=@magnet;";
+            read.AddWithValue("@tmdb", tmdbId);
+            read.AddWithValue("@type", type);
+            read.AddWithValue("@season", season);
+            read.AddWithValue("@episode", episode);
+            read.AddWithValue("@preset", preset);
+            read.AddWithValue("@magnet", magnet);
+            var result = await read.ExecuteScalarAsync(ct).ConfigureAwait(false);
+            return result is null or DBNull ? 0 : Convert.ToInt32(result, System.Globalization.CultureInfo.InvariantCulture);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Clears any dead-swarm re-confirmation count for a single candidate (its
+    /// swarm came back / it validated). Removing the row makes the candidate
+    /// count as viable again on the next browse read.
+    /// </summary>
+    public async Task ClearDeadSwarmConfirmationAsync(
+        int tmdbId,
+        string type,
+        int season,
+        int episode,
+        string preset,
+        string magnet,
+        CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        ArgumentNullException.ThrowIfNull(preset);
+        ArgumentException.ThrowIfNullOrWhiteSpace(magnet);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"DELETE FROM dead_swarm_confirmations
+                WHERE tmdb_id=@tmdb AND type=@type AND season=@season AND episode=@episode AND preset=@preset AND magnet=@magnet;";
+            cmd.AddWithValue("@tmdb", tmdbId);
+            cmd.AddWithValue("@type", type);
+            cmd.AddWithValue("@season", season);
+            cmd.AddWithValue("@episode", episode);
+            cmd.AddWithValue("@preset", preset);
+            cmd.AddWithValue("@magnet", magnet);
+            await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
         finally
         {
@@ -3201,10 +3367,21 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
     }
 
     public async Task<IReadOnlyList<VisibleMovieRow>> ListVisibleMovieRowsAsync(CancellationToken ct)
+        => await ListVisibleMovieRowsAsync(DefaultDeadSwarmBrowsePruneThreshold, ct).ConfigureAwait(false);
+
+    /// <summary>
+    /// Default dead-swarm re-confirmation threshold used by the parameterless
+    /// browse overloads; mirrors <c>PluginConfiguration.DeadSwarmBrowsePruneThreshold</c>'s
+    /// default so a caller without config sees the same behaviour.
+    /// </summary>
+    public const int DefaultDeadSwarmBrowsePruneThreshold = 2;
+
+    public async Task<IReadOnlyList<VisibleMovieRow>> ListVisibleMovieRowsAsync(int deadSwarmThreshold, CancellationToken ct)
     {
+        deadSwarmThreshold = Math.Max(1, deadSwarmThreshold);
         await using var conn = await OpenAsync(ct).ConfigureAwait(false);
         await using var cmd = conn.CreateCommand();
-        cmd.CommandText = @"SELECT m.tmdb_id,m.type,m.title,m.year,m.overview,m.poster_url,m.backdrop_url,
+        cmd.CommandText = $@"SELECT m.tmdb_id,m.type,m.title,m.year,m.overview,m.poster_url,m.backdrop_url,
                    m.genres_json,m.official_rating,m.community_rating,m.original_title,m.fetched_at,m.runtime_minutes,m.relevance_score,
                    ms.tmdb_id,ms.type,ms.season,ms.episode,ms.stub_path,ms.fuse_path,ms.materialised_at,
                    a.tmdb_id,a.type,a.season,a.episode,a.status,a.checked_at,a.next_check_at,
@@ -3224,12 +3401,14 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                         SELECT 1 FROM source_candidates sc
                         WHERE sc.tmdb_id=m.tmdb_id AND sc.type='movie' AND sc.season=-1 AND sc.episode=-1
                           AND sc.validation_status <> 'invalid'
+                          AND NOT ({CandidateIsThresholdDeadSwarmSql("sc", "@deadSwarmThreshold")})
                     )
                 ))
             )
             ORDER BY CASE WHEN ms.tmdb_id IS NOT NULL THEN 0 ELSE 1 END,
                      m.relevance_score DESC,
                      COALESCE(ms.materialised_at, m.fetched_at) DESC;";
+        cmd.AddWithValue("@deadSwarmThreshold", deadSwarmThreshold);
         var list = new List<VisibleMovieRow>();
         await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
         while (await r.ReadAsync(ct).ConfigureAwait(false))
@@ -3282,11 +3461,15 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
     }
 
     public async Task<IReadOnlyList<VisibleSeriesRow>> ListVisibleSeriesRowsAsync(int minAvailableEpisodes, CancellationToken ct)
+        => await ListVisibleSeriesRowsAsync(minAvailableEpisodes, DefaultDeadSwarmBrowsePruneThreshold, ct).ConfigureAwait(false);
+
+    public async Task<IReadOnlyList<VisibleSeriesRow>> ListVisibleSeriesRowsAsync(int minAvailableEpisodes, int deadSwarmThreshold, CancellationToken ct)
     {
         minAvailableEpisodes = Math.Max(1, minAvailableEpisodes);
+        deadSwarmThreshold = Math.Max(1, deadSwarmThreshold);
         await using var conn = await OpenAsync(ct).ConfigureAwait(false);
         await using var cmd = conn.CreateCommand();
-        cmd.CommandText = @"SELECT m.tmdb_id,m.type,m.title,m.year,m.overview,m.poster_url,m.backdrop_url,
+        cmd.CommandText = $@"SELECT m.tmdb_id,m.type,m.title,m.year,m.overview,m.poster_url,m.backdrop_url,
                    m.genres_json,m.official_rating,m.community_rating,m.original_title,m.fetched_at,m.runtime_minutes,m.relevance_score,
                    COALESCE(av.available_count,0), COALESCE(mat.materialised_count,0)
             FROM tmdb_metadata m
@@ -3302,6 +3485,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                         SELECT 1 FROM source_candidates sc
                         WHERE sc.tmdb_id=ai.tmdb_id AND sc.type='episode' AND sc.season=ai.season AND sc.episode=ai.episode
                           AND sc.validation_status <> 'invalid'
+                          AND NOT ({CandidateIsThresholdDeadSwarmSql("sc", "@deadSwarmThreshold")})
                     )
                   )
                 GROUP BY ai.tmdb_id
@@ -3324,6 +3508,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                             SELECT 1 FROM source_candidates sc
                             WHERE sc.tmdb_id=ai.tmdb_id AND sc.type='episode' AND sc.season=ai.season AND sc.episode=ai.episode
                               AND sc.validation_status <> 'invalid'
+                              AND NOT ({CandidateIsThresholdDeadSwarmSql("sc", "@deadSwarmThreshold")})
                         )
                       )
                     UNION
@@ -3336,6 +3521,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                      m.relevance_score DESC,
                      m.fetched_at DESC;";
         cmd.AddWithValue("@min", minAvailableEpisodes);
+        cmd.AddWithValue("@deadSwarmThreshold", deadSwarmThreshold);
         var list = new List<VisibleSeriesRow>();
         await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
         while (await r.ReadAsync(ct).ConfigureAwait(false))
@@ -3758,8 +3944,11 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
     // iff its parent series is both server-visible and not hidden by that user.
 
     public async Task<IReadOnlyList<VisibleMovieRow>> ListVisibleMovieRowsAsync(Guid userId, CancellationToken ct)
+        => await ListVisibleMovieRowsAsync(userId, DefaultDeadSwarmBrowsePruneThreshold, ct).ConfigureAwait(false);
+
+    public async Task<IReadOnlyList<VisibleMovieRow>> ListVisibleMovieRowsAsync(Guid userId, int deadSwarmThreshold, CancellationToken ct)
     {
-        var baseRows = await ListVisibleMovieRowsAsync(ct).ConfigureAwait(false);
+        var baseRows = await ListVisibleMovieRowsAsync(deadSwarmThreshold, ct).ConfigureAwait(false);
         var hidden = await HiddenTmdbIdsAsync(userId, "movie", ct).ConfigureAwait(false);
         if (hidden.Count == 0)
         {
@@ -3779,8 +3968,11 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
     }
 
     public async Task<IReadOnlyList<VisibleSeriesRow>> ListVisibleSeriesRowsAsync(Guid userId, int minAvailableEpisodes, CancellationToken ct)
+        => await ListVisibleSeriesRowsAsync(userId, minAvailableEpisodes, DefaultDeadSwarmBrowsePruneThreshold, ct).ConfigureAwait(false);
+
+    public async Task<IReadOnlyList<VisibleSeriesRow>> ListVisibleSeriesRowsAsync(Guid userId, int minAvailableEpisodes, int deadSwarmThreshold, CancellationToken ct)
     {
-        var baseRows = await ListVisibleSeriesRowsAsync(minAvailableEpisodes, ct).ConfigureAwait(false);
+        var baseRows = await ListVisibleSeriesRowsAsync(minAvailableEpisodes, deadSwarmThreshold, ct).ConfigureAwait(false);
         var hidden = await HiddenTmdbIdsAsync(userId, "series", ct).ConfigureAwait(false);
         if (hidden.Count == 0)
         {

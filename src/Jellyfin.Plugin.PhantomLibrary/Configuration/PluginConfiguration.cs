@@ -22,6 +22,7 @@ public class PluginConfiguration : BasePluginConfiguration
     private int _sourceValidationTtlHours;
     private int _sourceValidationTransientRetryMinutes;
     private int _sourceValidationLeaseMinutes;
+    private int _deadSwarmBrowsePruneThreshold;
     private int _bulkMaterialiseRunningStaleMinutes;
     private int _bulkMaterialiseWorkerCount;
     private int _bulkMaterialiseMaxAttempts;
@@ -139,6 +140,7 @@ public class PluginConfiguration : BasePluginConfiguration
         SourceValidationDetailsBudgetSeconds = 8;
         SourceValidationTtlHours = 168;
         SourceValidationTransientRetryMinutes = 30;
+        DeadSwarmBrowsePruneThreshold = 2;
         SourceValidationLeaseMinutes = 10;
         BulkMaterialiseRunningStaleMinutes = 30;
         BulkMaterialiseWorkerCount = 2;
@@ -768,6 +770,21 @@ public class PluginConfiguration : BasePluginConfiguration
     {
         get => _sourceValidationLeaseMinutes;
         set => _sourceValidationLeaseMinutes = Math.Clamp(value, 1, 60);
+    }
+
+    /// <summary>
+    /// Number of times an available item's sole remaining candidate must be
+    /// re-confirmed as a dead/stale swarm (a <c>magnet_dead_stale</c>-family
+    /// transient validation failure) before that candidate stops counting as
+    /// "viable" for default-browse visibility (browse-prune-dead-swarm-001,
+    /// ROI P12 dial #2). A single transient blip below this threshold keeps the
+    /// item visible so a recoverable swarm is not evicted prematurely; the item
+    /// reappears automatically the moment a fresh non-dead candidate is cached.
+    /// </summary>
+    public int DeadSwarmBrowsePruneThreshold
+    {
+        get => _deadSwarmBrowsePruneThreshold;
+        set => _deadSwarmBrowsePruneThreshold = Math.Clamp(value, 1, 100);
     }
 
     /// <summary>Age after which running bulk items are reset to retry on startup.</summary>

@@ -1331,6 +1331,21 @@ public sealed class Materialiser : IMaterialiser
         {
             await MarkCandidateFailedAsync(candidate, tmdbId, imdb, type, season, episode, cfg, reason, ttl, ct).ConfigureAwait(false);
         }
+
+        // browse-prune-dead-swarm-001: a candidate that validates clean is no
+        // longer a dead swarm — drop any accumulated dead-swarm confirmations so
+        // it counts as viable again and its item reappears in default browse.
+        if (string.Equals(status, "valid", StringComparison.OrdinalIgnoreCase))
+        {
+            await _db.ClearDeadSwarmConfirmationAsync(
+                tmdbId,
+                type,
+                sSentinel,
+                eSentinel,
+                cfg.SourcePickerPreset,
+                candidate.Magnet.Magnet,
+                ct).ConfigureAwait(false);
+        }
     }
 
     private async Task ReleaseLosingValidationsAsync(
@@ -1708,6 +1723,25 @@ public sealed class Materialiser : IMaterialiser
                 candidate.Request.SelectedFilePath,
                 null),
             ct).ConfigureAwait(false);
+
+        // browse-prune-dead-swarm-001: a SOFT/transient dead-or-stale-swarm
+        // failure (the magnet_dead_stale-family reasons) keeps the candidate
+        // validation_status transient (never 'invalid'), so P10's all-invalid
+        // prune leaves it visible. Count each such re-confirmation so
+        // ListVisible*RowsAsync can prune an item whose only candidate is a
+        // threshold-exceeded dead swarm. Non-dead-swarm reasons are ignored.
+        if (PhantomDb.DeadSwarmReasons.Contains(reason, StringComparer.Ordinal)
+            && !string.Equals(status, "invalid", StringComparison.OrdinalIgnoreCase))
+        {
+            await _db.IncrementDeadSwarmConfirmationAsync(
+                tmdbId,
+                type,
+                sSentinel,
+                eSentinel,
+                cfg.SourcePickerPreset,
+                candidate.Magnet.Magnet,
+                ct).ConfigureAwait(false);
+        }
 
         if (candidate.FromCache)
         {

@@ -425,8 +425,8 @@ public sealed partial class PhantomShowsChannel
         // (non-empty) userId additionally subtracts that user's hidden set
         // (REQ-M14-PER-USER Surface 3).
         var visible = userId == Guid.Empty
-            ? await _db.ListVisibleSeriesRowsAsync(SeriesMinAvailableEpisodes(), ct).ConfigureAwait(false)
-            : await _db.ListVisibleSeriesRowsAsync(userId, SeriesMinAvailableEpisodes(), ct).ConfigureAwait(false);
+            ? await _db.ListVisibleSeriesRowsAsync(SeriesMinAvailableEpisodes(), CurrentConfiguration().DeadSwarmBrowsePruneThreshold, ct).ConfigureAwait(false)
+            : await _db.ListVisibleSeriesRowsAsync(userId, SeriesMinAvailableEpisodes(), CurrentConfiguration().DeadSwarmBrowsePruneThreshold, ct).ConfigureAwait(false);
         foreach (var row in visible)
         {
             ct.ThrowIfCancellationRequested();

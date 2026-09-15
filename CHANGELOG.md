@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Prune doomed-but-visible dead-swarm items from default browse
+  (browse-prune-dead-swarm-001, ROI P12 dial #2).** Closes the gap P10
+  (`p10-prune-nonplayable-browse`) left open: a candidate that resolves and
+  then dies at the swarm (the `magnet_dead_stale`-family playback cause) is a
+  SOFT/transient failure, so `Materialiser` keeps it `validation_status`
+  transient (never `invalid`) — P10's all-invalid prune therefore leaves such
+  a DOOMED-BUT-VISIBLE item in default browse even though every cold attempt
+  re-resolves the same dead swarm. `ListVisibleMovieRowsAsync` /
+  `ListVisibleSeriesRowsAsync` now additionally exclude an `available` item
+  from DEFAULT BROWSE when every one of its `source_candidates` rows is either
+  `validation_status='invalid'` OR a THRESHOLD-EXCEEDED dead swarm (its
+  `validation_reason` in the enumerated `PhantomDb.DeadSwarmReasons` set AND
+  re-confirmed dead at least `DeadSwarmBrowsePruneThreshold` times, default 2).
+  A single below-threshold blip, a still-viable sibling candidate, or a
+  materialised item all stay visible; the item stays searchable/badged (P6
+  split) and reappears automatically the moment a fresh non-dead candidate is
+  cached — no new background loop, no re-promotion step. MOVIE AND EPISODE
+  parity. Re-confirmations are counted in a purely-additive new table
+  `dead_swarm_confirmations` (incremented on each transient dead-swarm
+  validation failure, cleared when a candidate validates clean).
+  **BREAKING: requires wipe** — schema bumped v21 → v22 (adds the
+  `dead_swarm_confirmations` table + index; touches no existing table). Per
+  AGENTS.md "no migrations until v1.0", the upgrade path is
+  `sudo bash scripts/phantom-wipe.sh --commit` with Jellyfin stopped, then
+  restart (the plugin recreates the v22 schema and `SuggestionsRefreshTask`
+  repopulates on its next tick). The shared-Postgres blue/green path
+  self-applies the additive `v21_v22_dead_swarm_confirmations` expand
+  migration automatically (no wipe needed there).
+
+### Availability-probe reconcile (existing)
 - **Availability-probe reconcile + bounded negative backoff
   (availability-probe-reconcile-001).** Three coordinated moves to raise the
   cold (`materialise_then_play`) availability-probe success rate without

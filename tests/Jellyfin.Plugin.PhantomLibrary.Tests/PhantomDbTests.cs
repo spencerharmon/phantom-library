@@ -721,6 +721,169 @@ public class PhantomDbTests : IDisposable
     }
 
     // ----------------------------------------------------------------
+    // browse-prune-dead-swarm-001 (ROI P12 dial #2): prune an available item
+    // whose only candidate is a THRESHOLD-EXCEEDED dead swarm (a
+    // magnet_dead_stale-family transient failure, NOT 'invalid', so P10's
+    // all-invalid prune leaves it visible). A single below-threshold blip stays
+    // visible; a still-viable sibling candidate keeps it visible; materialised
+    // items bypass the check; and it re-enters when a fresh candidate appears.
+    // ----------------------------------------------------------------
+
+    private static readonly string DeadSwarmReason = PhantomDb.DeadSwarmReasons[0];
+
+    private static async Task SeedDeadSwarmCandidateAsync(
+        PhantomDb db, int tmdb, string type, int season, int episode, string magnet, int confirmations)
+    {
+        var infoHash = magnet.Split(':')[^1];
+        await db.UpsertSourceCandidatesAsync(
+            tmdb, type, season, episode, "preset",
+            new[] { new Jellyfin.Plugin.PhantomLibrary.Sources.MagnetCandidate(magnet, infoHash, 1234, 10, "idx") { Title = infoHash } },
+            "test", TimeSpan.FromHours(1), CancellationToken.None);
+        await db.UpdateSourceCandidateValidationAsync(new SourceCandidateValidationUpdate(
+            tmdb, type, season, episode, "preset", magnet,
+            "transient", DeadSwarmReason, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow.AddMinutes(30),
+            5, "policy-v1", null, null, null), CancellationToken.None);
+        for (var i = 0; i < confirmations; i++)
+        {
+            await db.IncrementDeadSwarmConfirmationAsync(tmdb, type, season, episode, "preset", magnet, CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task ListVisibleMovieRows_ExcludesMovieWhenOnlyCandidateIsThresholdDeadSwarm()
+    {
+        using var db = await NewDbAsync();
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(700, "movie", "Dead Swarm Movie", null, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await db.MarkAvailabilityAvailableAsync(700, "movie", -1, -1, candidate: null, CancellationToken.None);
+
+        // One dead-swarm re-confirmation (below the default threshold of 2):
+        // a single blip must NOT evict the item.
+        await SeedDeadSwarmCandidateAsync(db, 700, "movie", -1, -1, "magnet:?xt=urn:btih:dead700", confirmations: 1);
+        Assert.Contains(await db.ListVisibleMovieRowsAsync(CancellationToken.None), r => r.Metadata.TmdbId == 700);
+
+        // Second re-confirmation reaches the threshold: now it is pruned.
+        await db.IncrementDeadSwarmConfirmationAsync(700, "movie", -1, -1, "preset", "magnet:?xt=urn:btih:dead700", CancellationToken.None);
+        Assert.DoesNotContain(await db.ListVisibleMovieRowsAsync(CancellationToken.None), r => r.Metadata.TmdbId == 700);
+    }
+
+    [Fact]
+    public async Task ListVisibleMovieRows_KeepsMovieWhenAViableCandidateSurvivesAlongsideDeadSwarm()
+    {
+        using var db = await NewDbAsync();
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(701, "movie", "Mixed Movie", null, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await db.MarkAvailabilityAvailableAsync(701, "movie", -1, -1, candidate: null, CancellationToken.None);
+
+        await SeedDeadSwarmCandidateAsync(db, 701, "movie", -1, -1, "magnet:?xt=urn:btih:dead701", confirmations: 5);
+        // A second, still-viable (unvalidated) candidate keeps the item visible.
+        await db.UpsertSourceCandidatesAsync(
+            701, "movie", -1, -1, "preset",
+            new[] { new Jellyfin.Plugin.PhantomLibrary.Sources.MagnetCandidate("magnet:?xt=urn:btih:live701", "live701", 1234, 10, "idx") { Title = "Live" } },
+            "test", TimeSpan.FromHours(1), CancellationToken.None);
+
+        Assert.Contains(await db.ListVisibleMovieRowsAsync(CancellationToken.None), r => r.Metadata.TmdbId == 701);
+    }
+
+    [Fact]
+    public async Task ListVisibleMovieRows_MaterialisedItemBypassesDeadSwarmPrune()
+    {
+        using var db = await NewDbAsync();
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(702, "movie", "Materialised Movie", null, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await db.MarkAvailabilityAvailableAsync(702, "movie", -1, -1, candidate: null, CancellationToken.None);
+        await SeedDeadSwarmCandidateAsync(db, 702, "movie", -1, -1, "magnet:?xt=urn:btih:dead702", confirmations: 5);
+        await db.InsertMaterialisedStateAsync(702, "movie", -1, -1, "/stub/702.mkv", "/fuse/702.mkv", CancellationToken.None);
+
+        Assert.Contains(await db.ListVisibleMovieRowsAsync(CancellationToken.None), r => r.Metadata.TmdbId == 702);
+    }
+
+    [Fact]
+    public async Task ListVisibleMovieRows_ReentersWhenFreshCandidateAppearsAfterDeadSwarmPrune()
+    {
+        using var db = await NewDbAsync();
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(703, "movie", "Recovering Movie", null, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await db.MarkAvailabilityAvailableAsync(703, "movie", -1, -1, candidate: null, CancellationToken.None);
+        await SeedDeadSwarmCandidateAsync(db, 703, "movie", -1, -1, "magnet:?xt=urn:btih:dead703", confirmations: 3);
+        Assert.DoesNotContain(await db.ListVisibleMovieRowsAsync(CancellationToken.None), r => r.Metadata.TmdbId == 703);
+
+        // A fresh re-probe surfaces a new, not-yet-validated candidate: item reappears.
+        await db.UpsertSourceCandidatesAsync(
+            703, "movie", -1, -1, "preset",
+            new[] { new Jellyfin.Plugin.PhantomLibrary.Sources.MagnetCandidate("magnet:?xt=urn:btih:fresh703", "fresh703", 1234, 10, "idx") { Title = "Fresh" } },
+            "test", TimeSpan.FromHours(1), CancellationToken.None);
+        Assert.Contains(await db.ListVisibleMovieRowsAsync(CancellationToken.None), r => r.Metadata.TmdbId == 703);
+    }
+
+    [Fact]
+    public async Task ListVisibleSeriesRows_ExcludesSeriesWhenOnlyEpisodeCandidateIsThresholdDeadSwarm()
+    {
+        using var db = await NewDbAsync();
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(800, "series", "Dead Swarm Series", null, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await db.MarkAvailabilityAvailableAsync(800, "episode", 1, 1, candidate: null, CancellationToken.None);
+
+        await SeedDeadSwarmCandidateAsync(db, 800, "episode", 1, 1, "magnet:?xt=urn:btih:dead800", confirmations: 1);
+        // Below threshold: still visible.
+        Assert.Contains(await db.ListVisibleSeriesRowsAsync(CancellationToken.None), r => r.Metadata.TmdbId == 800);
+
+        await db.IncrementDeadSwarmConfirmationAsync(800, "episode", 1, 1, "preset", "magnet:?xt=urn:btih:dead800", CancellationToken.None);
+        Assert.DoesNotContain(await db.ListVisibleSeriesRowsAsync(CancellationToken.None), r => r.Metadata.TmdbId == 800);
+    }
+
+    [Fact]
+    public async Task ListVisibleSeriesRows_KeepsSeriesWhenAViableEpisodeCandidateSurvives()
+    {
+        using var db = await NewDbAsync();
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(801, "series", "Mixed Series", null, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await db.MarkAvailabilityAvailableAsync(801, "episode", 1, 1, candidate: null, CancellationToken.None);
+        await SeedDeadSwarmCandidateAsync(db, 801, "episode", 1, 1, "magnet:?xt=urn:btih:dead801", confirmations: 5);
+        await db.UpsertSourceCandidatesAsync(
+            801, "episode", 1, 1, "preset",
+            new[] { new Jellyfin.Plugin.PhantomLibrary.Sources.MagnetCandidate("magnet:?xt=urn:btih:live801", "live801", 1234, 10, "idx") { Title = "Live" } },
+            "test", TimeSpan.FromHours(1), CancellationToken.None);
+
+        Assert.Contains(await db.ListVisibleSeriesRowsAsync(CancellationToken.None), r => r.Metadata.TmdbId == 801);
+    }
+
+    [Fact]
+    public async Task ClearDeadSwarmConfirmation_RestoresVisibility()
+    {
+        using var db = await NewDbAsync();
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(704, "movie", "Cleared Movie", null, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await db.MarkAvailabilityAvailableAsync(704, "movie", -1, -1, candidate: null, CancellationToken.None);
+        await SeedDeadSwarmCandidateAsync(db, 704, "movie", -1, -1, "magnet:?xt=urn:btih:dead704", confirmations: 3);
+        Assert.DoesNotContain(await db.ListVisibleMovieRowsAsync(CancellationToken.None), r => r.Metadata.TmdbId == 704);
+
+        // The candidate's swarm came back / it validated clean -> counter cleared.
+        await db.ClearDeadSwarmConfirmationAsync(704, "movie", -1, -1, "preset", "magnet:?xt=urn:btih:dead704", CancellationToken.None);
+        Assert.Contains(await db.ListVisibleMovieRowsAsync(CancellationToken.None), r => r.Metadata.TmdbId == 704);
+    }
+
+    [Fact]
+    public async Task ListVisibleMovieRows_DeadSwarmReasonBelowThresholdIgnoredEvenWithoutConfirmationRow()
+    {
+        using var db = await NewDbAsync();
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(705, "movie", "Blip Movie", null, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await db.MarkAvailabilityAvailableAsync(705, "movie", -1, -1, candidate: null, CancellationToken.None);
+        // Dead-swarm reason but ZERO confirmations recorded -> not a threshold dead swarm.
+        await SeedDeadSwarmCandidateAsync(db, 705, "movie", -1, -1, "magnet:?xt=urn:btih:dead705", confirmations: 0);
+        Assert.Contains(await db.ListVisibleMovieRowsAsync(CancellationToken.None), r => r.Metadata.TmdbId == 705);
+    }
+
+    // ----------------------------------------------------------------
     // p10-relevance-sort: default browse ordering blends availability
     // confidence, newness and a popularity proxy into a stored, cheaply-
     // refreshed relevance_score column.
