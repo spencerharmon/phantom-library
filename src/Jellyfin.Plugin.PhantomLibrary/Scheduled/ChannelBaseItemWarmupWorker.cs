@@ -1,10 +1,14 @@
 using System;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Jellyfin.Data;
+using Jellyfin.Database.Implementations.Enums;
 using Jellyfin.Plugin.PhantomLibrary.Channels;
 using Jellyfin.Plugin.PhantomLibrary.Configuration;
 using MediaBrowser.Controller.Channels;
 using MediaBrowser.Controller.Entities;
+using MediaBrowser.Controller.Library;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -30,7 +34,12 @@ namespace Jellyfin.Plugin.PhantomLibrary.Scheduled;
 ///
 /// This worker reproduces exactly that root browse — the same
 /// <c>GetChannelItemsInternal</c> call path the <c>/Channels/{id}/Items</c> API
-/// uses — on a timer and at startup, for both phantom channels. It wraps the
+/// uses — on a timer and at startup, for both phantom channels. CRITICAL: it
+/// must pass a REAL (non-empty) user, because both phantom channels special-case
+/// a <c>Guid.Empty</c> user at the folderless root to return only the small
+/// bounded "latest" set (the shape core's <c>RefreshLatestChannelItems</c>
+/// issues), NOT the full flat catalogue. Only a non-empty user id routes to the
+/// full flat series/movie list that wraps every visible title. It wraps the
 /// FULL root each channel emits (no <c>Limit</c>: the limit only bounds the
 /// returned page, wrapping persists every enumerated item), so every shelf
 /// member stays navigable. Bounded work — two channel enumerations per tick,
@@ -39,6 +48,7 @@ namespace Jellyfin.Plugin.PhantomLibrary.Scheduled;
 public sealed class ChannelBaseItemWarmupWorker : IHostedService, IDisposable
 {
     private readonly IChannelManager _channelManager;
+    private readonly IUserManager _userManager;
     private readonly ILogger<ChannelBaseItemWarmupWorker> _logger;
     private readonly Func<PluginConfiguration> _configProvider;
     private Timer? _timer;
@@ -48,17 +58,20 @@ public sealed class ChannelBaseItemWarmupWorker : IHostedService, IDisposable
 
     public ChannelBaseItemWarmupWorker(
         IChannelManager channelManager,
+        IUserManager userManager,
         ILogger<ChannelBaseItemWarmupWorker> logger)
-        : this(channelManager, logger, () => Plugin.Instance?.Configuration ?? new PluginConfiguration())
+        : this(channelManager, userManager, logger, () => Plugin.Instance?.Configuration ?? new PluginConfiguration())
     {
     }
 
     internal ChannelBaseItemWarmupWorker(
         IChannelManager channelManager,
+        IUserManager userManager,
         ILogger<ChannelBaseItemWarmupWorker> logger,
         Func<PluginConfiguration> configProvider)
     {
         _channelManager = channelManager ?? throw new ArgumentNullException(nameof(channelManager));
+        _userManager = userManager ?? throw new ArgumentNullException(nameof(userManager));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _configProvider = configProvider ?? throw new ArgumentNullException(nameof(configProvider));
     }
@@ -129,11 +142,24 @@ public sealed class ChannelBaseItemWarmupWorker : IHostedService, IDisposable
     /// </summary>
     internal async Task<int> WarmAsync(CancellationToken ct)
     {
+        // Both phantom channels return only the small bounded "latest" set at a
+        // Guid.Empty-user root; only a real user id routes to the full flat
+        // catalogue that wraps every visible title. Prefer an administrator
+        // (whose per-user visibility hides nothing), else any user.
+        var users = _userManager.GetUsers().ToList();
+        var user = users.FirstOrDefault(u => u.HasPermission(PermissionKind.IsAdministrator))
+            ?? users.FirstOrDefault();
+        if (user is null)
+        {
+            _logger.LogWarning("Channel BaseItem warmup skipped: no Jellyfin users exist to browse the channel root as");
+            return 0;
+        }
+
         var total = 0;
         foreach (var channelId in new[] { ChannelIds.Movies, ChannelIds.Shows })
         {
             ct.ThrowIfCancellationRequested();
-            var query = new InternalItemsQuery
+            var query = new InternalItemsQuery(user)
             {
                 ChannelIds = new[] { channelId },
                 ParentId = Guid.Empty,   // channel root — parentItem resolves to the channel itself
@@ -144,7 +170,9 @@ public sealed class ChannelBaseItemWarmupWorker : IHostedService, IDisposable
                 .GetChannelItemsInternal(query, new Progress<double>(), ct)
                 .ConfigureAwait(false);
             total += result.Items.Count;
-            _logger.LogDebug("Channel {ChannelId} warmup wrapped {Count} root items", channelId, result.Items.Count);
+            _logger.LogDebug(
+                "Channel {ChannelId} warmup wrapped root as user {User}, returned page {Count}",
+                channelId, user.Username, result.Items.Count);
         }
 
         return total;

@@ -22,6 +22,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **0.5.7.3: warmup must browse the channel root AS A REAL USER.** The first
+  cut of `ChannelBaseItemWarmupWorker` issued its root browse with no user
+  (`InternalItemsQuery.User == null` → `UserId == Guid.Empty`). Both phantom
+  channels special-case that exact shape — it is what core's
+  `RefreshLatestChannelItems` sends — and return only the small bounded
+  “latest” set, NOT the full flat catalogue, so the warm wrapped ~0 titles and
+  the shelves stayed collapsed. The worker now resolves a real user (an
+  administrator when present, else any user) via `IUserManager` and passes it on
+  the query, routing to the full flat series/movie list that wraps every visible
+  title — the same path a real authenticated Home load (and the manual
+  `/Channels/{id}/Items?userId=…` browse that was proven to restore the cache)
+  takes.
+
 - **0.5.7.2 supersedes 0.5.7.1 for the dev(green) deploy line.** 0.5.7.1 was
   briefly built from plugin `main` (which carries the undeployed
   `availability-probe-reconcile-001` schema bump to v21 that has no additive
