@@ -22,6 +22,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **0.5.7.2 supersedes 0.5.7.1 for the dev(green) deploy line.** 0.5.7.1 was
+  briefly built from plugin `main` (which carries the undeployed
+  `availability-probe-reconcile-001` schema bump to v21 that has no additive
+  migration from the live v20 DB and requires a destructive wipe). To ship the
+  home-shelves warmup fix WITHOUT that wipe, the warmup change is rebased onto
+  the deployed base `e9f1517` (schema v20). Because the version string is the
+  plugin-update contract (the image entrypoint only reinstalls the PVC plugin
+  when the baked version differs), the schema-v20 build must carry a NEW
+  version so it replaces the transient schema-v21 0.5.7.1 DLL that a first
+  deploy attempt left in the dev PVC. No code change vs 0.5.7.1 other than the
+  version bump.
+
 - **Home shelves collapse to near-empty / whole media types vanish
   (home-shelves-basitem-warmup).** The Home shelves
   (`/Plugins/PhantomLibrary/Shelves`) map every curated row member to its
