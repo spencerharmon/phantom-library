@@ -7,6 +7,36 @@ provider. The old GitHub Actions workflows (`.github/workflows/build.yml`,
 `tools/ci/verify-zuul-config.py`) were removed by the `gitea-cutover` task once
 the Gitea Actions path was proven live end to end.
 
+## The repo must exist as a Gitea repo (mirror wiring)
+
+Gitea Actions can only trigger on a Gitea-hosted repo — `.gitea/workflows/*`
+is invisible to GitHub. This repo's *only* git remote is GitHub
+(`git@github.com:spencerharmon/phantom-library.git`), so a Gitea-hosted
+mirror of `phantom-library` must exist (analogous to the `jellyfin` fork
+submodule's dual-remote `origin` + `gitea` pattern) for ANY workflow under
+`.gitea/workflows/` — including the daily `phantom-loadtime-daily.yaml`
+rig — to ever actually run.
+
+`tools/ci/gitea-mirror-sync.sh` is the sync helper: given
+`PHANTOM_GITEA_REMOTE_URL` (the mirror's remote URL — never baked into this
+tracked file, operator/CI-config-supplied per the infra-identifier rule) it
+adds/updates a `gitea-mirror` remote and pushes the tracked branch's current
+tip, idempotently (a no-op if the mirror is already at the local tip).
+Regression harness: `scripts/tests/gitea-mirror-sync.test.sh` (throwaway
+synthetic repos only, no network, no real Gitea instance).
+
+Provisioning the actual Gitea-side repo (creating `phantom-library` under
+`git.spencerharmon.com`, ideally as a pull-mirror from GitHub so ordinary
+pushes need no dual-push discipline), enabling Gitea Actions on it,
+confirming the `gitea-actions-runner` label is registered, and wiring the
+workflow's already-declared secrets/vars
+(`PHANTOM_INCLUSTER_KUBECONFIG_B64`, `PHANTOM_INCLUSTER_ADMIN_TOKEN`,
+`PHANTOM_INCLUSTER_DEV_HOST`, `PHANTOM_INCLUSTER_PROD_HOST`,
+`PHANTOM_INCLUSTER_NAMESPACE`, `PHANTOM_PUSHGATEWAY_URL`) are operator-side
+Gitea-instance actions outside this repo's own tracked state — see the
+`ttfb-daily-rig-gitea-mirror-wiring` change doc for the current status of
+that provisioning step.
+
 ## What lands in this repo
 
 | Path | Role |
