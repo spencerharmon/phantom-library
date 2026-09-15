@@ -160,6 +160,9 @@ public class PluginConfiguration : BasePluginConfiguration
         CuratedRowSize = 40;
         CuratedGenreRowMinItems = 3;
         CuratedHomeMaxRails = 14;
+        ChannelWarmupEnabled = true;
+        ChannelWarmupIntervalMinutes = 10;
+        ChannelWarmupStartupDelaySeconds = 30;
     }
 
     /// <summary>
@@ -197,6 +200,32 @@ public class PluginConfiguration : BasePluginConfiguration
     /// (genre affinity × movie/TV share). Clamped to at least 1.
     /// </summary>
     public int CuratedHomeMaxRails { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the channel-item BaseItem warmup
+    /// worker runs (home-shelves-basitem-warmup). It periodically wraps the root
+    /// of both phantom channels so the Home shelves' cards always resolve to a
+    /// navigable <c>BaseItem</c> — without it, Jellyfin's lazily-populated
+    /// channel BaseItem cache decays to near-empty (nothing browses the folderless
+    /// channels any more) and rails collapse. On by default.
+    /// </summary>
+    public bool ChannelWarmupEnabled { get; set; }
+
+    /// <summary>
+    /// Gets or sets the interval, in minutes, between channel BaseItem warmup
+    /// passes. Must comfortably beat the channel <c>DataVersion</c>-driven cache
+    /// invalidation cadence so the shelves stay populated between passes.
+    /// Clamped to at least 1.
+    /// </summary>
+    public int ChannelWarmupIntervalMinutes { get; set; }
+
+    /// <summary>
+    /// Gets or sets the delay, in seconds, before the first channel BaseItem
+    /// warmup pass after startup — short so a freshly-deployed pod repopulates
+    /// the shelves quickly, but non-zero so it does not contend with the rest of
+    /// startup. Clamped to at least 0.
+    /// </summary>
+    public int ChannelWarmupStartupDelaySeconds { get; set; }
 
     /// <summary>
     /// Gets or sets a value indicating whether the plugin pushes its
