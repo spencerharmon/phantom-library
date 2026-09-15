@@ -114,6 +114,13 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         // zero effect on materialise TTFB.
         serviceCollection.AddHostedService<MagnetCacheDrainWorker>();
 
+        // home-shelves-basitem-warmup: keep the channel-item BaseItem cache
+        // populated so the Home shelves (PhantomLibraryShelvesController) always
+        // resolve their cards. The folderless curated-rows redesign removed the
+        // browse traffic that used to keep this cache warm; this worker
+        // reproduces the root browse on a timer + at startup.
+        serviceCollection.AddHostedService<ChannelBaseItemWarmupWorker>();
+
         // SeriesAutopilot (stage-2.1 stub; rewritten in Stage 5.2).
         serviceCollection.AddSingleton<SeriesAutopilot>();
         serviceCollection.AddSingleton<ISeriesAutopilot>(sp => sp.GetRequiredService<SeriesAutopilot>());

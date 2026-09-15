@@ -22,6 +22,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Home shelves collapse to near-empty / whole media types vanish
+  (home-shelves-basitem-warmup).** The Home shelves
+  (`/Plugins/PhantomLibrary/Shelves`) map every curated row member to its
+  navigable Jellyfin `BaseItem` guid and drop any member core has not yet
+  wrapped (so `#/details?id=<guid>` always resolves). Jellyfin only creates /
+  refreshes those channel `BaseItem`s lazily — when a channel folder is browsed
+  (`IChannelManager.GetChannelItemsInternal`) or the built-in Refresh-Channels
+  task runs — and invalidates them whenever the channel `DataVersion` bumps
+  (which the availability/materialise workers do frequently). Since the
+  curated-rows redesign dropped the browsable category folders and routes users
+  to the shelves instead, nothing browsed the channels any more, so the BaseItem
+  cache decayed to near-empty (observed live: series `BaseItem`s fell 9,585 → 7
+  with no browse traffic) and rails collapsed — the exact "no TV rails, movie
+  rails nearly empty, no visible toggle" symptom. New
+  `ChannelBaseItemWarmupWorker` reproduces the channel-root browse (the same
+  `GetChannelItemsInternal` call the `/Channels/{id}/Items` API uses) for both
+  phantom channels on a timer and at startup, wrapping the full root each
+  channel emits so every shelf member stays navigable. Bounded (two channel
+  enumerations per tick, never an O(catalogue) scan). Configurable via
+  `ChannelWarmupEnabled` (default on), `ChannelWarmupIntervalMinutes` (default
+  10), `ChannelWarmupStartupDelaySeconds` (default 30).
+
 - **gostream library token env fallback (gostream-token-durable-wiring).**
   Durable fix for the outage where an empty (hand-set, never-templated)
   `GostreamApiToken` plugin config value produced a gostream 401
