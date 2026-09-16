@@ -1575,6 +1575,35 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
     /// swarm, so a single transient blip never evicts an item. Used to subtract
     /// such candidates from the "viable candidate exists" browse predicate.
     /// </summary>
+    /// <summary>
+    /// Builds the correlated SQL predicate "this <paramref name="aiAlias"/>
+    /// availability_items row (status='available') has NEVER been assessed to
+    /// the point of caching a source candidate" — i.e. its
+    /// <c>candidate_magnet</c> column is still NULL. This is the distinguisher
+    /// (availability-stale-candidate-reprobe-001, ROI P12 dial #1/#2 follow-up)
+    /// that closes the stale-available-with-no-live-candidates browse gap: the
+    /// "no source_candidates row" browse branch admits BOTH a brand-new item
+    /// that was never probed (correct — it must stay visible so it can be
+    /// tried) AND an item that WAS probed, cached a candidate, and then had that
+    /// candidate expire out of / prune from <c>source_candidates</c> while the
+    /// stale <c>availability_items.status='available'</c> row lingered. The
+    /// latter is visible-but-empty — a cold attempt goes straight to
+    /// no_candidate/availability_abstain — so it must NOT stay visible. A
+    /// successful probe (<see cref="MarkAvailabilityAvailableAsync"/> /
+    /// <c>CompleteAvailableAsync</c>) records the winning magnet in
+    /// <c>candidate_magnet</c> (COALESCE-preserved across later updates), so a
+    /// NULL <c>candidate_magnet</c> is exactly "never had a candidate cached"
+    /// (never assessed) and a non-NULL one with zero live <c>source_candidates</c>
+    /// rows is exactly "assessed, cached, then cache emptied" — excluded from
+    /// default browse until a background re-probe restores a live candidate or
+    /// confirms unavailability. No schema change: reuses the existing
+    /// <c>candidate_magnet</c> column. Applied ONLY inside the "no
+    /// source_candidates row" browse branch (movie + episode parity), so it
+    /// never relaxes the existing dead-swarm / all-invalid prune.
+    /// </summary>
+    private static string AvailableNeverAssessedSql(string aiAlias)
+        => $"{aiAlias}.candidate_magnet IS NULL";
+
     private static string CandidateIsThresholdDeadSwarmSql(string scAlias, string thresholdParam)
         => $@"{scAlias}.validation_reason IN ({DeadSwarmReasonSqlList})
               AND EXISTS (
@@ -2938,6 +2967,53 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
     }
 
     /// <summary>
+    /// availability-stale-candidate-reprobe-001 (ROI P12 dial #1/#2 follow-up):
+    /// force an EAGER re-probe of every "stale available, no live candidates"
+    /// row — an <c>availability_items</c> row that reads <c>status='available'</c>
+    /// and was previously assessed to the point of caching a candidate
+    /// (<c>candidate_magnet IS NOT NULL</c>) but now has ZERO live
+    /// <c>source_candidates</c> rows (they expired out of / were pruned from the
+    /// magnet cache). Such a row is actively LYING that the item is playable, so
+    /// it is a WORSE offender than a never-probed row and must jump the queue:
+    /// this makes it due NOW (<c>next_check_at=0</c>) and RAISES its claim
+    /// priority to at least <paramref name="priority"/> (never lowers an already-
+    /// higher one), so <see cref="ClaimDueAvailabilityAsync"/> picks it up ahead
+    /// of the ordinary backlog. Only touches unleased rows (never steals an
+    /// in-flight probe) and never touches <c>candidate_magnet</c> / status, so
+    /// the browse-exclusion distinguisher is preserved until a real re-probe
+    /// resolves the row. Returns the number of rows promoted.
+    /// </summary>
+    public async Task<int> MarkStaleAvailableItemsDueAsync(int priority, DateTimeOffset now, CancellationToken ct)
+    {
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"UPDATE availability_items
+                SET next_check_at=0,
+                    priority=CASE WHEN priority < @priority THEN @priority ELSE priority END
+                WHERE status='available'
+                  AND candidate_magnet IS NOT NULL
+                  AND (lease_until IS NULL OR lease_until < @now)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM source_candidates sc
+                      WHERE sc.tmdb_id=availability_items.tmdb_id
+                        AND sc.type=availability_items.type
+                        AND sc.season=availability_items.season
+                        AND sc.episode=availability_items.episode
+                  );";
+            cmd.AddWithValue("@priority", priority);
+            cmd.AddWithValue("@now", now.ToUnixTimeSeconds());
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    /// <summary>
     /// Raises (never lowers) the priority of every episode availability row of
     /// a series so a user-initiated series-level request promotes its
     /// representative (and any other) episodes ahead of the background
@@ -3393,10 +3469,10 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
             WHERE m.type='movie' AND (
                 ms.tmdb_id IS NOT NULL
                 OR (a.status='available' AND (
-                    NOT EXISTS (
+                    (NOT EXISTS (
                         SELECT 1 FROM source_candidates sc
                         WHERE sc.tmdb_id=m.tmdb_id AND sc.type='movie' AND sc.season=-1 AND sc.episode=-1
-                    )
+                     ) AND {AvailableNeverAssessedSql("a")})
                     OR EXISTS (
                         SELECT 1 FROM source_candidates sc
                         WHERE sc.tmdb_id=m.tmdb_id AND sc.type='movie' AND sc.season=-1 AND sc.episode=-1
@@ -3477,10 +3553,10 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                 SELECT ai.tmdb_id, COUNT(*) AS available_count FROM availability_items ai
                 WHERE ai.type='episode' AND ai.status='available'
                   AND (
-                    NOT EXISTS (
+                    (NOT EXISTS (
                         SELECT 1 FROM source_candidates sc
                         WHERE sc.tmdb_id=ai.tmdb_id AND sc.type='episode' AND sc.season=ai.season AND sc.episode=ai.episode
-                    )
+                     ) AND {AvailableNeverAssessedSql("ai")})
                     OR EXISTS (
                         SELECT 1 FROM source_candidates sc
                         WHERE sc.tmdb_id=ai.tmdb_id AND sc.type='episode' AND sc.season=ai.season AND sc.episode=ai.episode
@@ -3500,10 +3576,10 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                     SELECT ai.tmdb_id, ai.season, ai.episode FROM availability_items ai
                     WHERE ai.type='episode' AND ai.status='available'
                       AND (
-                        NOT EXISTS (
+                        (NOT EXISTS (
                             SELECT 1 FROM source_candidates sc
                             WHERE sc.tmdb_id=ai.tmdb_id AND sc.type='episode' AND sc.season=ai.season AND sc.episode=ai.episode
-                        )
+                         ) AND {AvailableNeverAssessedSql("ai")})
                         OR EXISTS (
                             SELECT 1 FROM source_candidates sc
                             WHERE sc.tmdb_id=ai.tmdb_id AND sc.type='episode' AND sc.season=ai.season AND sc.episode=ai.episode

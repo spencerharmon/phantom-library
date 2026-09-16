@@ -24,8 +24,7 @@ namespace Jellyfin.Plugin.PhantomLibrary.Scheduled;
 /// </summary>
 public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
 {
-    private readonly PhantomDb _db;
-    private readonly MagnetSelector _selector;
+    private readonly PhantomDb _db;    private readonly MagnetSelector _selector;
     private readonly TmdbExternalIdResolver _externalIds;
     private readonly ITmdbClient _tmdb;
     private readonly ChannelStateProvider _state;
@@ -38,6 +37,13 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
     private CancellationTokenSource? _stopping;
     private Task? _currentTick;
     private int _running;
+
+    // availability-stale-candidate-reprobe-001: claim priority a
+    // stale-available-no-candidate row is promoted to for eager re-probe.
+    // Below PhantomDb.UserActivityPriority (100 — a live user must always win)
+    // yet well above the ordinary backlog default (0), so an actively-lying
+    // "available but empty" row is re-probed ahead of never-probed items.
+    private const int StaleAvailableReprobePriority = 50;
 
     public AvailabilityProbeWorker(
         PhantomDb db,
@@ -168,6 +174,33 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
 
             var batch = Math.Max(1, cfg.AvailabilityMaxBatchSize);
             var anyWork = false;
+
+            // availability-stale-candidate-reprobe-001 (ROI P12 dial #1/#2
+            // follow-up): before the ordinary batch, promote every
+            // "stale available, no live candidates" row to the front of the
+            // claim queue. Such a row was probed and cached a candidate that has
+            // since expired out of source_candidates while its
+            // status='available' row lingered — it is now excluded from default
+            // browse (PhantomDb.AvailableNeverAssessedSql) and is a worse
+            // offender than a never-probed row, so it is re-probed FIRST to
+            // either restore a live candidate or confirm unavailability. Movie
+            // AND episode rows are promoted uniformly (both carry candidate_magnet
+            // + source_candidates), preserving parity.
+            try
+            {
+                var promoted = await _db.MarkStaleAvailableItemsDueAsync(
+                    StaleAvailableReprobePriority, DateTimeOffset.UtcNow, serviceStopping).ConfigureAwait(false);
+                if (promoted > 0)
+                {
+                    _logger.LogDebug(
+                        "Promoted {Count} stale-available-no-candidate row(s) to eager re-probe", promoted);
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogWarning(ex, "Stale-available eager re-probe promotion failed");
+            }
+
             for (var i = 0; i < batch; i++)
             {
                 using var cts = CancellationTokenSource.CreateLinkedTokenSource(serviceStopping);
