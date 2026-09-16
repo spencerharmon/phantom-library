@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Text.Json;
@@ -206,12 +207,43 @@ public sealed class ProwlarrClient : IIndexerClient
             }
 
             var results = new List<IndexerCandidate>(items.Count);
+            var needRedirect = new List<ProwlarrItemDto>();
             foreach (var it in items)
             {
-                var candidate = await MapItemAsync(it, ct).ConfigureAwait(false);
+                // First pass: NO network. infoHash / guid-magnet / literal magnet
+                // cover the magnet-based indexers (~75% of real results) and can
+                // never stall the search budget.
+                var candidate = MapItemNoNetwork(it);
                 if (candidate is not null)
                 {
                     results.Add(candidate);
+                }
+                else if (!string.IsNullOrWhiteSpace(it.MagnetUrl) || !string.IsNullOrWhiteSpace(it.DownloadUrl))
+                {
+                    needRedirect.Add(it);
+                }
+            }
+
+            // Second pass: BOUNDED, CONCURRENT, short-capped redirect resolution
+            // for the results that carried no info-hash/magnet (e.g. LimeTorrents /
+            // TorrentDownload, which expose only a Prowlarr /download proxy). This
+            // was previously done inline per-result with the full 30s search
+            // budget, so a single slow .torrent indexer stalled the whole search
+            // (and, via the drain worker, the whole queue). Cap the count and run
+            // them together, each with its own short timeout, so this phase costs
+            // ~RedirectResolveTimeoutSeconds worst-case regardless of result count.
+            if (needRedirect.Count > 0)
+            {
+                var toResolve = needRedirect
+                    .OrderByDescending(r => r.Seeders ?? 0)
+                    .Take(MaxRedirectResolves)
+                    .Select(it => MapItemViaRedirectAsync(it, ct));
+                foreach (var resolved in await Task.WhenAll(toResolve).ConfigureAwait(false))
+                {
+                    if (resolved is not null)
+                    {
+                        results.Add(resolved);
+                    }
                 }
             }
 
@@ -250,35 +282,37 @@ public sealed class ProwlarrClient : IIndexerClient
         return queries;
     }
 
-    private async Task<IndexerCandidate?> MapItemAsync(ProwlarrItemDto it, CancellationToken ct)
+    // Cap on how many info-hash-less results per search get the network
+    // redirect-resolution fallback, ordered by seeders. Bounds the worst-case
+    // cost of a search when a .torrent-only indexer returns many hits.
+    private const int MaxRedirectResolves = 25;
+
+    // Per-attempt timeout for one redirect resolution. A Prowlarr /download
+    // proxy that 301s to a magnet answers in ~20ms; a .torrent passthrough that
+    // hangs is abandoned at this cap instead of consuming the search budget.
+    private const int RedirectResolveTimeoutSeconds = 5;
+
+    // No-network mapping: use the info-hash (and ready magnet: in `guid`) that
+    // Prowlarr returns on every torrent result, or an explicit magnet: URI in
+    // magnetUrl/downloadUrl. Returns null when only a proxy /download URL is
+    // present (that result is handed to the bounded redirect pass instead).
+    // NEVER touches magnetUrl/downloadUrl as if they were magnets: for most
+    // indexers they are Prowlarr's PROXY /download URL, not a magnet: URI.
+    private IndexerCandidate? MapItemNoNetwork(ProwlarrItemDto it)
     {
-        // Prowlarr returns the torrent's info-hash (and frequently a ready
-        // magnet: URI in `guid`) on EVERY torrent result. Use those FIRST: they
-        // need no network round-trip and, crucially, they avoid `magnetUrl` /
-        // `downloadUrl`, which for most indexers is Prowlarr's PROXY download
-        // indirection URL (http://<prowlarr>/<indexerId>/download?apikey=...),
-        // NOT a magnet: URI. Feeding that proxy URL to ExtractInfoHash yields
-        // nothing and silently drops the candidate — the bug that made Prowlarr
-        // return "built 0 candidates" for search results it had actually found.
         string? magnet = null;
 
-        // 1. A `guid` that is already a magnet: URI is the richest source
-        //    (carries dn + the indexer's own tracker list).
         if (!string.IsNullOrWhiteSpace(it.Guid)
             && it.Guid!.StartsWith("magnet:", StringComparison.OrdinalIgnoreCase))
         {
             magnet = it.Guid;
         }
 
-        // 2. Synthesize a magnet straight from the info-hash Prowlarr already
-        //    handed us (default tracker list attached by BuildMagnet).
         if (magnet is null && !string.IsNullOrWhiteSpace(it.InfoHash))
         {
             magnet = MagnetUtils.BuildMagnet(it.InfoHash!.Trim(), it.Title);
         }
 
-        // 3. Legacy fallbacks for indexers that expose an explicit magnet: URI
-        //    directly in magnetUrl/downloadUrl.
         if (magnet is null)
         {
             foreach (var url in new[] { it.MagnetUrl, it.DownloadUrl })
@@ -292,32 +326,33 @@ public sealed class ProwlarrClient : IIndexerClient
             }
         }
 
-        // 4. Last resort: a Prowlarr /download proxy that 3xx-redirects to a
-        //    magnet: (read from the Location header without following the
-        //    non-HTTP magnet hop). Only reached when 1-3 all fail, so it never
-        //    adds a network round-trip on the common path.
-        if (magnet is null)
-        {
-            foreach (var url in new[] { it.MagnetUrl, it.DownloadUrl })
-            {
-                if (string.IsNullOrWhiteSpace(url))
-                {
-                    continue;
-                }
+        return magnet is null ? null : BuildCandidate(it, magnet);
+    }
 
-                magnet = await TryResolveMagnetRedirectAsync(url!, ct).ConfigureAwait(false);
-                if (magnet is not null)
-                {
-                    break;
-                }
+    // Network fallback: resolve a Prowlarr /download proxy (or other http
+    // download URL) whose 3xx Location is a magnet:, without following the
+    // non-HTTP magnet hop. Bounded by RedirectResolveTimeoutSeconds per attempt.
+    private async Task<IndexerCandidate?> MapItemViaRedirectAsync(ProwlarrItemDto it, CancellationToken ct)
+    {
+        foreach (var url in new[] { it.MagnetUrl, it.DownloadUrl })
+        {
+            if (string.IsNullOrWhiteSpace(url))
+            {
+                continue;
+            }
+
+            var magnet = await TryResolveMagnetRedirectAsync(url!, ct).ConfigureAwait(false);
+            if (magnet is not null)
+            {
+                return BuildCandidate(it, magnet);
             }
         }
 
-        if (string.IsNullOrWhiteSpace(magnet))
-        {
-            return null;
-        }
+        return null;
+    }
 
+    private IndexerCandidate? BuildCandidate(ProwlarrItemDto it, string magnet)
+    {
         var hash = MagnetUtils.ExtractInfoHash(magnet);
         if (string.IsNullOrWhiteSpace(hash))
         {
@@ -328,7 +363,7 @@ public sealed class ProwlarrClient : IIndexerClient
         return new IndexerCandidate
         {
             Title = it.Title ?? string.Empty,
-            Magnet = magnet!,
+            Magnet = magnet,
             InfoHash = hash!,
             Size = it.Size ?? 0,
             Seeders = it.Seeders ?? 0,
@@ -346,20 +381,25 @@ public sealed class ProwlarrClient : IIndexerClient
             return null;
         }
 
+        // Hard per-attempt cap so one hung .torrent passthrough cannot consume
+        // the caller's whole indexer budget. A real /download proxy 301s in ~20ms.
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(TimeSpan.FromSeconds(RedirectResolveTimeoutSeconds));
+
         using var req = new HttpRequestMessage(HttpMethod.Get, uri);
         HttpResponseMessage resp;
         try
         {
-            resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+            resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, timeoutCts.Token).ConfigureAwait(false);
         }
         catch (HttpRequestException ex)
         {
             _logger.LogDebug(ex, "Prowlarr download URL {Url} could not be resolved to magnet", downloadUrl);
             return null;
         }
-        catch (TaskCanceledException ex) when (!ct.IsCancellationRequested)
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
-            _logger.LogDebug(ex, "Prowlarr download URL {Url} timed out resolving magnet", downloadUrl);
+            _logger.LogDebug("Prowlarr download URL {Url} redirect resolve timed out after {Seconds}s", downloadUrl, RedirectResolveTimeoutSeconds);
             return null;
         }
 

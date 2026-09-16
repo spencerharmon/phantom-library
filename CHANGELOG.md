@@ -22,6 +22,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **0.5.7.5: bound the Prowlarr redirect-resolution fallback — the REAL cause of
+  the 30s Prowlarr search timeouts.** Results lacking an info-hash (e.g.
+  LimeTorrents / TorrentDownload, which expose only a Prowlarr `/download` proxy)
+  were redirect-resolved INLINE, one per result, against the full 30s indexer
+  budget — so a single slow `.torrent` passthrough stalled the whole search and,
+  via the drain worker, the whole magnet-build queue. Mapping is now a two-pass
+  split: an all-synchronous no-network pass (info-hash / `guid` magnet / literal
+  magnet — ~75% of real results) followed by a BOUNDED, CONCURRENT redirect pass
+  for the remainder (top 25 by seeders, each capped at 5s), so this phase costs
+  ~5s worst-case regardless of result count and can never blow the search budget.
+
 - **0.5.7.4: Prowlarr now yields candidates instead of `built 0 candidates`.**
   `ProwlarrClient` read the result's `magnetUrl`, which for most indexers is
   Prowlarr's PROXY `/download` indirection URL
