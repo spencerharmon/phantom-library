@@ -70,25 +70,31 @@ public sealed class ProwlarrClient : IIndexerClient
         IndexerTransientException? transient = null;
         var successfulResponses = 0;
 
-        foreach (var queryStr in queries)
+        // Run the (at most two: imdb + title) query variants CONCURRENTLY rather
+        // than sequentially. Each variant is a full fan-out across every enabled
+        // Prowlarr indexer; serializing them made a movie search cost the SUM of
+        // two fan-outs, which blew the MagnetSelector per-indexer budget
+        // (IndexerProbeTimeoutSeconds) whenever a public indexer was slow. Firing
+        // them together makes the wall cost the MAX of the two instead.
+        var settled = await Task.WhenAll(
+            queries.Select(q => RunQuerySafeAsync(baseUrl, apiKey, q, cat, ct)))
+            .ConfigureAwait(false);
+
+        foreach (var outcome in settled)
         {
-            IReadOnlyList<IndexerCandidate> hits;
-            try
+            if (outcome.Auth is not null)
             {
-                hits = await SearchSingleAsync(baseUrl, apiKey, queryStr, cat, ct).ConfigureAwait(false);
-                successfulResponses++;
+                throw outcome.Auth;
             }
-            catch (IndexerAuthException)
+
+            if (outcome.Transient is not null)
             {
-                throw;
-            }
-            catch (IndexerTransientException ex)
-            {
-                transient ??= ex;
+                transient ??= outcome.Transient;
                 continue;
             }
 
-            foreach (var hit in hits)
+            successfulResponses++;
+            foreach (var hit in outcome.Hits)
             {
                 if (string.IsNullOrWhiteSpace(hit.InfoHash) || seen.Add(hit.InfoHash))
                 {
@@ -103,6 +109,36 @@ public sealed class ProwlarrClient : IIndexerClient
         }
 
         return results;
+    }
+
+    private readonly record struct QueryOutcome(
+        IReadOnlyList<IndexerCandidate> Hits,
+        IndexerTransientException? Transient,
+        IndexerAuthException? Auth);
+
+    // Runs one query variant, capturing (never propagating) the transient/auth
+    // outcome so sibling variants running concurrently are never cancelled by
+    // one variant's failure. Auth is surfaced back to the caller to rethrow.
+    private async Task<QueryOutcome> RunQuerySafeAsync(
+        string baseUrl,
+        string apiKey,
+        string queryStr,
+        string cat,
+        CancellationToken ct)
+    {
+        try
+        {
+            var hits = await SearchSingleAsync(baseUrl, apiKey, queryStr, cat, ct).ConfigureAwait(false);
+            return new QueryOutcome(hits, null, null);
+        }
+        catch (IndexerAuthException ex)
+        {
+            return new QueryOutcome(Array.Empty<IndexerCandidate>(), null, ex);
+        }
+        catch (IndexerTransientException ex)
+        {
+            return new QueryOutcome(Array.Empty<IndexerCandidate>(), ex, null);
+        }
     }
 
     private async Task<IReadOnlyList<IndexerCandidate>> SearchSingleAsync(
@@ -216,20 +252,64 @@ public sealed class ProwlarrClient : IIndexerClient
 
     private async Task<IndexerCandidate?> MapItemAsync(ProwlarrItemDto it, CancellationToken ct)
     {
-        // Prefer magnetUrl. If absent, accept magnet downloadUrl. Some
-        // Prowlarr indexers (notably LimeTorrents) expose a Prowlarr
-        // /download URL that 301-redirects to the real magnet; resolve
-        // that header without following the non-HTTP magnet redirect.
-        var magnet = it.MagnetUrl;
-        if (string.IsNullOrWhiteSpace(magnet))
+        // Prowlarr returns the torrent's info-hash (and frequently a ready
+        // magnet: URI in `guid`) on EVERY torrent result. Use those FIRST: they
+        // need no network round-trip and, crucially, they avoid `magnetUrl` /
+        // `downloadUrl`, which for most indexers is Prowlarr's PROXY download
+        // indirection URL (http://<prowlarr>/<indexerId>/download?apikey=...),
+        // NOT a magnet: URI. Feeding that proxy URL to ExtractInfoHash yields
+        // nothing and silently drops the candidate — the bug that made Prowlarr
+        // return "built 0 candidates" for search results it had actually found.
+        string? magnet = null;
+
+        // 1. A `guid` that is already a magnet: URI is the richest source
+        //    (carries dn + the indexer's own tracker list).
+        if (!string.IsNullOrWhiteSpace(it.Guid)
+            && it.Guid!.StartsWith("magnet:", StringComparison.OrdinalIgnoreCase))
         {
-            if (!string.IsNullOrWhiteSpace(it.DownloadUrl) && it.DownloadUrl!.StartsWith("magnet:", StringComparison.OrdinalIgnoreCase))
+            magnet = it.Guid;
+        }
+
+        // 2. Synthesize a magnet straight from the info-hash Prowlarr already
+        //    handed us (default tracker list attached by BuildMagnet).
+        if (magnet is null && !string.IsNullOrWhiteSpace(it.InfoHash))
+        {
+            magnet = MagnetUtils.BuildMagnet(it.InfoHash!.Trim(), it.Title);
+        }
+
+        // 3. Legacy fallbacks for indexers that expose an explicit magnet: URI
+        //    directly in magnetUrl/downloadUrl.
+        if (magnet is null)
+        {
+            foreach (var url in new[] { it.MagnetUrl, it.DownloadUrl })
             {
-                magnet = it.DownloadUrl;
+                if (!string.IsNullOrWhiteSpace(url)
+                    && url!.StartsWith("magnet:", StringComparison.OrdinalIgnoreCase))
+                {
+                    magnet = url;
+                    break;
+                }
             }
-            else if (!string.IsNullOrWhiteSpace(it.DownloadUrl))
+        }
+
+        // 4. Last resort: a Prowlarr /download proxy that 3xx-redirects to a
+        //    magnet: (read from the Location header without following the
+        //    non-HTTP magnet hop). Only reached when 1-3 all fail, so it never
+        //    adds a network round-trip on the common path.
+        if (magnet is null)
+        {
+            foreach (var url in new[] { it.MagnetUrl, it.DownloadUrl })
             {
-                magnet = await TryResolveMagnetRedirectAsync(it.DownloadUrl!, ct).ConfigureAwait(false);
+                if (string.IsNullOrWhiteSpace(url))
+                {
+                    continue;
+                }
+
+                magnet = await TryResolveMagnetRedirectAsync(url!, ct).ConfigureAwait(false);
+                if (magnet is not null)
+                {
+                    break;
+                }
             }
         }
 
@@ -325,6 +405,8 @@ public sealed class ProwlarrClient : IIndexerClient
         [JsonPropertyName("leechers")] public int? Leechers { get; set; }
         [JsonPropertyName("magnetUrl")] public string? MagnetUrl { get; set; }
         [JsonPropertyName("downloadUrl")] public string? DownloadUrl { get; set; }
+        [JsonPropertyName("infoHash")] public string? InfoHash { get; set; }
+        [JsonPropertyName("guid")] public string? Guid { get; set; }
         [JsonPropertyName("indexer")] public string? Indexer { get; set; }
     }
 }

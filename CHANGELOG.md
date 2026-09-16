@@ -22,6 +22,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **0.5.7.4: Prowlarr now yields candidates instead of `built 0 candidates`.**
+  `ProwlarrClient` read the result's `magnetUrl`, which for most indexers is
+  Prowlarr's PROXY `/download` indirection URL
+  (`http://<prowlarr>/<indexerId>/download?apikey=…`), **not** a `magnet:` URI.
+  Passing that to `ExtractInfoHash` returned nothing and silently dropped every
+  candidate — so every magnet-cache build (and every synchronous cache-miss at
+  play time) produced zero sources and playback failed, even though Prowlarr had
+  found hundreds of results. The client now uses the `infoHash` (and the ready
+  `magnet:` in `guid`) that Prowlarr already returns on every torrent result,
+  synthesizing the magnet directly and only falling back to the proxy-redirect
+  resolution when neither is present. No per-result network round-trip on the
+  common path.
+- **0.5.7.4: Prowlarr movie search runs its (imdb + title) query variants
+  concurrently** instead of sequentially, so a movie search costs the MAX of the
+  two indexer fan-outs rather than their SUM — stopping slow public indexers
+  from blowing the per-indexer probe budget. `IndexerProbeTimeoutSeconds` default
+  raised 20 → 30 for additional headroom on a genuinely slow single fan-out.
+
 - **0.5.7.3: warmup must browse the channel root AS A REAL USER.** The first
   cut of `ChannelBaseItemWarmupWorker` issued its root browse with no user
   (`InternalItemsQuery.User == null` → `UserId == Guid.Empty`). Both phantom

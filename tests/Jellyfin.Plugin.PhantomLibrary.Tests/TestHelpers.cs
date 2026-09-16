@@ -24,6 +24,7 @@ internal sealed class StubKeyProvider : ITmdbApiKeyProvider
 internal sealed class QueuedHandler : HttpMessageHandler
 {
     private readonly Queue<Func<HttpRequestMessage, HttpResponseMessage>> _responses = new();
+    private readonly object _gate = new();
     public List<HttpRequestMessage> Requests { get; } = new();
 
     public QueuedHandler Enqueue(HttpStatusCode status, string? body = null, Action<HttpResponseMessage>? mutate = null)
@@ -50,13 +51,20 @@ internal sealed class QueuedHandler : HttpMessageHandler
 
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
-        Requests.Add(request);
-        if (_responses.Count == 0)
+        // Thread-safe: ProwlarrClient now dispatches its (imdb + title) query
+        // variants CONCURRENTLY, so multiple SendAsync calls can race here.
+        Func<HttpRequestMessage, HttpResponseMessage> producer;
+        lock (_gate)
         {
-            throw new InvalidOperationException("QueuedHandler ran out of canned responses");
+            Requests.Add(request);
+            if (_responses.Count == 0)
+            {
+                throw new InvalidOperationException("QueuedHandler ran out of canned responses");
+            }
+
+            producer = _responses.Dequeue();
         }
 
-        var producer = _responses.Dequeue();
         return Task.FromResult(producer(request));
     }
 }

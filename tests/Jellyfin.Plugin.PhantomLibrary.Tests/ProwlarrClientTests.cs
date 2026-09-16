@@ -73,9 +73,11 @@ public class ProwlarrClientTests
         Assert.Equal(2, res.Count);
         Assert.Contains(res, c => c.InfoHash == "AAAA");
         Assert.Contains(res, c => c.InfoHash == "BBBB");
-        Assert.Contains("tt0245429", handler.Requests[0].RequestUri!.ToString());
-        Assert.Contains("Spirited", handler.Requests[1].RequestUri!.ToString());
-        Assert.Contains("2001", handler.Requests[1].RequestUri!.ToString());
+        // Both variants are dispatched CONCURRENTLY now, so request arrival order
+        // is undefined — assert the union of issued queries, not their index order.
+        Assert.Contains(handler.Requests, r => r.RequestUri!.ToString().Contains("tt0245429"));
+        Assert.Contains(handler.Requests, r => r.RequestUri!.ToString().Contains("Spirited")
+            && r.RequestUri!.ToString().Contains("2001"));
     }
 
     [Fact]
@@ -126,6 +128,47 @@ public class ProwlarrClientTests
         Assert.Contains("Spirited", uri);
         Assert.Contains("2001", uri);
         Assert.DoesNotContain("imdbid", uri);
+    }
+
+    [Fact]
+    public async Task Prefers_InfoHash_Over_Proxy_MagnetUrl()
+    {
+        // The real Prowlarr shape: magnetUrl is the /download PROXY URL (not a
+        // magnet: URI) and the usable info-hash is in `infoHash`. The client must
+        // synthesize the magnet from infoHash and NOT drop the candidate, and NOT
+        // make any network round-trip to the proxy URL (only the one search call).
+        var body = "[{\"title\":\"Batman 1080p\",\"size\":1556974120,\"seeders\":1609,\"leechers\":849,"
+            + "\"infoHash\":\"3E4822F5C85E623AAC3FD85E849769736A595493\","
+            + "\"magnetUrl\":\"http://prowlarr.test:9696/1/download?apikey=K&link=abc\","
+            + "\"indexer\":\"The Pirate Bay\"}]";
+        var handler = new QueuedHandler().Enqueue(HttpStatusCode.OK, body);
+        var c = Make(handler);
+        var res = await c.SearchAsync(new IndexerQuery { Type = "movie", Imdb = "tt1" }, CancellationToken.None);
+
+        Assert.Single(res);
+        Assert.Equal("3E4822F5C85E623AAC3FD85E849769736A595493", res[0].InfoHash);
+        Assert.StartsWith("magnet:?xt=urn:btih:3E4822F5C85E623AAC3FD85E849769736A595493", res[0].Magnet);
+        // Exactly one HTTP call (the search) — the proxy magnetUrl was never fetched.
+        Assert.Single(handler.Requests);
+    }
+
+    [Fact]
+    public async Task Prefers_Guid_Magnet_When_Present()
+    {
+        // Prowlarr often carries a ready magnet: URI in `guid`; it is the richest
+        // source (dn + the indexer's own trackers) and wins over the proxy magnetUrl.
+        var body = "[{\"title\":\"X\",\"size\":1,\"seeders\":5,"
+            + "\"guid\":\"magnet:?xt=urn:btih:ABCD1234&dn=X&tr=udp%3A%2F%2Ftr%3A1337\","
+            + "\"magnetUrl\":\"http://prowlarr.test:9696/1/download?apikey=K\","
+            + "\"infoHash\":\"ABCD1234\"}]";
+        var handler = new QueuedHandler().Enqueue(HttpStatusCode.OK, body);
+        var c = Make(handler);
+        var res = await c.SearchAsync(new IndexerQuery { Type = "movie", Imdb = "tt1" }, CancellationToken.None);
+
+        Assert.Single(res);
+        Assert.Equal("ABCD1234", res[0].InfoHash);
+        Assert.Contains("dn=X", res[0].Magnet); // came from guid, not synthesized bare
+        Assert.Single(handler.Requests);
     }
 
     [Fact]

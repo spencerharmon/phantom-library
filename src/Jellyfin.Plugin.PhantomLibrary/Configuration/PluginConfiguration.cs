@@ -142,7 +142,7 @@ public class PluginConfiguration : BasePluginConfiguration
         BulkMaterialiseMaxAttempts = 5;
         SourceValidationPolicyVersion = "sv14-parser-audio-v1";
         GostreamHeavyConcurrency = 2;
-        IndexerProbeTimeoutSeconds = 20;
+        IndexerProbeTimeoutSeconds = 30;
         GostreamToken = string.Empty;
 
         MetricsOtlpEnabled = false;
