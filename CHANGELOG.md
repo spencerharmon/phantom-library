@@ -6,7 +6,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Fast-indexer early return now ON by default
+  (ttfb-fast-indexer-early-return-enable-default, ROI Priority 9).** The
+  `FastIndexerEarlyReturnEnabled` toggle added in a prior release shipped
+  default-`false`, and four consecutive TTFB analysis passes confirmed it was
+  never enabled in the deployed config — so the movie-materialise stage every
+  pass ranked dominant kept paying the SLOWEST indexer's wall-clock even when a
+  faster indexer had already returned a usable candidate. The shipped default
+  of a freshly-constructed `PluginConfiguration` is now `true`, bounded by the
+  same conservative guards (`MinEarlyReturnCandidates` = 1,
+  `EarlyReturnMinElapsedMs` = 250ms) so a fast-but-unhelpful indexer can never
+  short-circuit the probe before the 250ms fan-out floor, and slower indexers
+  keep running in the background to populate the shared magnet cache. Full-wait
+  behavior is still available by setting the toggle to `false` via the plugin
+  config API/page — the disabled path is byte-for-byte unchanged. Movie/episode
+  parity preserved (both share `ProbeCoreAsync`). Operator note: the plugin
+  config XML persists in the PVC and is NOT overwritten by an image update, so
+  a PVC that already has `FastIndexerEarlyReturnEnabled=false` persisted keeps
+  the old behavior until the field is set true cluster-side (plugin config API,
+  pluginId `9e7a1f4c2b5d4e8f9a3b7c1d2e5f6a8b`); fresh PVCs get the new default.
+
 ### Added
+
 - **Prune doomed-but-visible dead-swarm items from default browse
   (browse-prune-dead-swarm-001, ROI P12 dial #2).** Closes the gap P10
   (`p10-prune-nonplayable-browse`) left open: a candidate that resolves and

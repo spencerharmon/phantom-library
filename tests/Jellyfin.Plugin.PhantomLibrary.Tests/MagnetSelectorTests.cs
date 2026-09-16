@@ -688,7 +688,17 @@ public class MagnetSelectorTests
             .Returns(() => Task.Run(() => Gate("Movie B 1080p")));
 
         var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
-        var sel = new MagnetSelector(new[] { ix1.Object, ix2.Object }, scorer, NullLogger<MagnetSelector>.Instance, TestConfig);
+        // Pin the disabled path: this test asserts BOTH indexers' candidates are
+        // aggregated, which only holds under full-wait. The shipped default is now
+        // early-return ON, so opt out explicitly here.
+        PluginConfiguration FullWaitConfig()
+        {
+            var c = TestConfig();
+            c.FastIndexerEarlyReturnEnabled = false;
+            return c;
+        }
+
+        var sel = new MagnetSelector(new[] { ix1.Object, ix2.Object }, scorer, NullLogger<MagnetSelector>.Instance, FullWaitConfig);
 
         var probeTask = sel.ProbeAsync(1, "tt1", "movie", null, null, "Movie", 2020, CancellationToken.None);
 
@@ -712,6 +722,10 @@ public class MagnetSelectorTests
         // indexer's real candidate.
         var cfg = TestConfig();
         cfg.IndexerProbeTimeoutSeconds = 5; // clamp floor; still fast in test
+        // Isolate the per-indexer timeout behavior from early-return: keep full-wait
+        // so the assertion targets only timeout isolation. (The shipped default is
+        // now early-return ON.)
+        cfg.FastIndexerEarlyReturnEnabled = false;
 
         var slow = new Mock<IIndexerClient>(MockBehavior.Strict);
         slow.SetupGet(i => i.IsEnabled).Returns(true);
@@ -822,10 +836,14 @@ public class MagnetSelectorTests
     [Fact]
     public async Task EarlyReturn_Disabled_DefaultBehaviorUnchanged()
     {
-        // Regression guard: with the toggle at its default (false), behavior
+        // Regression guard: with the toggle explicitly OFF, behavior
         // is byte-for-byte the same full-wait as before this feature existed
         // — the probe waits for BOTH indexers and aggregates both results.
+        // (The SHIPPED default is now ON — see
+        // ShippedDefault_EarlyReturnEnabled_BoundsDurationNearFastWinner — so
+        // this test opts out explicitly rather than relying on the default.)
         var cfg = TestConfig();
+        cfg.FastIndexerEarlyReturnEnabled = false;
         Assert.False(cfg.FastIndexerEarlyReturnEnabled);
 
         var ix1 = new Mock<IIndexerClient>(MockBehavior.Strict);
@@ -933,5 +951,119 @@ public class MagnetSelectorTests
         Assert.True(sw.ElapsedMilliseconds >= 300, $"expected to honor the {cfg.EarlyReturnMinElapsedMs}ms floor, took {sw.Elapsed}");
         Assert.Equal(MagnetProbeOutcome.Available, probe.Outcome);
         Assert.Equal(2, probe.Candidates.Count);
+    }
+
+    [Fact]
+    public async Task ShippedDefault_EarlyReturnEnabled_BoundsDurationNearFastWinner()
+    {
+        // ttfb-fast-indexer-early-return-enable-default (ROI Priority 9):
+        // the SHIPPED default of a freshly-constructed PluginConfiguration must
+        // now enable the early-return race. This test constructs the real
+        // default config (NOT the test-local TestConfig()) and drives a
+        // multi-indexer fan-out with one fast winner and one deliberately slow
+        // loser. With the flag at its shipped default it must return bounded
+        // near the fast winner's completion — WELL before the slow indexer's
+        // multi-second delay. This FAILS against the old false default (the
+        // probe would block on Task.WhenAll for the full slow delay) and PASSES
+        // once the default is flipped to true.
+        var cfg = new PluginConfiguration();
+
+        // Guard: the shipped defaults are the ones under test — assert them
+        // explicitly so a future default regression is caught here.
+        Assert.True(cfg.FastIndexerEarlyReturnEnabled, "shipped default must enable fast-indexer early return");
+        Assert.Equal(1, cfg.MinEarlyReturnCandidates);
+        Assert.Equal(250, cfg.EarlyReturnMinElapsedMs);
+
+        var slowDelay = TimeSpan.FromSeconds(5);
+
+        // Fast winner: seeders 30 >= shipped MinSeeders (5), 5GB 1080p >= 4GB
+        // floor, so it is a scorer-passing candidate that satisfies
+        // MinEarlyReturnCandidates=1 on its own. It completes shortly AFTER the
+        // shipped 250ms EarlyReturnMinElapsedMs floor (so the floor is honored)
+        // but far ahead of the slow loser — this is the exact case the flag
+        // exists to accelerate.
+        var fast = new Mock<IIndexerClient>(MockBehavior.Strict);
+        fast.SetupGet(i => i.IsEnabled).Returns(true);
+        fast.SetupGet(i => i.Name).Returns("fast");
+        fast.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .Returns(async (IndexerQuery _, CancellationToken t) =>
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(400), t).ConfigureAwait(false);
+                return (IReadOnlyList<IndexerCandidate>)new[] { MakeCandidate("Movie 1080p", 5, 30) };
+            });
+
+        // Slow loser: only completes after slowDelay. Under full-wait the probe
+        // would block on it for the whole delay.
+        var slow = new Mock<IIndexerClient>(MockBehavior.Strict);
+        slow.SetupGet(i => i.IsEnabled).Returns(true);
+        slow.SetupGet(i => i.Name).Returns("slow");
+        slow.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .Returns(async (IndexerQuery _, CancellationToken t) =>
+            {
+                await Task.Delay(slowDelay, t).ConfigureAwait(false);
+                return (IReadOnlyList<IndexerCandidate>)new[] { MakeCandidate("Movie 1080p alt", 5, 20) };
+            });
+
+        var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
+        var sel = new MagnetSelector(new[] { slow.Object, fast.Object }, scorer, NullLogger<MagnetSelector>.Instance, () => cfg);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var probe = await sel.ProbeAsync(1, "tt1", "movie", null, null, "Movie", 2020, CancellationToken.None);
+        sw.Stop();
+
+        // Bounded near the fast winner + the 250ms floor — far below slowDelay.
+        // A generous 2s ceiling keeps the assertion robust on a loaded CI box
+        // while still proving the probe did NOT wait the full 5s slow delay.
+        Assert.True(
+            sw.Elapsed < TimeSpan.FromSeconds(2),
+            $"expected early return bounded near the fast winner (< 2s), took {sw.Elapsed} (slow delay was {slowDelay})");
+        Assert.Equal(MagnetProbeOutcome.Available, probe.Outcome);
+        Assert.Contains(probe.Candidates, c => c.Seeders == 30);
+    }
+
+    [Fact]
+    public async Task ShippedDefault_EarlyReturnEnabledForEpisode_MovieEpisodeParity()
+    {
+        // Movie/TV parity: the shipped early-return default applies identically
+        // to the episode flow (both share ProbeCoreAsync, no item-type
+        // special-casing). Same fast-winner/slow-loser shape as the movie test,
+        // driven through the episode probe path.
+        var cfg = new PluginConfiguration();
+        Assert.True(cfg.FastIndexerEarlyReturnEnabled);
+
+        var slowDelay = TimeSpan.FromSeconds(5);
+
+        var fast = new Mock<IIndexerClient>(MockBehavior.Strict);
+        fast.SetupGet(i => i.IsEnabled).Returns(true);
+        fast.SetupGet(i => i.Name).Returns("fast");
+        fast.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .Returns(async (IndexerQuery _, CancellationToken t) =>
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(400), t).ConfigureAwait(false);
+                return (IReadOnlyList<IndexerCandidate>)new[] { MakeCandidate("Show S01E01 1080p", 5, 30) };
+            });
+
+        var slow = new Mock<IIndexerClient>(MockBehavior.Strict);
+        slow.SetupGet(i => i.IsEnabled).Returns(true);
+        slow.SetupGet(i => i.Name).Returns("slow");
+        slow.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
+            .Returns(async (IndexerQuery _, CancellationToken t) =>
+            {
+                await Task.Delay(slowDelay, t).ConfigureAwait(false);
+                return (IReadOnlyList<IndexerCandidate>)new[] { MakeCandidate("Show S01E01 1080p alt", 5, 20) };
+            });
+
+        var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
+        var sel = new MagnetSelector(new[] { slow.Object, fast.Object }, scorer, NullLogger<MagnetSelector>.Instance, () => cfg);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var probe = await sel.ProbeAsync(1, "tt1", "episode", 1, 1, "Show", 2020, CancellationToken.None);
+        sw.Stop();
+
+        Assert.True(
+            sw.Elapsed < TimeSpan.FromSeconds(2),
+            $"episode parity: expected early return bounded near the fast winner (< 2s), took {sw.Elapsed}");
+        Assert.Equal(MagnetProbeOutcome.Available, probe.Outcome);
+        Assert.Contains(probe.Candidates, c => c.Seeders == 30);
     }
 }

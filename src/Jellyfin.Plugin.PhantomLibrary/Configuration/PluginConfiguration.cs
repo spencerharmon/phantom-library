@@ -148,7 +148,16 @@ public class PluginConfiguration : BasePluginConfiguration
         SourceValidationPolicyVersion = "sv14-parser-audio-v1";
         GostreamHeavyConcurrency = 2;
         IndexerProbeTimeoutSeconds = 20;
-        FastIndexerEarlyReturnEnabled = false;
+        // ttfb-fast-indexer-early-return-enable-default (ROI Priority 9): shipped
+        // ON by default. The probe fan-out returns as soon as >= MinEarlyReturnCandidates
+        // scorer-passing candidates exist AND EarlyReturnMinElapsedMs has elapsed,
+        // instead of waiting on every (possibly slow) indexer. Slower indexers keep
+        // running in the background to populate the shared magnet cache. The two
+        // guards below keep this conservative: require at least one usable candidate,
+        // and never short-circuit before a 250ms fan-out floor so a fast-but-unhelpful
+        // indexer cannot pre-empt others that need a moment to start. Set to false via
+        // the plugin config to restore byte-for-byte full-wait behavior.
+        FastIndexerEarlyReturnEnabled = true;
         MinEarlyReturnCandidates = 1;
         EarlyReturnMinElapsedMs = 250;
         GostreamToken = string.Empty;
@@ -856,9 +865,10 @@ public class PluginConfiguration : BasePluginConfiguration
     /// indexer via <c>Task.WhenAll</c>. Still-running slower indexers are NOT
     /// cancelled — they keep running in the background so their result still
     /// lands in the shared magnet cache for future hits; only the caller stops
-    /// waiting on them. Default <c>false</c> (conservative rollout): today's
-    /// full-wait behavior is unchanged until an operator explicitly enables
-    /// this.
+    /// waiting on them. Default <c>true</c> (ttfb-fast-indexer-early-return-enable-default,
+    /// ROI Priority 9): the early-return race is now the shipped behavior, bounded by
+    /// the conservative <see cref="MinEarlyReturnCandidates"/> / <see cref="EarlyReturnMinElapsedMs"/>
+    /// guards. Set to <c>false</c> to restore byte-for-byte full-wait behavior.
     /// </summary>
     public bool FastIndexerEarlyReturnEnabled { get; set; }
 
