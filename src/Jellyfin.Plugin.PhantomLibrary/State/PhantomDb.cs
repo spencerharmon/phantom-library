@@ -1586,6 +1586,69 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
               )";
 
     /// <summary>
+    /// availability-stale-candidate-reprobe-001 (ROI P12 dial #1/#2
+    /// follow-up): a "stale available, no live candidates" row is an
+    /// <c>availability_items</c> row whose <c>status='available'</c> but
+    /// whose <c>source_candidates</c> — cached by a PRIOR probe — have since
+    /// gone empty (all rows have <c>expires_at</c> in the past, are marked
+    /// 'invalid', or are threshold dead-swarm). This is distinct from
+    /// "never probed" (no <c>source_candidates</c> row has EVER existed for
+    /// the key), which stays visible as before. Both
+    /// <see cref="ListVisibleMovieRowsAsync(int,CancellationToken)"/> and
+    /// <see cref="ListVisibleSeriesRowsAsync(int,int,CancellationToken)"/>
+    /// already exclude such a row from default browse (their viable-candidate
+    /// EXISTS predicate now requires <c>expires_at &gt; now</c>, so an
+    /// all-expired/invalid/dead-swarm candidate set no longer counts as
+    /// live) — this method ADDITIONALLY reprioritises exactly those excluded
+    /// rows for an eager re-probe via the EXISTING
+    /// <see cref="AvailabilityProbeWorker"/> claim/lease plumbing (dial #1),
+    /// so the row is not just hidden but actively re-checked ahead of the
+    /// worker's normal batch order — it is a worse offender than a
+    /// never-probed row (it was ACTIVELY LYING that the item is playable).
+    /// Never touches a row with an active lease (<c>lease_until IS NOT
+    /// NULL</c>) — an in-flight probe is left alone. Returns the number of
+    /// rows reprioritised.
+    /// </summary>
+    public async Task<int> PrioritizeStaleAvailableForReprobeAsync(int priority, int deadSwarmThreshold, CancellationToken ct)
+    {
+        deadSwarmThreshold = Math.Max(1, deadSwarmThreshold);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            cmd.CommandText = $@"UPDATE availability_items
+                SET next_check_at=@now,
+                    priority=CASE WHEN priority < @priority THEN @priority ELSE priority END
+                WHERE status='available'
+                  AND lease_until IS NULL
+                  AND (next_check_at > @now OR priority < @priority)
+                  AND EXISTS (
+                      SELECT 1 FROM source_candidates sc
+                      WHERE sc.tmdb_id=availability_items.tmdb_id AND sc.type=availability_items.type
+                        AND sc.season=availability_items.season AND sc.episode=availability_items.episode
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM source_candidates sc
+                      WHERE sc.tmdb_id=availability_items.tmdb_id AND sc.type=availability_items.type
+                        AND sc.season=availability_items.season AND sc.episode=availability_items.episode
+                        AND sc.validation_status <> 'invalid'
+                        AND sc.expires_at > @now
+                        AND NOT ({CandidateIsThresholdDeadSwarmSql("sc", "@deadSwarmThreshold")})
+                  );";
+            cmd.AddWithValue("@now", now);
+            cmd.AddWithValue("@priority", priority);
+            cmd.AddWithValue("@deadSwarmThreshold", deadSwarmThreshold);
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    /// <summary>
     /// Records one more dead/stale-swarm re-confirmation for a candidate,
     /// upserting its <c>dead_swarm_confirmations</c> row (+1). Returns the new
     /// confirmation count. Purely-additive: touches no existing table.
@@ -2996,6 +3059,16 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
     public const int UserActivityPriority = 100;
 
     /// <summary>
+    /// availability-stale-candidate-reprobe-001: priority stamped by
+    /// <see cref="PrioritizeStaleAvailableForReprobeAsync"/> onto a
+    /// stale-available-no-live-candidates row. Sits ABOVE the background
+    /// default (0) — such a row is a worse offender than a never-probed one
+    /// and must be re-checked ahead of the ordinary backlog — but BELOW
+    /// <see cref="UserActivityPriority"/>, so a live user request always wins.
+    /// </summary>
+    public const int StaleAvailableReprobePriority = 50;
+
+    /// <summary>
     /// Wire-point for every user-initiated availability path: promote the
     /// target availability row's claim priority to <see cref="UserActivityPriority"/>
     /// (movie or a single episode) AND stamp the user-activity yield marker,
@@ -3401,6 +3474,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                         SELECT 1 FROM source_candidates sc
                         WHERE sc.tmdb_id=m.tmdb_id AND sc.type='movie' AND sc.season=-1 AND sc.episode=-1
                           AND sc.validation_status <> 'invalid'
+                          AND sc.expires_at > @now
                           AND NOT ({CandidateIsThresholdDeadSwarmSql("sc", "@deadSwarmThreshold")})
                     )
                 ))
@@ -3409,6 +3483,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                      m.relevance_score DESC,
                      COALESCE(ms.materialised_at, m.fetched_at) DESC;";
         cmd.AddWithValue("@deadSwarmThreshold", deadSwarmThreshold);
+        cmd.AddWithValue("@now", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
         var list = new List<VisibleMovieRow>();
         await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
         while (await r.ReadAsync(ct).ConfigureAwait(false))
@@ -3485,6 +3560,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                         SELECT 1 FROM source_candidates sc
                         WHERE sc.tmdb_id=ai.tmdb_id AND sc.type='episode' AND sc.season=ai.season AND sc.episode=ai.episode
                           AND sc.validation_status <> 'invalid'
+                          AND sc.expires_at > @now
                           AND NOT ({CandidateIsThresholdDeadSwarmSql("sc", "@deadSwarmThreshold")})
                     )
                   )
@@ -3508,6 +3584,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                             SELECT 1 FROM source_candidates sc
                             WHERE sc.tmdb_id=ai.tmdb_id AND sc.type='episode' AND sc.season=ai.season AND sc.episode=ai.episode
                               AND sc.validation_status <> 'invalid'
+                              AND sc.expires_at > @now
                               AND NOT ({CandidateIsThresholdDeadSwarmSql("sc", "@deadSwarmThreshold")})
                         )
                       )
@@ -3522,6 +3599,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                      m.fetched_at DESC;";
         cmd.AddWithValue("@min", minAvailableEpisodes);
         cmd.AddWithValue("@deadSwarmThreshold", deadSwarmThreshold);
+        cmd.AddWithValue("@now", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
         var list = new List<VisibleSeriesRow>();
         await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
         while (await r.ReadAsync(ct).ConfigureAwait(false))

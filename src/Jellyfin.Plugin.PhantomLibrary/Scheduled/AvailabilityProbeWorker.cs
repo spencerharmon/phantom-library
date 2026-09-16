@@ -166,6 +166,17 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
                 }
             }
 
+            // availability-stale-candidate-reprobe-001: before claiming the
+            // batch, reprioritise any 'available' row whose cached candidates
+            // have all gone empty (expired/invalid/dead-swarm) since the last
+            // probe so it is re-checked ahead of the ordinary backlog instead
+            // of sitting stale (ListVisible*RowsAsync already hides it from
+            // browse; this makes the hide temporary rather than permanent).
+            await _db.PrioritizeStaleAvailableForReprobeAsync(
+                PhantomDb.StaleAvailableReprobePriority,
+                cfg.DeadSwarmBrowsePruneThreshold,
+                serviceStopping).ConfigureAwait(false);
+
             var batch = Math.Max(1, cfg.AvailabilityMaxBatchSize);
             var anyWork = false;
             for (var i = 0; i < batch; i++)

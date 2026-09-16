@@ -749,6 +749,33 @@ public class PhantomDbTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// availability-stale-candidate-reprobe-001 test helper: forces an
+    /// already-cached <c>source_candidates</c> row's <c>expires_at</c> into
+    /// the past to simulate the MagnetCacheTtlHours window having elapsed —
+    /// <see cref="PhantomDb.UpsertSourceCandidatesAsync"/> itself clamps a
+    /// non-positive TTL up to 1 hour, so a real DB-level UPDATE is the only
+    /// way to construct an already-expired row for a test.
+    /// </summary>
+    private async Task ForceExpireCandidateAsync(int tmdb, string type, int season, int episode, string preset, string magnet)
+    {
+        var cs = new SqliteConnectionStringBuilder { DataSource = _dbPath, Mode = SqliteOpenMode.ReadWriteCreate }.ToString();
+        await using var conn = new SqliteConnection(cs);
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"UPDATE source_candidates SET expires_at=@expires
+            WHERE tmdb_id=@tmdb AND type=@type AND season=@season AND episode=@episode AND preset=@preset AND magnet=@magnet;";
+        cmd.Parameters.AddWithValue("@expires", DateTimeOffset.UtcNow.AddHours(-1).ToUnixTimeSeconds());
+        cmd.Parameters.AddWithValue("@tmdb", tmdb);
+        cmd.Parameters.AddWithValue("@type", type);
+        cmd.Parameters.AddWithValue("@season", season);
+        cmd.Parameters.AddWithValue("@episode", episode);
+        cmd.Parameters.AddWithValue("@preset", preset);
+        cmd.Parameters.AddWithValue("@magnet", magnet);
+        var rows = await cmd.ExecuteNonQueryAsync();
+        Assert.Equal(1, rows);
+    }
+
     [Fact]
     public async Task ListVisibleMovieRows_ExcludesMovieWhenOnlyCandidateIsThresholdDeadSwarm()
     {
@@ -881,6 +908,159 @@ public class PhantomDbTests : IDisposable
         // Dead-swarm reason but ZERO confirmations recorded -> not a threshold dead swarm.
         await SeedDeadSwarmCandidateAsync(db, 705, "movie", -1, -1, "magnet:?xt=urn:btih:dead705", confirmations: 0);
         Assert.Contains(await db.ListVisibleMovieRowsAsync(CancellationToken.None), r => r.Metadata.TmdbId == 705);
+    }
+
+    // ----------------------------------------------------------------
+    // availability-stale-candidate-reprobe-001 (ROI P12 dial #1/#2
+    // follow-up): distinguish "never probed" (no source_candidates row ever
+    // existed) from "assessed, cached, then the cache emptied out" (a
+    // source_candidates row exists but has expired, is invalid, or is a
+    // threshold dead swarm) for an 'available'-status item. The former
+    // stays visible (unchanged p10 behaviour); the latter must NOT stay
+    // silently visible-with-zero-live-candidates.
+    // ----------------------------------------------------------------
+
+    /// <summary>
+    /// Movie parity: an 'available' movie whose only candidate has expired
+    /// out of the TTL window (expires_at in the past) is excluded from
+    /// default browse exactly like the all-invalid / dead-swarm cases —
+    /// today's query only checked validation_status/dead-swarm and ignored
+    /// expires_at entirely, so a stale-but-technically-'unknown' candidate
+    /// kept the item visible even with zero live candidates.
+    /// </summary>
+    [Fact]
+    public async Task ListVisibleMovieRows_ExcludesAvailableMovieWhenOnlyCandidateExpired()
+    {
+        using var db = await NewDbAsync();
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(900, "movie", "Stale Movie", null, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await db.MarkAvailabilityAvailableAsync(900, "movie", -1, -1, candidate: null, CancellationToken.None);
+        // Cached, then the TTL elapsed: candidate is present but expires_at is in the past.
+        await db.UpsertSourceCandidatesAsync(
+            900,
+            "movie",
+            -1,
+            -1,
+            "preset",
+            new[] { new Jellyfin.Plugin.PhantomLibrary.Sources.MagnetCandidate("magnet:?xt=urn:btih:stale900", "stale900", 1234, 10, "idx") { Title = "Stale" } },
+            "test",
+            TimeSpan.FromHours(1),
+            CancellationToken.None);
+        await ForceExpireCandidateAsync(900, "movie", -1, -1, "preset", "magnet:?xt=urn:btih:stale900");
+
+        Assert.DoesNotContain(await db.ListVisibleMovieRowsAsync(CancellationToken.None), r => r.Metadata.TmdbId == 900);
+    }
+
+    /// <summary>
+    /// A never-probed item (no source_candidates row at all) is unaffected
+    /// by the staleness predicate and stays visible, same as before.
+    /// </summary>
+    [Fact]
+    public async Task ListVisibleMovieRows_KeepsAvailableMovieWithNoCandidatesEverProbed()
+    {
+        using var db = await NewDbAsync();
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(901, "movie", "Never Probed Movie", null, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await db.MarkAvailabilityAvailableAsync(901, "movie", -1, -1, candidate: null, CancellationToken.None);
+
+        Assert.Contains(await db.ListVisibleMovieRowsAsync(CancellationToken.None), r => r.Metadata.TmdbId == 901);
+    }
+
+    /// <summary>
+    /// Once a fresh (non-expired) candidate is cached for a stale item, it
+    /// re-enters the browse list without any special re-promotion step.
+    /// </summary>
+    [Fact]
+    public async Task ListVisibleMovieRows_ReentersListWhenFreshCandidateReplacesExpiredOne()
+    {
+        using var db = await NewDbAsync();
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(902, "movie", "Recovered Stale Movie", null, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await db.MarkAvailabilityAvailableAsync(902, "movie", -1, -1, candidate: null, CancellationToken.None);
+        await db.UpsertSourceCandidatesAsync(
+            902, "movie", -1, -1, "preset",
+            new[] { new Jellyfin.Plugin.PhantomLibrary.Sources.MagnetCandidate("magnet:?xt=urn:btih:oldstale902", "oldstale902", 1234, 10, "idx") { Title = "Old" } },
+            "test", TimeSpan.FromHours(1), CancellationToken.None);
+        await ForceExpireCandidateAsync(902, "movie", -1, -1, "preset", "magnet:?xt=urn:btih:oldstale902");
+
+        Assert.DoesNotContain(await db.ListVisibleMovieRowsAsync(CancellationToken.None), r => r.Metadata.TmdbId == 902);
+
+        await db.UpsertSourceCandidatesAsync(
+            902, "movie", -1, -1, "preset",
+            new[] { new Jellyfin.Plugin.PhantomLibrary.Sources.MagnetCandidate("magnet:?xt=urn:btih:fresh902", "fresh902", 1234, 10, "idx") { Title = "Fresh" } },
+            "test", TimeSpan.FromHours(1), CancellationToken.None);
+
+        Assert.Contains(await db.ListVisibleMovieRowsAsync(CancellationToken.None), r => r.Metadata.TmdbId == 902);
+    }
+
+    /// <summary>
+    /// TV parity: the same expired-candidate exclusion applies to an
+    /// episode via the series min-available-episode display gate.
+    /// </summary>
+    [Fact]
+    public async Task ListVisibleSeriesRows_ExcludesSeriesWhenOnlyEpisodeCandidateExpired()
+    {
+        using var db = await NewDbAsync();
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(910, "series", "Stale Series", null, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await db.MarkAvailabilityAvailableAsync(910, "episode", 1, 1, candidate: null, CancellationToken.None);
+        await db.UpsertSourceCandidatesAsync(
+            910, "episode", 1, 1, "preset",
+            new[] { new Jellyfin.Plugin.PhantomLibrary.Sources.MagnetCandidate("magnet:?xt=urn:btih:staleep910", "staleep910", 1234, 10, "idx") { Title = "Stale" } },
+            "test", TimeSpan.FromHours(1), CancellationToken.None);
+        await ForceExpireCandidateAsync(910, "episode", 1, 1, "preset", "magnet:?xt=urn:btih:staleep910");
+
+        Assert.DoesNotContain(await db.ListVisibleSeriesRowsAsync(CancellationToken.None), r => r.Metadata.TmdbId == 910);
+    }
+
+    /// <summary>
+    /// availability-stale-candidate-reprobe-001: <c>PrioritizeStaleAvailableForReprobeAsync</c>
+    /// forces an eager re-probe of exactly the stale-available-no-live-
+    /// candidates row (never-probed rows and rows with a live candidate are
+    /// left untouched; a currently-leased row is left untouched too).
+    /// </summary>
+    [Fact]
+    public async Task PrioritizeStaleAvailableForReprobe_OnlyReprioritisesStaleAvailableRowsWithExhaustedCandidates()
+    {
+        using var db = await NewDbAsync();
+
+        // Stale: available, candidate expired -> should be reprioritised.
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(920, "movie", "Stale Reprobe Movie", null, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await db.MarkAvailabilityAvailableAsync(920, "movie", -1, -1, candidate: null, CancellationToken.None);
+        await db.UpsertSourceCandidatesAsync(
+            920, "movie", -1, -1, "preset",
+            new[] { new Jellyfin.Plugin.PhantomLibrary.Sources.MagnetCandidate("magnet:?xt=urn:btih:stalereprobe920", "stalereprobe920", 1234, 10, "idx") { Title = "Stale" } },
+            "test", TimeSpan.FromHours(1), CancellationToken.None);
+        await ForceExpireCandidateAsync(920, "movie", -1, -1, "preset", "magnet:?xt=urn:btih:stalereprobe920");
+
+        // Never probed: available, no candidates at all -> must NOT be touched.
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(921, "movie", "Never Probed Reprobe Movie", null, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await db.MarkAvailabilityAvailableAsync(921, "movie", -1, -1, candidate: null, CancellationToken.None);
+
+        // Live candidate: available, fresh non-expired candidate -> must NOT be touched.
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(922, "movie", "Live Candidate Reprobe Movie", null, null, null, null, null, null, null, null, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        await db.MarkAvailabilityAvailableAsync(922, "movie", -1, -1, candidate: null, CancellationToken.None);
+        await db.UpsertSourceCandidatesAsync(
+            922, "movie", -1, -1, "preset",
+            new[] { new Jellyfin.Plugin.PhantomLibrary.Sources.MagnetCandidate("magnet:?xt=urn:btih:livereprobe922", "livereprobe922", 1234, 10, "idx") { Title = "Live" } },
+            "test", TimeSpan.FromHours(1), CancellationToken.None);
+
+        var changed = await db.PrioritizeStaleAvailableForReprobeAsync(PhantomDb.StaleAvailableReprobePriority, PhantomDb.DefaultDeadSwarmBrowsePruneThreshold, CancellationToken.None);
+        Assert.Equal(1, changed);
+
+        var lease = await db.ClaimDueAvailabilityAsync("test-owner", TimeSpan.FromMinutes(5), DateTimeOffset.UtcNow, "policy", CancellationToken.None);
+        Assert.NotNull(lease);
+        Assert.Equal(920, lease!.TmdbId);
     }
 
     // ----------------------------------------------------------------
