@@ -371,6 +371,44 @@ jellyfinMetadataReaper:
     # keep a little headroom for the candidate list itself.
     limits: { cpu: "500m", memory: 384Mi }
 
+# ------------------------------------------------------- daily load-time measurement rig --
+# In-cluster CronJob that fires tools/ci/loadtime-daily-run.sh on a daily cadence (task
+# ttfb-daily-rig-incluster-cronjob), so the TTFB-reduction loop gets a fresh
+# phantom_loadtime_seconds sample WITHOUT depending on the Gitea Actions mirror (a standing
+# NEEDS-HUMAN). Complementary to .gitea/workflows/phantom-loadtime-daily.yaml — whichever fires
+# produces a sample. Default OFF until an operator reviews and wires the config objects below.
+#
+# INFRA-IDENTIFIER RULE: real hostnames/URLs/credentials are NEVER baked into this tracked chart.
+# The dev/prod hosts + Pushgateway URL are supplied at deploy time from a ConfigMap
+# (`configMapName`, keys devHost/prodHost/pushgatewayUrl) and the Jellyfin admin token from a
+# Secret (`adminTokenSecretName`/`adminTokenSecretKey`); the defaults here are example.com
+# placeholders only. The script keeps its prod-safety refusal (DEV_HOST==PROD_HOST is refused).
+loadtimeDaily:
+  enabled: false
+  schedule: "17 6 * * *"   # daily; mirrors the Gitea workflow's cron
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  # A daily measurement run must be bounded so a hung network probe never wedges the CronJob.
+  activeDeadlineSeconds: 1800
+  backoffLimit: 1
+  # Init container that clones the phantom-library source (the daily script sources a whole tree
+  # of sibling tools/ + scripts/). URL + ref supplied by values — example.com placeholder default.
+  gitImage: docker.io/alpine/git:latest
+  repoUrl: "https://git.example.com/phantom-library/phantom-library.git"
+  repoRef: "main"
+  # Main-container image: needs bash + kubectl + curl + jq + openssl + python3 (the toolchain the
+  # Gitea workflow installs for the rig). Supply a purpose-built/pinned image at deploy time.
+  image: "docker.io/example/phantom-loadtime-rig:latest"
+  # ConfigMap carrying the live target config (keys: devHost, prodHost, pushgatewayUrl).
+  # Provisioned OUT OF BAND with the REAL values; the chart only references it.
+  configMapName: phantom-loadtime-daily-config
+  # Secret carrying the Jellyfin admin ApiKey/AccessToken for the live measurement.
+  adminTokenSecretName: phantom-loadtime-daily-token
+  adminTokenSecretKey: admin-token
+  resources:
+    requests: { cpu: "100m", memory: 128Mi }
+    limits: { cpu: "1", memory: 512Mi }
+
 # --------------------------------------------------------------- gostream tuning config --
 # configMapName is the fixed (unsuffixed) name the workload mounts and components.gostreamConfig
 # creates. The data is rendered from `config` below (disk_warmup_quota_gb injected from warmup.quotaGb).

@@ -1,0 +1,165 @@
+{{- if .Values.loadtimeDaily.enabled }}
+{{/*
+In-cluster daily load-time measurement rig (task ttfb-daily-rig-incluster-cronjob).
+
+The daily TTFB-reduction loop's ONLY previous trigger was the Gitea Actions workflow
+.gitea/workflows/phantom-loadtime-daily.yaml, which cannot fire until a Gitea mirror of
+phantom-library is provisioned (gitea-mirror-provision-wiring — a standing NEEDS-HUMAN). A
+buildable dependency is never a standing human gate: tools/ci/loadtime-daily-run.sh is the
+complete daily cadence engine (resolve dev color live from the Ingress -> measure the six
+load-time flows against the deployed HTTPS host -> push to Pushgateway -> ratcheting guard);
+it needs only a Kubernetes CronJob to fire it on schedule, exactly as
+jellyfin-metadata-reaper-cronjob.yaml drives the reaper in-cluster. This removes the Gitea-mirror
+dependency from the measurement loop ENTIRELY. The two triggers are COMPLEMENTARY — this CronJob
+does not replace or disable the Gitea workflow; whichever fires produces a sample.
+
+Unlike the reaper (which runs `find`+`du`+`rm` and so ships its whole script in a ConfigMap and
+runs inside the already-mounted workload image), loadtime-daily-run.sh sources a WHOLE TREE of
+sibling repo files (tools/rig-scenarios/, scripts/, tools/perf/, tools/ci/lib-cleanup.sh). Rather
+than fan that tree out across ConfigMaps, an init container clones the repo (URL+ref from values,
+example.com placeholder default — infra-identifier rule) into an emptyDir, and the main container
+runs the script from that checkout with kubectl/curl/jq/openssl/python3 available (same toolchain
+the Gitea workflow installs). Endpoints/tokens come ONLY from a Secret + ConfigMap wired through
+values; the real hostnames/URLs are NEVER baked into this tracked chart.
+
+The script's prod-safety refusal is preserved unchanged: it refuses when DEV_HOST == PROD_HOST, so
+both hosts are supplied (from the ConfigMap) and the guard runs exactly as it does in CI.
+*/}}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "phantom-library.fullname" . }}-loadtime-daily
+  labels:
+    {{- include "phantom-library.labels" . | nindent 4 }}
+    app.kubernetes.io/component: loadtime-daily
+spec:
+  schedule: {{ .Values.loadtimeDaily.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: {{ .Values.loadtimeDaily.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.loadtimeDaily.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      # One measurement run must not pile up on a slow/interrupted predecessor; Forbid above +
+      # a bounded deadline keep at most one active at a time.
+      activeDeadlineSeconds: {{ .Values.loadtimeDaily.activeDeadlineSeconds }}
+      backoffLimit: {{ .Values.loadtimeDaily.backoffLimit }}
+      template:
+        metadata:
+          labels:
+            {{- include "phantom-library.labels" . | nindent 12 }}
+            app.kubernetes.io/component: loadtime-daily
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ include "phantom-library.fullname" . }}-loadtime-daily
+          initContainers:
+            # Clone the phantom-library source into an emptyDir so the main container has the
+            # WHOLE tree the daily script sources (tools/, scripts/). Repo URL + ref come from
+            # values (example.com placeholder default), never baked here.
+            - name: checkout
+              image: {{ .Values.loadtimeDaily.gitImage | quote }}
+              imagePullPolicy: {{ .Values.images.pullPolicy }}
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  rm -rf /src/* /src/.git 2>/dev/null || true
+                  git clone --depth 1 --branch "$REPO_REF" "$REPO_URL" /src
+                  echo "checkout: cloned $REPO_URL @ $REPO_REF"
+              env:
+                - name: REPO_URL
+                  value: {{ .Values.loadtimeDaily.repoUrl | quote }}
+                - name: REPO_REF
+                  value: {{ .Values.loadtimeDaily.repoRef | quote }}
+              volumeMounts:
+                - name: src
+                  mountPath: /src
+          containers:
+            - name: loadtime-daily
+              image: {{ .Values.loadtimeDaily.image | quote }}
+              imagePullPolicy: {{ .Values.images.pullPolicy }}
+              workingDir: /src
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -euo pipefail
+                  git config --global --add safe.directory /src || true
+                  exec ./tools/ci/loadtime-daily-run.sh
+              env:
+                # Live target config comes from the ConfigMap; the admin token from the Secret.
+                # Real hostnames/URLs live ONLY in those objects, never in this tracked chart.
+                - name: PHANTOM_INCLUSTER_DEV_HOST
+                  valueFrom:
+                    configMapKeyRef:
+                      name: {{ .Values.loadtimeDaily.configMapName | quote }}
+                      key: devHost
+                - name: PHANTOM_INCLUSTER_PROD_HOST
+                  valueFrom:
+                    configMapKeyRef:
+                      name: {{ .Values.loadtimeDaily.configMapName | quote }}
+                      key: prodHost
+                - name: PHANTOM_INCLUSTER_NAMESPACE
+                  value: {{ .Release.Namespace | quote }}
+                - name: PHANTOM_PUSHGATEWAY_URL
+                  valueFrom:
+                    configMapKeyRef:
+                      name: {{ .Values.loadtimeDaily.configMapName | quote }}
+                      key: pushgatewayUrl
+                - name: PHANTOM_INCLUSTER_ADMIN_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.loadtimeDaily.adminTokenSecretName | quote }}
+                      key: {{ .Values.loadtimeDaily.adminTokenSecretKey | quote }}
+              resources:
+                {{- toYaml .Values.loadtimeDaily.resources | nindent 16 }}
+              volumeMounts:
+                - name: src
+                  mountPath: /src
+          volumes:
+            - name: src
+              emptyDir: {}
+---
+# ServiceAccount + minimal RBAC: the script's ONLY in-cluster read is `kubectl get ingress
+# phantom-library-{blue,green}` to resolve which color is the dev host LIVE from the Ingress
+# (never a cached/CNAME guess). It performs no writes, so grant read-only on Ingresses only.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "phantom-library.fullname" . }}-loadtime-daily
+  labels:
+    {{- include "phantom-library.labels" . | nindent 4 }}
+    app.kubernetes.io/component: loadtime-daily
+{{- if .Values.imagePullSecret }}
+imagePullSecrets:
+  - name: {{ .Values.imagePullSecret }}
+{{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "phantom-library.fullname" . }}-loadtime-daily
+  labels:
+    {{- include "phantom-library.labels" . | nindent 4 }}
+    app.kubernetes.io/component: loadtime-daily
+rules:
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "phantom-library.fullname" . }}-loadtime-daily
+  labels:
+    {{- include "phantom-library.labels" . | nindent 4 }}
+    app.kubernetes.io/component: loadtime-daily
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "phantom-library.fullname" . }}-loadtime-daily
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "phantom-library.fullname" . }}-loadtime-daily
+    namespace: {{ .Release.Namespace }}
+{{- end }}
