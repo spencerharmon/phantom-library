@@ -397,7 +397,11 @@ loadtimeDaily:
   repoUrl: "https://git.example.com/phantom-library/phantom-library.git"
   repoRef: "main"
   # Main-container image: needs bash + kubectl + curl + jq + openssl + python3 (the toolchain the
-  # Gitea workflow installs for the rig). Supply a purpose-built/pinned image at deploy time.
+  # Gitea workflow installs for the rig). Built from deploy/loadtime-rig/Dockerfile and published by
+  # .gitea/workflows/build-loadtime-rig-image.yml to <forge-host>/<owner>/loadtime-rig:<tag> (never a
+  # floating tag; forge host from the Actions context, never baked). The example.com placeholder default
+  # below stays infra-identifier-safe per the AGENTS.md rule; the real PINNED DIGEST is supplied by a
+  # separate flux-owned values override at deploy time (out of scope for this chart default).
   image: "docker.io/example/phantom-loadtime-rig:latest"
   # ConfigMap carrying the live target config (keys: devHost, prodHost, pushgatewayUrl).
   # Provisioned OUT OF BAND with the REAL values; the chart only references it.

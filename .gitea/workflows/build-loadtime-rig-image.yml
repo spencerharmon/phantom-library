@@ -1,0 +1,103 @@
+name: build loadtime-rig image
+# .gitea/workflows/build-loadtime-rig-image.yml
+#
+# ROI Priority 9 — build + publish the purpose-built main-container image for
+# the in-cluster daily load-time CronJob (deploy/loadtime-rig/Dockerfile),
+# so deploy/helm/phantom-library values.yaml `loadtimeDaily.image` can point
+# at a REAL pullable artifact instead of the inert
+# `docker.io/example/phantom-loadtime-rig:latest` placeholder
+# ttfb-daily-rig-incluster-cronjob shipped.
+#
+# Tag-driven (a `loadtime-rig-v*` tag) or manual (workflow_dispatch), mirroring
+# release.yaml / nonrig-gate.yaml's pattern and the already-DONE
+# flux/gitea-actions-image-build-workflows + jellyfin/gitea-actions-image-
+# workflows recipe: run on the SELF-HOSTED Gitea Actions runner
+# ([self-hosted, gitea-actions-runner], NEVER ubuntu-latest), inside a PINNED
+# base image, build the Dockerfile with buildah/podman, and publish to the
+# forge OCI registry.
+#
+# NO deployment-specific identifier is hardcoded: the forge host and repo
+# come from the Actions context at run time (github.server_url /
+# github.repository, which Gitea Actions populates), so the published path
+# resolves to whatever forge this repo lives on — e.g.
+# <forge-host>/<owner>/loadtime-rig:<tag> — with the concrete host supplied by
+# the runner context, never baked here (infra-identifier rule). The published
+# TAG is derived from the git tag (or a workflow_dispatch input) and is NEVER
+# a floating tag — that would defeat the pinned-digest supply the flux-owned
+# values override injects.
+#
+# Regression harness: scripts/tests/loadtime-rig-image-build.test.sh asserts
+# this file parses, runs on the self-hosted runner in a pinned base image,
+# builds the Dockerfile with buildah/podman, and never references :latest for
+# its own build base or its published tag.
+
+on:
+  push:
+    tags:
+      - 'loadtime-rig-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag to publish (never "latest")'
+        required: true
+        default: 'manual'
+
+jobs:
+  build-loadtime-rig-image:
+    name: build + publish loadtime-rig image
+    runs-on: [self-hosted, gitea-actions-runner]
+    # Pinned base image carrying buildah/podman — a concrete tag, never
+    # :latest — so the image build cannot silently drift onto an untested
+    # builder toolchain.
+    container:
+      image: quay.io/buildah/stable:v1.37.5
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: mark repo safe for git (container UID != checkout owner)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: resolve published tag (never latest)
+        id: tag
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            # refs/tags/loadtime-rig-vX.Y.Z -> vX.Y.Z
+            REF="${GITHUB_REF#refs/tags/loadtime-rig-}"
+            TAG="$REF"
+          else
+            TAG="${{ github.event.inputs.tag }}"
+          fi
+          if [ -z "$TAG" ] || [ "$TAG" = "latest" ]; then
+            echo "refusing to publish an empty or floating tag" >&2
+            exit 1
+          fi
+          # Forge host + owning repo from the Actions context — no baked infra
+          # identifier. github.repository is <owner>/<repo>; the image lives at
+          # <registry-host>/<owner>/loadtime-rig.
+          SERVER="${GITHUB_SERVER_URL#https://}"
+          SERVER="${SERVER#http://}"
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          IMAGE="${SERVER}/${OWNER}/loadtime-rig:${TAG}"
+          echo "tag=$TAG"      >> "$GITHUB_OUTPUT"
+          echo "image=$IMAGE"  >> "$GITHUB_OUTPUT"
+          echo "resolved image: $IMAGE"
+
+      - name: build the loadtime-rig image with buildah
+        run: |
+          set -euo pipefail
+          buildah bud \
+            --format docker \
+            -f deploy/loadtime-rig/Dockerfile \
+            -t "${{ steps.tag.outputs.image }}" \
+            deploy/loadtime-rig
+
+      - name: publish to the forge OCI registry with buildah push
+        run: |
+          set -euo pipefail
+          buildah login \
+            --username "${{ github.actor }}" \
+            --password "${{ secrets.GITEA_TOKEN }}" \
+            "${GITHUB_SERVER_URL#*://}"
+          buildah push "${{ steps.tag.outputs.image }}"
