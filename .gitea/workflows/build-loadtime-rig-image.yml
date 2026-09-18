@@ -30,6 +30,16 @@ name: build loadtime-rig image
 # this file parses, runs on the self-hosted runner in a pinned base image,
 # builds the Dockerfile with buildah/podman, and never references :latest for
 # its own build base or its published tag.
+#
+# NOTE ON THE PUBLISHED REFERENCE (do not "fix" this to publish :main):
+# this workflow deliberately publishes ONLY a NON-floating tag — `vX.Y.Z`
+# from a `loadtime-rig-v*` tag push, or the `workflow_dispatch` input — and
+# explicitly refuses an empty/floating tag (the "resolve published tag" step
+# exits non-zero on "" or "latest"). There is therefore NO `loadtime-rig:main`
+# artifact and never will be: a floating `:main` tag is exactly what the
+# flux-owned pinned-digest values override exists to avoid. Any verification of
+# this build's deliverable must therefore inspect the published `vX.Y.Z` tag (or
+# run this file's regression harness), NOT `docker://.../loadtime-rig:main`.
 
 on:
   push:
