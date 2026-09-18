@@ -335,7 +335,7 @@ public sealed class PhantomMaterialisingMediaSourceProvider : IMediaSourceProvid
 
         var path = ResolveMaterialisedPath(type, existing);
 
-        await WaitForFileAsync(path, cancellationToken).ConfigureAwait(false);
+        await WaitForFileAsync(path, parsed, type, season, episode, cancellationToken).ConfigureAwait(false);
 
         _logger.LogInformation("Phantom native-open resolved {Type}/{Tmdb} to {Path}", type, parsed.TmdbId, path);
         var source = await FuseMediaSourceAsync(path, parsed.Encode(), cancellationToken).ConfigureAwait(false);
@@ -436,7 +436,87 @@ public sealed class PhantomMaterialisingMediaSourceProvider : IMediaSourceProvid
             ? GostreamPathResolver.ResolveMoviePath(state.FusePath)
             : GostreamPathResolver.ResolveEpisodePath(state.FusePath);
 
-    private async Task WaitForFileAsync(string path, CancellationToken ct)
+    /// <summary>
+    /// Wait for the FUSE path gostream is expected to expose after a successful
+    /// register. Mirrors <c>GostreamClient.AddAsync</c>'s own one-retry discipline
+    /// one step earlier in the same handoff: if the path never appears within one
+    /// bounded poll window, issue exactly ONE eager re-register call to gostream
+    /// for the same item and, on success, extend the wait by one additional
+    /// bounded poll window before finally raising <see cref="FileNotFoundException"/>.
+    /// If the eager re-register call itself fails, fail fast — no stacked retries,
+    /// no unbounded/exponential backoff.
+    /// </summary>
+    private async Task WaitForFileAsync(
+        string path,
+        ChannelItemId parsed,
+        string type,
+        int? season,
+        int? episode,
+        CancellationToken ct)
+    {
+        if (await PollForFileAsync(path, ct).ConfigureAwait(false))
+        {
+            return;
+        }
+
+        // First bounded poll window elapsed with no FUSE path. Issue exactly ONE
+        // eager re-register to gostream for the same item (the register call one
+        // step earlier already retries once on transient HTTP failure; this is the
+        // symmetric single retry at the FUSE-wait step).
+        _logger.LogWarning(
+            "Phantom FUSE path {Path} for {Type}/{Tmdb} did not appear within the wait window; issuing one eager re-register",
+            path,
+            type,
+            parsed.TmdbId);
+
+        MaterialisationOutcome reregister;
+        try
+        {
+            reregister = await _materialiser.MaterialiseAsync(
+                parsed.TmdbId!.Value,
+                type,
+                season,
+                episode,
+                MaterialiseTrigger.Play,
+                ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // The eager re-register call itself failed: fail fast to
+            // gostream_cannot_fetch. No stacked retries.
+            _logger.LogWarning(ex, "Phantom eager re-register for {Type}/{Tmdb} threw; failing fast", type, parsed.TmdbId);
+            throw new FileNotFoundException("Materialised FUSE path did not appear and eager re-register failed", path, ex);
+        }
+
+        if (reregister.Status != MaterialisationStatus.Success
+            && reregister.Status != MaterialisationStatus.Duplicate
+            && reregister.Status != MaterialisationStatus.AlreadyInProgress)
+        {
+            // The eager re-register call itself failed: fail fast. No second window.
+            _logger.LogWarning(
+                "Phantom eager re-register for {Type}/{Tmdb} returned {Status}; failing fast",
+                type,
+                parsed.TmdbId,
+                reregister.Status);
+            throw new FileNotFoundException("Materialised FUSE path did not appear and eager re-register failed", path);
+        }
+
+        // Eager re-register succeeded: extend the wait by exactly one additional
+        // bounded poll window (same config, no new knob).
+        if (await PollForFileAsync(path, ct).ConfigureAwait(false))
+        {
+            return;
+        }
+
+        throw new FileNotFoundException("Materialised FUSE path did not appear before playback open timeout", path);
+    }
+
+    /// <summary>
+    /// One bounded poll window over <see cref="PluginConfiguration.FusePathWaitTimeoutSeconds"/>
+    /// at <see cref="PluginConfiguration.FusePathPollIntervalMilliseconds"/> cadence.
+    /// Returns true if the file appeared, false if the window elapsed without it.
+    /// </summary>
+    private async Task<bool> PollForFileAsync(string path, CancellationToken ct)
     {
         var cfg = _configProvider();
         var deadline = DateTimeOffset.UtcNow.AddSeconds(Math.Max(1, cfg.FusePathWaitTimeoutSeconds));
@@ -446,13 +526,13 @@ public sealed class PhantomMaterialisingMediaSourceProvider : IMediaSourceProvid
             ct.ThrowIfCancellationRequested();
             if (File.Exists(path))
             {
-                return;
+                return true;
             }
 
             await Task.Delay(pollMs, ct).ConfigureAwait(false);
         }
 
-        throw new FileNotFoundException("Materialised FUSE path did not appear before playback open timeout", path);
+        return false;
     }
 
     private static ChannelItemId ParseToken(string openToken)

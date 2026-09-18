@@ -69,9 +69,105 @@ public class PhantomMaterialisingMediaSourceProviderTests : IDisposable
         Assert.Equal(1, opened.MediaSource.DefaultAudioStreamIndex);
     }
 
+    [Theory]
+    [InlineData("movie", 9911, "phantom:movie_9911", -1, -1)]
+    [InlineData("episode", 9912, "phantom:episode_9912_s01e02", 1, 2)]
+    public async Task OpenMediaSource_FusePathMissing_EagerReregistersOnceThenSucceeds(
+        string type, int tmdb, string token, int seasonKey, int episodeKey)
+    {
+        // The primary materialise registers and writes materialised_state but the
+        // FUSE path gostream is expected to expose does NOT appear within the first
+        // bounded poll window. The provider must then issue EXACTLY ONE eager
+        // re-register and, on its success, check the FUSE file again — which now
+        // appears because the eager re-register is what made gostream expose it.
+        var path = Path.Combine(_root, type + "-reregister.mkv");
+
+        var call = 0;
+        var fuseFileChecksAfterReregister = 0;
+        var materialiser = new Mock<IMaterialiser>(MockBehavior.Strict);
+        materialiser
+            .Setup(m => m.MaterialiseAsync(tmdb, type, It.IsAny<int?>(), It.IsAny<int?>(), MaterialiseTrigger.Play, It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                var n = Interlocked.Increment(ref call);
+                if (n == 1)
+                {
+                    // Primary materialise: register succeeds and state is written,
+                    // but the FUSE file is NOT yet present.
+                    await _db.InsertMaterialisedStateAsync(tmdb, type, seasonKey, episodeKey, "/stub", path, CancellationToken.None);
+                }
+                else
+                {
+                    // Eager re-register (the retry under test): this is what finally
+                    // makes gostream expose the FUSE path.
+                    Interlocked.Increment(ref fuseFileChecksAfterReregister);
+                    await File.WriteAllTextAsync(path, "x", CancellationToken.None);
+                }
+
+                return MaterialisationOutcome.Success(path, "/stub");
+            });
+
+        var provider = CreateProvider(materialiser);
+
+        var opened = await provider.OpenMediaSource(token, new(), CancellationToken.None);
+
+        Assert.Equal(path, opened.MediaSource.Path);
+        // Exactly one eager re-register (call #2) beyond the primary materialise,
+        // and the FUSE file was checked again after it succeeded (the open resolved).
+        Assert.Equal(2, call);
+        Assert.Equal(1, fuseFileChecksAfterReregister);
+        Assert.True(File.Exists(path));
+    }
+
+    [Theory]
+    [InlineData("movie", 9921, "phantom:movie_9921", -1, -1)]
+    [InlineData("episode", 9922, "phantom:episode_9922_s01e02", 1, 2)]
+    public async Task OpenMediaSource_FusePathMissing_EagerReregisterFails_FailsFastNoExtraAttempt(
+        string type, int tmdb, string token, int seasonKey, int episodeKey)
+    {
+        // The FUSE file never appears. After the first poll window the provider
+        // issues one eager re-register; that call itself FAILS, so the provider
+        // must fail fast to gostream_cannot_fetch (FileNotFoundException, which
+        // OpenMediaSource classifies as CauseGostreamCannotFetch and re-throws) with
+        // NO further re-register attempt — no stacked retries, no infinite loop.
+        var path = Path.Combine(_root, type + "-reregister-fail.mkv");
+
+        var call = 0;
+        var materialiser = new Mock<IMaterialiser>(MockBehavior.Strict);
+        materialiser
+            .Setup(m => m.MaterialiseAsync(tmdb, type, It.IsAny<int?>(), It.IsAny<int?>(), MaterialiseTrigger.Play, It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                var n = Interlocked.Increment(ref call);
+                if (n == 1)
+                {
+                    // Primary materialise: register succeeds, state written, no file.
+                    await _db.InsertMaterialisedStateAsync(tmdb, type, seasonKey, episodeKey, "/stub", path, CancellationToken.None);
+                    return MaterialisationOutcome.Success(path, "/stub");
+                }
+
+                // Eager re-register fails.
+                return MaterialisationOutcome.ErrorResult("gostream register failed");
+            });
+
+        var provider = CreateProvider(materialiser);
+
+        await Assert.ThrowsAsync<FileNotFoundException>(
+            () => provider.OpenMediaSource(token, new(), CancellationToken.None));
+
+        // Exactly one eager re-register attempt (call #2) — no third attempt.
+        Assert.Equal(2, call);
+        Assert.False(File.Exists(path));
+    }
+
     private PhantomMaterialisingMediaSourceProvider CreateProvider()
     {
         var materialiser = new Mock<IMaterialiser>(MockBehavior.Strict);
+        return CreateProvider(materialiser);
+    }
+
+    private PhantomMaterialisingMediaSourceProvider CreateProvider(Mock<IMaterialiser> materialiser)
+    {
         var encoder = new Mock<IMediaEncoder>(MockBehavior.Loose);
         encoder.Setup(e => e.GetMediaInfo(It.IsAny<MediaInfoRequest>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new MediaInfo
