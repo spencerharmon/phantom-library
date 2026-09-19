@@ -1,0 +1,74 @@
+name: phantom-library P4 multi-replica acceptance rig
+# .gitea/workflows/p4-multi-replica-acceptance-rig.yaml
+#
+# ROI Priority 4's acceptance bar — mirrors in-cluster-acceptance-rig.yaml (P3
+# Stage 5) exactly, but drives tools/ci/p4-multi-replica-acceptance-run.sh
+# against a color running >=2 Jellyfin+gostream replicas instead of a single
+# instance, proving Stage A (shared Postgres) + Stage B (consolidated
+# co-located gostream) deliver horizontal scale without single-writer
+# corruption. See tools/ci/p4-multi-replica-acceptance-run.sh for the full
+# assertion list and docs/tasks/p4-multi-replica-acceptance-rig.md for the
+# design.
+#
+# Runs on the self-hosted Gitea Actions runner (no Zuul/Nodepool nodeset).
+# Everything substantive is delegated to
+# tools/ci/p4-multi-replica-acceptance-run.sh so this file stays a thin
+# trigger + toolchain declaration, mirroring in-cluster-acceptance-rig.yaml.
+#
+# Never touches production: the script refuses outright if
+# PHANTOM_INCLUSTER_DEV_HOST resolves to the color carrying the apex/prod
+# host (see GATES.md THE AUTHORITY + the script's own guard).
+#
+# Regression harness: scripts/tests/p4-multi-replica-acceptance-rig.test.sh
+# proves this file parses, runs on the self-hosted runner, declares a pinned
+# toolchain, invokes the shared script (never a hand-rolled copy), and that a
+# toolchain-agnostic dry run (PHANTOM_CI_DRYRUN=1) exits 0 with no cluster
+# access.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  p4-multi-replica-acceptance:
+    name: P4 multi-replica acceptance (deployed dev color, live, >=2 replicas)
+    runs-on: [self-hosted, gitea-actions-runner]
+    container:
+      image: mcr.microsoft.com/dotnet/sdk:9.0.305-noble
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install kubectl + curl + openssl + jq + python3 (needed by the rig)
+        run: |
+          set -euo pipefail
+          apt-get update -y
+          apt-get install -y --no-install-recommends \
+            curl ca-certificates openssl jq python3 python3-pip
+          curl -fsSL -o /usr/local/bin/kubectl \
+            "https://dl.k8s.io/release/$(curl -fsSL -L https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x /usr/local/bin/kubectl
+          rm -rf /var/lib/apt/lists/*
+
+      - name: mark repo safe for git (container UID != checkout owner)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: write scoped kubeconfig from the provisioned secret
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.kube"
+          printf '%s' "$PHANTOM_INCLUSTER_KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+        env:
+          PHANTOM_INCLUSTER_KUBECONFIG_B64: ${{ secrets.PHANTOM_INCLUSTER_KUBECONFIG_B64 }}
+
+      - name: P4 multi-replica acceptance rig (shared script; drives the DEPLOYED dev color live)
+        run: ./tools/ci/p4-multi-replica-acceptance-run.sh
+        env:
+          PHANTOM_INCLUSTER_DEV_HOST: ${{ vars.PHANTOM_INCLUSTER_DEV_HOST }}
+          PHANTOM_INCLUSTER_PROD_HOST: ${{ vars.PHANTOM_INCLUSTER_PROD_HOST }}
+          PHANTOM_INCLUSTER_NAMESPACE: ${{ vars.PHANTOM_INCLUSTER_NAMESPACE }}
+          PHANTOM_INCLUSTER_ADMIN_TOKEN: ${{ secrets.PHANTOM_INCLUSTER_ADMIN_TOKEN }}
+          PHANTOM_MULTI_MIN_REPLICAS: ${{ vars.PHANTOM_MULTI_MIN_REPLICAS }}
