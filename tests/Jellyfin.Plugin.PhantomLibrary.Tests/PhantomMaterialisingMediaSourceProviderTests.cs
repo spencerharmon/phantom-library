@@ -160,6 +160,81 @@ public class PhantomMaterialisingMediaSourceProviderTests : IDisposable
         Assert.False(File.Exists(path));
     }
 
+    [Theory]
+    [InlineData("movie", 9931, "phantom:movie_9931", -1, -1)]
+    [InlineData("episode", 9932, "phantom:episode_9932_s01e02", 1, 2)]
+    public async Task OpenMediaSource_AlreadyInProgress_PollTimeout_EagerReclaimReclaimsStaleClaim(
+        string type, int tmdb, string token, int seasonKey, int episodeKey)
+    {
+        // The primary MaterialiseAsync call observes AlreadyInProgress (a concurrent request
+        // already holds the in-flight claim). WaitForMaterialisedStateAsync's poll loop never
+        // sees a materialised_state row because the claim it is waiting behind is actually
+        // leaked/stale. On poll-timeout the provider must issue exactly ONE additional
+        // MaterialiseAsync call for the same item: since the claim really is stale, this second
+        // call reclaims it (Materialiser's own steal-if-stale logic) and performs a real
+        // materialise, writing the materialised_state row. The provider must then re-read/extend
+        // the wait by one bounded window and resolve successfully — no timeout.
+        var path = Path.Combine(_root, type + "-reclaim.mkv");
+        await File.WriteAllTextAsync(path, "x", CancellationToken.None);
+
+        var call = 0;
+        var materialiser = new Mock<IMaterialiser>(MockBehavior.Strict);
+        materialiser
+            .Setup(m => m.MaterialiseAsync(tmdb, type, It.IsAny<int?>(), It.IsAny<int?>(), MaterialiseTrigger.Play, It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                var n = Interlocked.Increment(ref call);
+                if (n == 1)
+                {
+                    // Primary call: another request already holds the (leaked) claim.
+                    return MaterialisationOutcome.AlreadyInProgress;
+                }
+
+                // Eager reclaim call (the retry under test): the claim was actually stale, so
+                // this call reclaims it and performs the real materialise.
+                await _db.InsertMaterialisedStateAsync(tmdb, type, seasonKey, episodeKey, "/stub", path, CancellationToken.None);
+                return MaterialisationOutcome.Success(path, "/stub");
+            });
+
+        var provider = CreateProvider(materialiser);
+
+        var opened = await provider.OpenMediaSource(token, new(), CancellationToken.None);
+
+        Assert.Equal(path, opened.MediaSource.Path);
+        // Exactly one eager reclaim call (call #2) beyond the primary AlreadyInProgress call.
+        Assert.Equal(2, call);
+    }
+
+    [Theory]
+    [InlineData("movie", 9941, "phantom:movie_9941")]
+    [InlineData("episode", 9942, "phantom:episode_9942_s01e02")]
+    public async Task OpenMediaSource_AlreadyInProgress_PollTimeout_EagerReclaimStillInProgress_FailsFastNoThirdCall(
+        string type, int tmdb, string token)
+    {
+        // The primary call observes AlreadyInProgress; the poll loop times out with no
+        // materialised_state row. The provider issues the one eager reclaim MaterialiseAsync
+        // call, but the original claim is still FRESH, so the reclaim attempt itself returns
+        // AlreadyInProgress again. The provider must fail fast to the existing TimeoutException
+        // path with no third call -- no stacked retries, no unbounded backoff.
+        var call = 0;
+        var materialiser = new Mock<IMaterialiser>(MockBehavior.Strict);
+        materialiser
+            .Setup(m => m.MaterialiseAsync(tmdb, type, It.IsAny<int?>(), It.IsAny<int?>(), MaterialiseTrigger.Play, It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                Interlocked.Increment(ref call);
+                return Task.FromResult(MaterialisationOutcome.AlreadyInProgress);
+            });
+
+        var provider = CreateProvider(materialiser);
+
+        await Assert.ThrowsAsync<TimeoutException>(
+            () => provider.OpenMediaSource(token, new(), CancellationToken.None));
+
+        // Exactly one eager reclaim attempt (call #2) beyond the primary call -- no third call.
+        Assert.Equal(2, call);
+    }
+
     private PhantomMaterialisingMediaSourceProvider CreateProvider()
     {
         var materialiser = new Mock<IMaterialiser>(MockBehavior.Strict);

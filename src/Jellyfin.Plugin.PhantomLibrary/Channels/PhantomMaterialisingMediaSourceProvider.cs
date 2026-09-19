@@ -324,9 +324,12 @@ public sealed class PhantomMaterialisingMediaSourceProvider : IMediaSourceProvid
             }
         }
 
-        existing ??= await WaitForMaterialisedStateAsync(parsed.TmdbId!.Value, type, seasonKey, episodeKey, cancellationToken)
-            .ConfigureAwait(false);
-
+        // NOTE: existing is already fully resolved by the if/else chain above (Success/Duplicate
+        // reads the row directly; AlreadyInProgress waits for it via WaitForMaterialisedStateAsync,
+        // which itself performs the bounded eager-reclaim retry on its own poll-timeout). Do NOT add
+        // a second WaitForMaterialisedStateAsync fallback here: doing so would invoke the eager
+        // reclaim's exactly-one-retry contract a second time, silently doubling both the wait budget
+        // and the number of MaterialiseAsync calls issued to the still-fresh in-flight claim.
         if (existing is null)
         {
             throw new TimeoutException(
@@ -413,6 +416,28 @@ public sealed class PhantomMaterialisingMediaSourceProvider : IMediaSourceProvid
         int episode,
         CancellationToken ct)
     {
+        var state = await PollForMaterialisedStateAsync(tmdbId, type, season, episode, ct).ConfigureAwait(false);
+        if (state is not null)
+        {
+            return state;
+        }
+
+        return await EagerReclaimMaterialiseAsync(tmdbId, type, season, episode, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// One bounded poll window over <see cref="PluginConfiguration.FusePathWaitTimeoutSeconds"/>
+    /// at <see cref="PluginConfiguration.FusePathPollIntervalMilliseconds"/> cadence, polling the
+    /// <c>materialised_state</c> row. Returns the row if it appeared, null if the window elapsed
+    /// without it.
+    /// </summary>
+    private async Task<MaterialisedStateRow?> PollForMaterialisedStateAsync(
+        int tmdbId,
+        string type,
+        int season,
+        int episode,
+        CancellationToken ct)
+    {
         var cfg = _configProvider();
         var deadline = DateTimeOffset.UtcNow.AddSeconds(Math.Max(1, cfg.FusePathWaitTimeoutSeconds));
         var pollMs = Math.Max(50, cfg.FusePathPollIntervalMilliseconds);
@@ -430,6 +455,76 @@ public sealed class PhantomMaterialisingMediaSourceProvider : IMediaSourceProvid
 
         return null;
     }
+
+    /// <summary>
+    /// Called after the first bounded poll window for the <c>materialised_state</c> row elapses
+    /// with no row present. The concurrent caller we deferred behind (which returned
+    /// AlreadyInProgress) may be holding a genuinely leaked in-flight claim: the Materialiser's own
+    /// steal-if-stale logic (<c>TryInsertMaterialiseInFlightAsync</c>) will gladly reclaim a claim
+    /// older than <c>MaterialiseInFlightStaleMinutes</c> (default 10 min) but nothing in this 60s
+    /// poll loop ever calls back into that claim path to trigger it. Issue exactly ONE additional
+    /// call into <see cref="IMaterialiser.MaterialiseAsync(int, string, int?, int?, MaterialiseTrigger, CancellationToken)"/>
+    /// for the same item: if the original claim is stale, this reclaims it and starts a real
+    /// materialise, so on success we extend the wait by one bounded poll window; if the claim is
+    /// still fresh, the reclaim attempt itself returns AlreadyInProgress again and we fail fast (no
+    /// stacked retries, no unbounded backoff) — mirroring the day-6 FUSE-wait eager re-register fix.
+    /// </summary>
+    private async Task<MaterialisedStateRow?> EagerReclaimMaterialiseAsync(
+        int tmdbId,
+        string type,
+        int season,
+        int episode,
+        CancellationToken ct)
+    {
+        var (waitSeason, waitEpisode) = SentinelsToSeasonEpisode(type, season, episode);
+
+        _logger.LogWarning(
+            "Phantom materialised_state wait for {Type}/{Tmdb} timed out; issuing one eager reclaim MaterialiseAsync call",
+            type,
+            tmdbId);
+
+        MaterialisationOutcome reclaim;
+        try
+        {
+            reclaim = await _materialiser.MaterialiseAsync(
+                tmdbId,
+                type,
+                waitSeason,
+                waitEpisode,
+                MaterialiseTrigger.Play,
+                ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // The eager reclaim call itself failed: fail fast. No stacked retries.
+            _logger.LogWarning(ex, "Phantom eager reclaim MaterialiseAsync for {Type}/{Tmdb} threw; failing fast", type, tmdbId);
+            return null;
+        }
+
+        if (reclaim.Status != MaterialisationStatus.Success && reclaim.Status != MaterialisationStatus.Duplicate)
+        {
+            // Either the claim is still fresh (AlreadyInProgress again) or the reclaim attempt
+            // itself failed: fail fast to the existing TimeoutException path. No second window,
+            // no third call.
+            _logger.LogWarning(
+                "Phantom eager reclaim MaterialiseAsync for {Type}/{Tmdb} returned {Status}; failing fast",
+                type,
+                tmdbId,
+                reclaim.Status);
+            return null;
+        }
+
+        // Reclaim succeeded (it actually stole the stale claim and materialised): extend the wait
+        // by exactly one additional bounded poll window (same config, no new knob).
+        return await PollForMaterialisedStateAsync(tmdbId, type, season, episode, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Converts the sentinel season/episode key form used by <c>materialised_state</c> lookups
+    /// (movie: -1/-1) back to the nullable season/episode form <see cref="IMaterialiser.MaterialiseAsync(int, string, int?, int?, MaterialiseTrigger, CancellationToken)"/> expects.
+    /// </summary>
+    private static (int? Season, int? Episode) SentinelsToSeasonEpisode(string type, int seasonKey, int episodeKey)
+        => type == "episode" ? (seasonKey, episodeKey) : (null, null);
 
     private static string ResolveMaterialisedPath(string type, MaterialisedStateRow state)
         => type == "movie"
