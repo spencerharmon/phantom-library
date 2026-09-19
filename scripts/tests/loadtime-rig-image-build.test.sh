@@ -56,7 +56,10 @@ fatal() { printf '\033[31mFATAL: %s\033[0m\n' "$*" >&2; exit 2; }
 # =========================================================================
 head_ "Dockerfile installs EXACTLY the toolchain the daily script needs"
 # The daily rig toolchain, per phantom-loadtime-daily.yaml's inline install +
-# tools/ci/loadtime-daily-run.sh's shell-outs.
+# tools/ci/loadtime-daily-run.sh's shell-outs. bash/curl/ca-certificates/
+# openssl/jq/python3 are apt-installed; dotnet is provided by the pinned .NET
+# SDK base image (see the base-pin assertion below), so it is asserted
+# separately.
 for tool in bash curl ca-certificates openssl jq python3; do
     if grep -qE "(^|[[:space:]])${tool}([[:space:]]|\\\\|$)" "$DOCKERFILE"; then
         ok "Dockerfile installs '$tool'"
@@ -64,6 +67,15 @@ for tool in bash curl ca-certificates openssl jq python3; do
         bad "Dockerfile does not install required tool '$tool'"
     fi
 done
+# dotnet: tools/perf/loadtime-guard.sh step 3 runs `dotnet run --project
+# tools/perf/ratchet-guard -c Release` (net9.0); without a .NET SDK on PATH it
+# exits 127 and fails the whole daily run. It comes from the pinned .NET SDK
+# base image (mcr.microsoft.com/dotnet/sdk:9.0.x), asserted below.
+if grep -qE '^\s*FROM\s+\S*dotnet/sdk:9\.' "$DOCKERFILE"; then
+    ok "Dockerfile provides dotnet via a pinned .NET 9 SDK base image"
+else
+    bad "Dockerfile does not provide a .NET 9 SDK (guard's 'dotnet run' would exit 127)"
+fi
 if grep -qE '/usr/local/bin/kubectl' "$DOCKERFILE" && grep -qE 'dl\.k8s\.io/release' "$DOCKERFILE"; then
     ok "Dockerfile installs kubectl (pinned download from dl.k8s.io)"
 else
