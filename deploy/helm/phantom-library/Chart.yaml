@@ -41,7 +41,11 @@ type: application
 # fixed 0.5s target line, and the current ratcheted threshold; materialise + play_materialised are
 # visually flagged as priority signals. Datasource referenced by provisioned name only (no baked
 # Mimir/Grafana URL). Additive values schema.
-version: 2.10.0
+# 2.11.0: publish the already-committed loadtime-daily rig (templates/loadtime-daily-cronjob.yaml +
+# `loadtimeDaily.*` values, added by ttfb-daily-rig-incluster-cronjob) as a NEW chart version so flux
+# re-pulls it. No functional/template/values change vs 2.10.0 — version bump only, to carry the
+# in-cluster daily TTFB load-time CronJob into a publishable chart tip.
+version: 2.11.0
 # Tracks the app milestone, not a container tag (images are digest-pinned in values).
 appVersion: "m14"
 keywords:
