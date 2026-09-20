@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Batch the per-orphan gostream tmdb/metadata/hidden-set lookups in the
+  movie browse list (ttfb-list-load-movie-render-profile, ROI Priority 9).**
+  Profiling the first genuinely-fresh `phantom_loadtime_seconds` sample
+  (`list_load{item_type="movie"}=432.610197s` vs
+  `list_load{item_type="episode"}=66.15218s`) traced the ~7x movie/episode gap
+  to per-item DB round-trips in `PhantomMoviesChannel.BuildFlatMovieItemsAsync`:
+  every gostream orphan MOVIE FILE paid its own `GetGostreamPathTmdbAsync` +
+  `GetTmdbMetadataAsync` round trip (each opening a fresh DB connection), and
+  every emitted external-variant item paid its own `IsItemHiddenAsync` round
+  trip — an O(catalogue) chain of sequential DB round trips. The TV/episode
+  path never had this problem because its equivalent resolution
+  (`TryResolveEnrichedGostreamSeriesAsync`) is keyed per SERIES DIRECTORY, not
+  per episode file — far fewer round trips for the same catalogue size. Added
+  `PhantomDb.GetGostreamPathTmdbsAsync`, `GetTmdbMetadataBatchAsync`, and
+  `ListHiddenTmdbIdsAsync` batch primitives, and rewired the movie browse's
+  already-cached-file fast path (the steady-state case the daily Mimir sample
+  measures) through them: the whole list now resolves with two batched round
+  trips for cached mappings/metadata plus one for the hidden set, instead of
+  up to 3 round trips PER orphan file. Falls through unchanged to the
+  existing per-file TMDB search only for genuinely new/uncached files. Movie
+  parity is the point of the fix; the episode path (already directory-scoped)
+  needed no change — verified unaffected (`PhantomShowsChannelTests` all
+  green). Behavior is otherwise byte-for-byte identical: same dedup, same
+  ordering, same hidden-item filtering, same fallback to `TryResolveEnriched-
+  GostreamMovieAsync` for cache misses.
+
 - **Fast-indexer early return now ON by default
   (ttfb-fast-indexer-early-return-enable-default, ROI Priority 9).** The
   `FastIndexerEarlyReturnEnabled` toggle added in a prior release shipped

@@ -415,6 +415,56 @@ public class PhantomMoviesChannelTests : IDisposable
         _tmdb.Verify(t => t.SearchMoviesAsync("Apex", 2026, It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
+    /// <summary>
+    /// ttfb-list-load-movie-render-profile: reproduces the profiled
+    /// list_load{item_type="movie"} cost shape — a large number of gostream
+    /// orphan files whose (path→tmdb) mapping and tmdb metadata are ALREADY
+    /// cached (the steady-state case after the first discovery tick, which is
+    /// what the daily Mimir sample measures). Before the fix, each file paid
+    /// its own <c>GetGostreamPathTmdbAsync</c> + <c>GetTmdbMetadataAsync</c>
+    /// DB round trip (a fresh connection each) — O(N) connections for N
+    /// files. After the fix, the whole browse resolves the cached set with
+    /// exactly two batched round trips regardless of N. This test FAILS
+    /// against the pre-fix implementation (connections scale with file count)
+    /// and PASSES after it (connections stay O(1) — a small constant
+    /// independent of N).
+    /// </summary>
+    [Fact]
+    public async Task GetChannelItems_ManyCachedGostreamOrphans_ResolvesWithBoundedDbRoundTrips()
+    {
+        const int FileCount = 60;
+        for (var i = 0; i < FileCount; i++)
+        {
+            var tmdbId = 900000 + i;
+            var path = Path.Combine(_moviesRoot, $"Cached Movie {i}_2021_1080p_deadbeef{i:D2}.mkv");
+            File.WriteAllText(path, string.Empty);
+            await _db.UpsertGostreamPathTmdbAsync(path, "movie", tmdbId, CancellationToken.None);
+            await SeedMetaAsync(tmdbId, $"Cached Movie {i}");
+        }
+
+        GostreamFilesystemEnumerator.ResetForTests();
+        _db.ResetConnectionsOpenedForTests();
+
+        var result = await _channel.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
+
+        Assert.Equal(FileCount, result.Items.Count);
+        // No orphan should have needed a TMDB network round trip — every
+        // path/tmdb-id/metadata triple was already cached.
+        _tmdb.Verify(t => t.SearchMoviesAsync(It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Never);
+        _tmdb.Verify(t => t.GetMovieAsync(It.IsAny<int>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Never);
+
+        // The regression assertion: DB round trips must stay a small constant,
+        // never scale linearly with FileCount. Pre-fix this was
+        // 2 * FileCount (=120) at minimum, one pair per orphan file. A
+        // generous bound well below FileCount proves the batched path is
+        // exercised, not the old per-item loop.
+        Assert.True(
+            _db.ConnectionsOpenedForTests < FileCount,
+            $"Expected O(1)/O(batches) DB round trips for {FileCount} cached orphans, " +
+            $"but observed {_db.ConnectionsOpenedForTests} connections opened — " +
+            "looks like the per-item DB round-trip path regressed.");
+    }
+
     [Fact]
     public async Task GetChannelItems_FolderIdSet_ReturnsEmpty()
     {

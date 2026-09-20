@@ -405,6 +405,19 @@ public sealed class PhantomDb : IDisposable
     private readonly IPhantomDbProvider _provider;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
     private int _schemaEnsured;
+    private int _connectionsOpenedForTests;
+
+    /// <summary>
+    /// Test-only counter of DB connections opened (≈ round trips) via
+    /// <see cref="OpenAsync"/>. Used by regression tests
+    /// (ttfb-list-load-movie-render-profile) to assert that a bulk read path
+    /// stays O(1)/O(batches) rather than issuing one connection per catalogue
+    /// item. Not used by production code paths.
+    /// </summary>
+    internal int ConnectionsOpenedForTests => _connectionsOpenedForTests;
+
+    /// <summary>Resets <see cref="ConnectionsOpenedForTests"/> to zero.</summary>
+    internal void ResetConnectionsOpenedForTests() => Interlocked.Exchange(ref _connectionsOpenedForTests, 0);
 
     /// <summary>
     /// A per-instance identity for THIS PhantomDb (i.e. this host/process),
@@ -456,6 +469,7 @@ public sealed class PhantomDb : IDisposable
     {
         var conn = _provider.CreateConnection();
         await conn.OpenAsync(ct).ConfigureAwait(false);
+        Interlocked.Increment(ref _connectionsOpenedForTests);
         if (Interlocked.CompareExchange(ref _schemaEnsured, 1, 0) == 0)
         {
             try
@@ -4010,6 +4024,18 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         return set;
     }
 
+    /// <summary>
+    /// Public batch form of the user hidden-set lookup (ttfb-list-load-movie-
+    /// render-profile): every (tmdb_id, type) a user has hidden, in ONE round
+    /// trip. Callers that previously checked <see cref="IsItemHiddenAsync"/>
+    /// once per catalogue item (an O(catalogue) round-trip chain) should
+    /// fetch this set once per browse instead and check membership in
+    /// memory. <see cref="Guid.Empty"/> (no user context) always returns an
+    /// empty set without a DB round trip.
+    /// </summary>
+    public async Task<IReadOnlyCollection<int>> ListHiddenTmdbIdsAsync(Guid userId, string type, CancellationToken ct)
+        => userId == Guid.Empty ? Array.Empty<int>() : await HiddenTmdbIdsAsync(userId, type, ct).ConfigureAwait(false);
+
     // ---- per-user visibility (composition over the server-wide queries) ----
     //
     // These filter the server-wide visibility results by the user's hidden set.
@@ -5043,6 +5069,97 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         {
             _writeLock.Release();
         }
+    }
+
+    /// <summary>
+    /// Batched form of <see cref="GetGostreamPathTmdbAsync"/> — resolves every
+    /// already-cached (path,kind) → tmdb_id mapping in <paramref name="paths"/>
+    /// with ONE round trip instead of one query per path.
+    /// (ttfb-list-list-movie-render-profile: the movie <c>list_load</c> flow
+    /// previously issued this lookup per orphan gostream file — an O(catalogue)
+    /// sequential DB round-trip chain that dominated the flow's cost for a
+    /// large orphan set. A path absent from the result has no cached mapping
+    /// yet — the caller falls back to its existing per-path TMDB search.)
+    /// </summary>
+    public async Task<IReadOnlyDictionary<string, int>> GetGostreamPathTmdbsAsync(
+        IReadOnlyCollection<string> paths,
+        string kind,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(paths);
+        ArgumentException.ThrowIfNullOrWhiteSpace(kind);
+        var result = new Dictionary<string, int>(StringComparer.Ordinal);
+        if (paths.Count == 0)
+        {
+            return result;
+        }
+
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        var paramNames = new List<string>(paths.Count);
+        var i = 0;
+        foreach (var path in paths)
+        {
+            var p = "@p" + i.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            paramNames.Add(p);
+            cmd.AddWithValue(p, path);
+            i++;
+        }
+
+        cmd.CommandText = $"SELECT path, tmdb_id FROM gostream_path_tmdb WHERE kind=@kind AND path IN ({string.Join(",", paramNames)});";
+        cmd.AddWithValue("@kind", kind);
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            result[r.GetString(0)] = r.GetInt32(1);
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Batched form of <see cref="GetTmdbMetadataAsync"/> — resolves every
+    /// already-catalogued tmdb id in <paramref name="tmdbIds"/> with ONE round
+    /// trip instead of one query per id. See
+    /// <see cref="GetGostreamPathTmdbsAsync"/> for the flow this feeds.
+    /// </summary>
+    public async Task<IReadOnlyDictionary<int, TmdbMetadataRow>> GetTmdbMetadataBatchAsync(
+        IReadOnlyCollection<int> tmdbIds,
+        string type,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(tmdbIds);
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        var result = new Dictionary<int, TmdbMetadataRow>();
+        if (tmdbIds.Count == 0)
+        {
+            return result;
+        }
+
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        var paramNames = new List<string>(tmdbIds.Count);
+        var i = 0;
+        foreach (var id in tmdbIds)
+        {
+            var p = "@t" + i.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            paramNames.Add(p);
+            cmd.AddWithValue(p, id);
+            i++;
+        }
+
+        cmd.CommandText = $@"SELECT tmdb_id, type, title, year, overview, poster_url, backdrop_url,
+                   genres_json, official_rating, community_rating, original_title, fetched_at, runtime_minutes, relevance_score
+            FROM tmdb_metadata WHERE type=@type AND tmdb_id IN ({string.Join(",", paramNames)});";
+        cmd.AddWithValue("@type", type);
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            var row = ReadTmdbMetadata(r);
+            result[row.TmdbId] = row;
+        }
+
+        return result;
     }
 
     private static TmdbMetadataRow ReadTmdbMetadata(DbDataReader r)

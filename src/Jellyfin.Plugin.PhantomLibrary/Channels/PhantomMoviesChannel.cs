@@ -343,10 +343,52 @@ public sealed class PhantomMoviesChannel
         var unresolvedOrphans = new List<GostreamFileEntry>();
         var variantsByTmdb = new Dictionary<int, List<MediaSourceInfo>>();
         var metadataByTmdb = new Dictionary<int, TmdbMetadataRow>();
+
+        // ttfb-list-load-movie-render-profile: batch-resolve the common
+        // (already-catalogued) case in TWO round trips total instead of up
+        // to 2*N sequential DB round trips (one gostream_path_tmdb lookup +
+        // one tmdb_metadata lookup PER orphan file). This is the dominant
+        // per-item DB-round-trip cost profiled for the movie list_load flow
+        // (432.6s baseline) — the TV/episode equivalent
+        // (TryResolveEnrichedGostreamSeriesAsync) already amortises this over
+        // one lookup per SERIES DIRECTORY rather than per file, which is why
+        // list_load{episode} (66.2s) was never affected. Only a path with no
+        // cached mapping, or a cached tmdb id missing its metadata row, falls
+        // through to the existing per-file resolution path below (TMDB search
+        // and/or a single-row DB fetch) — behaviourally identical to before,
+        // just no longer paying a full round trip per file for data already
+        // on hand.
+        var orphanPaths = orphans.Select(o => o.Path).ToList();
+        var cachedPathTmdbs = orphanPaths.Count == 0
+            ? new Dictionary<string, int>(StringComparer.Ordinal)
+            : await _db.GetGostreamPathTmdbsAsync(orphanPaths, "movie", cancellationToken).ConfigureAwait(false);
+        var neededTmdbIds = cachedPathTmdbs.Values.Distinct().ToList();
+        var batchedMetadata = neededTmdbIds.Count == 0
+            ? new Dictionary<int, TmdbMetadataRow>()
+            : await _db.GetTmdbMetadataBatchAsync(neededTmdbIds, "movie", cancellationToken).ConfigureAwait(false);
+
         foreach (var o in orphans)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var enriched = await TryResolveEnrichedGostreamMovieAsync(o.Path, cancellationToken).ConfigureAwait(false);
+            EnrichedGostreamMovie? enriched = null;
+            if (cachedPathTmdbs.TryGetValue(o.Path, out var cachedTmdbId)
+                && batchedMetadata.TryGetValue(cachedTmdbId, out var cachedMeta))
+            {
+                var cachedSource = await FuseMediaSourceAsync(o.Path, cancellationToken).ConfigureAwait(false);
+                enriched = new EnrichedGostreamMovie(cachedTmdbId, cachedMeta, cachedSource);
+                // Keep the in-memory per-path cache warm too, so a later hit
+                // in the same process (e.g. GetChannelItemMediaInfo) short-
+                // circuits without even the batched query.
+                lock (_gostreamMovieTmdbByPath)
+                {
+                    _gostreamMovieTmdbByPath[o.Path] = cachedTmdbId;
+                }
+            }
+            else
+            {
+                enriched = await TryResolveEnrichedGostreamMovieAsync(o.Path, cancellationToken).ConfigureAwait(false);
+            }
+
             if (enriched is null)
             {
                 unresolvedOrphans.Add(o);
@@ -410,6 +452,12 @@ public sealed class PhantomMoviesChannel
         }
 
         // --- 2. Gostream files with TMDB hits (real media; outrank unprobed discovery phantoms). Group variants by TMDB. ---
+        // ttfb-list-load-movie-render-profile: fetch the user's hidden-tmdb
+        // set ONCE (a single round trip) rather than once per candidate item
+        // — this loop previously called IsHiddenForUserAsync per variant
+        // group, another O(catalogue) per-item DB round-trip contributor to
+        // the profiled movie list_load cost.
+        var hiddenTmdbIds = await _db.ListHiddenTmdbIdsAsync(userId, "movie", cancellationToken).ConfigureAwait(false);
         foreach (var kvp in variantsByTmdb.OrderBy(k => metadataByTmdb[k.Key].Title, StringComparer.OrdinalIgnoreCase))
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -422,7 +470,7 @@ public sealed class PhantomMoviesChannel
             // backs it — step 1 already excluded it from `visible`/`emittedTmdbs`,
             // so without this check the on-disk variant would leak it straight
             // back in here.
-            if (await IsHiddenForUserAsync(userId, kvp.Key, cancellationToken).ConfigureAwait(false))
+            if (hiddenTmdbIds.Contains(kvp.Key))
             {
                 continue;
             }
@@ -608,17 +656,6 @@ public sealed class PhantomMoviesChannel
                 return null!;
         }
     }
-
-    /// <summary>
-    /// True iff <paramref name="userId"/> is a real caller (not
-    /// <see cref="Guid.Empty"/>) and has hidden this movie tmdb id
-    /// (REQ-M14-PER-USER Surface 3). <see cref="Guid.Empty"/> — no user context,
-    /// e.g. a system/background caller — never filters.
-    /// </summary>
-    private Task<bool> IsHiddenForUserAsync(Guid userId, int tmdbId, CancellationToken ct)
-        => userId == Guid.Empty
-            ? Task.FromResult(false)
-            : _db.IsItemHiddenAsync(userId, tmdbId, "movie", ct);
 
     /// <summary>
     /// Build a single movie ChannelItemInfo. <paramref name="materialised"/>
