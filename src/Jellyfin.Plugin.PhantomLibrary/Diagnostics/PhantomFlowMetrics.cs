@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using Jellyfin.Plugin.PhantomLibrary.State.Db;
+using Prometheus;
 
 namespace Jellyfin.Plugin.PhantomLibrary.Diagnostics;
 
@@ -103,6 +104,17 @@ internal static class PhantomFlowMetrics
         unit: "{attempt}",
         description: "Definitive per-attempt phantom playback outcome, split by flow/item_type/cause.");
 
+    // Pull-based prometheus-net mirror of the OTLP counter above (playback-
+    // outcome-real-cause-dual-emit-001). Same metric name and {flow,item_type,
+    // cause} labels, dual-emitted from the SAME RecordPlaybackOutcome call
+    // site, so the in-cluster scrape path that already picks up
+    // phantom_availability_probes_total (see PhantomMetrics) picks up this
+    // series too, with no OTLP/exporter/observe.spencerharmon.com change.
+    private static readonly Counter PlaybackOutcomesPrometheus = Metrics.CreateCounter(
+        "phantom_playback_outcome_total",
+        "Definitive per-attempt phantom playback outcome, split by flow/item_type/cause.",
+        new CounterConfiguration { LabelNames = new[] { "flow", "item_type", "cause" } });
+
     private static readonly Histogram<double> FlowDurationMs = Meter.CreateHistogram<double>(
         "phantom_flow_duration_ms",
         unit: "ms",
@@ -153,6 +165,7 @@ internal static class PhantomFlowMetrics
             new KeyValuePair<string, object?>("flow", flow),
             new KeyValuePair<string, object?>("item_type", itemType),
             new KeyValuePair<string, object?>("cause", cause));
+        PlaybackOutcomesPrometheus.WithLabels(flow, itemType, cause).Inc();
     }
 
     /// <summary>

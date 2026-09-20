@@ -6,6 +6,7 @@ using Jellyfin.Plugin.PhantomLibrary.Configuration;
 using Jellyfin.Plugin.PhantomLibrary.Diagnostics;
 using Jellyfin.Plugin.PhantomLibrary.State.Db;
 using OpenTelemetry.Exporter;
+using Prometheus;
 using Xunit;
 
 namespace Jellyfin.Plugin.PhantomLibrary.Tests;
@@ -159,6 +160,43 @@ public sealed class PhantomFlowMetricsTests
         var outcome = Assert.Single(measurements, m => m.Instrument == "phantom_playback_outcome_total");
         Assert.Equal(PhantomFlowMetrics.ItemTypeMovie, outcome.Tags["item_type"]);
         Assert.Equal(PhantomFlowMetrics.CauseSuccess, outcome.Tags["cause"]);
+    }
+
+    /// <summary>
+    /// playback-outcome-real-cause-dual-emit-001: RecordPlaybackOutcome must
+    /// ALSO increment a prometheus-net registry counter of the identical name
+    /// (<c>phantom_playback_outcome_total</c>) and {flow,item_type,cause}
+    /// labels, alongside the existing OTLP Meter counter — a pure addition
+    /// that lets the same in-cluster Prometheus scrape path that already
+    /// picks up phantom_availability_probes_total (job/pod scraping, not
+    /// per-metric) pick up the real per-attempt series too. Uses a
+    /// before/after delta because the prometheus-net counter is a static
+    /// process-wide singleton shared across test cases in this class.
+    /// </summary>
+    [Theory]
+    [InlineData(
+        PhantomFlowMetrics.PlaybackFlowMaterialiseThenPlay,
+        PhantomFlowMetrics.ItemTypeEpisode,
+        PhantomFlowMetrics.CauseGostreamRegisterFail)]
+    [InlineData(
+        PhantomFlowMetrics.PlaybackFlowPlayAlreadyMaterialised,
+        PhantomFlowMetrics.ItemTypeMovie,
+        PhantomFlowMetrics.CauseSuccess)]
+    public void RecordPlaybackOutcome_AlsoIncrementsPrometheusNetCounter_ForMovieAndEpisode(
+        string flow,
+        string itemType,
+        string cause)
+    {
+        var prometheusCounter = Metrics.CreateCounter(
+            "phantom_playback_outcome_total",
+            "Definitive per-attempt phantom playback outcome, split by flow/item_type/cause.",
+            new CounterConfiguration { LabelNames = new[] { "flow", "item_type", "cause" } });
+        var before = prometheusCounter.WithLabels(flow, itemType, cause).Value;
+
+        PhantomFlowMetrics.RecordPlaybackOutcome(flow, itemType, cause);
+
+        var after = prometheusCounter.WithLabels(flow, itemType, cause).Value;
+        Assert.Equal(1d, after - before);
     }
 
     [Fact]

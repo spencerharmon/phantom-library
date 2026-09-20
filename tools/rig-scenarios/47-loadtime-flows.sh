@@ -40,13 +40,30 @@
 # often fails today per P6 — still emits a duration record for the attempt AND
 # errors_total 1, so the failure RATE is recorded, never silently dropped.)
 #
-# It ALSO emits the DEFINITIVE per-attempt playback-outcome metric
-# (playback-outcome-instrumentation-001) the playback-error-reduction series
-# ranks causes from — the SAME metric the OTLP-native Phantom.Flows meter
-# records live via PhantomFlowMetrics.RecordPlaybackOutcome, mirrored here into
-# Mimir via the P8 Pushgateway emitter precedent:
-#   phantom_playback_outcome_total{flow="<materialise_then_play|play_already_materialised>",item_type="<movie|episode>",cause="<cause>"} 1
-# where cause ∈ {success, availability_abstain, no_candidate, magnet_dead_stale,
+# It ALSO emits a synthetic per-attempt playback-outcome fixture
+# (playback-outcome-instrumentation-001).
+#
+# IMPORTANT (playback-outcome-real-cause-dual-emit-001): this rig NEVER calls
+# the real classification (ClassifyMaterialiseFailure / PhantomFlowMetrics.
+# RecordPlaybackOutcome) — DRYRUN has no server at all, and LIVE only inspects
+# its own curl exit codes for the materialise/play calls, hard-coding every
+# materialise-side failure to "gostream_register_fail" and every play-side
+# failure to "gostream_cannot_fetch" (never availability_abstain/no_candidate/
+# magnet_dead_stale, never a real distinction between them). So the two
+# branches now emit DIFFERENT metric names, to make that distinction
+# impossible to lose track of again:
+#   - DRYRUN keeps emitting `phantom_playback_outcome_total{flow,item_type,cause}`
+#     — this branch has no live server and no server-side counterpart to
+#     conflict with, so reusing the real metric's name here is harmless.
+#   - LIVE now emits `phantom_loadtime_rig_outcome_total{flow,item_type,cause}`
+#     instead — a distinctly-named rig artifact that can never again be
+#     mistaken for the real per-attempt series. The REAL series is
+#     `phantom_playback_outcome_total`, emitted ONLY by
+#     PhantomFlowMetrics.RecordPlaybackOutcome (OTLP AND, as of this task, a
+#     dual-emitted prometheus-net counter of the identical name/labels),
+#     scraped in-cluster like `phantom_availability_probes_total` — NOT
+#     produced by this rig.
+# cause ∈ {success, availability_abstain, no_candidate, magnet_dead_stale,
 # gostream_register_fail, gostream_cannot_fetch, first_byte_timeout,
 # plugin_host_error}. A success attempt carries cause="success"; a failed flow
 # emits its definitive cause, never a silently-dropped failure. NO Mimir/
@@ -183,28 +200,39 @@ EOF
 "
 }
 
-# --- playback-outcome emission (playback-outcome-instrumentation-001) --------
-# The playback-error-reduction series ranks causes from a DEFINITIVE per-attempt
-# outcome metric. Alongside the load-time record above, a materialise/get_sources/
-# play flow ALSO emits exactly one `phantom_playback_outcome_total{flow,item_type,
-# cause}` record: a success carries cause="success"; a failed flow emits its
-# definitive cause, never a silently-dropped failure. `flow` here is the playback
-# flow vocabulary the C# PhantomFlowMetrics.RecordPlaybackOutcome tags
+# --- playback-outcome emission (playback-outcome-instrumentation-001, renamed
+# for the LIVE branch by playback-outcome-real-cause-dual-emit-001) ----------
+# Alongside the load-time record above, a materialise/get_sources/play flow
+# ALSO emits exactly one synthetic per-attempt playback-outcome record: a
+# success carries cause="success"; a failed flow emits its definitive cause,
+# never a silently-dropped failure. `flow` here is the playback flow
+# vocabulary the C# PhantomFlowMetrics.RecordPlaybackOutcome tags
 # (materialise_then_play vs play_already_materialised), NOT the load-time flow
-# label — this is the same metric the OTLP meter emits, mirrored to Mimir.
+# label. This is a RIG ARTIFACT, not the real per-attempt series — see the
+# metric-name note above the DRYRUN/LIVE split: the metric name defaults to
+# the real series' name (`phantom_playback_outcome_total`, harmless in DRYRUN
+# which has no server-side counterpart) but the LIVE call site below passes
+# `phantom_loadtime_rig_outcome_total` explicitly so it is never conflated
+# with the real per-attempt series that PhantomFlowMetrics.RecordPlaybackOutcome
+# now dual-emits (OTLP + prometheus-net) from the live plugin.
 PLAYBACK_FLOWS=(materialise_then_play play_already_materialised)
 PLAYBACK_CAUSES=(success availability_abstain no_candidate magnet_dead_stale \
     gostream_register_fail gostream_cannot_fetch first_byte_timeout plugin_host_error)
 _outcome_records=""
-# emit_playback_outcome <flow> <item_type> <cause>
+_outcome_metric_names=""
+# emit_playback_outcome <flow> <item_type> <cause> [metric_name]
 emit_playback_outcome() {
-    local flow="$1" item_type="$2" cause="$3"
-    _outcome_records="${_outcome_records}phantom_playback_outcome_total{flow=\"$flow\",item_type=\"$item_type\",cause=\"$cause\"} 1
+    local flow="$1" item_type="$2" cause="$3" metric="${4:-phantom_playback_outcome_total}"
+    _outcome_records="${_outcome_records}${metric}{flow=\"$flow\",item_type=\"$item_type\",cause=\"$cause\"} 1
 "
+    case " $_outcome_metric_names " in
+        *" $metric "*) ;;
+        *) _outcome_metric_names="$_outcome_metric_names $metric" ;;
+    esac
 }
 
 flush_records() {
-    local header
+    local header outcome_header metric
     header="$(cat <<'EOF'
 # HELP phantom_loadtime_seconds Wall-clock duration of a phantom-library channel load-time flow, in seconds.
 # TYPE phantom_loadtime_seconds gauge
@@ -212,13 +240,26 @@ flush_records() {
 # TYPE phantom_loadtime_runs_total counter
 # HELP phantom_loadtime_errors_total Number of runs of a flow that returned an error in this batch.
 # TYPE phantom_loadtime_errors_total counter
-# HELP phantom_playback_outcome_total Definitive per-attempt phantom playback outcome, split by flow/item_type/cause.
-# TYPE phantom_playback_outcome_total counter
 EOF
 )"
-    printf '%s\n%s%s' "$header" "$_records" "$_outcome_records"
+    outcome_header=""
+    for metric in $_outcome_metric_names; do
+        case "$metric" in
+            phantom_playback_outcome_total)
+                outcome_header="${outcome_header}# HELP phantom_playback_outcome_total Definitive per-attempt phantom playback outcome, split by flow/item_type/cause.
+# TYPE phantom_playback_outcome_total counter
+"
+                ;;
+            phantom_loadtime_rig_outcome_total)
+                outcome_header="${outcome_header}# HELP phantom_loadtime_rig_outcome_total Synthetic rig-derived (NOT real per-attempt) playback outcome classification from this LIVE loadtime rig run's curl exit codes, split by flow/item_type/cause. NOT phantom_playback_outcome_total.
+# TYPE phantom_loadtime_rig_outcome_total counter
+"
+                ;;
+        esac
+    done
+    printf '%s%s\n%s%s' "$header" "$outcome_header" "$_records" "$_outcome_records"
     if [ -n "$OUT" ]; then
-        { printf '%s\n%s%s' "$header" "$_records" "$_outcome_records"; } > "$OUT"
+        { printf '%s%s\n%s%s' "$header" "$outcome_header" "$_records" "$_outcome_records"; } > "$OUT"
         log "wrote exposition to $OUT"
     fi
 }
@@ -406,19 +447,23 @@ for spec in "movie:$CH_MOVIES:$MOVIE_ID" "episode:$CH_SHOWS:$EPISODE_ID"; do
     time_flow play_materialised "$it" curl -sS --fail -L --max-time 30 -H "X-Emby-Token: $TOK" -H 'Range: bytes=0-4095' -o /dev/null "$API/Videos/$gid/stream.mkv?static=true"
     play_errors="$LAST_FLOW_ERRORS"
 
-    # --- definitive per-attempt playback outcome (movie AND episode) ---------
-    # This driver exercises a fresh materialise-then-play attempt. A clean run is
-    # cause="success"; a materialise error is a definitive materialise-side cause
-    # (the register handoff), a play-side error after a good materialise is a
-    # fetch-side cause — never a silently-dropped failure. (The C# meter records
-    # the fine-grained cause live per attempt; the rig maps its coarse
-    # materialise/play error markers to the same cause vocabulary for the mirror.)
+    # --- synthetic rig-derived playback outcome (movie AND episode) ----------
+    # This driver exercises a fresh materialise-then-play attempt but ONLY ever
+    # inspects its own curl exit codes -- it never calls the real per-attempt
+    # classification (ClassifyMaterialiseFailure / PhantomFlowMetrics.
+    # RecordPlaybackOutcome), so it can only produce a coarse two-cause
+    # approximation, never the real availability_abstain/no_candidate/
+    # magnet_dead_stale/first_byte_timeout/plugin_host_error causes. Emitted
+    # under the DISTINCT `phantom_loadtime_rig_outcome_total` metric name
+    # (playback-outcome-real-cause-dual-emit-001) so it is never mistaken for
+    # the real `phantom_playback_outcome_total` series the live plugin now
+    # dual-emits (OTLP + prometheus-net) from the real call site.
     if [ "$mat_errors" = 1 ]; then
-        emit_playback_outcome materialise_then_play "$it" gostream_register_fail
+        emit_playback_outcome materialise_then_play "$it" gostream_register_fail phantom_loadtime_rig_outcome_total
     elif [ "$play_errors" = 1 ]; then
-        emit_playback_outcome materialise_then_play "$it" gostream_cannot_fetch
+        emit_playback_outcome materialise_then_play "$it" gostream_cannot_fetch phantom_loadtime_rig_outcome_total
     else
-        emit_playback_outcome materialise_then_play "$it" success
+        emit_playback_outcome materialise_then_play "$it" success phantom_loadtime_rig_outcome_total
     fi
 done
 
