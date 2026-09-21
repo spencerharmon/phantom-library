@@ -257,9 +257,25 @@ EOF
                 ;;
         esac
     done
-    printf '%s%s\n%s%s' "$header" "$outcome_header" "$_records" "$_outcome_records"
+    # Assemble the exposition with an EXPLICIT newline between every segment so
+    # no two segments ever concatenate onto one line, regardless of whether
+    # $outcome_header / $_outcome_records is empty. Command substitution strips
+    # $header's trailing newline (and $outcome_header carries its own trailing
+    # newline per emitted TYPE line), so joining with printf '%s\n' segments —
+    # skipping empty ones — is the only shape that stays Prometheus-text valid
+    # for the empty, single-outcome-metric, and both-outcome-metric cases.
+    _emit_exposition() {
+        # $header always present; the record/outcome blobs already carry their
+        # own trailing newlines, so strip only when appending to avoid blank
+        # lines while still guaranteeing a separator after the header block.
+        printf '%s\n' "$header"
+        [ -n "$outcome_header" ] && printf '%s' "$outcome_header"
+        [ -n "$_records" ] && printf '%s' "$_records"
+        [ -n "$_outcome_records" ] && printf '%s' "$_outcome_records"
+    }
+    _emit_exposition
     if [ -n "$OUT" ]; then
-        { printf '%s%s\n%s%s' "$header" "$outcome_header" "$_records" "$_outcome_records"; } > "$OUT"
+        _emit_exposition > "$OUT"
         log "wrote exposition to $OUT"
     fi
 }

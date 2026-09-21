@@ -156,5 +156,43 @@ else
 fi
 rm -f /tmp/p8-push-missing.$$.log
 
+head_ "G. engine exposition is well-formed Prometheus text (parser-validated)"
+# Regression for ttfb-loadtime-push-exposition-newline-fix: flush_records() used
+# to glue the load-time TYPE header block directly onto the outcome-metric HELP
+# header (printf '%s%s\n...' with the only newline AFTER $outcome_header, not
+# between $header and $outcome_header), producing a malformed line like
+#   `# TYPE ... counter# HELP phantom_loadtime_rig_outcome_total ...`
+# that the Pushgateway/promtool parser rejects with
+#   `text format parsing error in line N: unknown metric type "counter# HELP ..."`.
+# This silently discarded every fresh measurement batch (HTTP 400). The engine
+# ALWAYS emits an outcome-metric block in live mode, and the DRYRUN path here
+# also triggers emit_playback_outcome, so the DRYRUN exposition reproduces the
+# concatenation. Validate it through a REAL Prometheus text-format parser.
+validate_wellformed() {
+    local label="$1" text="$2"
+    if command -v promtool >/dev/null 2>&1; then
+        if printf '%s\n' "$text" | promtool check metrics >/tmp/p8-promtool.$$.log 2>&1; then
+            ok "$label exposition is valid Prometheus text (promtool check metrics exit 0)"
+        else
+            bad "$label exposition is MALFORMED Prometheus text (promtool rejected it):"
+            sed 's/^/      /' /tmp/p8-promtool.$$.log >&2
+        fi
+        rm -f /tmp/p8-promtool.$$.log
+    else
+        # Fallback structural validator: no line may contain a metric-type token
+        # (`counter`/`gauge`/`histogram`/`summary`/`untyped`) immediately followed
+        # by a `#` directive, i.e. two segments concatenated onto one physical line.
+        if printf '%s\n' "$text" | grep -Eq '(counter|gauge|histogram|summary|untyped)#'; then
+            bad "$label exposition has two directives/samples concatenated onto one line (promtool unavailable; structural check)"
+            printf '%s\n' "$text" | grep -En '(counter|gauge|histogram|summary|untyped)#' | sed 's/^/      /' >&2
+        else
+            ok "$label exposition has no concatenated lines (promtool unavailable; structural check)"
+        fi
+    fi
+}
+ENGINE_DRYRUN_OUT="$(PHANTOM_CI_DRYRUN=1 PHANTOM_LOADTIME_COLOR=rigtest bash "$ENGINE" 2>/dev/null)" \
+    || fatal "could not run the measurement engine for the well-formedness assertion"
+validate_wellformed "DRYRUN engine" "$ENGINE_DRYRUN_OUT"
+
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"
 [ "$fail_count" -eq 0 ]
