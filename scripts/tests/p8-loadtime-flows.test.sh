@@ -195,5 +195,22 @@ else
 fi
 rm -f /tmp/p8-prodguard.$$.log
 
+head_ "F. info_open flow always includes a non-empty userId query param (ttfb-rig-info-open-userid-fix)"
+# Stock Jellyfin's UserLibraryController.GetItem(Guid? userId, Guid itemId)
+# throws ArgumentException("Guid can't be empty") -> HTTP 400 when userId is
+# omitted from `GET /Items/{id}`. Assert the engine's CONSTRUCTED info_open
+# request URL (logged to stderr) carries a non-empty userId= query param,
+# under DRYRUN (no cluster/network access needed).
+UOUT="$(PHANTOM_CI_DRYRUN=1 PHANTOM_LOADTIME_COLOR=rigtest bash "$ENGINE" 2>&1 1>/dev/null)" \
+    || fatal "dry run of the engine (userId check) exited non-zero"
+INFO_LINES="$(printf '%s\n' "$UOUT" | grep 'flow=info_open' || true)"
+if [ -z "$INFO_LINES" ]; then
+    bad "no info_open flow log line found in engine output"
+elif printf '%s\n' "$INFO_LINES" | grep -qE 'constructed_url=[^ ]*[?&]userId=[^&[:space:]]+'; then
+    ok "info_open request URL carries a non-empty userId query parameter"
+else
+    bad "info_open request URL missing a non-empty userId query parameter: $INFO_LINES"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"
 [ "$fail_count" -eq 0 ]

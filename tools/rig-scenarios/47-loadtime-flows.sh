@@ -134,6 +134,24 @@ DRYRUN_CATALOGUE_EPISODE=340
 log()  { printf '# %s\n' "$*" >&2; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
+# --- resolve a real Jellyfin user id (ttfb-rig-info-open-userid-fix) --------
+# Stock Jellyfin's UserLibraryController.GetItem(Guid? userId, Guid itemId)
+# throws ArgumentException("Guid can't be empty") -> HTTP 400 when userId is
+# omitted from `GET /Items/{id}`, which is exactly what the info_open flow
+# below calls. Every real Jellyfin client always includes `?userId=...` on
+# this route, so resolve one real user id ONCE, near the top, alongside the
+# MOVIE_ID/SERIES_ID/EPISODE_ID resolution below. DRYRUN has no live server
+# (no network access at all), so use a fixed deterministic placeholder GUID —
+# the assertion this backs only needs the CONSTRUCTED request URL to carry a
+# non-empty userId, never an actual request.
+if [ "$DRYRUN" = 1 ]; then
+    USER_ID="00000000-0000-0000-0000-000000000001"
+else
+    USER_ID="$(curl -sS --fail -H "X-Emby-Token: $TOK" "$API/Users" \
+        | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['Id'] if d else '')" 2>/dev/null || true)"
+    [ -n "$USER_ID" ] || fail "could not resolve a Jellyfin user id"
+fi
+
 # --- prod-safety guard: refuse to measure against the production port -------
 # The rig is :18096; production owns :8096. A record captured against prod
 # would poison the ratchet with prod-shaped numbers, so refuse outright.
@@ -326,6 +344,14 @@ if [ "$DRYRUN" = 1 ]; then
                     badge_fanout_and_materialise "$catalogue" dryrun_batch_runner
                     dur="$(elapsed "$start")"
                     ;;
+                info_open)
+                    if [ "$it" = movie ]; then dur="${DUR_MOVIE[$flow]}"; else dur="${DUR_EPISODE[$flow]}"; fi
+                    # No live server in DRYRUN; log the CONSTRUCTED request URL
+                    # (ttfb-rig-info-open-userid-fix) so the in-repo harness can
+                    # assert a non-empty userId query param without a network call.
+                    info_open_url="$API/Items/dryrun-\$id?userId=$USER_ID"
+                    log "flow=info_open item_type=$it constructed_url=$info_open_url"
+                    ;;
                 *)
                     if [ "$it" = movie ]; then dur="${DUR_MOVIE[$flow]}"; else dur="${DUR_EPISODE[$flow]}"; fi
                     if [ "$flow" = materialise ] && [ "$force_mat_fail" = 1 ]; then
@@ -455,7 +481,8 @@ for spec in "movie:$CH_MOVIES:$MOVIE_ID" "episode:$CH_SHOWS:$EPISODE_ID"; do
     IFS=: read -r it ch id <<<"$spec"
     time_full_list_flow list_load   "$it" "$ch" ""
     time_full_list_flow sort_change "$it" "$ch" "&SortBy=SortName&SortOrder=Descending"
-    time_flow info_open        "$it" api "$API/Items/$id"
+    log "flow=info_open item_type=$it constructed_url=$API/Items/$id?userId=$USER_ID"
+    time_flow info_open        "$it" api "$API/Items/$id?userId=$USER_ID"
     time_flow get_sources      "$it" api "$API/Items/$id/PlaybackInfo"
     gid="$(hyphen "$id")"
     time_flow materialise      "$it" json_post -d '{"AutoOpenLiveStream":true}' "$API/Items/$gid/PlaybackInfo?AutoOpenLiveStream=true"
