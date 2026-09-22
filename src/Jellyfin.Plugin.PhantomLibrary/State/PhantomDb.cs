@@ -392,6 +392,14 @@ public sealed class PhantomDb : IDisposable
                 "CREATE INDEX IF NOT EXISTS idx_tmdb_metadata_relevance ON tmdb_metadata(type, relevance_score DESC);",
             }),
         (
+            20,
+            21,
+            "v20_v21_availability_items_negative_streak",
+            new[]
+            {
+                "ALTER TABLE availability_items ADD COLUMN IF NOT EXISTS negative_streak INTEGER NOT NULL DEFAULT 0;",
+            }),
+        (
             21,
             22,
             "v21_v22_dead_swarm_confirmations",

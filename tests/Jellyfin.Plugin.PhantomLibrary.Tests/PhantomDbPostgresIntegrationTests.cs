@@ -199,7 +199,7 @@ public sealed class PhantomDbPostgresIntegrationTests : IAsyncLifetime
         using var staleDb = NewDb();
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => staleDb.CountCatalogueItemsAsync("movie", null, default));
-        Assert.Contains("Pre-v1.0 has no migrations", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("no additive expand migration path covers the gap", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -442,7 +442,13 @@ UPDATE phantom_schema_meta SET version = 19;";
         await using var readVersion = verify.CreateCommand();
         readVersion.CommandText = "SELECT version FROM phantom_schema_meta LIMIT 1;";
         var version = Convert.ToInt32(await readVersion.ExecuteScalarAsync(), CultureInfo.InvariantCulture);
-        Assert.Equal(20, version);
+
+        // With the v20->v21 (phantom-schema-v20-v21-expand-migration) and
+        // v21->v22 expand migrations also registered, EnsureSchemaOnceAsync
+        // walks the WHOLE remaining chain in one pass rather than stopping at
+        // the first applied entry — so a v19 DB now lands at the current
+        // CurrentSchemaVersion (22), not just v20.
+        Assert.Equal(PhantomDb.CurrentSchemaVersion, version);
     }
 
     /// <summary>
@@ -490,5 +496,104 @@ UPDATE phantom_schema_meta SET version = 19;";
         Assert.Equal(freshColumns, expandedColumns);
         Assert.Equal(freshHasIndex, expandedHasIndex);
         Assert.True(expandedHasIndex);
+    }
+
+    /// <summary>
+    /// A Postgres database left at v20 (the dev/green blue/green color found
+    /// stuck here per <c>phantom-schema-v20-v21-expand-migration</c>, the
+    /// v20-&gt;v21 bump having shipped without a registered expand migration)
+    /// must be SELF-HEALED by <c>EnsureSchemaOnceAsync</c> — the additive
+    /// v20-&gt;v21 expand migration applies automatically — rather than
+    /// hard-refusing and disabling the plugin.
+    /// </summary>
+    [Fact]
+    public async Task BehindVersionDb_SelfAppliesNegativeStreakExpand_InsteadOfHardRefusing()
+    {
+        if (!Enabled)
+        {
+            return;
+        }
+
+        // Get to a fresh, fully-installed (v22) schema first...
+        using (var seed = NewDb())
+        {
+            await seed.CountCatalogueItemsAsync("movie", null, default);
+        }
+
+        // ...then roll it BACK to the v20 shape by hand (drop the v21 column
+        // and rewind the recorded version), simulating exactly the
+        // "db_version behind build version" state EnsureSchemaOnceAsync must
+        // tolerate.
+        await using (var conn = new NpgsqlConnection(_connectionString))
+        {
+            await conn.OpenAsync();
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+ALTER TABLE availability_items DROP COLUMN IF EXISTS negative_streak;
+UPDATE phantom_schema_meta SET version = 20;";
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        Assert.DoesNotContain("negative_streak", await ListColumnsAsync("availability_items"));
+
+        // A NEW PhantomDb instance (fresh _schemaEnsured gate) opening against
+        // this behind-version database must NOT throw — it self-applies the
+        // registered expand migrations instead of hard-refusing.
+        using var db = NewDb();
+        var count = await db.CountCatalogueItemsAsync("movie", null, default);
+        Assert.Equal(0, count);
+
+        Assert.Contains("negative_streak", await ListColumnsAsync("availability_items"));
+
+        await using var verify = new NpgsqlConnection(_connectionString);
+        await verify.OpenAsync();
+        await using var readVersion = verify.CreateCommand();
+        readVersion.CommandText = "SELECT version FROM phantom_schema_meta LIMIT 1;";
+        var version = Convert.ToInt32(await readVersion.ExecuteScalarAsync(), CultureInfo.InvariantCulture);
+        Assert.Equal(22, version);
+    }
+
+    /// <summary>
+    /// Fresh==expanded parity: the <c>availability_items</c> column set
+    /// produced by a from-scratch v22 install must be IDENTICAL to the
+    /// column set produced by expanding a v20 database via the registered
+    /// migration — the "keep fresh-install DDL and the expand list in sync"
+    /// requirement for the v20-&gt;v21 <c>negative_streak</c> bump.
+    /// </summary>
+    [Fact]
+    public async Task FreshSchema_MatchesExpandedSchema_ForNegativeStreak()
+    {
+        if (!Enabled)
+        {
+            return;
+        }
+
+        using (var fresh = NewDb())
+        {
+            await fresh.CountCatalogueItemsAsync("movie", null, default);
+        }
+
+        var freshColumns = await ListColumnsAsync("availability_items");
+
+        // Roll back to v20 and let a fresh PhantomDb instance re-expand it.
+        await using (var conn = new NpgsqlConnection(_connectionString))
+        {
+            await conn.OpenAsync();
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+ALTER TABLE availability_items DROP COLUMN IF EXISTS negative_streak;
+UPDATE phantom_schema_meta SET version = 20;";
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        using (var expanded = NewDb())
+        {
+            await expanded.CountCatalogueItemsAsync("movie", null, default);
+        }
+
+        var expandedColumns = await ListColumnsAsync("availability_items");
+
+        Assert.Equal(freshColumns, expandedColumns);
+        Assert.Contains("negative_streak", expandedColumns);
     }
 }

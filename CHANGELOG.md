@@ -6,6 +6,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Register the missing v20->v21 `availability_items.negative_streak`
+  additive expand migration (phantom-schema-v20-v21-expand-migration).**
+  The availability-probe-reconcile-001 v20->v21 bump (adding
+  `availability_items.negative_streak INTEGER NOT NULL DEFAULT 0`) shipped
+  without a registered `PhantomDb.ExpandMigrations` entry, so any
+  Postgres-backed blue/green color left at schema v20 hard-refused every
+  request (`InvalidOperationException: ... requires version 22 ... no
+  additive expand migration path covers the gap`) instead of self-applying
+  the purely-additive column, exactly the class of change
+  `p7-additive-expand-relevance-score-and-gate` established a self-heal
+  path for. Added `(20, 21, "v20_v21_availability_items_negative_streak",
+  ["ALTER TABLE availability_items ADD COLUMN IF NOT EXISTS
+  negative_streak INTEGER NOT NULL DEFAULT 0;"])`, mirroring the v19->v20
+  entry's style, plus fresh==expanded parity and self-heal regression tests
+  (`FreshSchema_MatchesExpandedSchema_ForNegativeStreak`,
+  `BehindVersionDb_SelfAppliesNegativeStreakExpand_InsteadOfHardRefusing`)
+  in `PhantomDbPostgresIntegrationTests`.
+
 ### Changed
 - **Batch the per-orphan gostream tmdb/metadata/hidden-set lookups in the
   movie browse list (ttfb-list-load-movie-render-profile, ROI Priority 9).**
