@@ -3849,6 +3849,56 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         return await r.ReadAsync(ct).ConfigureAwait(false) ? ReadAvailability(r) : null;
     }
 
+    /// <summary>
+    /// badge-deadswarm-episode-parity-001: "this item (identified by the
+    /// availability_items key) has at least one surviving (non-'invalid')
+    /// <c>source_candidates</c> row AND every such surviving candidate is a
+    /// THRESHOLD-EXCEEDED dead swarm" — i.e. a cold playback attempt would go
+    /// straight to <c>magnet_dead_stale</c>. This is exactly the state dial #2's
+    /// browse-prune (<see cref="ListVisibleMovieRowsAsync(int, CancellationToken)"/>)
+    /// hides a movie for, but which season-detail episode listing (and the
+    /// search/direct-link movie path) deliberately bypass — so the badge layer
+    /// must surface it as a distinct "stale, re-probe pending" signal instead of
+    /// an ordinary phantom. Reuses the SAME <see cref="CandidateIsThresholdDeadSwarmSql"/>
+    /// predicate dial #2 uses (no duplication, no schema change). Requiring at
+    /// least one surviving candidate keeps a brand-new/never-probed item (no
+    /// source_candidates rows at all) OUT of this state — that item is a genuine
+    /// fresh phantom, not a known-dead one.
+    /// </summary>
+    public async Task<bool> AllSurvivingCandidatesAreThresholdDeadSwarmAsync(
+        int tmdbId, string type, int season, int episode, CancellationToken ct)
+        => await AllSurvivingCandidatesAreThresholdDeadSwarmAsync(
+            tmdbId, type, season, episode, DefaultDeadSwarmBrowsePruneThreshold, ct).ConfigureAwait(false);
+
+    /// <inheritdoc cref="AllSurvivingCandidatesAreThresholdDeadSwarmAsync(int, string, int, int, CancellationToken)"/>
+    public async Task<bool> AllSurvivingCandidatesAreThresholdDeadSwarmAsync(
+        int tmdbId, string type, int season, int episode, int deadSwarmThreshold, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        deadSwarmThreshold = Math.Max(1, deadSwarmThreshold);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = $@"SELECT
+                EXISTS (
+                    SELECT 1 FROM source_candidates sc
+                    WHERE sc.tmdb_id=@tmdb AND sc.type=@type AND sc.season=@season AND sc.episode=@episode
+                      AND sc.validation_status <> 'invalid'
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM source_candidates sc
+                    WHERE sc.tmdb_id=@tmdb AND sc.type=@type AND sc.season=@season AND sc.episode=@episode
+                      AND sc.validation_status <> 'invalid'
+                      AND NOT ({CandidateIsThresholdDeadSwarmSql("sc", "@deadSwarmThreshold")})
+                );";
+        cmd.AddWithValue("@tmdb", tmdbId);
+        cmd.AddWithValue("@type", type);
+        cmd.AddWithValue("@season", season);
+        cmd.AddWithValue("@episode", episode);
+        cmd.AddWithValue("@deadSwarmThreshold", deadSwarmThreshold);
+        var v = await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
+        return v is not null and not DBNull && Convert.ToInt64(v, System.Globalization.CultureInfo.InvariantCulture) != 0;
+    }
+
     public async Task<bool> IsEpisodeVisibleAsync(int seriesTmdbId, int season, int episode, CancellationToken ct)
     {
         await using var conn = await OpenAsync(ct).ConfigureAwait(false);

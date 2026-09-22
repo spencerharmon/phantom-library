@@ -91,6 +91,52 @@ public class PhantomLibraryBadgesControllerTests : IDisposable
         await cmd.ExecuteNonQueryAsync(CancellationToken.None);
     }
 
+    /// <summary>
+    /// badge-deadswarm-episode-parity-001: seed a single surviving (non-'invalid')
+    /// source_candidates row plus a dead_swarm_confirmations row whose count is at
+    /// or above <paramref name="confirmations"/> — reproducing "status='available'
+    /// item whose only cached candidate is a CONFIRMED threshold dead swarm".
+    /// </summary>
+    private async Task SeedThresholdDeadSwarmCandidateAsync(
+        PhantomDb db, int tmdb, string type, int season, int episode, int confirmations)
+    {
+        const string magnet = "magnet:?xt=urn:btih:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        const string preset = "";
+        await using var conn = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
+        await conn.OpenAsync();
+        await using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = @"INSERT OR REPLACE INTO source_candidates
+                (tmdb_id,type,season,episode,preset,magnet,info_hash,indexer,title,rank,source,fetched_at,expires_at,validation_status,validation_reason)
+                VALUES ($tmdb,$type,$season,$episode,$preset,$magnet,'deadbeef','idx','t',0,'src',$now,$exp,'unknown','validation_transient');";
+            cmd.Parameters.AddWithValue("$tmdb", tmdb);
+            cmd.Parameters.AddWithValue("$type", type);
+            cmd.Parameters.AddWithValue("$season", season);
+            cmd.Parameters.AddWithValue("$episode", episode);
+            cmd.Parameters.AddWithValue("$preset", preset);
+            cmd.Parameters.AddWithValue("$magnet", magnet);
+            cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            cmd.Parameters.AddWithValue("$exp", DateTimeOffset.UtcNow.AddDays(7).ToUnixTimeSeconds());
+            await cmd.ExecuteNonQueryAsync(CancellationToken.None);
+        }
+
+        await using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = @"INSERT OR REPLACE INTO dead_swarm_confirmations
+                (tmdb_id,type,season,episode,preset,magnet,confirmations,updated_at)
+                VALUES ($tmdb,$type,$season,$episode,$preset,$magnet,$conf,$now);";
+            cmd.Parameters.AddWithValue("$tmdb", tmdb);
+            cmd.Parameters.AddWithValue("$type", type);
+            cmd.Parameters.AddWithValue("$season", season);
+            cmd.Parameters.AddWithValue("$episode", episode);
+            cmd.Parameters.AddWithValue("$preset", preset);
+            cmd.Parameters.AddWithValue("$magnet", magnet);
+            cmd.Parameters.AddWithValue("$conf", confirmations);
+            cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            await cmd.ExecuteNonQueryAsync(CancellationToken.None);
+        }
+    }
+
     private static Dictionary<string, string> Cast(IActionResult r)
     {
         var ok = Assert.IsType<OkObjectResult>(r);
@@ -406,6 +452,61 @@ public class PhantomLibraryBadgesControllerTests : IDisposable
         lib.Setup(l => l.GetItemById(id)).Returns(item);
 
         var ctrl = MakeController(lib.Object, db, PhantomBadgeVisibility.AlwaysShow, currentUserAdmin: false);
+        var res = await ctrl.States(new PhantomLibraryStatesRequest { Ids = new() { id.ToString() } }, CancellationToken.None);
+
+        Assert.Equal("Phantom", Cast(res)[id.ToString()]);
+    }
+
+    // ---- badge-deadswarm-episode-parity-001 ----
+
+    [Fact]
+    public async Task PhantomEpisode_AvailableButAllCandidatesThresholdDeadSwarm_ReturnsStaleReprobePending()
+    {
+        using var db = await NewDbAsync();
+        var id = Guid.NewGuid();
+        var item = MakePhantomShowItem(id, "episode_99200001_s01e05");
+        var lib = new Mock<ILibraryManager>(MockBehavior.Loose);
+        lib.Setup(l => l.GetItemById(id)).Returns(item);
+        await SeedAvailabilityAsync(db, 99200001, "episode", 1, 5, "available");
+        await SeedThresholdDeadSwarmCandidateAsync(db, 99200001, "episode", 1, 5, PhantomDb.DefaultDeadSwarmBrowsePruneThreshold);
+
+        var ctrl = MakeController(lib.Object, db);
+        var res = await ctrl.States(new PhantomLibraryStatesRequest { Ids = new() { id.ToString() } }, CancellationToken.None);
+
+        Assert.Equal(PhantomLibraryBadgesController.StateStaleReprobePending, Cast(res)[id.ToString()]);
+    }
+
+    [Fact]
+    public async Task PhantomMovie_AvailableButAllCandidatesThresholdDeadSwarm_ReturnsStaleReprobePending()
+    {
+        using var db = await NewDbAsync();
+        var id = Guid.NewGuid();
+        var item = MakePhantomMovie(id, 99200002);
+        var lib = new Mock<ILibraryManager>(MockBehavior.Loose);
+        lib.Setup(l => l.GetItemById(id)).Returns(item);
+        await SeedAvailabilityAsync(db, 99200002, "movie", -1, -1, "available");
+        await SeedThresholdDeadSwarmCandidateAsync(db, 99200002, "movie", -1, -1, PhantomDb.DefaultDeadSwarmBrowsePruneThreshold);
+
+        var ctrl = MakeController(lib.Object, db);
+        var res = await ctrl.States(new PhantomLibraryStatesRequest { Ids = new() { id.ToString() } }, CancellationToken.None);
+
+        Assert.Equal(PhantomLibraryBadgesController.StateStaleReprobePending, Cast(res)[id.ToString()]);
+    }
+
+    [Fact]
+    public async Task PhantomEpisode_AvailableWithBelowThresholdDeadSwarm_StaysPhantom()
+    {
+        using var db = await NewDbAsync();
+        var id = Guid.NewGuid();
+        var item = MakePhantomShowItem(id, "episode_99200003_s01e05");
+        var lib = new Mock<ILibraryManager>(MockBehavior.Loose);
+        lib.Setup(l => l.GetItemById(id)).Returns(item);
+        await SeedAvailabilityAsync(db, 99200003, "episode", 1, 5, "available");
+        // Only one confirmation — below the default threshold of 2, so a single
+        // transient blip must NOT trip the stale badge.
+        await SeedThresholdDeadSwarmCandidateAsync(db, 99200003, "episode", 1, 5, 1);
+
+        var ctrl = MakeController(lib.Object, db);
         var res = await ctrl.States(new PhantomLibraryStatesRequest { Ids = new() { id.ToString() } }, CancellationToken.None);
 
         Assert.Equal("Phantom", Cast(res)[id.ToString()]);

@@ -58,6 +58,17 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
     public const string StateMaterialised = "Materialised";
     public const string StateUnavailable = "Unavailable";
 
+    /// <summary>
+    /// badge-deadswarm-episode-parity-001: an item whose availability row still
+    /// reads <c>status='available'</c> but whose ONLY surviving cached source
+    /// candidate(s) are all CONFIRMED threshold dead swarms — a cold playback
+    /// attempt would fail with <c>magnet_dead_stale</c>. Dial #2's browse-prune
+    /// hides such a MOVIE from the list, but season-detail episode listing (and
+    /// the search/direct-link movie path) deliberately bypass that prune, so the
+    /// badge must warn distinctly instead of showing an ordinary phantom badge.
+    /// </summary>
+    public const string StateStaleReprobePending = "StaleReprobePending";
+
     public PhantomLibraryBadgesController(ILibraryManager libraryManager, PhantomDb db, IUserManager userManager)
         : this(libraryManager, db, userManager, () => Plugin.Instance?.Configuration ?? new PluginConfiguration())
     {
@@ -234,6 +245,16 @@ public sealed class PhantomLibraryBadgesController : ControllerBase
             else if ((await _db.GetAvailabilityItemAsync(tmdbId.Value, type, sSentinel, eSentinel, ct).ConfigureAwait(false))?.Status == "unavailable")
             {
                 state = StateUnavailable;
+            }
+            else if (await _db.AllSurvivingCandidatesAreThresholdDeadSwarmAsync(tmdbId.Value, type, sSentinel, eSentinel, ct).ConfigureAwait(false))
+            {
+                // status='available' (not unavailable/materialised/in-flight) yet
+                // every surviving cached candidate is a confirmed threshold dead
+                // swarm. Movie/episode parity: the browse-list prune hides this
+                // for movies, but season-detail episode listing and search/direct
+                // movie links bypass it — so warn distinctly here instead of the
+                // ordinary phantom badge (badge-deadswarm-episode-parity-001).
+                state = StateStaleReprobePending;
             }
             else
             {
