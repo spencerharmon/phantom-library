@@ -388,6 +388,18 @@ public sealed class PhantomDbPostgresIntegrationTests : IAsyncLifetime
         return result is not null;
     }
 
+    private async Task<bool> TableExistsAsync(string tableName)
+    {
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText =
+            "SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = @n;";
+        cmd.Parameters.AddWithValue("n", tableName);
+        var result = await cmd.ExecuteScalarAsync();
+        return result is not null;
+    }
+
     /// <summary>
     /// A Postgres database left at v19 (the shape p10-relevance-sort's schema
     /// bump found in the shared phantom_dev DB before the operator hand-applied
@@ -595,5 +607,112 @@ UPDATE phantom_schema_meta SET version = 20;";
 
         Assert.Equal(freshColumns, expandedColumns);
         Assert.Contains("negative_streak", expandedColumns);
+    }
+
+    /// <summary>
+    /// A Postgres database left at v21 — the exact shape
+    /// <c>schema-expand-migration-not-self-applying</c> found live: the
+    /// <c>phantom_expand_migrations</c> bookkeeping table did not exist at all
+    /// and <c>dead_swarm_confirmations</c> had to be created by hand via
+    /// <c>psql</c> as an operational workaround — must be SELF-HEALED by
+    /// <c>EnsureSchemaOnceAsync</c>: the additive v21-&gt;v22 expand migration
+    /// (<c>v21_v22_dead_swarm_confirmations</c>) applies automatically, rather
+    /// than hard-refusing and 500ing every Channels/*/Items request.
+    /// </summary>
+    [Fact]
+    public async Task BehindVersionDb_SelfAppliesDeadSwarmConfirmationsExpand_InsteadOfHardRefusing()
+    {
+        if (!Enabled)
+        {
+            return;
+        }
+
+        // Get to a fresh, fully-installed (v22) schema first...
+        using (var seed = NewDb())
+        {
+            await seed.CountCatalogueItemsAsync("movie", null, default);
+        }
+
+        // ...then roll it BACK to the v21 shape by hand (drop the v22 table +
+        // index and rewind the recorded version), simulating exactly the
+        // "db_version behind build version" state EnsureSchemaOnceAsync must
+        // tolerate.
+        await using (var conn = new NpgsqlConnection(_connectionString))
+        {
+            await conn.OpenAsync();
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+DROP INDEX IF EXISTS idx_dead_swarm_confirmations_item;
+DROP TABLE IF EXISTS dead_swarm_confirmations;
+UPDATE phantom_schema_meta SET version = 21;";
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        Assert.False(await TableExistsAsync("dead_swarm_confirmations"));
+
+        // A NEW PhantomDb instance (fresh _schemaEnsured gate) opening against
+        // this behind-version database must NOT throw — it self-applies the
+        // registered expand migration instead of hard-refusing.
+        using var db = NewDb();
+        var count = await db.CountCatalogueItemsAsync("movie", null, default);
+        Assert.Equal(0, count);
+
+        Assert.True(await TableExistsAsync("dead_swarm_confirmations"));
+        Assert.True(await IndexExistsAsync("idx_dead_swarm_confirmations_item"));
+
+        await using var verify = new NpgsqlConnection(_connectionString);
+        await verify.OpenAsync();
+        await using var readVersion = verify.CreateCommand();
+        readVersion.CommandText = "SELECT version FROM phantom_schema_meta LIMIT 1;";
+        var version = Convert.ToInt32(await readVersion.ExecuteScalarAsync(), CultureInfo.InvariantCulture);
+        Assert.Equal(PhantomDb.CurrentSchemaVersion, version);
+    }
+
+    /// <summary>
+    /// Fresh==expanded parity: the <c>dead_swarm_confirmations</c> table (columns
+    /// + index) produced by a from-scratch v22 install must be IDENTICAL to the
+    /// table produced by expanding a v21 database via the registered migration —
+    /// the "keep fresh-install DDL and the expand list in sync" requirement for
+    /// the v21-&gt;v22 <c>dead_swarm_confirmations</c> bump.
+    /// </summary>
+    [Fact]
+    public async Task FreshSchema_MatchesExpandedSchema_ForDeadSwarmConfirmations()
+    {
+        if (!Enabled)
+        {
+            return;
+        }
+
+        using (var fresh = NewDb())
+        {
+            await fresh.CountCatalogueItemsAsync("movie", null, default);
+        }
+
+        var freshColumns = await ListColumnsAsync("dead_swarm_confirmations");
+        var freshHasIndex = await IndexExistsAsync("idx_dead_swarm_confirmations_item");
+
+        // Roll back to v21 and let a fresh PhantomDb instance re-expand it.
+        await using (var conn = new NpgsqlConnection(_connectionString))
+        {
+            await conn.OpenAsync();
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+DROP INDEX IF EXISTS idx_dead_swarm_confirmations_item;
+DROP TABLE IF EXISTS dead_swarm_confirmations;
+UPDATE phantom_schema_meta SET version = 21;";
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        using (var expanded = NewDb())
+        {
+            await expanded.CountCatalogueItemsAsync("movie", null, default);
+        }
+
+        var expandedColumns = await ListColumnsAsync("dead_swarm_confirmations");
+        var expandedHasIndex = await IndexExistsAsync("idx_dead_swarm_confirmations_item");
+
+        Assert.Equal(freshColumns, expandedColumns);
+        Assert.Equal(freshHasIndex, expandedHasIndex);
+        Assert.True(expandedHasIndex);
     }
 }
