@@ -59,6 +59,23 @@
 # (exit 3 from loadtime-guard.sh) but does not fail this wrapper's own exit
 # code — the guard already files its own follow-up task; the daily job's
 # purpose is to keep measuring, not to redundantly fail a schedule trigger.
+#
+# --- durable per-stage outcome metric (ttfb-loadtime-daily-stage-outcome-metric) ---
+# The daily CronJob's pod is garbage-collected well within the ~24h before the
+# next daily-cadence honeybee pass runs, and there is no in-cluster log
+# aggregator — a STRUCTURAL gap (daily cadence slower than pod GC), not a
+# one-off timing miss. So on top of the flow measurements this script already
+# pushes in stage 2, it ALSO pushes its own per-stage outcome
+# (phantom_loadtime_daily_stage_exit_code{stage=...} and
+# phantom_loadtime_daily_stage_seconds{stage=...}) to the SAME Pushgateway,
+# under a DISTINCT job group (job="phantom-loadtime-daily-run", no
+# color/flow/item_type labels) so it never collides with / shows up inside
+# the flow-metric job="phantom-loadtime" group the honor_labels dashboards
+# scrape. record_stage() is called via a trap around each stage so a
+# stage-3 (guard) failure still gets its outcome pushed BEFORE this script's
+# own fail()/exit path runs — that is the entire point: make a failed
+# stage's exit code durable in Mimir even though the pod is reaped within
+# hours.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -81,6 +98,48 @@ note() { printf '    %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
 kube() { kubectl "${KCTX[@]}" -n "$NAMESPACE" "$@"; }
+
+# --- durable per-stage outcome metric --------------------------------------
+# job="phantom-loadtime-daily-run" — a DISTINCT Pushgateway group from the
+# flow-metric job="phantom-loadtime" this script's own stage 2 pushes into,
+# so existing honor_labels flow dashboards are unaffected.
+STAGE_PUSH_JOB="phantom-loadtime-daily-run"
+
+# record_stage <stage> <exit_code> <start_epoch_seconds>
+# Pushes phantom_loadtime_daily_stage_exit_code{stage=...} and
+# phantom_loadtime_daily_stage_seconds{stage=...} to the Pushgateway. Called
+# via a trap around each stage so a failing stage's outcome is durable in
+# Mimir BEFORE this script's own fail()/exit path runs — the pod is reaped
+# well within the ~24h before the next daily-cadence pass, so this is the
+# only durable record of which stage failed and why.
+#
+# Does NOT go through scripts/phantom-loadtime-push.sh — that emitter's
+# validate_records() REQUIRES a phantom_loadtime_seconds{ record (the flow
+# family), which a stage-outcome payload never carries. This is a small,
+# self-contained PUT mirroring that script's own dry-run/live contract
+# (job=phantom-loadtime-daily-run, PUT /metrics/job/<job>, --dry-run prints
+# the target + payload instead of curling — no network, deterministic).
+record_stage() {
+    local stage="$1" ec="$2" start="$3" now dur payload url
+    now="$(date +%s)"
+    dur=$(( now - start ))
+    payload="phantom_loadtime_daily_stage_exit_code{stage=\"${stage}\"} ${ec}
+phantom_loadtime_daily_stage_seconds{stage=\"${stage}\"} ${dur}"
+    if [ "$DRYRUN" = 1 ]; then
+        url="${PHANTOM_PUSHGATEWAY_URL:-http://pushgateway.example.com:9091}/metrics/job/${STAGE_PUSH_JOB}"
+        note "[stage-metric dry-run] PUT ${url}"
+        printf '%s\n' "$payload" | sed 's/^/    /' >&2
+        return 0
+    fi
+    if [ -z "${PHANTOM_PUSHGATEWAY_URL:-}" ]; then
+        note "WARNING: PHANTOM_PUSHGATEWAY_URL not set — cannot push stage=$stage outcome metric (non-fatal)"
+        return 0
+    fi
+    url="${PHANTOM_PUSHGATEWAY_URL%/}/metrics/job/${STAGE_PUSH_JOB}"
+    if ! printf '%s\n' "$payload" | curl -sf --max-time 30 --data-binary @- -X PUT "$url" >&2; then
+        note "WARNING: failed to push stage=$stage outcome metric to $url (non-fatal)"
+    fi
+}
 
 EXPO="$(mktemp -t loadtime-daily-expo.XXXXXX.txt)"
 _torn_down=0
@@ -145,25 +204,38 @@ API="https://$DEV_HOST"
 # 1. measure the six flows against the DEPLOYED stack
 # =========================================================================
 log "[1] measuring six load-time flows against $API (color=$COLOR)"
+_stage_start="$(date +%s)"
+set +e
 PHANTOM_LOADTIME_API="$API" \
 PHANTOM_LOADTIME_TOKEN="$ADMIN_TOKEN" \
 PHANTOM_LOADTIME_COLOR="$COLOR" \
 PHANTOM_CI_DRYRUN="$DRYRUN" \
     bash "$REPO_ROOT/tools/rig-scenarios/47-loadtime-flows.sh" > "$EXPO"
+measure_rc=$?
+set -e
+record_stage measure "$measure_rc" "$_stage_start"
+[ "$measure_rc" = 0 ] || fail "measurement engine exited $measure_rc"
 note "measurement batch written to $EXPO"
 
 # =========================================================================
 # 2. push the batch to the Pushgateway
 # =========================================================================
 log "[2] pushing the measurement batch to the Pushgateway"
+_stage_start="$(date +%s)"
 push_args=(push "$EXPO")
 [ "$DRYRUN" = 1 ] && push_args=(--dry-run "${push_args[@]}")
+set +e
 bash "$REPO_ROOT/scripts/phantom-loadtime-push.sh" "${push_args[@]}"
+push_rc=$?
+set -e
+record_stage push "$push_rc" "$_stage_start"
+[ "$push_rc" = 0 ] || fail "Pushgateway push exited $push_rc"
 
 # =========================================================================
 # 3. ratcheting regression guard against the SAME live target
 # =========================================================================
 log "[3] running the daily ratcheting regression guard"
+_stage_start="$(date +%s)"
 if [ "$DRYRUN" = 1 ]; then
     # Never --apply against the real thresholds registry from a synthetic
     # dry-run fixture — that would seed/tighten real ceilings from fake
@@ -174,9 +246,18 @@ else
     command -v beehive >/dev/null 2>&1 || guard_args+=(--no-file)
 fi
 set +e
-bash "$REPO_ROOT/tools/perf/loadtime-guard.sh" "${guard_args[@]}"
-guard_rc=$?
+# PHANTOM_CI_FORCE_GUARD_FAIL=1 lets the in-repo regression harness
+# deterministically exercise the stage="guard" failure path (no live
+# cluster needed) — asserting the stage-outcome push fires with a non-zero
+# exit code BEFORE this script's own fail()/exit runs. Never set in prod.
+if [ "${PHANTOM_CI_FORCE_GUARD_FAIL:-0}" = 1 ]; then
+    guard_rc=2
+else
+    bash "$REPO_ROOT/tools/perf/loadtime-guard.sh" "${guard_args[@]}"
+    guard_rc=$?
+fi
 set -e
+record_stage guard "$guard_rc" "$_stage_start"
 if [ "$guard_rc" = 0 ]; then
     note "regression guard: OK (no breach)"
 elif [ "$guard_rc" = 3 ]; then

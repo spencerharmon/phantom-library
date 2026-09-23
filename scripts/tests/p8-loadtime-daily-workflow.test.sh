@@ -259,6 +259,51 @@ else
 fi
 rm -f "/tmp/p8-loadtime-daily-dryrun.$$.log"
 
+head_ "shared script: pushes a durable per-stage outcome metric (ttfb-loadtime-daily-stage-outcome-metric)"
+if grep -q 'record_stage' "$DAILY_SCRIPT" && grep -q 'record_stage measure' "$DAILY_SCRIPT"; then
+    ok "$DAILY_SCRIPT records a stage-outcome push call site for stage=measure"
+else
+    bad "$DAILY_SCRIPT is missing a stage-outcome push call site for stage=measure"
+fi
+if grep -q 'record_stage push' "$DAILY_SCRIPT"; then
+    ok "$DAILY_SCRIPT records a stage-outcome push call site for stage=push"
+else
+    bad "$DAILY_SCRIPT is missing a stage-outcome push call site for stage=push"
+fi
+if grep -q 'record_stage guard' "$DAILY_SCRIPT"; then
+    ok "$DAILY_SCRIPT records a stage-outcome push call site for stage=guard"
+else
+    bad "$DAILY_SCRIPT is missing a stage-outcome push call site for stage=guard"
+fi
+if grep -qE 'phantom_loadtime_daily_stage_exit_code\{stage=' "$DAILY_SCRIPT" \
+    && grep -qE 'phantom_loadtime_daily_stage_seconds\{stage=' "$DAILY_SCRIPT"; then
+    ok "$DAILY_SCRIPT emits phantom_loadtime_daily_stage_exit_code/seconds{stage=...}"
+else
+    bad "$DAILY_SCRIPT does not emit the stage-outcome metric families"
+fi
+if grep -qE 'job/\$\{?STAGE_PUSH_JOB\}?' "$DAILY_SCRIPT" \
+    && grep -qE 'STAGE_PUSH_JOB="phantom-loadtime-daily-run"' "$DAILY_SCRIPT"; then
+    ok "$DAILY_SCRIPT pushes the stage-outcome metric under a DISTINCT job=phantom-loadtime-daily-run group"
+else
+    bad "$DAILY_SCRIPT does not push the stage-outcome metric under its own distinct job group"
+fi
+
+head_ "shared script: a forced stage=guard failure pushes its outcome BEFORE the wrapper's own non-zero exit (no live cluster needed)"
+rc=0
+PHANTOM_CI_DRYRUN=1 PHANTOM_CI_PKILL=0 PHANTOM_REPO_ROOT="$REPO_ROOT" PHANTOM_CI_FORCE_GUARD_FAIL=1 \
+    bash "$DAILY_SCRIPT" >/tmp/p8-loadtime-daily-guardfail.$$.log 2>&1 || rc=$?
+if [ "$rc" = 0 ]; then
+    bad "daily script did NOT fail when PHANTOM_CI_FORCE_GUARD_FAIL=1 forced a stage=guard failure"
+else
+    if grep -qE 'stage-metric dry-run.*job/phantom-loadtime-daily-run' /tmp/p8-loadtime-daily-guardfail.$$.log \
+        && grep -A2 'stage="guard"' /tmp/p8-loadtime-daily-guardfail.$$.log | grep -qE 'phantom_loadtime_daily_stage_exit_code\{stage="guard"\} [1-9][0-9]*'; then
+        ok "daily script pushed a non-zero stage=\"guard\" exit-code outcome before its own non-zero exit ($rc)"
+    else
+        bad "daily script exited non-zero ($rc) but did not push a non-zero stage=\"guard\" outcome metric first"
+    fi
+fi
+rm -f "/tmp/p8-loadtime-daily-guardfail.$$.log"
+
 head_ "prod-safety self-test: dry run REFUSES when dev host equals prod host"
 if PHANTOM_CI_DRYRUN=1 PHANTOM_CI_PKILL=0 PHANTOM_REPO_ROOT="$REPO_ROOT" \
     PHANTOM_INCLUSTER_DEV_HOST=example.com PHANTOM_INCLUSTER_PROD_HOST=example.com \
