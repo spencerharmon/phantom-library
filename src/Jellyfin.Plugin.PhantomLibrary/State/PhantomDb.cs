@@ -3012,21 +3012,48 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         {
             await using var conn = await OpenAsync(ct).ConfigureAwait(false);
             await using var cmd = conn.CreateCommand();
-            cmd.CommandText = @"UPDATE availability_items
+            cmd.CommandText = $@"UPDATE availability_items
                 SET next_check_at=0,
                     priority=CASE WHEN priority < @priority THEN @priority ELSE priority END
                 WHERE status='available'
                   AND candidate_magnet IS NOT NULL
                   AND (lease_until IS NULL OR lease_until < @now)
-                  AND NOT EXISTS (
-                      SELECT 1 FROM source_candidates sc
-                      WHERE sc.tmdb_id=availability_items.tmdb_id
-                        AND sc.type=availability_items.type
-                        AND sc.season=availability_items.season
-                        AND sc.episode=availability_items.episode
+                  AND (
+                      -- (a) candidate expired out: ZERO surviving source_candidates rows.
+                      NOT EXISTS (
+                          SELECT 1 FROM source_candidates sc
+                          WHERE sc.tmdb_id=availability_items.tmdb_id
+                            AND sc.type=availability_items.type
+                            AND sc.season=availability_items.season
+                            AND sc.episode=availability_items.episode
+                      )
+                      -- (b) availability-deadswarm-eager-reprobe-001: candidate STILL
+                      -- EXISTS but every surviving candidate is a confirmed threshold
+                      -- dead swarm, so the row lies 'available' while every attempt
+                      -- fails magnet_dead_stale. Promote when there is >=1 surviving
+                      -- candidate AND no surviving candidate that is NOT a threshold
+                      -- dead swarm. Reuses CandidateIsThresholdDeadSwarmSql verbatim.
+                      OR (
+                          EXISTS (
+                              SELECT 1 FROM source_candidates sc
+                              WHERE sc.tmdb_id=availability_items.tmdb_id
+                                AND sc.type=availability_items.type
+                                AND sc.season=availability_items.season
+                                AND sc.episode=availability_items.episode
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1 FROM source_candidates sc
+                              WHERE sc.tmdb_id=availability_items.tmdb_id
+                                AND sc.type=availability_items.type
+                                AND sc.season=availability_items.season
+                                AND sc.episode=availability_items.episode
+                                AND NOT ({CandidateIsThresholdDeadSwarmSql("sc", "@deadSwarmThreshold")})
+                          )
+                      )
                   );";
             cmd.AddWithValue("@priority", priority);
             cmd.AddWithValue("@now", now.ToUnixTimeSeconds());
+            cmd.AddWithValue("@deadSwarmThreshold", DefaultDeadSwarmBrowsePruneThreshold);
             return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
         finally

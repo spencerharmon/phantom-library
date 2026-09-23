@@ -1040,6 +1040,106 @@ public class PhantomDbTests : IDisposable
     }
 
     // ----------------------------------------------------------------
+    // availability-deadswarm-eager-reprobe-001 (ROI P12): the eager-reprobe
+    // promotion must ALSO fire for a status='available' row whose only surviving
+    // source_candidates row is a confirmed threshold dead swarm (candidate STILL
+    // present, but dead) -- not just for a row whose candidate expired out. The
+    // badge layer already WARNS about these; without this promotion nothing
+    // refreshes the dead candidate and every playback attempt fails
+    // magnet_dead_stale until the slow sweep incidentally re-probes it. Movie AND
+    // episode parity, plus a below-threshold negative control.
+    // ----------------------------------------------------------------
+
+    private async Task<long> NextCheckAtAsync(int tmdb, string type, int season, int episode)
+    {
+        await using var conn = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT next_check_at FROM availability_items WHERE tmdb_id=$t AND type=$ty AND season=$s AND episode=$e;";
+        cmd.Parameters.AddWithValue("$t", tmdb);
+        cmd.Parameters.AddWithValue("$ty", type);
+        cmd.Parameters.AddWithValue("$s", season);
+        cmd.Parameters.AddWithValue("$e", episode);
+        return Convert.ToInt64(await cmd.ExecuteScalarAsync());
+    }
+
+    private async Task<long> PriorityAsync(int tmdb, string type, int season, int episode)
+    {
+        await using var conn = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT priority FROM availability_items WHERE tmdb_id=$t AND type=$ty AND season=$s AND episode=$e;";
+        cmd.Parameters.AddWithValue("$t", tmdb);
+        cmd.Parameters.AddWithValue("$ty", type);
+        cmd.Parameters.AddWithValue("$s", season);
+        cmd.Parameters.AddWithValue("$e", episode);
+        return Convert.ToInt64(await cmd.ExecuteScalarAsync());
+    }
+
+    [Fact]
+    public async Task MarkStaleAvailableItemsDue_PromotesAvailableRowWhoseOnlyCandidateIsThresholdDeadSwarm_MovieAndEpisodeParity()
+    {
+        using var db = await NewDbAsync();
+        var now = DateTimeOffset.UtcNow;
+
+        // (a) MOVIE: status='available', candidate_magnet set, and its only
+        // surviving source_candidates row is a confirmed threshold dead swarm
+        // (>= DefaultDeadSwarmBrowsePruneThreshold). MUST be promoted.
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(930, "movie", "Dead Swarm Movie", null, null, null, null, null, null, null, null, now),
+            CancellationToken.None);
+        await db.MarkAvailabilityAvailableAsync(930, "movie", -1, -1, StaleReprobeCandidate("mag930"), CancellationToken.None);
+        await SeedDeadSwarmCandidateAsync(db, 930, "movie", -1, -1, "magnet:?xt=urn:btih:dead930", confirmations: 2);
+
+        // (b) EPISODE parity: same shape.
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(931, "series", "Dead Swarm Series", null, null, null, null, null, null, null, null, now),
+            CancellationToken.None);
+        await db.MarkAvailabilityAvailableAsync(931, "episode", 1, 1, StaleReprobeCandidate("mag931"), CancellationToken.None);
+        await SeedDeadSwarmCandidateAsync(db, 931, "episode", 1, 1, "magnet:?xt=urn:btih:dead931", confirmations: 2);
+
+        // (c) NEGATIVE control MOVIE: candidate is a dead swarm but BELOW threshold
+        // (1 confirmation < default 2) -> still viable, MUST NOT be promoted.
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(932, "movie", "Below Threshold Movie", null, null, null, null, null, null, null, null, now),
+            CancellationToken.None);
+        await db.MarkAvailabilityAvailableAsync(932, "movie", -1, -1, StaleReprobeCandidate("mag932"), CancellationToken.None);
+        await SeedDeadSwarmCandidateAsync(db, 932, "movie", -1, -1, "magnet:?xt=urn:btih:dead932", confirmations: 1);
+
+        // (d) NEGATIVE control EPISODE: below threshold -> NOT promoted (parity).
+        await db.UpsertTmdbMetadataAsync(
+            new TmdbMetadataRow(933, "series", "Below Threshold Series", null, null, null, null, null, null, null, null, now),
+            CancellationToken.None);
+        await db.MarkAvailabilityAvailableAsync(933, "episode", 1, 1, StaleReprobeCandidate("mag933"), CancellationToken.None);
+        await SeedDeadSwarmCandidateAsync(db, 933, "episode", 1, 1, "magnet:?xt=urn:btih:dead933", confirmations: 1);
+
+        // Give the threshold-dead rows a non-zero next_check_at / low priority so
+        // the promotion's effect (next_check_at==0, priority raised) is observable.
+        await using (var seed = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString()))
+        {
+            await seed.OpenAsync();
+            await using var scmd = seed.CreateCommand();
+            scmd.CommandText = "UPDATE availability_items SET next_check_at=9999999999, priority=1;";
+            await scmd.ExecuteNonQueryAsync();
+        }
+
+        var promoted = await db.MarkStaleAvailableItemsDueAsync(50, now, CancellationToken.None);
+        Assert.Equal(2, promoted);
+
+        // Threshold dead-swarm rows (a) & (b) promoted: due now + priority raised.
+        Assert.Equal(0, await NextCheckAtAsync(930, "movie", -1, -1));
+        Assert.Equal(50, await PriorityAsync(930, "movie", -1, -1));
+        Assert.Equal(0, await NextCheckAtAsync(931, "episode", 1, 1));
+        Assert.Equal(50, await PriorityAsync(931, "episode", 1, 1));
+
+        // Below-threshold rows (c) & (d) NOT promoted: unchanged.
+        Assert.Equal(9999999999, await NextCheckAtAsync(932, "movie", -1, -1));
+        Assert.Equal(1, await PriorityAsync(932, "movie", -1, -1));
+        Assert.Equal(9999999999, await NextCheckAtAsync(933, "episode", 1, 1));
+        Assert.Equal(1, await PriorityAsync(933, "episode", 1, 1));
+    }
+
+    // ----------------------------------------------------------------
     // p10-relevance-sort: default browse ordering blends availability
     // confidence, newness and a popularity proxy into a stored, cheaply-
     // refreshed relevance_score column.
