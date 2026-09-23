@@ -1,103 +1,126 @@
-# playback-error-reduction-011 analysis (day 11)
+# Playback-error-reduction — day 11 analysis (ROI Priority 12)
 
-## Context / prior work check
-- Read `docs/tasks/playback-error-reduction-001.md` (series contract) and
-  `docs/tasks/playback-error-reduction-010-analysis.md` (day 10: first real
-  per-attempt Mimir sample, 2 episode `magnet_dead_stale` + 1 movie success,
-  traced to a movie/TV badge-parity gap, enqueued
-  `badge-deadswarm-episode-parity-001`).
-- **`badge-deadswarm-episode-parity-001` has landed** — `PLAN.md` shows it
-  `DONE` (review/commits `c614aafadfa115ca4c64977181b238d65b6fc7d0`, now part
-  of tracked main). It adds a `StateStaleReprobePending` badge for a
-  `status='available'` item (movie or episode) whose only surviving
-  `source_candidates` row is a confirmed threshold dead swarm, reusing the
-  existing `CandidateIsThresholdDeadSwarmSql` predicate. This is a **signal**
-  fix (warns the user before playback) — it does not itself refresh the dead
-  candidate.
+DIAGNOSE-AND-ENQUEUE pass. Read `docs/tasks/playback-error-reduction-001.md`
+(shared series doc) and the day-10 record
+(`submodules/phantom-library/docs/bee-playback-error-reduction-010-playback-error-reduction-010.md`,
+hive layer) first. This pass adds no submodule code.
 
-## Note on this task's own history
-A prior `playback-error-reduction-011` session was interrupted after filing
-its two `PLAN.md` append actions (`plan: file task
-availability-deadswarm-eager-reprobe-001 in phantom-library` and `plan: file
-task playback-error-reduction-012 in phantom-library`) but before writing
-this analysis doc or flipping the task's own status — a lost-work gap, not a
-data problem. Both filed follow-ups are legitimate and have since been
-independently worked to completion:
-- `availability-deadswarm-eager-reprobe-001` — `DONE`
-  (commit `e54ba784b786c4f21a2831d0032ed52fbe582d3e`,
-  "Eager-reprobe available rows whose only candidate is a threshold dead
-  swarm").
-- `playback-error-reduction-012` — filed and already itself completed
-  (its own analysis at `docs/tasks/playback-error-reduction-012-analysis.md`
-  references this task's findings), continuing the daily cadence.
-This pass backfills the day-11 analysis record; it does NOT re-file either
-follow-up (they already exist, correctly, in `PLAN.md`) and does not append
-another successor (`playback-error-reduction-012` already exists).
+## 0. Did badge-deadswarm-episode-parity-001 land?
 
-## Mimir re-query (accumulated volume)
+YES. It is `[DONE]` in PLAN.md (`commits=c614aafadfa115ca4c64977181b238d65b6fc7d0`,
+"Badge stale-reprobe-pending for confirmed dead-swarm available items") and the
+commit is an ancestor of this worktree's tip — verified:
+
 ```
-kubectl -n monitoring exec deploy/grafana -c grafana -- curl -sf \
-  http://mimir.monitoring.svc:8080/prometheus/api/v1/query \
-  --data-urlencode 'query=phantom_playback_outcome_total{job="jellyfin-phantom-library"}'
+$ beehive submodule git merge-base --is-ancestor c614aaf HEAD && echo IS-ANCESTOR
+IS-ANCESTOR
+$ beehive submodule git log origin/main --oneline | grep -i deadswarm
+c614aaf Badge stale-reprobe-pending for confirmed dead-swarm available items
 ```
-Result (2026-09-23, ~turn time):
-```json
-{"status":"success","data":{"resultType":"vector","result":[
- {"metric":{"cause":"magnet_dead_stale","flow":"materialise_then_play","item_type":"episode",...},"value":[...,"2"]},
- {"metric":{"cause":"success","flow":"materialise_then_play","item_type":"movie",...},"value":[...,"1"]}
-]}}
+
+The badge layer (`PhantomLibraryBadgesController`) now returns a distinct
+stale-reprobe-pending state — reusing `PhantomDb.CandidateIsThresholdDeadSwarmSql`
+— for an `availability_items.status='available'` item (movie AND episode) whose
+every surviving `source_candidates` row is a threshold-exceeded dead swarm. So the
+user now gets a truthful WARNING before a doomed playback attempt.
+
+## 1. Baseline (P5 discipline — measure BEFORE ranking)
+
+Real per-attempt counter re-queried in Mimir:
+
 ```
-**Volume is unchanged from day 10: still exactly the same 3 rig-driven
-samples** (2 episode `materialise_then_play` / `magnet_dead_stale`, 1 movie
-`materialise_then_play` / `success`). No organic dev traffic has occurred.
-Per the task's explicit instruction, this volume is NOT sufficient to force a
-genuine statistical flow x item_type x cause ranking — noting "no organic
-traffic yet" explicitly and continuing the code-level investigation approach
-day 10 used, rather than fabricating statistical weight from 3 samples.
+$ kubectl -n monitoring exec deploy/grafana -c grafana -- curl -sf \
+    http://mimir.monitoring.svc:8080/prometheus/api/v1/query --data-urlencode \
+    'query=phantom_playback_outcome_total{job="jellyfin-phantom-library"}'
+```
 
-## Baseline (P5 discipline)
-- Same 3-sample baseline as day 10: episode `magnet_dead_stale` = 2/2 failing
-  attempts (100% of episode attempts sampled), movie = 1/1 succeeding.
-- `badge-deadswarm-episode-parity-001` (the day-10 SIGNAL fix) has landed but
-  cannot yet be assessed against a fresh sample set, because no new playback
-  attempts have been recorded since day 10 — the counter values are
-  byte-for-byte the same 2/1 split. There is no rig re-run or organic traffic
-  between day 10 and day 11 to show whether the badge change altered user
-  behavior (it wouldn't change the underlying `magnet_dead_stale` counter
-  anyway, since it is a pre-playback warning, not a playback-path fix).
+Result (unchanged from day 10 — SAME 3 rig-driven samples):
 
-## Ranking (dominant remaining cause)
-With the signal-only fix landed and no new samples, the dominant remaining
-failure cause is still **episode `materialise_then_play` /
-`magnet_dead_stale`** — unchanged from day 10, 2/2 of all episode attempts
-sampled. The root cause (re-confirmed by code reading, since statistical
-re-ranking isn't honestly possible from 3 samples) is that
-`badge-deadswarm-episode-parity-001` only WARNS about a `status='available'`
-item whose only surviving `source_candidates` row is a confirmed threshold
-dead swarm — nothing actually REFRESHES that dead candidate before playback.
-`AvailabilityProbeWorker`'s eager-reprobe promotion
-(`PhantomDb.MarkStaleAvailableItemsDueAsync`) only promotes `status='available'`
-rows with ZERO surviving `source_candidates` (candidate expired out); it
-misses a row whose candidate still exists but is a confirmed threshold dead
-swarm, so the dead candidate lingers and every playback attempt keeps failing
-`magnet_dead_stale` until the slow sweep incidentally re-probes it.
+| flow                 | item_type | cause             | value |
+|----------------------|-----------|-------------------|-------|
+| materialise_then_play| episode   | magnet_dead_stale | 2     |
+| materialise_then_play| movie     | success           | 1     |
 
-## Fix enqueued for the biggest win
-This is exactly the gap the prior (interrupted) session already correctly
-identified and filed as `availability-deadswarm-eager-reprobe-001` — the
-ACTION half complementing day 10's SIGNAL fix. That task is now `DONE`
-(commit `e54ba784b786c4f21a2831d0032ed52fbe582d3e`): it widens
-`MarkStaleAvailableItemsDueAsync`'s `WHERE` to also promote a
-`status='available'`, unleased row that has >=1 surviving `source_candidates`
-row where every surviving candidate is a confirmed threshold dead swarm,
-reusing the existing `CandidateIsThresholdDeadSwarmSql` predicate, with
-movie/episode parity and a passing dotnet regression test (both types +
-negative control). No new fix task is enqueued by this pass since the
-correct one already exists and has landed.
+**No organic traffic yet.** Volume is still only the 3 rig-driven samples day 10
+read (2 episode failures + 1 movie success); no new buckets, no accumulated
+weight. Per the task card, this pass does NOT force a premature statistical
+ranking from a handful of samples — it makes an HONEST directional read and
+continues the code-level investigation approach day 10 established.
 
-## Successor
-`playback-error-reduction-012` was already filed (by the same interrupted
-prior session) referencing this exact day-11 state (badge parity landed,
-eager-reprobe gap diagnosed, `availability-deadswarm-eager-reprobe-001`
-enqueued) and has itself already progressed with its own day-12 analysis. No
-further successor append is needed from this pass.
+`playback_error_rate` (rig, directional): episode `materialise_then_play` =
+2/2 = 100% (`magnet_dead_stale`); movie `materialise_then_play` = 0/1 = 0%.
+
+## 2. Directional cause ranking (code-level, not statistical)
+
+The single observed failing bucket remains **episode `magnet_dead_stale` in the
+cold `materialise_then_play` flow** — identical to day 10. Day 10 correctly
+traced the movie/TV asymmetry to a badge-parity gap and closed the SIGNAL half of
+it (badge-deadswarm-episode-parity-001, landed). But a badge only WARNS the user;
+it does not lower the actual `magnet_dead_stale` failure rate. The item is still
+listed, still playable, and still fails when its only cached candidate is a
+confirmed dead swarm.
+
+Root-cause of the RESIDUAL failure (code reading — the biggest remaining win):
+
+- The eager re-probe worker `AvailabilityProbeWorker` promotes stale-available
+  rows to the front of the claim queue via
+  `PhantomDb.MarkStaleAvailableItemsDueAsync`
+  (`src/.../State/PhantomDb.cs:3008`, availability-stale-candidate-reprobe-001).
+- But its promotion predicate only fires for rows with `status='available'`,
+  `candidate_magnet IS NOT NULL`, AND **zero** surviving `source_candidates`
+  (`NOT EXISTS (SELECT 1 FROM source_candidates …)`) — i.e. the candidate
+  EXPIRED OUT of the cache.
+- It does NOT promote a row whose candidate row still EXISTS but is a
+  **confirmed threshold dead swarm** (`dead_swarm_confirmations >= threshold`).
+  That is precisely the day-10 episode `magnet_dead_stale` case: the candidate is
+  present (so the "no live candidate" clause is false), it is `status='available'`,
+  it badges stale-reprobe-pending (day-10 fix knows this), yet the eager-reprobe
+  worker never touches it. The dead candidate lingers indefinitely until the
+  ordinary slow background sweep happens to re-probe it, and every playback
+  attempt in the interim fails `magnet_dead_stale`.
+
+So the badge KNOWS the state; the re-prober is blind to it. Closing that blind
+spot — promoting confirmed-dead-swarm available rows to eager re-probe, reusing
+the SAME `CandidateIsThresholdDeadSwarmSql` predicate the browse-prune and the
+day-10 badge fix already use — actively refreshes the dead candidate to a live
+one (or confirms unavailability, which then prunes it from browse) BEFORE the
+next playback attempt. That directly attacks the observed `magnet_dead_stale`
+failure rather than merely labelling it.
+
+Residual buckets (`availability_abstain`, `no_candidate`, `gostream_*`,
+`first_byte_timeout`, `plugin_host_error`) show ZERO real samples — explicitly
+deferred until organic volume accumulates; not ranked from an empty bucket.
+
+## 3. Chosen fix (biggest win) — enqueued
+
+`availability-deadswarm-eager-reprobe-001`: extend
+`MarkStaleAvailableItemsDueAsync` (and its `AvailabilityProbeWorker` caller
+comment) so it ALSO promotes an `availability_items.status='available'` row
+(movie AND episode, parity) whose EVERY surviving `source_candidates` row is a
+threshold-exceeded dead swarm — reusing the existing
+`CandidateIsThresholdDeadSwarmSql` predicate (do NOT duplicate the SQL). Design
+doc + `dotnet test` check on the task. This is the ACTION half that
+complements day-10's SIGNAL half.
+
+## 4. Successor
+
+`playback-error-reduction-012` appended `[TODO]`, held `not_before ≈ +24h`
+(daily cadence). It will re-query for accumulated organic volume and — if the
+eager-reprobe fix has landed — assess whether the episode `magnet_dead_stale`
+rate has moved.
+
+## Discipline note
+
+DIAGNOSE-AND-ENQUEUE ONLY. No fix implemented here. Baseline recorded before the
+ranking. `ROI.md` untouched.
+
+## Reconciliation note (added by later session)
+This file was authored by an earlier `playback-error-reduction-011` session
+that filed `availability-deadswarm-eager-reprobe-001` and
+`playback-error-reduction-012` (both now landed/progressed) but whose branch
+push raced/orphaned before the runner could merge it, stranding the task
+claim. A later session independently re-derived and wrote an equivalent
+analysis, then discovered this orphaned branch on reconciliation; the two
+were merged, keeping this (the original, contemporaneous) analysis as the
+canonical record since it predates and matches the already-landed follow-up
+work.
