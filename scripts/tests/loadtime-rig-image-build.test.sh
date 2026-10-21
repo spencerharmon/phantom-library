@@ -146,6 +146,24 @@ else
 fi
 
 head_ "build workflow: tag-driven (or workflow_dispatch)"
+if python3 - "$WORKFLOW" <<'PY'
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    workflow = yaml.safe_load(f)
+steps = workflow["jobs"]["build-loadtime-rig-image"]["steps"]
+checkout = next(i for i, step in enumerate(steps)
+                if step.get("uses", "").startswith("actions/checkout@"))
+bootstrap = "\n".join(step.get("run", "") for step in steps[:checkout])
+assert "dnf install" in bootstrap and "git" in bootstrap and "nodejs" in bootstrap, \
+    "Buildah base lacks git and node: install both before actions/checkout"
+PY
+then
+    ok "workflow installs git and Node.js before the checkout action"
+else
+    bad "workflow cannot execute checkout in the Buildah base image"
+fi
 if grep -qE '^\s*tags:\s*$' "$WORKFLOW" && grep -qE "^\s*-\s*'loadtime-rig-v" "$WORKFLOW"; then
     ok "workflow fires on a loadtime-rig-v* tag push"
 else

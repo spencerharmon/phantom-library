@@ -12,7 +12,7 @@ name: build loadtime-rig image
 # release.yaml / nonrig-gate.yaml's pattern and the already-DONE
 # flux/gitea-actions-image-build-workflows + jellyfin/gitea-actions-image-
 # workflows recipe: run on the SELF-HOSTED Gitea Actions runner
-# ([self-hosted, gitea-actions-runner], NEVER ubuntu-latest), inside a PINNED
+# ([k8s], NEVER ubuntu-latest), inside a PINNED
 # base image, build the Dockerfile with buildah/podman, and publish to the
 # forge OCI registry.
 #
@@ -64,6 +64,10 @@ jobs:
     container:
       image: quay.io/buildah/stable:v1.37.5
     steps:
+      - name: install checkout prerequisites
+        # The Buildah image provides neither the action runtime nor git.
+        run: dnf install -y --setopt=install_weak_deps=False git nodejs
+
       - name: checkout
         uses: actions/checkout@v4
 
