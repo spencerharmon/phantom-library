@@ -116,10 +116,15 @@ jobs:
             deploy/loadtime-rig
 
       - name: publish to the forge OCI registry with buildah push
+        env:
+          REGISTRY_USERNAME: ${{ vars.REGISTRY_USERNAME }}
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
+          : "${REGISTRY_USERNAME:?set the package owner username variable}"
+          : "${REGISTRY_TOKEN:?set a write:package token secret}"
           buildah login \
-            --username "${{ github.actor }}" \
-            --password "${{ secrets.GITEA_TOKEN }}" \
-            "${GITHUB_SERVER_URL#*://}"
+            --username "$REGISTRY_USERNAME" \
+            --password-stdin \
+            "${GITHUB_SERVER_URL#*://}" <<< "$REGISTRY_TOKEN"
           buildah push "${{ steps.tag.outputs.image }}"

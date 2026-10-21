@@ -160,6 +160,10 @@ assert not any("uses" in step for step in steps), "Buildah base has no JS runtim
 script = steps[checkout]["run"]
 assert 'fetch --depth=1 origin "$GITHUB_SHA"' in script
 assert 'test "$(git rev-parse HEAD)" = "$GITHUB_SHA"' in script
+publish = steps[-1]
+assert publish["env"]["REGISTRY_TOKEN"] == "${{ secrets.REGISTRY_TOKEN }}"
+assert publish["env"]["REGISTRY_USERNAME"] == "${{ vars.REGISTRY_USERNAME }}"
+assert "--password-stdin" in publish["run"]
 PY
 then
     ok "workflow installs git and checks out the exact source SHA without a JS runtime"
