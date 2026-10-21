@@ -168,6 +168,56 @@ internal static class PhantomFlowMetrics
         PlaybackOutcomesPrometheus.WithLabels(flow, itemType, cause).Inc();
     }
 
+    /// <summary>Every canonical playback flow tag.</summary>
+    public static readonly string[] PlaybackFlows =
+    {
+        PlaybackFlowMaterialiseThenPlay,
+        PlaybackFlowPlayAlreadyMaterialised,
+    };
+
+    /// <summary>Every canonical item type tag.</summary>
+    public static readonly string[] ItemTypes = { ItemTypeMovie, ItemTypeEpisode };
+
+    /// <summary>Every canonical playback outcome cause tag.</summary>
+    public static readonly string[] PlaybackCauses =
+    {
+        CauseSuccess,
+        CauseAvailabilityAbstain,
+        CauseNoCandidate,
+        CauseMagnetDeadStale,
+        CauseGostreamRegisterFail,
+        CauseGostreamCannotFetch,
+        CauseFirstByteTimeout,
+        CausePluginHostError,
+    };
+
+    /// <summary>
+    /// Zero-initialises every flow x item_type x cause series of
+    /// <c>phantom_playback_outcome_total</c> on both the prometheus-net mirror
+    /// (a published child at 0) and the OTLP counter (<c>Add(0, tags)</c>), so
+    /// the series exist from plugin start instead of only after the first
+    /// recorded attempt (playback-outcome-zero-seed-001). Idempotent: repeated
+    /// calls add 0 and re-touch existing children, never changing any value.
+    /// </summary>
+    public static void SeedPlaybackOutcomes()
+    {
+        foreach (var flow in PlaybackFlows)
+        {
+            foreach (var itemType in ItemTypes)
+            {
+                foreach (var cause in PlaybackCauses)
+                {
+                    PlaybackOutcomes.Add(
+                        0,
+                        new KeyValuePair<string, object?>("flow", flow),
+                        new KeyValuePair<string, object?>("item_type", itemType),
+                        new KeyValuePair<string, object?>("cause", cause));
+                    PlaybackOutcomesPrometheus.WithLabels(flow, itemType, cause).Inc(0);
+                }
+            }
+        }
+    }
+
     /// <summary>
     /// Starts timing a flow. Dispose the returned scope (ideally via
     /// <c>using</c>) to record the elapsed latency. Set

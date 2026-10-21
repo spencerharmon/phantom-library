@@ -31,6 +31,7 @@ public class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
         : base(applicationPaths, xmlSerializer)
     {
         Instance = this;
+        Diagnostics.PhantomFlowMetrics.SeedPlaybackOutcomes();
     }
 
     /// <summary>

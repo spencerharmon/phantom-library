@@ -199,6 +199,61 @@ public sealed class PhantomFlowMetricsTests
         Assert.Equal(1d, after - before);
     }
 
+    /// <summary>
+    /// playback-outcome-zero-seed-001: after SeedPlaybackOutcomes every
+    /// flow x item_type x cause combination exposes a 0 sample on both the
+    /// OTLP counter and the prometheus-net mirror, and a later
+    /// RecordPlaybackOutcome increments only its own series.
+    /// </summary>
+    [Fact]
+    public void SeedPlaybackOutcomes_ZeroInitialisesEveryCombination_AndRecordIncrementsOnlyOwnSeries()
+    {
+        var prometheusCounter = Metrics.CreateCounter(
+            "phantom_playback_outcome_total",
+            "Definitive per-attempt phantom playback outcome, split by flow/item_type/cause.",
+            new CounterConfiguration { LabelNames = new[] { "flow", "item_type", "cause" } });
+
+        var (measurements, listener) = StartListener();
+        using (listener)
+        {
+            PhantomFlowMetrics.SeedPlaybackOutcomes();
+            PhantomFlowMetrics.SeedPlaybackOutcomes(); // idempotent
+        }
+
+        var published = prometheusCounter.GetAllLabelValues()
+            .Select(v => string.Join("|", v))
+            .ToHashSet(StringComparer.Ordinal);
+        var combos = (from f in PhantomFlowMetrics.PlaybackFlows
+                      from i in PhantomFlowMetrics.ItemTypes
+                      from c in PhantomFlowMetrics.PlaybackCauses
+                      select (f, i, c)).ToList();
+        Assert.Equal(2 * 2 * 8, combos.Count);
+
+        var seeded = measurements.Where(m => m.Instrument == "phantom_playback_outcome_total").ToList();
+        foreach (var (f, i, c) in combos)
+        {
+            Assert.Contains($"{f}|{i}|{c}", published);
+            Assert.Contains(seeded, m => m.Value == 0
+                && (string?)m.Tags["flow"] == f
+                && (string?)m.Tags["item_type"] == i
+                && (string?)m.Tags["cause"] == c);
+        }
+
+        Assert.All(seeded, m => Assert.Equal(0d, m.Value));
+
+        var before = combos.ToDictionary(x => x, x => prometheusCounter.WithLabels(x.f, x.i, x.c).Value);
+        var target = (PhantomFlowMetrics.PlaybackFlowMaterialiseThenPlay,
+                      PhantomFlowMetrics.ItemTypeMovie,
+                      PhantomFlowMetrics.CauseFirstByteTimeout);
+        PhantomFlowMetrics.RecordPlaybackOutcome(target.Item1, target.Item2, target.Item3);
+
+        foreach (var x in combos)
+        {
+            var delta = prometheusCounter.WithLabels(x.f, x.i, x.c).Value - before[x];
+            Assert.Equal(x == target ? 1d : 0d, delta);
+        }
+    }
+
     [Fact]
     public void PlaybackOutcomeCauseConstants_AreEightDistinct()
     {
