@@ -153,6 +153,8 @@ import yaml
 with open(sys.argv[1]) as f:
     workflow = yaml.safe_load(f)
 steps = workflow["jobs"]["build-loadtime-rig-image"]["steps"]
+assert workflow["jobs"]["build-loadtime-rig-image"]["env"]["REGISTRY_URL"] == \
+    "${{ vars.REGISTRY_URL || github.server_url }}"
 checkout = next(i for i, step in enumerate(steps) if step["name"] == "checkout")
 bootstrap = "\n".join(step.get("run", "") for step in steps[:checkout])
 assert "dnf install" in bootstrap and "git" in bootstrap, "install git before checkout"
@@ -164,6 +166,8 @@ publish = steps[-1]
 assert publish["env"]["REGISTRY_TOKEN"] == "${{ secrets.REGISTRY_TOKEN }}"
 assert publish["env"]["REGISTRY_USERNAME"] == "${{ vars.REGISTRY_USERNAME }}"
 assert "--password-stdin" in publish["run"]
+assert '${REGISTRY_URL#*://}' in publish["run"]
+assert any('${REGISTRY_URL#https://}' in step.get("run", "") for step in steps)
 PY
 then
     ok "workflow installs git and checks out the exact source SHA without a JS runtime"

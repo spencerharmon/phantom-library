@@ -55,6 +55,9 @@ on:
 jobs:
   build-loadtime-rig-image:
     name: build + publish loadtime-rig image
+    env:
+      # Runner server_url may be an internal HTTP API, not the OCI endpoint.
+      REGISTRY_URL: ${{ vars.REGISTRY_URL || github.server_url }}
     # The self-hosted in-cluster runner advertises labels [ubuntu-latest,k8s,...];
     # target the "k8s" label (self-hosted only), never the ubuntu-latest alias.
     runs-on: [k8s]
@@ -98,7 +101,7 @@ jobs:
           # Forge host + owning repo from the Actions context — no baked infra
           # identifier. github.repository is <owner>/<repo>; the image lives at
           # <registry-host>/<owner>/loadtime-rig.
-          SERVER="${GITHUB_SERVER_URL#https://}"
+          SERVER="${REGISTRY_URL#https://}"
           SERVER="${SERVER#http://}"
           OWNER="${GITHUB_REPOSITORY%%/*}"
           IMAGE="${SERVER}/${OWNER}/loadtime-rig:${TAG}"
@@ -126,5 +129,5 @@ jobs:
           buildah login \
             --username "$REGISTRY_USERNAME" \
             --password-stdin \
-            "${GITHUB_SERVER_URL#*://}" <<< "$REGISTRY_TOKEN"
+            "${REGISTRY_URL#*://}" <<< "$REGISTRY_TOKEN"
           buildah push "${{ steps.tag.outputs.image }}"
