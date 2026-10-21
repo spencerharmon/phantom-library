@@ -4548,6 +4548,39 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
             DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(6)));
     }
 
+    /// <summary>
+    /// Batched, season-keyed form of <see cref="GetMaterialisedStateAsync"/> for
+    /// episodes: every materialised episode of (series, season) in ONE round
+    /// trip, keyed by episode number (ttfb-list-load-episode-render-profile).
+    /// </summary>
+    public async Task<IReadOnlyDictionary<int, MaterialisedStateRow>> ListMaterialisedEpisodesForSeasonAsync(
+        int seriesTmdbId, int season, CancellationToken ct)
+    {
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT tmdb_id, type, season, episode, stub_path, fuse_path, materialised_at
+            FROM materialised_state
+            WHERE tmdb_id=@tmdb AND type='episode' AND season=@season;";
+        cmd.AddWithValue("@tmdb", seriesTmdbId);
+        cmd.AddWithValue("@season", season);
+        var result = new Dictionary<int, MaterialisedStateRow>();
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            var row = new MaterialisedStateRow(
+                r.GetInt32(0),
+                r.GetString(1),
+                r.GetInt32(2),
+                r.GetInt32(3),
+                r.GetString(4),
+                r.GetString(5),
+                DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(6)));
+            result.TryAdd(row.Episode, row);
+        }
+
+        return result;
+    }
+
     public async Task<IReadOnlyList<MaterialisedStateRow>> ListMaterialisedStateAsync(string type, CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(type);
@@ -5329,6 +5362,63 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
             cmd.AddWithValue("@runtime", (object?)row.RuntimeMinutes ?? DBNull.Value);
             cmd.AddWithValue("@fetched", row.FetchedAt.ToUnixTimeSeconds());
             await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Batched form of <see cref="UpsertTmdbEpisodeAsync"/> — upserts every row
+    /// on ONE connection inside ONE transaction instead of one connection per
+    /// episode (ttfb-list-load-episode-render-profile: the episode
+    /// <c>list_load</c> flow upserted each season episode separately — an
+    /// O(page-size) sequential DB round-trip chain).
+    /// </summary>
+    public async Task UpsertTmdbEpisodesAsync(IReadOnlyCollection<TmdbEpisodeRow> rows, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(rows);
+        if (rows.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var row in rows)
+        {
+            ArgumentNullException.ThrowIfNull(row);
+            ArgumentException.ThrowIfNullOrWhiteSpace(row.Title);
+        }
+
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var tx = await conn.BeginTransactionAsync(ct).ConfigureAwait(false);
+            var sql = _provider.TranslateUpsertSql(@"INSERT OR REPLACE INTO tmdb_episode_cache
+                (series_tmdb_id, season, episode, title, overview, still_url,
+                 air_date, runtime_minutes, fetched_at)
+                VALUES (@series, @season, @episode, @title, @overview, @still,
+                        @air, @runtime, @fetched);");
+            foreach (var row in rows)
+            {
+                ct.ThrowIfCancellationRequested();
+                await using var cmd = conn.CreateCommand();
+                cmd.Transaction = tx;
+                cmd.CommandText = sql;
+                cmd.AddWithValue("@series", row.SeriesTmdbId);
+                cmd.AddWithValue("@season", row.Season);
+                cmd.AddWithValue("@episode", row.Episode);
+                cmd.AddWithValue("@title", row.Title);
+                cmd.AddWithValue("@overview", (object?)row.Overview ?? DBNull.Value);
+                cmd.AddWithValue("@still", (object?)row.StillUrl ?? DBNull.Value);
+                cmd.AddWithValue("@air", (object?)row.AirDate ?? DBNull.Value);
+                cmd.AddWithValue("@runtime", (object?)row.RuntimeMinutes ?? DBNull.Value);
+                cmd.AddWithValue("@fetched", row.FetchedAt.ToUnixTimeSeconds());
+                await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            }
+
+            await tx.CommitAsync(ct).ConfigureAwait(false);
         }
         finally
         {

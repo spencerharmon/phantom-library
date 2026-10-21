@@ -363,6 +363,38 @@ public class PhantomShowsChannelTests : IDisposable
         Assert.Equal("Episode 1 of Season 1", cached[0].Title);
     }
 
+    /// <summary>
+    /// ttfb-list-load-episode-render-profile regression: the season-episode
+    /// browse must issue a page-size-independent number of DB round trips.
+    /// Pre-fix each episode cost one upsert + one materialised_state lookup
+    /// (connections scaled linearly with episode count); post-fix both are
+    /// one batched season-keyed call.
+    /// </summary>
+    [Fact]
+    public async Task GetChannelItems_SeasonFolder_DbRoundTripsIndependentOfEpisodeCount()
+    {
+        await SeedSeriesMetaAsync(1399, "Game of Thrones");
+
+        async Task<int> CountFor(int season, int episodes)
+        {
+            _tmdb.Setup(t => t.GetSeasonAsync(1399, season, null, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(MakeSeasonDetails(1399, season, episodes));
+            _db.ResetConnectionsOpenedForTests();
+            var result = await _channel.GetChannelItems(
+                new InternalChannelItemQuery { FolderId = $"season_1399_s{season:D2}" }, CancellationToken.None);
+            Assert.Equal(episodes, result.Items.Count);
+            return _db.ConnectionsOpenedForTests;
+        }
+
+        // Warm-up: absorb one-time lazy initialisation (schema ensure etc.).
+        await CountFor(3, 1);
+        var small = await CountFor(1, 3);
+        var large = await CountFor(2, 40);
+        Assert.True(
+            small == large,
+            $"Expected page-size-independent DB round trips; 3 episodes opened {small} connections, 40 opened {large}.");
+    }
+
     [Fact]
     public async Task GetChannelItems_SeasonFolder_OneAvailableEpisode_EmitsUnknownAndUnavailableSiblings()
     {

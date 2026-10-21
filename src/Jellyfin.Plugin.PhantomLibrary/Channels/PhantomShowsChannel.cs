@@ -716,9 +716,12 @@ public sealed partial class PhantomShowsChannel
                     AirDate: e.AirDate,
                     RuntimeMinutes: e.Runtime,
                     FetchedAt: DateTimeOffset.UtcNow);
-                await _db.UpsertTmdbEpisodeAsync(row, ct).ConfigureAwait(false);
                 rows.Add(row);
             }
+
+            // ttfb-list-load-episode-render-profile: one batched upsert for the
+            // whole season instead of one DB round trip per episode.
+            await _db.UpsertTmdbEpisodesAsync(rows, ct).ConfigureAwait(false);
         }
         else
         {
@@ -748,6 +751,9 @@ public sealed partial class PhantomShowsChannel
         var externalSeriesName = hasExternalSeries ? externalSeries[0].Metadata.Title : null;
         var items = new List<ChannelItemInfo>(rows.Count + externalEpisodes.Count);
         var emittedEpisodes = new HashSet<int>();
+        // ttfb-list-load-episode-render-profile: one season-keyed query for
+        // every materialised episode instead of one lookup per episode row.
+        var materialisedByEpisode = await _db.ListMaterialisedEpisodesForSeasonAsync(seriesTmdb, season, ct).ConfigureAwait(false);
         foreach (var row in rows)
         {
             ct.ThrowIfCancellationRequested();
@@ -758,8 +764,7 @@ public sealed partial class PhantomShowsChannel
             }
             else
             {
-                var materialised = await _db.GetMaterialisedStateAsync(
-                    seriesTmdb, "episode", season, row.Episode, ct).ConfigureAwait(false);
+                materialisedByEpisode.TryGetValue(row.Episode, out var materialised);
                 items.Add(await BuildEpisodeItemFromRowAsync(row, materialised, seriesName, ct).ConfigureAwait(false));
             }
 
@@ -1466,6 +1471,7 @@ public sealed partial class PhantomShowsChannel
 
     private async Task UpsertSeasonEpisodeRowsAsync(TmdbSeasonDetails seasonDetails, CancellationToken ct)
     {
+        var batch = new List<TmdbEpisodeRow>(seasonDetails.Episodes.Count);
         foreach (var e in seasonDetails.Episodes)
         {
             if (e.EpisodeNumber <= 0)
@@ -1476,7 +1482,7 @@ public sealed partial class PhantomShowsChannel
             var title = string.IsNullOrWhiteSpace(e.Name)
                 ? $"Episode {e.EpisodeNumber}"
                 : e.Name;
-            await _db.UpsertTmdbEpisodeAsync(
+            batch.Add(
                 new TmdbEpisodeRow(
                     SeriesTmdbId: seasonDetails.SeriesTmdbId,
                     Season: seasonDetails.SeasonNumber,
@@ -1486,9 +1492,10 @@ public sealed partial class PhantomShowsChannel
                     StillUrl: BuildImageUrl(e.StillPath),
                     AirDate: e.AirDate,
                     RuntimeMinutes: e.Runtime,
-                    FetchedAt: DateTimeOffset.UtcNow),
-                ct).ConfigureAwait(false);
+                    FetchedAt: DateTimeOffset.UtcNow));
         }
+
+        await _db.UpsertTmdbEpisodesAsync(batch, ct).ConfigureAwait(false);
     }
 
     private async Task<Clients.Models.TmdbSeriesDetails?> SafeGetSeriesAsync(int seriesTmdb, CancellationToken ct)
