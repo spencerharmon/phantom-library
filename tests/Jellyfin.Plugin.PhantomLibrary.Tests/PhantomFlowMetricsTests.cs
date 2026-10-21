@@ -1,11 +1,19 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics.Metrics;
+using System.IO;
 using System.Linq;
+using System.Text;
 using Jellyfin.Plugin.PhantomLibrary.Configuration;
 using Jellyfin.Plugin.PhantomLibrary.Diagnostics;
 using Jellyfin.Plugin.PhantomLibrary.State.Db;
+using MediaBrowser.Common.Configuration;
+using MediaBrowser.Model.Serialization;
+using Microsoft.Extensions.Logging.Abstractions;
+using Moq;
+using OpenTelemetry;
 using OpenTelemetry.Exporter;
+using OpenTelemetry.Metrics;
 using Prometheus;
 using Xunit;
 
@@ -197,6 +205,130 @@ public sealed class PhantomFlowMetricsTests
 
         var after = prometheusCounter.WithLabels(flow, itemType, cause).Value;
         Assert.Equal(1d, after - before);
+    }
+
+    [Theory]
+    [InlineData(PhantomFlowMetrics.PlaybackFlowMaterialiseThenPlay, PhantomFlowMetrics.ItemTypeMovie)]
+    [InlineData(PhantomFlowMetrics.PlaybackFlowMaterialiseThenPlay, PhantomFlowMetrics.ItemTypeEpisode)]
+    [InlineData(PhantomFlowMetrics.PlaybackFlowPlayAlreadyMaterialised, PhantomFlowMetrics.ItemTypeMovie)]
+    [InlineData(PhantomFlowMetrics.PlaybackFlowPlayAlreadyMaterialised, PhantomFlowMetrics.ItemTypeEpisode)]
+    public async Task SeedPlaybackOutcomes_PluginThenExporterStartup_PublishesZerosAndPreservesAttempts(
+        string targetFlow, string targetItemType)
+    {
+        var counter = Metrics.CreateCounter(
+            "phantom_playback_outcome_total",
+            "Definitive per-attempt phantom playback outcome, split by flow/item_type/cause.",
+            new CounterConfiguration { LabelNames = new[] { "flow", "item_type", "cause" } });
+        // The assembly disables parallel tests. Remove static children so prior
+        // playback tests cannot turn an incorrect nonzero seed into a passing delta.
+        foreach (var labels in counter.GetAllLabelValues().ToArray())
+        {
+            counter.RemoveLabelled(labels);
+        }
+
+        var previousPlugin = Plugin.Instance;
+        try
+        {
+            var paths = new Mock<IApplicationPaths>();
+            paths.SetupGet(p => p.PluginsPath).Returns(Path.GetTempPath());
+            _ = new Plugin(paths.Object, Mock.Of<IXmlSerializer>());
+            await AssertSamplesAsync(null, attempted: false);
+
+            using var snapshot = new PlaybackSnapshotExporter();
+            using var reader = new PeriodicExportingMetricReader(snapshot, exportIntervalMilliseconds: int.MaxValue)
+            {
+                TemporalityPreference = MetricReaderTemporalityPreference.Cumulative,
+            };
+            using var service = new PhantomMetricsExporter(
+                NullLogger<PhantomMetricsExporter>.Instance,
+                () => new PluginConfiguration
+                {
+                    MetricsOtlpEnabled = true,
+                    MetricsOtlpEndpoint = "http://127.0.0.1:1/v1/metrics",
+                    MetricsOtlpProtocol = "http/protobuf",
+                },
+                builder => builder.AddReader(reader));
+            await service.StartAsync(CancellationToken.None);
+            Assert.True(reader.Collect());
+            await AssertSamplesAsync(snapshot, attempted: false);
+
+            PhantomFlowMetrics.SeedPlaybackOutcomes();
+            Assert.True(reader.Collect());
+            await AssertSamplesAsync(snapshot, attempted: false);
+
+            PhantomFlowMetrics.RecordPlaybackOutcome(targetFlow, targetItemType, PhantomFlowMetrics.CauseFirstByteTimeout);
+            Assert.True(reader.Collect());
+            await AssertSamplesAsync(snapshot, attempted: true);
+
+            PhantomFlowMetrics.SeedPlaybackOutcomes();
+            Assert.True(reader.Collect());
+            await AssertSamplesAsync(snapshot, attempted: true);
+        }
+        finally
+        {
+            foreach (var labels in counter.GetAllLabelValues().ToArray())
+            {
+                counter.RemoveLabelled(labels);
+            }
+
+            typeof(Plugin).GetProperty(nameof(Plugin.Instance))!.SetValue(null, previousPlugin);
+        }
+
+        async Task AssertSamplesAsync(PlaybackSnapshotExporter? snapshot, bool attempted)
+        {
+            using var stream = new MemoryStream();
+            await Metrics.DefaultRegistry.CollectAndExportAsTextAsync(stream);
+            var samples = Encoding.UTF8.GetString(stream.ToArray()).Split('\n')
+                .Where(line => line.StartsWith("phantom_playback_outcome_total{", StringComparison.Ordinal)).ToArray();
+            Assert.Equal(32, samples.Length);
+            if (snapshot != null)
+            {
+                Assert.Equal(32, snapshot.Values.Count);
+            }
+
+            foreach (var flow in PhantomFlowMetrics.PlaybackFlows)
+            foreach (var itemType in PhantomFlowMetrics.ItemTypes)
+            foreach (var cause in PhantomFlowMetrics.PlaybackCauses)
+            {
+                var expected = attempted && flow == targetFlow && itemType == targetItemType
+                    && cause == PhantomFlowMetrics.CauseFirstByteTimeout ? 1 : 0;
+                Assert.Contains($"phantom_playback_outcome_total{{flow=\"{flow}\",item_type=\"{itemType}\",cause=\"{cause}\"}} {expected}", samples);
+                if (snapshot != null)
+                {
+                    Assert.Equal(expected, snapshot.Values[(flow, itemType, cause)]);
+                }
+            }
+        }
+    }
+
+    private sealed class PlaybackSnapshotExporter : BaseExporter<Metric>
+    {
+        public Dictionary<(string Flow, string ItemType, string Cause), long> Values { get; } = new();
+
+        public override ExportResult Export(in Batch<Metric> batch)
+        {
+            Values.Clear();
+            foreach (var metric in batch)
+            {
+                if (metric.Name != "phantom_playback_outcome_total")
+                {
+                    continue;
+                }
+
+                foreach (ref readonly var point in metric.GetMetricPoints())
+                {
+                    var tags = new Dictionary<string, object?>();
+                    foreach (var tag in point.Tags)
+                    {
+                        tags.Add(tag.Key, tag.Value);
+                    }
+
+                    Values.Add(((string)tags["flow"]!, (string)tags["item_type"]!, (string)tags["cause"]!), point.GetSumLong());
+                }
+            }
+
+            return ExportResult.Success;
+        }
     }
 
     [Fact]

@@ -45,6 +45,7 @@ public sealed class PhantomMetricsExporter : IHostedService, IDisposable
 {
     private readonly ILogger<PhantomMetricsExporter> _logger;
     private readonly Func<PluginConfiguration> _configProvider;
+    private readonly Action<MeterProviderBuilder>? _configureProvider;
     private MeterProvider? _meterProvider;
 
     /// <summary>Initializes a new instance of the <see cref="PhantomMetricsExporter"/> class.</summary>
@@ -54,10 +55,14 @@ public sealed class PhantomMetricsExporter : IHostedService, IDisposable
     {
     }
 
-    internal PhantomMetricsExporter(ILogger<PhantomMetricsExporter> logger, Func<PluginConfiguration> configProvider)
+    internal PhantomMetricsExporter(
+        ILogger<PhantomMetricsExporter> logger,
+        Func<PluginConfiguration> configProvider,
+        Action<MeterProviderBuilder>? configureProvider = null)
     {
         _logger = logger;
         _configProvider = configProvider;
+        _configureProvider = configureProvider;
     }
 
     /// <inheritdoc/>
@@ -83,7 +88,7 @@ public sealed class PhantomMetricsExporter : IHostedService, IDisposable
 
             var protocol = ResolveProtocol(config);
 
-            _meterProvider = Sdk.CreateMeterProviderBuilder()
+            var builder = Sdk.CreateMeterProviderBuilder()
                 .ConfigureResource(r => r.AddService("jellyfin-phantom-library"))
                 .AddMeter(PhantomFlowMetrics.MeterName)
                 .AddOtlpExporter((exporterOptions, readerOptions) =>
@@ -94,8 +99,11 @@ public sealed class PhantomMetricsExporter : IHostedService, IDisposable
                     // signal path for HTTP/protobuf — e.g. Mimir's /otlp/v1/metrics.
                     exporterOptions.Endpoint = new Uri(endpoint);
                     exporterOptions.Protocol = protocol;
-                })
-                .Build();
+                });
+            _configureProvider?.Invoke(builder);
+            _meterProvider = builder.Build();
+            // The constructor's seed predates this subscription; counters do not replay it.
+            PhantomFlowMetrics.SeedPlaybackOutcomes();
 
             _logger.LogInformation(
                 "Phantom OTLP flow metrics exporter started (endpoint={Endpoint}, protocol={Protocol}).",
