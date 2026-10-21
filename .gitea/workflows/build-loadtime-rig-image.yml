@@ -65,14 +65,20 @@ jobs:
       image: quay.io/buildah/stable:v1.37.5
     steps:
       - name: install checkout prerequisites
-        # The Buildah image provides neither the action runtime nor git.
-        run: dnf install -y --setopt=install_weak_deps=False git nodejs
+        run: dnf install -y --setopt=install_weak_deps=False git
 
       - name: checkout
-        uses: actions/checkout@v4
-
-      - name: mark repo safe for git (container UID != checkout owner)
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        # Use git directly: the pinned builder has no JavaScript action runtime.
+        env:
+          CHECKOUT_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          AUTH="$(printf 'x-access-token:%s' "$CHECKOUT_TOKEN" | base64 -w0)"
+          git -c "http.extraHeader=AUTHORIZATION: basic $AUTH" fetch --depth=1 origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
 
       - name: resolve published tag (never latest)
         id: tag

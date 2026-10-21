@@ -153,14 +153,16 @@ import yaml
 with open(sys.argv[1]) as f:
     workflow = yaml.safe_load(f)
 steps = workflow["jobs"]["build-loadtime-rig-image"]["steps"]
-checkout = next(i for i, step in enumerate(steps)
-                if step.get("uses", "").startswith("actions/checkout@"))
+checkout = next(i for i, step in enumerate(steps) if step["name"] == "checkout")
 bootstrap = "\n".join(step.get("run", "") for step in steps[:checkout])
-assert "dnf install" in bootstrap and "git" in bootstrap and "nodejs" in bootstrap, \
-    "Buildah base lacks git and node: install both before actions/checkout"
+assert "dnf install" in bootstrap and "git" in bootstrap, "install git before checkout"
+assert not any("uses" in step for step in steps), "Buildah base has no JS runtime"
+script = steps[checkout]["run"]
+assert 'fetch --depth=1 origin "$GITHUB_SHA"' in script
+assert 'test "$(git rev-parse HEAD)" = "$GITHUB_SHA"' in script
 PY
 then
-    ok "workflow installs git and Node.js before the checkout action"
+    ok "workflow installs git and checks out the exact source SHA without a JS runtime"
 else
     bad "workflow cannot execute checkout in the Buildah base image"
 fi
