@@ -158,8 +158,8 @@ else
 fi
 
 head_ "build workflow: self-hosted runner (never ubuntu-latest)"
-if grep -qE '^\s*runs-on:\s*\[.*self-hosted' "$WORKFLOW"; then
-    ok "workflow declares runs-on: [self-hosted, ...]"
+if grep -qE '^\s*runs-on:\s*\[k8s\]' "$WORKFLOW"; then
+    ok "workflow declares runs-on: [k8s] (the self-hosted runner's real label)"
 else
     bad "workflow does not run on the self-hosted Gitea Actions runner"
 fi

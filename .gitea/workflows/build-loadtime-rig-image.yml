@@ -55,7 +55,9 @@ on:
 jobs:
   build-loadtime-rig-image:
     name: build + publish loadtime-rig image
-    runs-on: [self-hosted, gitea-actions-runner]
+    # The self-hosted in-cluster runner advertises labels [ubuntu-latest,k8s,...];
+    # target the "k8s" label (self-hosted only), never the ubuntu-latest alias.
+    runs-on: [k8s]
     # Pinned base image carrying buildah/podman — a concrete tag, never
     # :latest — so the image build cannot silently drift onto an untested
     # builder toolchain.
