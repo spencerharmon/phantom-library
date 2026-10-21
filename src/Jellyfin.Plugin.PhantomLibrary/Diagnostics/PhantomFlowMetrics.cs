@@ -168,6 +168,53 @@ internal static class PhantomFlowMetrics
         PlaybackOutcomesPrometheus.WithLabels(flow, itemType, cause).Inc();
     }
 
+    /// <summary>Every canonical playback flow tag.</summary>
+    public static readonly string[] PlaybackFlows =
+    {
+        PlaybackFlowMaterialiseThenPlay,
+        PlaybackFlowPlayAlreadyMaterialised,
+    };
+
+    /// <summary>Every canonical item type tag.</summary>
+    public static readonly string[] ItemTypes = { ItemTypeMovie, ItemTypeEpisode };
+
+    /// <summary>Every canonical playback outcome cause tag.</summary>
+    public static readonly string[] PlaybackCauses =
+    {
+        CauseSuccess,
+        CauseAvailabilityAbstain,
+        CauseNoCandidate,
+        CauseMagnetDeadStale,
+        CauseGostreamRegisterFail,
+        CauseGostreamCannotFetch,
+        CauseFirstByteTimeout,
+        CausePluginHostError,
+    };
+
+    /// <summary>
+    /// Publishes all playback series at zero without resetting existing counts.
+    /// Call at plugin construction for Prometheus and after each OTLP provider
+    /// subscribes: synchronous counter measurements are not replayed to new listeners.
+    /// </summary>
+    public static void SeedPlaybackOutcomes()
+    {
+        foreach (var flow in PlaybackFlows)
+        {
+            foreach (var itemType in ItemTypes)
+            {
+                foreach (var cause in PlaybackCauses)
+                {
+                    PlaybackOutcomes.Add(
+                        0,
+                        new KeyValuePair<string, object?>("flow", flow),
+                        new KeyValuePair<string, object?>("item_type", itemType),
+                        new KeyValuePair<string, object?>("cause", cause));
+                    PlaybackOutcomesPrometheus.WithLabels(flow, itemType, cause);
+                }
+            }
+        }
+    }
+
     /// <summary>
     /// Starts timing a flow. Dispose the returned scope (ideally via
     /// <c>using</c>) to record the elapsed latency. Set

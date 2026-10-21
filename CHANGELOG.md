@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Publish all 32 playback outcome series at zero on plugin startup, including
+  OTLP seeding after the exporter subscribes. Idle movie and episode series now
+  exist before the first attempt; reseeding preserves recorded counts.
 - **Register the missing v20->v21 `availability_items.negative_streak`
   additive expand migration (phantom-schema-v20-v21-expand-migration).**
   The availability-probe-reconcile-001 v20->v21 bump (adding
