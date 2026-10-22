@@ -449,15 +449,33 @@ public sealed partial class PhantomShowsChannel
             orphanSeries = Array.Empty<GostreamSeriesEntry>();
         }
 
-        foreach (var series in orphanSeries)
+        var eligibleSeries = orphanSeries
+            .Where(series => series.Seasons.Count > 0 && series.Seasons.Any(s => s.Episodes.Count > 0))
+            .ToList();
+
+        // ttfb-shows-root-bulk-enrichment: resolve the common (already
+        // catalogued) case with a page-size-independent number of round
+        // trips — one bulk path->tmdb lookup, one bulk metadata fetch and one
+        // hidden-set fetch — instead of 2-3 sequential round trips PER series
+        // directory. Uncached directories fall back to the per-series
+        // title/year resolution (cold path, unchanged behaviour).
+        var prefetched = await PrefetchEnrichedGostreamSeriesAsync(eligibleSeries, ct).ConfigureAwait(false);
+        HashSet<int>? hiddenSeries = null;
+
+        foreach (var series in eligibleSeries)
         {
             ct.ThrowIfCancellationRequested();
-            if (series.Seasons.Count == 0 || series.Seasons.All(s => s.Episodes.Count == 0))
+
+            EnrichedGostreamSeries? enriched;
+            if (prefetched.TryGetValue(series.DirectoryPath, out var hit))
             {
-                continue;
+                enriched = hit;
+            }
+            else
+            {
+                enriched = await TryResolveEnrichedGostreamSeriesAsync(series, ct).ConfigureAwait(false);
             }
 
-            var enriched = await TryResolveEnrichedGostreamSeriesAsync(series, ct).ConfigureAwait(false);
             if (enriched is not null)
             {
                 if (seen.Contains(enriched.TmdbId))
@@ -469,7 +487,10 @@ public sealed partial class PhantomShowsChannel
                 // real gostream directory — the visible-series query above
                 // already excluded it from `seen`, so without this check the
                 // external resolution would leak it straight back in here.
-                if (await IsHiddenForUserAsync(userId, enriched.TmdbId, ct).ConfigureAwait(false))
+                // One hidden-set fetch per browse, membership checked in memory.
+                hiddenSeries ??= new HashSet<int>(
+                    await _db.ListHiddenTmdbIdsAsync(userId, "series", ct).ConfigureAwait(false));
+                if (hiddenSeries.Contains(enriched.TmdbId))
                 {
                     continue;
                 }
@@ -918,6 +939,86 @@ public sealed partial class PhantomShowsChannel
         }
 
         return matches;
+    }
+
+    /// <summary>
+    /// ttfb-shows-root-bulk-enrichment: bulk form of
+    /// <see cref="TryResolveEnrichedGostreamSeriesAsync"/> for every series
+    /// directory whose path->tmdb mapping is already known (in-memory or
+    /// persisted). Returns directoryPath -> enriched-or-null (null = cached
+    /// id with no metadata row, same as the per-series path). Directories
+    /// absent from the result have no cached mapping (or an unparseable
+    /// name) and must go through the per-series resolver.
+    /// </summary>
+    private async Task<Dictionary<string, EnrichedGostreamSeries?>> PrefetchEnrichedGostreamSeriesAsync(
+        IReadOnlyList<GostreamSeriesEntry> seriesList,
+        CancellationToken ct)
+    {
+        var result = new Dictionary<string, EnrichedGostreamSeries?>(StringComparer.Ordinal);
+        var tmdbByPath = new Dictionary<string, int>(StringComparer.Ordinal);
+        var unknownPaths = new List<string>();
+        foreach (var series in seriesList)
+        {
+            var (title, _) = ParseSeriesDirectoryName(Path.GetFileName(series.DirectoryPath));
+            if (string.IsNullOrWhiteSpace(title) || tmdbByPath.ContainsKey(series.DirectoryPath))
+            {
+                continue;
+            }
+
+            int tmdbId;
+            lock (_gostreamSeriesTmdbByPath)
+            {
+                _gostreamSeriesTmdbByPath.TryGetValue(series.DirectoryPath, out tmdbId);
+            }
+
+            if (tmdbId != 0)
+            {
+                tmdbByPath[series.DirectoryPath] = tmdbId;
+            }
+            else if (!unknownPaths.Contains(series.DirectoryPath, StringComparer.Ordinal))
+            {
+                unknownPaths.Add(series.DirectoryPath);
+            }
+        }
+
+        if (unknownPaths.Count > 0)
+        {
+            var persisted = await _db.GetGostreamPathTmdbsAsync(unknownPaths, "series", ct).ConfigureAwait(false);
+            foreach (var (path, tmdbId) in persisted)
+            {
+                if (tmdbId == 0)
+                {
+                    continue;
+                }
+
+                tmdbByPath[path] = tmdbId;
+                lock (_gostreamSeriesTmdbByPath)
+                {
+                    _gostreamSeriesTmdbByPath[path] = tmdbId;
+                }
+            }
+        }
+
+        if (tmdbByPath.Count == 0)
+        {
+            return result;
+        }
+
+        var metadata = await _db.GetTmdbMetadataBatchAsync(tmdbByPath.Values.Distinct().ToList(), "series", ct).ConfigureAwait(false);
+        foreach (var series in seriesList)
+        {
+            if (result.ContainsKey(series.DirectoryPath)
+                || !tmdbByPath.TryGetValue(series.DirectoryPath, out var tmdbId))
+            {
+                continue;
+            }
+
+            result[series.DirectoryPath] = metadata.TryGetValue(tmdbId, out var meta)
+                ? new EnrichedGostreamSeries(tmdbId, meta, series)
+                : null;
+        }
+
+        return result;
     }
 
     private async Task<EnrichedGostreamSeries?> TryResolveEnrichedGostreamSeriesAsync(GostreamSeriesEntry series, CancellationToken ct)

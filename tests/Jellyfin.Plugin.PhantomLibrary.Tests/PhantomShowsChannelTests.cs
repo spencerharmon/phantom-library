@@ -1045,6 +1045,55 @@ public class PhantomShowsChannelTests : IDisposable
         Assert.Equal("Renamed", series.Name);
     }
 
+    /// <summary>
+    /// ttfb-shows-root-bulk-enrichment regression: the Shows ROOT listing must
+    /// issue a page-size-independent number of DB round trips for catalogued
+    /// gostream series directories. Pre-fix each directory cost a
+    /// path->tmdb lookup + a metadata lookup + a hidden check (linear in
+    /// series count); post-fix these are bulk calls.
+    /// </summary>
+    [Fact]
+    public async Task GetChannelItems_Root_DbRoundTripsIndependentOfSeriesCount()
+    {
+        var nextTmdb = 99100000;
+
+        async Task<int> CountFor(string prefix, int seriesCount)
+        {
+            var root = Path.Combine(_splashHome, "shows-" + prefix);
+            for (var n = 0; n < seriesCount; n++)
+            {
+                var tmdb = ++nextTmdb;
+                var dir = Path.Combine(root, $"{prefix}_Show_{n} (2020)");
+                var seasonDir = Path.Combine(dir, "Season.01");
+                Directory.CreateDirectory(seasonDir);
+                await File.WriteAllTextAsync(Path.Combine(seasonDir, $"{prefix}_Show_{n}_S01E01_abcdef12.mkv"), "x", CancellationToken.None);
+                await _db.UpsertTmdbMetadataAsync(
+                    new TmdbMetadataRow(tmdb, "series", $"{prefix} Series {n}", 2020, "ov",
+                        null, null, new[] { "Drama" }, null, 7.0, $"{prefix} Series {n}", DateTimeOffset.UtcNow),
+                    CancellationToken.None);
+                await _db.UpsertGostreamPathTmdbAsync(dir, "series", tmdb, CancellationToken.None);
+            }
+
+            _enumerator.ShowsRootOverride = root;
+            GostreamFilesystemEnumerator.ResetForTests();
+            var cold = new PhantomShowsChannel(_db, _tmdb.Object, _splash, _state, _enumerator,
+                NullLogger<PhantomShowsChannel>.Instance, () => null);
+            cold.SetConfigurationProviderForTests(() => new PluginConfiguration { CuratedRowsEnabled = false });
+            _db.ResetConnectionsOpenedForTests();
+            var result = await cold.GetChannelItems(new InternalChannelItemQuery { UserId = TestUserId }, CancellationToken.None);
+            var opened = _db.ConnectionsOpenedForTests;
+            Assert.Equal(seriesCount, result.Items.Count(i => i.Id.StartsWith("series_", StringComparison.Ordinal)));
+            return opened;
+        }
+
+        await CountFor("warm", 1);
+        var small = await CountFor("small", 3);
+        var large = await CountFor("large", 40);
+        Assert.True(
+            small == large,
+            $"Expected page-size-independent DB round trips; 3 series opened {small} connections, 40 opened {large}.");
+    }
+
     [Fact]
     public async Task GostreamOnlyTvFiles_AppearAsOrphanSeriesSeasonsAndEpisodes()
     {
