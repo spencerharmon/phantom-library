@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Bump plugin version to 0.5.7.7 so the playback-outcome zero-seed fix
+  actually installs over the 0.5.7.6 DLL on existing PVCs.
+
 ### Fixed
 - Publish all 32 playback outcome series at zero on plugin startup, including
   OTLP seeding after the exporter subscribes. Idle movie and episode series now
