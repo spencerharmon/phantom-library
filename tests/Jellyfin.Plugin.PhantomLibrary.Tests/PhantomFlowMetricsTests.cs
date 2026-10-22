@@ -1,19 +1,24 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using System.IO;
 using System.Linq;
+using System.Reflection;
+using System.Reflection.Emit;
 using System.Text;
 using Jellyfin.Plugin.PhantomLibrary.Configuration;
 using Jellyfin.Plugin.PhantomLibrary.Diagnostics;
 using Jellyfin.Plugin.PhantomLibrary.State.Db;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Model.Serialization;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using OpenTelemetry;
 using OpenTelemetry.Exporter;
 using OpenTelemetry.Metrics;
+using OpenTelemetry.Resources;
 using Prometheus;
 using Xunit;
 
@@ -301,12 +306,178 @@ public sealed class PhantomFlowMetricsTests
         }
     }
 
+    [Theory]
+    [InlineData(null, null)]
+    [InlineData("configured-instance", null)]
+    [InlineData("configured-instance", "builder-instance")]
+    public async Task StartupProvenance_UsesBuiltProviderResource_AndLoadedAssembly(
+        string? environmentInstance, string? builderInstance)
+    {
+        var previousAttributes = Environment.GetEnvironmentVariable("OTEL_RESOURCE_ATTRIBUTES");
+        var previousName = Environment.GetEnvironmentVariable("OTEL_SERVICE_NAME");
+        try
+        {
+            Environment.SetEnvironmentVariable("OTEL_RESOURCE_ATTRIBUTES", environmentInstance == null ? null
+                : $"service.instance.id={environmentInstance},service.name=attribute-name,service.namespace=test-namespace,service.version=configured-version");
+            Environment.SetEnvironmentVariable("OTEL_SERVICE_NAME", environmentInstance == null ? null : "configured-name");
+            var logger = new ProvenanceLogger();
+            using var snapshot = new PlaybackSnapshotExporter();
+            using var reader = new PeriodicExportingMetricReader(snapshot, exportIntervalMilliseconds: int.MaxValue);
+            using var service = new PhantomMetricsExporter(logger, ExporterConfiguration, builder =>
+            {
+                builder.AddReader(reader);
+                if (builderInstance != null)
+                {
+                    builder.ConfigureResource(r => r.AddService("builder-name", serviceInstanceId: builderInstance));
+                }
+            });
+
+            await service.StartAsync(CancellationToken.None);
+            Assert.True(reader.Collect());
+            var record = Assert.Single(logger.Records);
+            var resource = snapshot.ResourceAttributes;
+            Assert.Equal(resource["service.instance.id"], record["ServiceInstanceId"]);
+            Assert.Equal(resource["service.name"], record["ServiceName"]);
+            Assert.False(string.IsNullOrWhiteSpace(Assert.IsType<string>(record["ServiceInstanceId"])));
+            Assert.Equal(builderInstance ?? environmentInstance ?? resource["service.instance.id"], record["ServiceInstanceId"]);
+            Assert.Equal(builderInstance != null ? "builder-name" : environmentInstance != null ? "configured-name" : "jellyfin-phantom-library", record["ServiceName"]);
+            Assert.Equal(resource.GetValueOrDefault("service.namespace"), record["ServiceNamespace"]);
+            Assert.Equal(resource.GetValueOrDefault("service.version"), record["ServiceVersion"]);
+            if (environmentInstance != null)
+            {
+                Assert.Equal("test-namespace", record["ServiceNamespace"]);
+                Assert.Equal("configured-version", record["ServiceVersion"]);
+            }
+
+            var assembly = typeof(PhantomMetricsExporter).Assembly;
+            Assert.Equal(assembly.ManifestModule.ModuleVersionId, record["AssemblyMvid"]);
+            Assert.Equal(assembly.GetName().Version?.ToString(), record["PluginVersion"]);
+            var informationalVersion = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+            Assert.Equal(informationalVersion, record["InformationalVersion"]);
+            Assert.Equal(informationalVersion?.Split('+', 2).ElementAtOrDefault(1), record["SourceRevision"]);
+            Assert.Equal(Environment.ProcessId, record["ProcessId"]);
+            using var process = Process.GetCurrentProcess();
+            Assert.Equal(process.StartTime.ToUniversalTime(), record["ProcessStartTimeUtc"]);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("OTEL_RESOURCE_ATTRIBUTES", previousAttributes);
+            Environment.SetEnvironmentVariable("OTEL_SERVICE_NAME", previousName);
+        }
+    }
+
+    [Fact]
+    public async Task StartupProvenance_ProviderLifecycle_KeepsSdkProcessIdentity()
+    {
+        var previous = Environment.GetEnvironmentVariable("OTEL_RESOURCE_ATTRIBUTES");
+        try
+        {
+            Environment.SetEnvironmentVariable("OTEL_RESOURCE_ATTRIBUTES", null);
+            var logger = new ProvenanceLogger();
+            var snapshots = new List<PlaybackSnapshotExporter>();
+            using var service = new PhantomMetricsExporter(logger, ExporterConfiguration, builder =>
+            {
+                var snapshot = new PlaybackSnapshotExporter();
+                snapshots.Add(snapshot);
+                builder.AddReader(new PeriodicExportingMetricReader(snapshot, exportIntervalMilliseconds: int.MaxValue));
+            });
+            await service.StartAsync(CancellationToken.None);
+            await service.StartAsync(CancellationToken.None);
+            Assert.Single(logger.Records);
+            Assert.Single(snapshots);
+            await service.StopAsync(CancellationToken.None);
+            Assert.True(snapshots[0].Disposed);
+            await service.StartAsync(CancellationToken.None);
+            await service.StopAsync(CancellationToken.None);
+            Assert.Equal(2, logger.Records.Count);
+            Assert.All(snapshots, snapshot => Assert.True(snapshot.Disposed));
+
+            using var otherService = new PhantomMetricsExporter(logger, ExporterConfiguration);
+            await otherService.StartAsync(CancellationToken.None);
+            Assert.Equal(3, logger.Records.Count);
+            Assert.All(logger.Records, record =>
+            {
+                Assert.Equal(logger.Records[0]["ServiceInstanceId"], record["ServiceInstanceId"]);
+                Assert.Equal(logger.Records[0]["ProcessStartTimeUtc"], record["ProcessStartTimeUtc"]);
+                Assert.Equal(Environment.ProcessId, record["ProcessId"]);
+            });
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("OTEL_RESOURCE_ATTRIBUTES", previous);
+        }
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("1.2.3")]
+    public void StartupProvenance_AbsentOptionalMetadata_IsNull(string? informationalVersion)
+    {
+        var assembly = AssemblyBuilder.DefineDynamicAssembly(new AssemblyName("MetadataFixture"), AssemblyBuilderAccess.Run);
+        assembly.DefineDynamicModule("MetadataFixture");
+        if (informationalVersion != null)
+        {
+            assembly.SetCustomAttribute(new CustomAttributeBuilder(
+                typeof(AssemblyInformationalVersionAttribute).GetConstructor(new[] { typeof(string) })!,
+                new object[] { informationalVersion }));
+        }
+
+        using var provider = Sdk.CreateMeterProviderBuilder().SetResourceBuilder(ResourceBuilder.CreateEmpty()).Build();
+        var logger = new ProvenanceLogger();
+        using var service = new PhantomMetricsExporter(logger, ExporterConfiguration);
+        service.LogProvenance(provider, assembly);
+        var record = Assert.Single(logger.Records);
+        Assert.Null(record["ServiceInstanceId"]);
+        Assert.Null(record["ServiceNamespace"]);
+        Assert.Null(record["ServiceVersion"]);
+        Assert.Equal(informationalVersion, record["InformationalVersion"]);
+        Assert.Null(record["SourceRevision"]);
+        Assert.Equal(assembly.ManifestModule.ModuleVersionId, record["AssemblyMvid"]);
+    }
+
+    private static PluginConfiguration ExporterConfiguration() => new()
+    {
+        MetricsOtlpEnabled = true,
+        MetricsOtlpEndpoint = "http://127.0.0.1:1/v1/metrics",
+        MetricsOtlpProtocol = "http/protobuf",
+    };
+
+    private sealed class ProvenanceLogger : ILogger<PhantomMetricsExporter>
+    {
+        public List<Dictionary<string, object?>> Records { get; } = new();
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            Assert.NotEqual(LogLevel.Error, logLevel);
+            if (eventId.Name == "PhantomMetricsProvenance")
+            {
+                Assert.Equal(LogLevel.Information, logLevel);
+                Records.Add(((IEnumerable<KeyValuePair<string, object?>>)state!).ToDictionary(p => p.Key, p => p.Value));
+            }
+        }
+    }
+
     private sealed class PlaybackSnapshotExporter : BaseExporter<Metric>
     {
         public Dictionary<(string Flow, string ItemType, string Cause), long> Values { get; } = new();
 
+        public Dictionary<string, object> ResourceAttributes { get; private set; } = new();
+
+        public bool Disposed { get; private set; }
+
+        protected override void Dispose(bool disposing)
+        {
+            Disposed = true;
+            base.Dispose(disposing);
+        }
+
         public override ExportResult Export(in Batch<Metric> batch)
         {
+            ResourceAttributes = ParentProvider.GetResource().Attributes.ToDictionary(p => p.Key, p => p.Value);
             Values.Clear();
             foreach (var metric in batch)
             {

@@ -1,5 +1,7 @@
 using System;
+using System.Diagnostics;
 using System.Diagnostics.Metrics;
+using System.Reflection;
 using Jellyfin.Plugin.PhantomLibrary.Configuration;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -16,9 +18,7 @@ namespace Jellyfin.Plugin.PhantomLibrary.Diagnostics;
 /// P5 browse-flow histograms over OTLP to the operator-configured collector.
 ///
 /// The exporter target is resolved entirely from configuration / environment —
-/// never a baked-in hostname (the deployment's observability stack is in flux:
-/// OpenObserve at <c>observe.spencerharmon.com</c> was retired in favour of a
-/// grafana-mimir-prometheus stack, so any hard-coded host would silently break).
+/// never a baked-in hostname, so changing collectors requires no plugin rebuild.
 /// Resolution order for the endpoint:
 /// <list type="number">
 ///   <item><c>PluginConfiguration.MetricsOtlpEndpoint</c> (admin dashboard);</item>
@@ -68,6 +68,11 @@ public sealed class PhantomMetricsExporter : IHostedService, IDisposable
     /// <inheritdoc/>
     public Task StartAsync(CancellationToken cancellationToken)
     {
+        if (_meterProvider != null)
+        {
+            return Task.CompletedTask;
+        }
+
         try
         {
             var config = _configProvider();
@@ -89,7 +94,9 @@ public sealed class PhantomMetricsExporter : IHostedService, IDisposable
             var protocol = ResolveProtocol(config);
 
             var builder = Sdk.CreateMeterProviderBuilder()
-                .ConfigureResource(r => r.AddService("jellyfin-phantom-library"))
+                // Defaults first, then explicit OTEL identity. AddService's generated
+                // instance ID is SDK/process-scoped, not a fresh ID per provider.
+                .ConfigureResource(r => r.AddService("jellyfin-phantom-library").AddEnvironmentVariableDetector())
                 .AddMeter(PhantomFlowMetrics.MeterName)
                 .AddOtlpExporter((exporterOptions, readerOptions) =>
                 {
@@ -105,6 +112,7 @@ public sealed class PhantomMetricsExporter : IHostedService, IDisposable
             // The constructor's seed predates this subscription; counters do not replay it.
             PhantomFlowMetrics.SeedPlaybackOutcomes();
 
+            LogProvenance(_meterProvider, typeof(PhantomMetricsExporter).Assembly);
             _logger.LogInformation(
                 "Phantom OTLP flow metrics exporter started (endpoint={Endpoint}, protocol={Protocol}).",
                 endpoint,
@@ -131,6 +139,33 @@ public sealed class PhantomMetricsExporter : IHostedService, IDisposable
     {
         _meterProvider?.Dispose();
         _meterProvider = null;
+    }
+
+    internal void LogProvenance(MeterProvider provider, Assembly assembly)
+    {
+        // Read the completed provider, including late resource customizations.
+        // Assembly metadata describes the loaded module; its file path may be replaced.
+        var resource = provider.GetResource().Attributes.ToDictionary(p => p.Key, p => p.Value);
+        var informationalVersion = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+        var sourceRevision = informationalVersion?.Split('+', 2).ElementAtOrDefault(1);
+        using var process = Process.GetCurrentProcess();
+        _logger.LogInformation(
+            new EventId(1, "PhantomMetricsProvenance"),
+            "Phantom OTLP runtime provenance: service.instance.id={ServiceInstanceId}, "
+            + "service.name={ServiceName}, service.namespace={ServiceNamespace}, service.version={ServiceVersion}, "
+            + "assembly.mvid={AssemblyMvid}, plugin.version={PluginVersion}, "
+            + "assembly.informational_version={InformationalVersion}, source.revision={SourceRevision}, "
+            + "process.pid={ProcessId}, process.start_time_utc={ProcessStartTimeUtc:O}",
+            resource.GetValueOrDefault("service.instance.id"),
+            resource.GetValueOrDefault("service.name"),
+            resource.GetValueOrDefault("service.namespace"),
+            resource.GetValueOrDefault("service.version"),
+            assembly.ManifestModule.ModuleVersionId,
+            assembly.GetName().Version?.ToString(),
+            informationalVersion,
+            sourceRevision,
+            Environment.ProcessId,
+            process.StartTime.ToUniversalTime());
     }
 
     internal static bool ResolveEnabled(PluginConfiguration config)

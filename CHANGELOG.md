@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Plugin package 0.5.7.7 logs loaded-module and process provenance with the
+  actual OTLP provider identity, preserving configured resource overrides.
+  See [OTLP runtime provenance](docs/otlp-runtime-provenance.md) for correlating
+  startup logs and build artifacts with Mimir; zero seeding is unchanged.
 - Publish all 32 playback outcome series at zero on plugin startup, including
   OTLP seeding after the exporter subscribes. Idle movie and episode series now
   exist before the first attempt; reseeding preserves recorded counts.
