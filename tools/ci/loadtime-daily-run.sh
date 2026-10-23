@@ -71,7 +71,7 @@
 # under a DISTINCT job group (job="phantom-loadtime-daily-run", no
 # color/flow/item_type labels) so it never collides with / shows up inside
 # the flow-metric job="phantom-loadtime" group the honor_labels dashboards
-# scrape. record_stage() is called via a trap around each stage so a
+# scrape. record_stage() is called after capturing each stage's exit code so a
 # stage-3 (guard) failure still gets its outcome pushed BEFORE this script's
 # own fail()/exit path runs — that is the entire point: make a failed
 # stage's exit code durable in Mimir even though the pod is reaped within
@@ -86,6 +86,7 @@ cd "$REPO_ROOT"
 source "$REPO_ROOT/tools/ci/lib-cleanup.sh"
 
 DRYRUN="${PHANTOM_CI_DRYRUN:-0}"
+RUN_START="$(date +%s)"
 NAMESPACE="${PHANTOM_INCLUSTER_NAMESPACE:-phantom-library}"
 DEV_HOST="${PHANTOM_INCLUSTER_DEV_HOST:-}"
 PROD_HOST="${PHANTOM_INCLUSTER_PROD_HOST:-}"
@@ -108,7 +109,7 @@ STAGE_PUSH_JOB="phantom-loadtime-daily-run"
 # record_stage <stage> <exit_code> <start_epoch_seconds>
 # Pushes phantom_loadtime_daily_stage_exit_code{stage=...} and
 # phantom_loadtime_daily_stage_seconds{stage=...} to the Pushgateway. Called
-# via a trap around each stage so a failing stage's outcome is durable in
+# after capturing each stage's exit code so a failing stage's outcome is durable in
 # Mimir BEFORE this script's own fail()/exit path runs — the pod is reaped
 # well within the ~24h before the next daily-cadence pass, so this is the
 # only durable record of which stage failed and why.
@@ -120,15 +121,16 @@ STAGE_PUSH_JOB="phantom-loadtime-daily-run"
 # (job=phantom-loadtime-daily-run, PUT /metrics/job/<job>, --dry-run prints
 # the target + payload instead of curling — no network, deterministic).
 record_stage() {
-    local stage="$1" ec="$2" start="$3" now dur payload url
+    local stage="$1" ec="$2" start="$3" now dur url
     now="$(date +%s)"
     dur=$(( now - start ))
-    payload="phantom_loadtime_daily_stage_exit_code{stage=\"${stage}\"} ${ec}
-phantom_loadtime_daily_stage_seconds{stage=\"${stage}\"} ${dur}"
+    # PUT replaces the whole group; retain every completed stage from this run.
+    printf 'phantom_loadtime_daily_stage_exit_code{stage="%s"} %s\nphantom_loadtime_daily_stage_seconds{stage="%s"} %s\n' \
+        "$stage" "$ec" "$stage" "$dur" >> "$STAGE_EXPO"
     if [ "$DRYRUN" = 1 ]; then
         url="${PHANTOM_PUSHGATEWAY_URL:-http://pushgateway.example.com:9091}/metrics/job/${STAGE_PUSH_JOB}"
         note "[stage-metric dry-run] PUT ${url}"
-        printf '%s\n' "$payload" | sed 's/^/    /' >&2
+        sed 's/^/    /' "$STAGE_EXPO" >&2
         return 0
     fi
     if [ -z "${PHANTOM_PUSHGATEWAY_URL:-}" ]; then
@@ -136,23 +138,26 @@ phantom_loadtime_daily_stage_seconds{stage=\"${stage}\"} ${dur}"
         return 0
     fi
     url="${PHANTOM_PUSHGATEWAY_URL%/}/metrics/job/${STAGE_PUSH_JOB}"
-    if ! printf '%s\n' "$payload" | curl -sf --max-time 30 --data-binary @- -X PUT "$url" >&2; then
+    if ! curl -sf --max-time 30 --data-binary "@$STAGE_EXPO" -X PUT "$url" >&2; then
         note "WARNING: failed to push stage=$stage outcome metric to $url (non-fatal)"
     fi
 }
 
 EXPO="$(mktemp -t loadtime-daily-expo.XXXXXX.txt)"
+STAGE_EXPO=""
 _torn_down=0
 teardown() {
     local ec=$?
     [ "$_torn_down" = 1 ] && exit "$ec"
     _torn_down=1
     log "mandatory cleanup"
-    rm -f "$EXPO"
+    rm -f "$EXPO" "$STAGE_EXPO"
     phantom_ci_cleanup_dotnet "$([ "$ec" != 0 ] && echo 1 || echo 0)" || true
     exit "$ec"
 }
 trap teardown EXIT INT TERM
+STAGE_EXPO="$(mktemp -t loadtime-daily-stages.XXXXXX.txt)"
+printf 'phantom_loadtime_daily_run_start_timestamp_seconds %s\n' "$RUN_START" > "$STAGE_EXPO"
 
 log "phantom-library daily load-time schedule job"
 note "namespace:  $NAMESPACE"

@@ -51,6 +51,44 @@ bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$*"; fail_count=$((fail_count+1));
 head_() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 fatal() { printf '\033[31mFATAL: %s\033[0m\n' "$*" >&2; exit 2; }
 
+assert_stage_payloads() {
+    python3 - "$1" "$2" <<'PY'
+import re
+import sys
+
+with open(sys.argv[1]) as f:
+    output = f.read()
+payloads = re.findall(
+    r'^    \[stage-metric dry-run\] PUT \S+/metrics/job/phantom-loadtime-daily-run\n'
+    r'((?:    phantom_loadtime_daily_.*\n)+)', output, re.MULTILINE)
+assert len(payloads) == 3, f"expected three stage PUTs, got {len(payloads)}"
+run_start = None
+for index in (2, 1, 0):
+    payload = payloads[index]
+    samples = dict(line.strip().split() for line in payload.splitlines())
+    stages = ('measure', 'push', 'guard')[:index + 1]
+    expected = {'phantom_loadtime_daily_run_start_timestamp_seconds'}
+    for stage in stages:
+        for metric in ('exit_code', 'seconds'):
+            key = f'phantom_loadtime_daily_stage_{metric}{{stage="{stage}"}}'
+            expected.add(key)
+            assert key in samples, f"PUT {index + 1} lost {key}"
+            value = int(samples[key])
+            if metric == 'seconds':
+                assert value >= 0, f"negative duration: {key}"
+            else:
+                allowed = {int(v) for v in sys.argv[2].split(',')} if stage == 'guard' else {0}
+                assert value in allowed, f"unexpected exit code: {key} {value}"
+    assert set(samples) == expected, f"PUT {index + 1} has missing or unexpected samples"
+    assert len(payload.splitlines()) == len(expected), "duplicate samples"
+    timestamp = int(samples['phantom_loadtime_daily_run_start_timestamp_seconds'])
+    assert timestamp > 0, "run start must be an epoch timestamp"
+    if run_start is None:
+        run_start = timestamp
+    assert timestamp == run_start, "run start changed between stage PUTs"
+PY
+}
+
 [[ -f "$WORKFLOW" ]]      || fatal "workflow not found: $WORKFLOW"
 [[ -f "$DAILY_SCRIPT" ]]  || fatal "shared daily script not found: $DAILY_SCRIPT"
 [[ -x "$DAILY_SCRIPT" ]]  || fatal "shared daily script not executable: $DAILY_SCRIPT"
@@ -257,6 +295,11 @@ if [ "$before_thresholds_sha" = "$after_thresholds_sha" ]; then
 else
     bad "dry run MUTATED tools/perf/loadtime-thresholds.json — a dry-run synthetic fixture must never seed/tighten the real thresholds registry"
 fi
+if assert_stage_payloads "/tmp/p8-loadtime-daily-dryrun.$$.log" "0,3"; then
+    ok "dry-run PUTs retain all completed stages and one stable run-start timestamp"
+else
+    bad "dry-run PUTs lost stage outcomes or run-start timestamp"
+fi
 rm -f "/tmp/p8-loadtime-daily-dryrun.$$.log"
 
 head_ "shared script: pushes a durable per-stage outcome metric (ttfb-loadtime-daily-stage-outcome-metric)"
@@ -301,6 +344,11 @@ else
     else
         bad "daily script exited non-zero ($rc) but did not push a non-zero stage=\"guard\" outcome metric first"
     fi
+fi
+if assert_stage_payloads "/tmp/p8-loadtime-daily-guardfail.$$.log" "2"; then
+    ok "forced guard failure retains measure+push successes and guard exit=2 in the final PUT"
+else
+    bad "forced guard failure lost earlier stages or failed guard outcome in the final PUT"
 fi
 rm -f "/tmp/p8-loadtime-daily-guardfail.$$.log"
 
