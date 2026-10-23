@@ -435,6 +435,153 @@ public sealed class PhantomFlowMetricsTests
         Assert.Equal(assembly.ManifestModule.ModuleVersionId, record["AssemblyMvid"]);
     }
 
+    private static void AssertLoadedRuntimeInfo(PlaybackSnapshotExporter snapshot)
+    {
+        var point = Assert.Single(snapshot.RuntimeInfoPoints);
+        Assert.Equal(1, point.Value);
+        var assembly = typeof(PhantomMetricsExporter).Assembly;
+        Assert.Equal(assembly.ManifestModule.ModuleVersionId.ToString(), point.Tags["assembly.mvid"]);
+        Assert.Equal(assembly.GetName().Version?.ToString(), point.Tags["plugin.version"]);
+        var informational = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+        Assert.Equal(informational, point.Tags.GetValueOrDefault("assembly.informational_version"));
+        Assert.Equal(informational?.Split('+', 2).ElementAtOrDefault(1), point.Tags.GetValueOrDefault("source.revision"));
+        var allowed = new[] { "assembly.mvid", "plugin.version", "assembly.informational_version", "source.revision" };
+        Assert.All(point.Tags.Keys, k => Assert.Contains(k, allowed));
+        Assert.All(allowed, k => Assert.DoesNotContain(k, snapshot.OutcomeTagKeys));
+    }
+
+    [Theory]
+    [InlineData(null, null)]
+    [InlineData("configured-instance", null)]
+    [InlineData("configured-instance", "builder-instance")]
+    public async Task RuntimeInfo_NoTraffic_EveryCollectionPublishesOneLoadedBuildPoint_WithProviderResource(
+        string? environmentInstance, string? builderInstance)
+    {
+        var previousAttributes = Environment.GetEnvironmentVariable("OTEL_RESOURCE_ATTRIBUTES");
+        try
+        {
+            Environment.SetEnvironmentVariable("OTEL_RESOURCE_ATTRIBUTES", environmentInstance == null ? null
+                : $"service.instance.id={environmentInstance},service.version=configured-version");
+            var logger = new ProvenanceLogger();
+            using var snapshot = new PlaybackSnapshotExporter();
+            using var reader = new PeriodicExportingMetricReader(snapshot, exportIntervalMilliseconds: int.MaxValue);
+            using var service = new PhantomMetricsExporter(logger, ExporterConfiguration, builder =>
+            {
+                builder.AddReader(reader);
+                if (builderInstance != null)
+                {
+                    builder.ConfigureResource(r => r.AddService("builder-name", serviceInstanceId: builderInstance));
+                }
+            });
+            await service.StartAsync(CancellationToken.None);
+            for (var i = 0; i < 2; i++)
+            {
+                Assert.True(reader.Collect());
+                AssertLoadedRuntimeInfo(snapshot);
+                var resource = snapshot.ResourceAttributes;
+                Assert.Equal(builderInstance ?? environmentInstance ?? resource["service.instance.id"], resource["service.instance.id"]);
+                Assert.Equal(resource["service.instance.id"], Assert.Single(logger.Records)["ServiceInstanceId"]);
+                if (environmentInstance != null)
+                {
+                    Assert.Equal("configured-version", resource["service.version"]);
+                }
+            }
+
+            Assert.Equal(2, snapshot.Exports);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("OTEL_RESOURCE_ATTRIBUTES", previousAttributes);
+        }
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("1.2.3")]
+    [InlineData("1.2.3+abc123")]
+    public void RuntimeInfo_MissingOptionalMetadata_IsOmitted(string? informationalVersion)
+    {
+        var assembly = AssemblyBuilder.DefineDynamicAssembly(new AssemblyName("RuntimeInfoFixture"), AssemblyBuilderAccess.Run);
+        assembly.DefineDynamicModule("RuntimeInfoFixture");
+        if (informationalVersion != null)
+        {
+            assembly.SetCustomAttribute(new CustomAttributeBuilder(
+                typeof(AssemblyInformationalVersionAttribute).GetConstructor(new[] { typeof(string) })!,
+                new object[] { informationalVersion }));
+        }
+
+        var tags = PhantomFlowMetrics.RuntimeInfoTags(assembly).ToDictionary(p => p.Key, p => p.Value);
+        Assert.Equal(assembly.ManifestModule.ModuleVersionId.ToString(), tags["assembly.mvid"]);
+        Assert.Equal(informationalVersion, tags.GetValueOrDefault("assembly.informational_version"));
+        Assert.Equal(informationalVersion == "1.2.3+abc123" ? "abc123" : null, tags.GetValueOrDefault("source.revision"));
+        Assert.Equal(informationalVersion == "1.2.3+abc123", tags.ContainsKey("source.revision"));
+    }
+
+    [Fact]
+    public async Task RuntimeInfo_DisabledExporter_BuildsNoProvider()
+    {
+        var previous = Environment.GetEnvironmentVariable("PHANTOM_METRICS_OTLP_ENABLED");
+        try
+        {
+            Environment.SetEnvironmentVariable("PHANTOM_METRICS_OTLP_ENABLED", null);
+            var built = 0;
+            using var service = new PhantomMetricsExporter(
+                NullLogger<PhantomMetricsExporter>.Instance,
+                () => new PluginConfiguration { MetricsOtlpEnabled = false, MetricsOtlpEndpoint = "http://127.0.0.1:1/v1/metrics" },
+                _ => built++);
+            await service.StartAsync(CancellationToken.None);
+            Assert.Equal(0, built);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("PHANTOM_METRICS_OTLP_ENABLED", previous);
+        }
+    }
+
+    [Fact]
+    public async Task RuntimeInfo_LifecycleAndConcurrentProviders_OnePointPerProviderWithOwnIdentity()
+    {
+        var snapshots = new List<(string Id, PlaybackSnapshotExporter Snapshot, PeriodicExportingMetricReader Reader)>();
+        PhantomMetricsExporter Make(string id) => new(NullLogger<PhantomMetricsExporter>.Instance, ExporterConfiguration, builder =>
+        {
+            var snapshot = new PlaybackSnapshotExporter();
+            var reader = new PeriodicExportingMetricReader(snapshot, exportIntervalMilliseconds: int.MaxValue);
+            snapshots.Add((id, snapshot, reader));
+            builder.AddReader(reader).ConfigureResource(r => r.AddService("phantom-" + id, serviceInstanceId: id));
+        });
+
+        using var a = Make("instance-a");
+        await a.StartAsync(CancellationToken.None);
+        await a.StartAsync(CancellationToken.None);
+        Assert.Single(snapshots);
+        using var b = Make("instance-b");
+        await b.StartAsync(CancellationToken.None);
+        Assert.Equal(2, snapshots.Count);
+        for (var i = 0; i < 2; i++)
+        {
+            foreach (var (id, snapshot, reader) in snapshots)
+            {
+                Assert.True(reader.Collect());
+                AssertLoadedRuntimeInfo(snapshot);
+                Assert.Equal(id, snapshot.ResourceAttributes["service.instance.id"]);
+            }
+        }
+
+        await a.StopAsync(CancellationToken.None);
+        await a.StartAsync(CancellationToken.None);
+        Assert.Equal(3, snapshots.Count);
+        Assert.True(snapshots[0].Snapshot.Disposed);
+        foreach (var (id, snapshot, reader) in snapshots.Skip(1))
+        {
+            Assert.True(reader.Collect());
+            AssertLoadedRuntimeInfo(snapshot);
+            Assert.Equal(id, snapshot.ResourceAttributes["service.instance.id"]);
+        }
+
+        await a.StopAsync(CancellationToken.None);
+        await b.StopAsync(CancellationToken.None);
+    }
+
     private static PluginConfiguration ExporterConfiguration() => new()
     {
         MetricsOtlpEnabled = true,
@@ -469,6 +616,12 @@ public sealed class PhantomFlowMetricsTests
 
         public bool Disposed { get; private set; }
 
+        public List<(long Value, Dictionary<string, object?> Tags)> RuntimeInfoPoints { get; } = new();
+
+        public HashSet<string> OutcomeTagKeys { get; } = new();
+
+        public int Exports { get; private set; }
+
         protected override void Dispose(bool disposing)
         {
             Disposed = true;
@@ -479,8 +632,27 @@ public sealed class PhantomFlowMetricsTests
         {
             ResourceAttributes = ParentProvider.GetResource().Attributes.ToDictionary(p => p.Key, p => p.Value);
             Values.Clear();
+            RuntimeInfoPoints.Clear();
+            OutcomeTagKeys.Clear();
+            Exports++;
             foreach (var metric in batch)
             {
+                if (metric.Name == PhantomFlowMetrics.RuntimeInfoName)
+                {
+                    foreach (ref readonly var point in metric.GetMetricPoints())
+                    {
+                        var info = new Dictionary<string, object?>();
+                        foreach (var tag in point.Tags)
+                        {
+                            info.Add(tag.Key, tag.Value);
+                        }
+
+                        RuntimeInfoPoints.Add((point.GetGaugeLastValueLong(), info));
+                    }
+
+                    continue;
+                }
+
                 if (metric.Name != "phantom_playback_outcome_total")
                 {
                     continue;
@@ -494,6 +666,7 @@ public sealed class PhantomFlowMetricsTests
                         tags.Add(tag.Key, tag.Value);
                     }
 
+                    OutcomeTagKeys.UnionWith(tags.Keys);
                     Values.Add(((string)tags["flow"]!, (string)tags["item_type"]!, (string)tags["cause"]!), point.GetSumLong());
                 }
             }
