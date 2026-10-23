@@ -115,6 +115,23 @@ internal static class PhantomFlowMetrics
         "Definitive per-attempt phantom playback outcome, split by flow/item_type/cause.",
         new CounterConfiguration { LabelNames = new[] { "flow", "item_type", "cause" } });
 
+    /// <summary>Instrument name of the loaded-build information gauge.</summary>
+    public const string RuntimeInfoName = "phantom_runtime_info";
+
+    // Loaded-build provenance (otlp-runtime-info-001): one point of value 1 per
+    // collection of every provider subscribed to this meter, so build identity is
+    // queryable without playback. Resource identity comes from the collecting
+    // provider; build labels live ONLY here, never on the outcome counters.
+    private static readonly KeyValuePair<string, object?>[] RuntimeInfoTagsLoaded =
+        RuntimeInfoTags(typeof(PhantomFlowMetrics).Assembly);
+
+    /// <summary>Gets the loaded-build information gauge (value 1).</summary>
+    internal static ObservableGauge<long> RuntimeInfo { get; } = Meter.CreateObservableGauge(
+        RuntimeInfoName,
+        () => new Measurement<long>(1, RuntimeInfoTagsLoaded),
+        unit: "1",
+        description: "Loaded Phantom plugin build identity (always 1).");
+
     private static readonly Histogram<double> FlowDurationMs = Meter.CreateHistogram<double>(
         "phantom_flow_duration_ms",
         unit: "ms",
@@ -124,6 +141,37 @@ internal static class PhantomFlowMetrics
         "phantom_flow_items",
         unit: "{item}",
         description: "Items returned by a Phantom user-facing browse flow.");
+
+    /// <summary>
+    /// Build-identity labels for <paramref name="assembly"/> read from the LOADED
+    /// module metadata (never a file path). Unavailable optional values are omitted.
+    /// </summary>
+    internal static KeyValuePair<string, object?>[] RuntimeInfoTags(System.Reflection.Assembly assembly)
+    {
+        var tags = new List<KeyValuePair<string, object?>>
+        {
+            new("assembly.mvid", assembly.ManifestModule.ModuleVersionId.ToString()),
+        };
+        var version = assembly.GetName().Version?.ToString();
+        if (!string.IsNullOrEmpty(version))
+        {
+            tags.Add(new("plugin.version", version));
+        }
+
+        var informational = System.Reflection.CustomAttributeExtensions
+            .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>(assembly)?.InformationalVersion;
+        if (!string.IsNullOrEmpty(informational))
+        {
+            tags.Add(new("assembly.informational_version", informational));
+            var revision = informational.Split('+', 2).ElementAtOrDefault(1);
+            if (!string.IsNullOrEmpty(revision))
+            {
+                tags.Add(new("source.revision", revision));
+            }
+        }
+
+        return tags.ToArray();
+    }
 
     /// <summary>
     /// Records one completed flow observation: its wall-clock latency (ms) and,
