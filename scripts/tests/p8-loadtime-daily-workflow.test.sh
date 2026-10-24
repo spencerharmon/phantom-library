@@ -366,5 +366,153 @@ else
 fi
 rm -f "/tmp/p8-loadtime-daily-guard.$$.log"
 
+# ---------------------------------------------------------------------------
+# same-batch behavioral integration (ttfb-loadtime-daily-same-batch-guard)
+#
+# Executes the REAL wrapper, guard, converter and ratchet (dotnet) inside a
+# scratch repo root whose only substitutions are: a COUNTING engine fixture
+# that returns batch A on call 1 and batch B on call 2 (opposite threshold
+# outcomes), scratch thresholds, and fake kubectl/curl/beehive on PATH that
+# record what was resolved/pushed/filed. Required — never silently skipped.
+# ---------------------------------------------------------------------------
+head_ "same-batch: daily wrapper guards the exact batch it pushed (real guard + converter + ratchet)"
+command -v dotnet >/dev/null 2>&1 || fatal "dotnet is required for the same-batch integration coverage (no silent skip)"
+SB="$(mktemp -d -t p8-same-batch.XXXXXX)"
+trap 'rm -rf "$SB"' EXIT
+sb_root="$SB/root"; sb_bin="$SB/bin"
+mkdir -p "$sb_root/tools/ci" "$sb_root/tools/perf" "$sb_root/tools/rig-scenarios" "$sb_root/scripts" "$sb_bin"
+ln -s "$DAILY_SCRIPT" "$sb_root/tools/ci/loadtime-daily-run.sh"
+ln -s "$REPO_ROOT/tools/ci/lib-cleanup.sh" "$sb_root/tools/ci/lib-cleanup.sh"
+ln -s "$GUARD_SCRIPT" "$sb_root/tools/perf/loadtime-guard.sh"
+ln -s "$REPO_ROOT/tools/perf/loadtime-expo-to-measurements.py" "$sb_root/tools/perf/loadtime-expo-to-measurements.py"
+# Real ratchet sources, copied (not symlinked) so its bin/obj build in scratch
+# and never alias the repo's own build outputs through a symlinked path.
+mkdir -p "$sb_root/tools/perf/ratchet-guard"
+cp "$REPO_ROOT"/tools/perf/ratchet-guard/*.cs "$REPO_ROOT"/tools/perf/ratchet-guard/*.csproj "$sb_root/tools/perf/ratchet-guard/"
+ln -s "$PUSH_SCRIPT" "$sb_root/scripts/phantom-loadtime-push.sh"
+SB_THR="$sb_root/tools/perf/loadtime-thresholds.json"
+# Counting engine fixture: SB_CASE=<backend>:<A-breach|A-pass>. The named
+# backend's list_load is 2.0s (breach of 1000ms) in one batch and 0.5s
+# (improvement -> ratchet to 525ms) in the other; the other backend is a
+# steady 0.95s (no change) in both batches.
+cat > "$sb_root/tools/rig-scenarios/47-loadtime-flows.sh" <<'ENG'
+#!/usr/bin/env bash
+set -euo pipefail
+n=$(( $(cat "$SB_COUNT" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$SB_COUNT"
+backend="${SB_CASE%%:*}"; mode="${SB_CASE#*:}"
+if [ "$n" = 1 ]; then batch=A; else batch=B; fi
+if [ "$mode" = A-breach ]; then [ "$batch" = A ] && v=2.0 || v=0.5
+else [ "$batch" = A ] && v=0.5 || v=2.0; fi
+for b in movie episode; do
+  val=0.95; [ "$b" = "$backend" ] && val=$v
+  printf 'phantom_loadtime_seconds{flow="list_load",item_type="%s",color="%s"} %s\n' "$b" "${PHANTOM_LOADTIME_COLOR:-green}" "$val"
+done
+ENG
+cat > "$sb_bin/kubectl" <<'K'
+#!/usr/bin/env bash
+case "$*" in *phantom-library-green*) echo "$SB_DEV_HOST" ;; esac
+K
+cat > "$sb_bin/curl" <<'C'
+#!/usr/bin/env bash
+url="${@: -1}"; data=""
+for ((i=1;i<=$#;i++)); do [ "${!i}" = --data-binary ] && { j=$((i+1)); data="${!j}"; }; done
+{ echo "PUT $url"; if [ "$data" = @- ]; then cat; else cat "${data#@}"; fi; echo "--"; } >> "$SB_CURL_LOG"
+C
+cat > "$sb_bin/beehive" <<'B'
+#!/usr/bin/env bash
+echo "$*" >> "$SB_BEEHIVE_LOG"
+B
+chmod +x "$sb_root/tools/rig-scenarios/47-loadtime-flows.sh" "$sb_bin"/*
+
+sb_reset() {
+    cat > "$SB_THR" <<'T'
+{
+  "improvement_margin_ratio": 0.1,
+  "ratchet_headroom_ratio": 0.05,
+  "scenarios": [
+    { "flow": "list_load", "backend": "movie", "quantile": "single", "threshold_ms": 1000 },
+    { "flow": "list_load", "backend": "episode", "quantile": "single", "threshold_ms": 1000 }
+  ]
+}
+T
+    rm -f "$SB/count" "$SB/curl.log" "$SB/beehive.log"; : > "$SB/curl.log"; : > "$SB/beehive.log"
+}
+sb_thr() { python3 -c 'import json,sys; print([s["threshold_ms"] for s in json.load(open(sys.argv[1]))["scenarios"] if s["backend"]==sys.argv[2]][0])' "$SB_THR" "$1"; }
+sb_run() { # sb_run <case> <dryrun 0|1> -> sets sb_rc, log in $SB/out.log
+    sb_rc=0
+    env PATH="$sb_bin:$PATH" PHANTOM_REPO_ROOT="$sb_root" PHANTOM_CI_DRYRUN="$2" PHANTOM_CI_PKILL=0 \
+        SB_CASE="$1" SB_COUNT="$SB/count" SB_CURL_LOG="$SB/curl.log" SB_BEEHIVE_LOG="$SB/beehive.log" \
+        SB_DEV_HOST=dev.example.com PHANTOM_INCLUSTER_DEV_HOST=dev.example.com \
+        PHANTOM_INCLUSTER_PROD_HOST=example.com PHANTOM_INCLUSTER_ADMIN_TOKEN=tok \
+        PHANTOM_PUSHGATEWAY_URL=http://pushgateway.example.com:9091 \
+        bash "$sb_root/tools/ci/loadtime-daily-run.sh" > "$SB/out.log" 2>&1 || sb_rc=$?
+}
+sb_check() { # sb_check <label> <cond-cmd...>
+    local label="$1"; shift
+    if "$@"; then ok "$label"; else bad "$label"; sed 's/^/      /' "$SB/out.log" | tail -40 >&2; fi
+}
+sb_guard_stage() { # final stage-outcome PUT's guard exit code
+    python3 - "$1" <<'PY'
+import re,sys
+t=open(sys.argv[1]).read()
+m=re.findall(r'phantom_loadtime_daily_stage_exit_code\{stage="guard"\} (\d+)',t)
+print(m[-1] if m else "missing")
+PY
+}
+
+for backend in movie episode; do
+  for mode in A-breach A-pass; do
+    c="$backend:$mode"
+    if [ "$mode" = A-breach ]; then a_val=2.0; want_guard=3; want_thr=1000; else a_val=0.5; want_guard=0; want_thr=525; fi
+    # ---- live ----
+    sb_reset; sb_run "$c" 0
+    sb_check "[$c live] wrapper exits 0 (got $sb_rc)" test "$sb_rc" = 0
+    sb_check "[$c live] engine invoked exactly once" test "$(cat "$SB/count" 2>/dev/null)" = 1
+    sb_check "[$c live] Pushgateway received batch A ($backend=$a_val)" \
+        grep -q "phantom_loadtime_seconds{flow=\"list_load\",item_type=\"$backend\",color=\"green\"} $a_val\$" "$SB/curl.log"
+    sb_check "[$c live] stage=guard outcome is A-based ($want_guard)" test "$(sb_guard_stage "$SB/curl.log")" = "$want_guard"
+    sb_check "[$c live] $backend threshold written from A (${want_thr}ms)" test "$(sb_thr "$backend")" = "$want_thr"
+    other=episode; [ "$backend" = episode ] && other=movie
+    sb_check "[$c live] $other threshold unchanged (1000ms)" test "$(sb_thr "$other")" = 1000
+    if [ "$mode" = A-breach ]; then
+        sb_check "[$c live] breach filed via beehive task add (live filing preserved)" \
+            grep -q "^task add phantom-library p8-daily-perf-regression-.*$backend" "$SB/beehive.log"
+    else
+        sb_check "[$c live] pass filed nothing" test ! -s "$SB/beehive.log"
+    fi
+    # ---- dry-run ----
+    sb_reset; before="$(sha256sum "$SB_THR" | awk '{print $1}')"; sb_run "$c" 1
+    sb_check "[$c dry-run] wrapper exits 0 (got $sb_rc)" test "$sb_rc" = 0
+    sb_check "[$c dry-run] engine invoked exactly once" test "$(cat "$SB/count" 2>/dev/null)" = 1
+    sb_check "[$c dry-run] pushed (dry-run) batch A ($backend=$a_val)" \
+        grep -q "phantom_loadtime_seconds{flow=\"list_load\",item_type=\"$backend\",color=\"green\"} $a_val\$" "$SB/out.log"
+    sb_check "[$c dry-run] stage=guard outcome is A-based ($want_guard)" test "$(sb_guard_stage "$SB/out.log")" = "$want_guard"
+    sb_check "[$c dry-run] thresholds byte-identical, nothing filed/curl'd" \
+        test "$before" = "$(sha256sum "$SB_THR" | awk '{print $1}')" -a ! -s "$SB/beehive.log" -a ! -s "$SB/curl.log"
+  done
+done
+
+head_ "guard --exposition: supplied-input preservation and error handling"
+sb_guard() { sb_rc=0; env PATH="$sb_bin:$PATH" PHANTOM_REPO_ROOT="$sb_root" SB_CASE="$SB_CASE_G" SB_COUNT="$SB/count" \
+    SB_BEEHIVE_LOG="$SB/beehive.log" bash "$sb_root/tools/perf/loadtime-guard.sh" "$@" > "$SB/out.log" 2>&1 || sb_rc=$?; }
+sb_reset; SB_CASE_G=movie:A-breach
+printf 'phantom_loadtime_seconds{flow="list_load",item_type="movie",color="green"} 2.0\nphantom_loadtime_seconds{flow="list_load",item_type="episode",color="green"} 0.95\n' > "$SB/in.expo"
+in_sha="$(sha256sum "$SB/in.expo" | awk '{print $1}')"
+sb_guard --exposition "$SB/in.expo" --no-file
+sb_check "supplied breach exposition -> exit 3 without invoking the engine" test "$sb_rc" = 3 -a ! -e "$SB/count"
+sb_check "supplied exposition file preserved byte-identical" test -f "$SB/in.expo" -a "$in_sha" = "$(sha256sum "$SB/in.expo" | awk '{print $1}')"
+sb_guard --exposition "$SB/missing.expo" --no-file
+sb_check "missing --exposition file -> exit 2" test "$sb_rc" = 2
+: > "$SB/empty.expo"; sb_guard --exposition "$SB/empty.expo" --no-file
+sb_check "empty --exposition file -> exit 2" test "$sb_rc" = 2
+echo 'garbage line' > "$SB/bad.expo"; sb_guard --exposition "$SB/bad.expo" --no-file
+sb_check "malformed --exposition file -> exit 2" test "$sb_rc" = 2
+echo 'phantom_other_metric 1' > "$SB/none.expo"; sb_guard --exposition "$SB/none.expo" --no-file
+sb_check "--exposition with no load-time measurements -> exit 2" test "$sb_rc" = 2
+sb_check "no engine invocation across all --exposition runs" test ! -e "$SB/count"
+sb_reset; sb_guard --no-file
+sb_check "standalone guard (no --exposition) still measures: engine once, A-breach -> exit 3" \
+    test "$sb_rc" = 3 -a "$(cat "$SB/count" 2>/dev/null)" = 1
+
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"
 [ "$fail_count" -eq 0 ]

@@ -30,7 +30,14 @@
 #   loadtime-guard.sh [--live] [--api <url>] [--token <tok>] [--color <c>]
 #                      [--thresholds <file>] [--apply] [--source-task <id>]
 #                      [--task-prefix <prefix>] [--submodule <name>] [--no-file]
+#                      [--exposition <file>]
 #
+#   --exposition    guard a CALLER-OWNED, already-measured exposition file
+#                   instead of invoking the measurement engine (the daily
+#                   wrapper passes the exact batch it pushed, so the guard
+#                   decision and threshold writes use the SAME observations
+#                   that were published). The file is read only, never
+#                   deleted; missing/unreadable/empty input is an error (2).
 #   --live          drive the real rig (PHANTOM_CI_DRYRUN=0); default is a
 #                   deterministic dry run (no cluster/network access).
 #   --api           rig Jellyfin base URL for --live (default :18096; never
@@ -65,6 +72,7 @@ NO_FILE=0
 API=""
 TOKEN=""
 COLOR=""
+EXPO_IN=""
 
 die() { echo "loadtime-guard.sh: $*" >&2; exit 2; }
 
@@ -80,12 +88,18 @@ while [ $# -gt 0 ]; do
     --task-prefix)  TASK_PREFIX=${2:?}; shift 2 ;;
     --submodule)    SUBMODULE=${2:?}; shift 2 ;;
     --no-file)      NO_FILE=1; shift ;;
+    --exposition)   EXPO_IN=${2:?}; shift 2 ;;
     -h|--help)      sed -n '2,45p' "$0"; exit 0 ;;
     *) die "unknown argument '$1'" ;;
   esac
 done
 
-[ -f "$ENGINE" ]     || die "measurement engine not found: $ENGINE"
+if [ -n "$EXPO_IN" ]; then
+  [ -f "$EXPO_IN" ] && [ -r "$EXPO_IN" ] || die "exposition file not found/readable: $EXPO_IN"
+  [ -s "$EXPO_IN" ] || die "exposition file is empty: $EXPO_IN"
+else
+  [ -f "$ENGINE" ] || die "measurement engine not found: $ENGINE"
+fi
 [ -f "$CONVERTER" ]  || die "converter not found: $CONVERTER"
 [ -f "$THRESHOLDS" ] || die "thresholds file not found: $THRESHOLDS"
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
@@ -96,7 +110,10 @@ PLAN=$(mktemp -t loadtime-plan.XXXXXX.json)
 cleanup() { rm -f "$EXPO" "$MEASUREMENTS" "$PLAN"; }
 trap cleanup EXIT INT TERM
 
-# --- 1. measure ---------------------------------------------------------
+# --- 1. measure (or use the caller-owned batch) ---------------------------
+if [ -n "$EXPO_IN" ]; then
+  cp "$EXPO_IN" "$EXPO"
+else
 engine_env=()
 if [ "$LIVE" = 1 ]; then
   [ -n "$API" ] && engine_env+=("PHANTOM_LOADTIME_API=$API")
@@ -107,9 +124,12 @@ fi
 [ -n "$COLOR" ] && engine_env+=("PHANTOM_LOADTIME_COLOR=$COLOR")
 
 env "${engine_env[@]}" bash "$ENGINE" > "$EXPO"
+fi
 
 # --- 2. convert -----------------------------------------------------------
 python3 "$CONVERTER" "$EXPO" "$MEASUREMENTS" || die "measurement conversion failed"
+python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["measurements"] else 1)' "$MEASUREMENTS" \
+  || die "exposition contained no phantom_loadtime_seconds measurements"
 
 # --- 3. ratchet-guard (reuses the P5 tool + engine verbatim) --------------
 guard_args=(--thresholds "$THRESHOLDS" --measurements "$MEASUREMENTS" --file-plan "$PLAN" --task-prefix "$TASK_PREFIX")

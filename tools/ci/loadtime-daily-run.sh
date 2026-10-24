@@ -27,7 +27,7 @@
 #      :8096 or :18096 — a real port-443 hit against what the user hits).
 #   3. push the resulting exposition to the Pushgateway (P8/2's emitter).
 #   4. run the ratcheting regression guard against that SAME measurement
-#      (P8/5's loadtime-guard.sh --live --apply), auto-filing a follow-up
+#      (P8/5's loadtime-guard.sh --exposition <EXPO> --apply), auto-filing a follow-up
 #      task per breached scenario when `beehive` is on PATH.
 #   5. mandatory build/test process cleanup (tools/ci/lib-cleanup.sh) +
 #      an EXIT/INT/TERM trap so a mid-run failure never leaves a stray
@@ -247,9 +247,14 @@ if [ "$DRYRUN" = 1 ]; then
     # numbers. Detect-only, no filing.
     guard_args=(--color "$COLOR" --no-file)
 else
-    guard_args=(--live --api "$API" --token "$ADMIN_TOKEN" --color "$COLOR" --apply)
+    guard_args=(--color "$COLOR" --apply)
     command -v beehive >/dev/null 2>&1 || guard_args+=(--no-file)
 fi
+# Same-batch invariant (ttfb-loadtime-daily-same-batch-guard): guard the
+# EXACT batch stage 1 measured and stage 2 pushed — never a second engine
+# run, whose cache/materialisation state could disagree with what was
+# published. Both live and dry-run branches use the caller-owned $EXPO.
+guard_args+=(--exposition "$EXPO")
 set +e
 # PHANTOM_CI_FORCE_GUARD_FAIL=1 lets the in-repo regression harness
 # deterministically exercise the stage="guard" failure path (no live
