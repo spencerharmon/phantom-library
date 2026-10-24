@@ -194,5 +194,106 @@ ENGINE_DRYRUN_OUT="$(PHANTOM_CI_DRYRUN=1 PHANTOM_LOADTIME_COLOR=rigtest bash "$E
     || fatal "could not run the measurement engine for the well-formedness assertion"
 validate_wellformed "DRYRUN engine" "$ENGINE_DRYRUN_OUT"
 
+head_ "H. synthetic runs and reserved playback samples never reach the push transport (intercepted curl)"
+# A test-local `curl` on PATH intercepts the REAL emitter's transport: it
+# records each call (args + stdin body) and never contacts any network.
+STUB_DIR="$(mktemp -d)"
+trap 'rm -f "$FIXTURE"; rm -rf "$STUB_DIR"' EXIT
+CALLS="$STUB_DIR/calls"
+cat > "$STUB_DIR/curl" <<STUB
+#!/usr/bin/env bash
+n=\$(( \$(ls "$STUB_DIR"/call.* 2>/dev/null | wc -l) + 1 ))
+printf '%s\n' "\$*" >> "$CALLS"
+cat > "$STUB_DIR/call.\$n.body"
+exit 0
+STUB
+chmod +x "$STUB_DIR/curl"
+reset_calls() { rm -f "$CALLS" "$STUB_DIR"/call.*; }
+ncalls() { if [ -f "$CALLS" ]; then wc -l < "$CALLS" | tr -d ' '; else echo 0; fi; }
+LIVE_URL="http://pushgateway.example.net:9091"
+# run_live <desc> <expect:fail|ok> <cmd...> — runs with the stub on PATH and a live URL.
+expect_refused() {
+    local desc="$1"; shift
+    reset_calls
+    if env PATH="$STUB_DIR:$PATH" PHANTOM_PUSHGATEWAY_URL="$LIVE_URL" "$@" >"$STUB_DIR/out" 2>&1 </dev/null; then
+        bad "$desc: expected refusal, got exit 0 ($(ncalls) transport calls)"
+    elif [ "$(ncalls)" != 0 ]; then
+        bad "$desc: refused but transport was called $(ncalls) time(s)"
+    else
+        ok "$desc: refused, zero transport calls"
+    fi
+}
+expect_refused "synthetic run, push dry-run default-disabled" \
+    env PHANTOM_CI_DRYRUN=1 PHANTOM_LOADTIME_COLOR=rigtest "$EMITTER" run
+expect_refused "synthetic run, PHANTOM_LOADTIME_PUSH_DRY_RUN=0 explicit" \
+    env PHANTOM_CI_DRYRUN=1 PHANTOM_LOADTIME_PUSH_DRY_RUN=0 PHANTOM_LOADTIME_COLOR=rigtest "$EMITTER" run
+if grep -q 'push dry-run is disabled' "$STUB_DIR/out"; then ok "synthetic-run refusal is actionable (names push dry-run)"; else bad "synthetic-run refusal message unhelpful: $(cat "$STUB_DIR/out")"; fi
+
+# Reserved movie+episode / cold+warm samples (the engine fixture carries all four).
+for it in movie episode; do for fl in play_already_materialised materialise_then_play; do
+    if grep -q "^phantom_playback_outcome_total{flow=\"$fl\",item_type=\"$it\"" "$FIXTURE"; then
+        ok "fixture carries reserved sample flow=$fl item_type=$it"
+    else bad "fixture lacks reserved sample flow=$fl item_type=$it"; fi
+done; done
+expect_refused "reserved samples via positional file (custom job)" \
+    env PHANTOM_LOADTIME_PUSH_JOB=custom-job "$EMITTER" push "$FIXTURE"
+expect_refused "reserved samples via PHANTOM_LOADTIME_RECORDS (custom job)" \
+    env PHANTOM_LOADTIME_RECORDS="$FIXTURE" PHANTOM_LOADTIME_PUSH_JOB=custom-job "$EMITTER" push
+reset_calls
+if PATH="$STUB_DIR:$PATH" PHANTOM_PUSHGATEWAY_URL="$LIVE_URL" PHANTOM_LOADTIME_PUSH_JOB=custom-job \
+        "$EMITTER" push < "$FIXTURE" >/dev/null 2>&1; then
+    bad "reserved samples via stdin: expected refusal"
+elif [ "$(ncalls)" != 0 ]; then bad "reserved samples via stdin: transport called"
+else ok "reserved samples via stdin (custom job): refused, zero transport calls"; fi
+
+# Whitespace-valid reserved samples (bare name + space, leading whitespace) are refused.
+WS="$STUB_DIR/ws.prom"
+printf 'phantom_loadtime_seconds{flow="list_load",item_type="movie",color="x"} 1\nphantom_playback_outcome_total 1\n' > "$WS"
+expect_refused "reserved sample without labels (name + space)" "$EMITTER" push "$WS"
+printf 'phantom_loadtime_seconds{flow="list_load",item_type="movie",color="x"} 1\n  phantom_playback_outcome_total\t{cause="success"} 1\n' > "$WS"
+expect_refused "reserved sample with leading/tab whitespace" "$EMITTER" push "$WS"
+
+# Legitimate live load-time + rig-outcome payload, with misleading comments
+# and similar names, reaches the transport ONCE with exact target + body.
+LEGIT="$STUB_DIR/legit.prom"
+cat > "$LEGIT" <<'EOP'
+# HELP phantom_loadtime_seconds Wall-clock duration.
+# TYPE phantom_loadtime_seconds gauge
+phantom_loadtime_seconds{flow="list_load",item_type="movie",color="blue"} 0.42
+phantom_loadtime_seconds{flow="list_load",item_type="episode",color="blue"} 0.51
+# HELP phantom_loadtime_rig_outcome_total not phantom_playback_outcome_total (renamed).
+# TYPE phantom_loadtime_rig_outcome_total counter
+phantom_loadtime_rig_outcome_total{flow="play_already_materialised",item_type="movie",cause="success"} 1
+phantom_loadtime_rig_outcome_total{flow="materialise_then_play",item_type="episode",cause="success"} 1
+phantom_playback_outcome_total_extra{cause="x"} 1
+EOP
+for mode in file env stdin; do
+    reset_calls
+    case "$mode" in
+        file)  PATH="$STUB_DIR:$PATH" PHANTOM_PUSHGATEWAY_URL="$LIVE_URL" "$EMITTER" push "$LEGIT" >/dev/null 2>&1 && rc=0 || rc=$? ;;
+        env)   PATH="$STUB_DIR:$PATH" PHANTOM_PUSHGATEWAY_URL="$LIVE_URL" PHANTOM_LOADTIME_RECORDS="$LEGIT" "$EMITTER" push >/dev/null 2>&1 && rc=0 || rc=$? ;;
+        stdin) PATH="$STUB_DIR:$PATH" PHANTOM_PUSHGATEWAY_URL="$LIVE_URL" "$EMITTER" push < "$LEGIT" >/dev/null 2>&1 && rc=0 || rc=$? ;;
+    esac
+    if [ "$rc" -eq 0 ] && [ "$(ncalls)" = 1 ] \
+        && grep -q -- "-X PUT $LIVE_URL/metrics/job/phantom-loadtime\$" "$CALLS" \
+        && cmp -s "$LEGIT" "$STUB_DIR/call.1.body"; then
+        ok "legitimate live payload ($mode) reaches transport once, exact PUT target, unchanged body"
+    else
+        bad "legitimate live payload ($mode): rc=$rc calls=$(ncalls) args=$(cat "$CALLS" 2>/dev/null)"
+    fi
+done
+
+# Explicit push dry-run (flag and env) stays offline and keeps fixture output.
+reset_calls
+FLAG_OUT="$(PATH="$STUB_DIR:$PATH" PHANTOM_PUSHGATEWAY_URL="$LIVE_URL" PHANTOM_CI_DRYRUN=1 PHANTOM_LOADTIME_COLOR=rigtest "$EMITTER" run --dry-run 2>/dev/null)" || true
+ENV_OUT="$(PATH="$STUB_DIR:$PATH" PHANTOM_PUSHGATEWAY_URL="$LIVE_URL" PHANTOM_LOADTIME_PUSH_DRY_RUN=1 "$EMITTER" push "$FIXTURE" 2>/dev/null)" || true
+if [ "$(ncalls)" = 0 ] \
+    && [ "$(printf '%s\n' "$FLAG_OUT" | grep -c '^phantom_playback_outcome_total{')" = 4 ] \
+    && [ "$(printf '%s\n' "$ENV_OUT" | grep -c '^phantom_playback_outcome_total{')" = 4 ]; then
+    ok "explicit push dry-run (flag + env) is offline and retains the fixture output"
+else
+    bad "explicit push dry-run regressed (calls=$(ncalls))"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"
 [ "$fail_count" -eq 0 ]
