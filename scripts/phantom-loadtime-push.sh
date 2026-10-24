@@ -21,17 +21,28 @@
 #   phantom_loadtime_seconds{flow=…,item_type=movie|episode,color=…}   <secs>
 #   phantom_loadtime_runs_total{flow=…,item_type=…,color=…}            <runs>
 #   phantom_loadtime_errors_total{flow=…,item_type=…,color=…}          <errors>
-# and — since playback-outcome-instrumentation-001 — the definitive per-attempt
-# playback-outcome family emitted in the SAME exposition:
-#   phantom_playback_outcome_total{flow=…,item_type=movie|episode,cause=…}  1
+# plus, in LIVE engine mode, the rig-outcome family
+#   phantom_loadtime_rig_outcome_total{flow=…,item_type=…,cause=…}         1
 # read from a FILE (arg or PHANTOM_LOADTIME_RECORDS env) or, absent both, from
-# stdin. This script does not re-derive or reshape those records — it PASSES
-# THEM THROUGH to the Pushgateway verbatim (the label set is already the
-# metric contract p8-loadtime-rig-flows established), so the playback-outcome
-# family requires NO special handling here: its flow/item_type/cause are METRIC
-# labels carried in the exposition text, mirrored under the same `honor_labels`
-# scrape-config rule documented below (the Prometheus config keeps the metrics'
-# OWN labels rather than overwriting them with the pushgateway job/instance).
+# stdin. Legitimate payloads are passed through to the Pushgateway verbatim
+# (never re-derived or reshaped).
+#
+# RESERVED-FAMILY GUARD (playback-outcome-synthetic-push-guard-001): the
+# engine's offline fixture (PHANTOM_CI_DRYRUN=1) still emits SYNTHETIC
+# `phantom_playback_outcome_total` samples. That family name is reserved for
+# REAL playback outcomes, so a LIVE (non-dry-run) push REFUSES the whole
+# payload if it carries any sample of exactly that family — whatever the input
+# source (file arg, PHANTOM_LOADTIME_RECORDS, stdin, engine output) and
+# whatever PHANTOM_LOADTIME_PUSH_JOB says. Nothing is stripped; the push fails.
+# Comments (# HELP/# TYPE) and similar names (e.g. the rig family) are not
+# samples and do not trigger it. Dry-run output is unaffected.
+#
+# DRY-RUN CONTROLS ARE INDEPENDENT: PHANTOM_CI_DRYRUN=1 makes the ENGINE
+# synthetic; it does NOT make the PUSH offline. `run` therefore refuses
+# PHANTOM_CI_DRYRUN=1 unless push dry-run (--dry-run or
+# PHANTOM_LOADTIME_PUSH_DRY_RUN=1) is also explicitly enabled — checked before
+# the engine runs. This guard does not prove provenance of arbitrary file/stdin
+# data that lacks reserved samples.
 #
 # GROUPING KEY: PUT'd under Pushgateway job="phantom-loadtime" (no `instance`
 # grouping label) — the per-flow identity (flow/item_type/color) lives as
@@ -50,8 +61,9 @@
 #   run           Run the measurement engine
 #                 (tools/rig-scenarios/47-loadtime-flows.sh) and push its
 #                 output in one step. Any PHANTOM_LOADTIME_* env the caller
-#                 has set (API/TOKEN/COLOR/PHANTOM_CI_DRYRUN/etc) passes
-#                 through to the engine unchanged.
+#                 has set (API/TOKEN/COLOR/etc) passes through to the engine
+#                 unchanged; PHANTOM_CI_DRYRUN=1 additionally requires an
+#                 explicit push dry-run (see RESERVED-FAMILY GUARD).
 #
 # Knobs (env):
 #   PHANTOM_PUSHGATEWAY_URL      Pushgateway base URL. REQUIRED for a live
@@ -121,6 +133,17 @@ validate_records() {
         || die "exposition carries no phantom_loadtime_seconds record — refusing to push"
 }
 
+# --- refuse a LIVE push carrying a sample of the reserved real-playback family.
+# A sample line is the exact metric name followed by `{` or whitespace (after
+# optional leading whitespace); comment lines and longer names never match.
+RESERVED_FAMILY="phantom_playback_outcome_total"
+reject_reserved_samples() {
+    local payload="$1"
+    if printf '%s\n' "$payload" | grep -Eq "^[[:space:]]*${RESERVED_FAMILY}([{[:space:]]|\$)"; then
+        die "payload carries reserved ${RESERVED_FAMILY} samples (synthetic/offline fixture data) — refusing the whole live push to job=${PUSH_JOB}; use --dry-run / PHANTOM_LOADTIME_PUSH_DRY_RUN=1 for fixture output"
+    fi
+}
+
 # --- PUT the exposition to the Pushgateway group job=<PUSH_JOB>. PUT replaces
 # the whole group so a later batch never leaves a stale prior flow behind.
 push() {
@@ -140,6 +163,7 @@ push() {
         printf '%s\n' "$payload"
         return 0
     fi
+    reject_reserved_samples "$payload"
     log "pushing load-time metrics to ${url}"
     printf '%s\n' "$payload" | curl -sf --max-time 30 --data-binary @- -X PUT "$url" \
         || die "push to Pushgateway failed: $url"
@@ -149,6 +173,9 @@ push() {
 # --- run the measurement engine, then push its output in one step -----------
 run() {
     local payload
+    if [ "${PHANTOM_CI_DRYRUN:-0}" = "1" ] && [ "$DRY_RUN" != "1" ]; then
+        die "PHANTOM_CI_DRYRUN=1 produces a SYNTHETIC engine run, but push dry-run is disabled — refusing to send synthetic records to the Pushgateway; add --dry-run (or PHANTOM_LOADTIME_PUSH_DRY_RUN=1) for offline fixture output, or unset PHANTOM_CI_DRYRUN for a live measurement"
+    fi
     payload="$(bash "$ENGINE")" || die "measurement engine failed"
     push <(printf '%s\n' "$payload")
 }
