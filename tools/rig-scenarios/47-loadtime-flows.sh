@@ -112,6 +112,27 @@ API="${PHANTOM_LOADTIME_API:-http://localhost:18096}"
 TOK="${PHANTOM_LOADTIME_TOKEN:-testtoken00000000000000000000000}"
 COLOR="${PHANTOM_LOADTIME_COLOR:-}"
 OUT="${PHANTOM_LOADTIME_OUT:-}"
+# Per-flow sample count (ttfb-loadtime-median-of-n-samples). Each flow is timed
+# SAMPLES times and the MEDIAN duration is emitted with runs_total=SAMPLES and
+# errors_total = the number of erroring samples, so single-sample cache-order
+# noise no longer drives trend/guard/ratchet verdicts. Metric names/labels are
+# unchanged. Env PHANTOM_LOADTIME_SAMPLES or flag --samples N (flag wins).
+SAMPLES="${PHANTOM_LOADTIME_SAMPLES:-3}"
+# DRYRUN-only controlled timing fixture (regression harness): comma-separated
+# per-sample durations / error markers, applied to EVERY flow in place of the
+# synthetic duration (sample i uses element i). Ignored in LIVE mode.
+SAMPLE_FIXTURE="${PHANTOM_LOADTIME_SAMPLE_FIXTURE:-}"
+SAMPLE_ERRORS_FIXTURE="${PHANTOM_LOADTIME_SAMPLE_ERRORS:-}"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --samples) SAMPLES="${2:-}"; shift 2 ;;
+        --samples=*) SAMPLES="${1#--samples=}"; shift ;;
+        *) printf 'FAIL: unknown argument: %s\n' "$1" >&2; exit 2 ;;
+    esac
+done
+case "$SAMPLES" in
+    ''|*[!0-9]*|0) printf 'FAIL: sample count must be a positive integer, got %q\n' "$SAMPLES" >&2; exit 2 ;;
+esac
 
 # The canonical flow-label vocabulary the emitter/ratchet/dashboard key on.
 # (Order matters only for readability; the labels are the contract.)
@@ -216,6 +237,38 @@ EOF
 )"
     _records="${_records}${block}
 "
+}
+
+# --- N-sample aggregation (median duration, summed errors) ------------------
+# sample_reset; sample_add <dur> <err> (x N); sample_emit <flow> <item_type>
+# Emits ONE record per flow: the median of the sample durations (mean of the
+# two middle values for even N), runs_total = sample count, errors_total =
+# summed error markers. Sets SAMPLE_ERRORS_TOTAL for callers.
+_sample_durs=""
+_sample_errs=0
+_sample_n=0
+SAMPLE_ERRORS_TOTAL=0
+sample_reset() { _sample_durs=""; _sample_errs=0; _sample_n=0; }
+sample_add() {
+    _sample_durs="${_sample_durs} $1"
+    _sample_errs=$((_sample_errs + $2))
+    _sample_n=$((_sample_n + 1))
+}
+sample_emit() {
+    local flow="$1" item_type="$2" med
+    # shellcheck disable=SC2086
+    med="$(python3 -c 'import sys, statistics; print(f"{statistics.median(float(x) for x in sys.argv[1:]):.6f}")' $_sample_durs)"
+    emit_record "$flow" "$item_type" "$med" "$_sample_n" "$_sample_errs"
+    SAMPLE_ERRORS_TOTAL="$_sample_errs"
+    log "flow=$flow item_type=$item_type median_s=$med runs=$_sample_n errors=$_sample_errs samples=[${_sample_durs# }]"
+}
+# fixture_at <csv> <index> -> element (empty if csv empty / short)
+fixture_at() {
+    local csv="$1" idx="$2"
+    [ -n "$csv" ] || return 0
+    local -a parts
+    IFS=, read -r -a parts <<<"$csv"
+    printf '%s' "${parts[$idx]:-}" | tr -d ' '
 }
 
 # --- playback-outcome emission (playback-outcome-instrumentation-001, renamed
@@ -328,6 +381,8 @@ if [ "$DRYRUN" = 1 ]; then
     for it in movie episode; do
         if [ "$it" = movie ]; then catalogue="$DRYRUN_CATALOGUE_MOVIE"; else catalogue="$DRYRUN_CATALOGUE_EPISODE"; fi
         for flow in "${FLOWS[@]}"; do
+          sample_reset
+          for ((s = 0; s < SAMPLES; s++)); do
             errors=0
             case "$flow" in
                 list_load)
@@ -359,7 +414,13 @@ if [ "$DRYRUN" = 1 ]; then
                     fi
                     ;;
             esac
-            emit_record "$flow" "$it" "$dur" 1 "$errors"
+            fx="$(fixture_at "$SAMPLE_FIXTURE" "$s")"
+            [ -z "$fx" ] || dur="$fx"
+            fe="$(fixture_at "$SAMPLE_ERRORS_FIXTURE" "$s")"
+            [ -z "$fe" ] || errors="$fe"
+            sample_add "$dur" "$errors"
+          done
+          sample_emit "$flow" "$it"
         done
         # --- definitive per-attempt playback outcome, movie AND episode -------
         # Every playback flow records exactly one definitive cause. In DRYRUN the
@@ -411,13 +472,16 @@ CH_SHOWS="$(printf '%s' "$CH_JSON" | python3 -c "import json,sys; d=json.load(sy
 LAST_FLOW_ERRORS=0
 time_flow() {
     local flow="$1" item_type="$2"; shift 2
-    local start errors=0 dur
-    start="$(now_s)"
-    if "$@" >/dev/null 2>&1; then errors=0; else errors=1; fi
-    dur="$(elapsed "$start")"
-    emit_record "$flow" "$item_type" "$dur" 1 "$errors"
-    LAST_FLOW_ERRORS="$errors"
-    log "flow=$flow item_type=$item_type duration_s=$dur errors=$errors"
+    local start errors=0 dur s
+    sample_reset
+    for ((s = 0; s < SAMPLES; s++)); do
+        start="$(now_s)"
+        if "$@" >/dev/null 2>&1; then errors=0; else errors=1; fi
+        dur="$(elapsed "$start")"
+        sample_add "$dur" "$errors"
+    done
+    sample_emit "$flow" "$item_type"
+    if [ "$SAMPLE_ERRORS_TOTAL" -gt 0 ]; then LAST_FLOW_ERRORS=1; else LAST_FLOW_ERRORS=0; fi
 }
 
 # --- pick a movie + an episode to drive -------------------------------------
@@ -438,7 +502,7 @@ trap 'rm -f /tmp/p8-movies.$$.json /tmp/p8-pb.$$.json' EXIT
 # batching), then hand the total count to the DOM-materialise helper. The
 # summed wall clock across fetch + fan-out + materialise is the flow's
 # duration — full user-perceived load, not one capped round trip.
-time_full_list_flow() {
+_full_list_sample() {
     local flow="$1" item_type="$2" ch="$3" sort_qs="$4"
     local start errors=0 dur total=0 start_index=0 page=200
     local all_ids_file
@@ -472,8 +536,16 @@ print(json.dumps(ids[$off:$off+$lim]))
     badge_fanout_and_materialise "$total" live_batch_runner
     rm -f "$all_ids_file"
     dur="$(elapsed "$start")"
-    emit_record "$flow" "$item_type" "$dur" 1 "$errors"
-    log "flow=$flow item_type=$item_type duration_s=$dur errors=$errors items=$total"
+    sample_add "$dur" "$errors"
+    log "flow=$flow item_type=$item_type sample_s=$dur errors=$errors items=$total"
+}
+time_full_list_flow() {
+    local s
+    sample_reset
+    for ((s = 0; s < SAMPLES; s++)); do
+        _full_list_sample "$@"
+    done
+    sample_emit "$1" "$2"
 }
 
 # --- the six flows, movie + episode -----------------------------------------

@@ -162,9 +162,11 @@ def get(metric, flow, item):
 ok = True
 for it in ('movie', 'episode'):
     err = get('errors_total', 'materialise', it)
+    runs = get('runs_total', 'materialise', it)
     dur = get('seconds', 'materialise', it)
-    if err != '1':
-        print(f"materialise/{it} errors_total expected 1, got {err!r}", file=sys.stderr); ok = False
+    # every sample of a forced failure errors: errors_total == runs_total (>=1)
+    if err is None or err != runs or int(err) < 1:
+        print(f"materialise/{it} errors_total expected == runs_total ({runs!r}), got {err!r}", file=sys.stderr); ok = False
     if dur is None:
         print(f"materialise/{it} still must emit a duration record on failure", file=sys.stderr); ok = False
     else:
@@ -177,7 +179,7 @@ if get('errors_total', 'list_load', 'movie') != '0':
 sys.exit(0 if ok else 1)
 PY
 then
-    ok "materialise failure sets errors_total=1 for movie+episode while still emitting a duration"
+    ok "materialise failure sets errors_total=runs_total for movie+episode while still emitting a duration"
 else
     bad "materialise-failure error marker not recorded correctly"
 fi
@@ -211,6 +213,52 @@ elif printf '%s\n' "$INFO_LINES" | grep -qE 'constructed_url=[^ ]*[?&]userId=[^&
 else
     bad "info_open request URL missing a non-empty userId query parameter: $INFO_LINES"
 fi
+
+head_ "G. N-sample median aggregation (ttfb-loadtime-median-of-n-samples)"
+# Controlled timing fixture: every flow's sample i takes the i-th fixture
+# duration / error marker. Read one record back for a given (flow,item).
+rec() { # rec <expo> <metric> <flow> <item>
+    printf '%s\n' "$1" | python3 -c '
+import sys
+m, f, i = sys.argv[1:4]
+for ln in sys.stdin:
+    if ln.startswith("phantom_loadtime_%s{" % m) and ("flow=\"%s\"" % f) in ln and ("item_type=\"%s\"" % i) in ln:
+        print(ln.split()[-1]); break
+' "$2" "$3" "$4"
+}
+run_eng() { env PHANTOM_CI_DRYRUN=1 PHANTOM_LOADTIME_COLOR=rigtest "$@" bash "$ENGINE" 2>/dev/null; }
+# G1: N=3 distinct durations -> median, runs=3, no errors; every flow, movie+episode.
+G1="$(run_eng PHANTOM_LOADTIME_SAMPLES=3 PHANTOM_LOADTIME_SAMPLE_FIXTURE=0.900000,0.100000,0.300000)" || G1=""
+g1ok=1
+for it in movie episode; do for f in "${FLOWS[@]}"; do
+    [ "$(rec "$G1" seconds "$f" "$it")" = 0.300000 ] || { g1ok=0; printf '      %s/%s seconds=%s (want 0.300000)\n' "$f" "$it" "$(rec "$G1" seconds "$f" "$it")"; }
+    [ "$(rec "$G1" runs_total "$f" "$it")" = 3 ] || { g1ok=0; printf '      %s/%s runs=%s (want 3)\n' "$f" "$it" "$(rec "$G1" runs_total "$f" "$it")"; }
+    [ "$(rec "$G1" errors_total "$f" "$it")" = 0 ] || { g1ok=0; printf '      %s/%s errors=%s (want 0)\n' "$f" "$it" "$(rec "$G1" errors_total "$f" "$it")"; }
+done; done
+if [ "$g1ok" = 1 ]; then ok "N=3 samples {0.9,0.1,0.3} emit median 0.300000 with runs_total=3 for all flows"; else bad "N=3 median/runs aggregation wrong"; fi
+# G2: --samples flag overrides env.
+G2="$(PHANTOM_CI_DRYRUN=1 PHANTOM_LOADTIME_COLOR=rigtest PHANTOM_LOADTIME_SAMPLES=1 \
+      PHANTOM_LOADTIME_SAMPLE_FIXTURE=0.500000,0.200000,0.400000,0.100000,0.300000 \
+      bash "$ENGINE" --samples 5 2>/dev/null)" || G2=""
+if [ "$(rec "$G2" seconds info_open episode)" = 0.300000 ] && [ "$(rec "$G2" runs_total info_open episode)" = 5 ]; then
+    ok "--samples 5 flag yields median 0.300000 and runs_total=5"
+else bad "--samples flag not honoured (seconds=$(rec "$G2" seconds info_open episode) runs=$(rec "$G2" runs_total info_open episode))"; fi
+# G3: N=1 preserves the pre-change single-sample output exactly.
+G3="$(run_eng PHANTOM_LOADTIME_SAMPLES=1)" || G3=""
+if [ "$(rec "$G3" seconds materialise movie)" = 4.500000 ] && [ "$(rec "$G3" runs_total materialise movie)" = 1 ] \
+   && [ "$(rec "$G3" seconds get_sources episode)" = 0.350000 ] && [ "$(rec "$G3" errors_total get_sources episode)" = 0 ]; then
+    ok "N=1 preserves the single-sample output (fixture durations, runs_total=1)"
+else bad "N=1 output changed (materialise/movie=$(rec "$G3" seconds materialise movie) runs=$(rec "$G3" runs_total materialise movie))"; fi
+# G4: an erroring sample is counted (summed), duration still the median.
+G4="$(run_eng PHANTOM_LOADTIME_SAMPLES=3 PHANTOM_LOADTIME_SAMPLE_FIXTURE=0.200000,0.600000,0.400000 PHANTOM_LOADTIME_SAMPLE_ERRORS=0,1,0)" || G4=""
+if [ "$(rec "$G4" errors_total list_load movie)" = 1 ] && [ "$(rec "$G4" seconds list_load movie)" = 0.400000 ] \
+   && [ "$(rec "$G4" runs_total list_load movie)" = 3 ]; then
+    ok "an erroring sample is counted: errors_total=1 of runs_total=3, median 0.400000"
+else bad "erroring sample not counted (errors=$(rec "$G4" errors_total list_load movie) seconds=$(rec "$G4" seconds list_load movie))"; fi
+# G5: default sample count is 3; invalid count is refused.
+G5="$(run_eng)" || G5=""
+if [ "$(rec "$G5" runs_total sort_change episode)" = 3 ]; then ok "default sample count is 3"; else bad "default sample count is not 3 (runs=$(rec "$G5" runs_total sort_change episode))"; fi
+if run_eng PHANTOM_LOADTIME_SAMPLES=0 >/dev/null; then bad "engine accepted sample count 0"; else ok "engine refuses a non-positive sample count"; fi
 
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"
 [ "$fail_count" -eq 0 ]
