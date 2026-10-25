@@ -71,3 +71,5 @@ jobs:
           PHANTOM_INCLUSTER_NAMESPACE: ${{ vars.PHANTOM_INCLUSTER_NAMESPACE }}
           PHANTOM_INCLUSTER_ADMIN_TOKEN: ${{ secrets.PHANTOM_INCLUSTER_ADMIN_TOKEN }}
           PHANTOM_PUSHGATEWAY_URL: ${{ vars.PHANTOM_PUSHGATEWAY_URL }}
+          # Infrastructure must mount the shared persistent registry into this job container.
+          PHANTOM_LOADTIME_THRESHOLDS_PATH: ${{ vars.PHANTOM_LOADTIME_THRESHOLDS_PATH }}

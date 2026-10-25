@@ -1,4 +1,9 @@
 {{- if .Values.loadtimeDaily.enabled }}
+{{- $thresholdsClaim := required "loadtimeDaily.thresholds.existingClaim is required when loadtimeDaily.enabled=true" .Values.loadtimeDaily.thresholds.existingClaim }}
+{{- $thresholdsMountPath := clean (required "loadtimeDaily.thresholds.mountPath is required" .Values.loadtimeDaily.thresholds.mountPath) }}
+{{- if or (not (hasPrefix "/" $thresholdsMountPath)) (eq $thresholdsMountPath "/") (eq $thresholdsMountPath "/src") (hasPrefix "/src/" $thresholdsMountPath) }}
+{{- fail "loadtimeDaily.thresholds.mountPath must be an absolute directory outside /src (not /)" }}
+{{- end }}
 {{/*
 In-cluster daily load-time measurement rig (task ttfb-daily-rig-incluster-cronjob).
 
@@ -87,6 +92,8 @@ spec:
                   git config --global --add safe.directory /src || true
                   exec ./tools/ci/loadtime-daily-run.sh
               env:
+                - name: PHANTOM_LOADTIME_THRESHOLDS_PATH
+                  value: {{ printf "%s/loadtime-thresholds.json" $thresholdsMountPath | quote }}
                 # Live target config comes from the ConfigMap; the admin token from the Secret.
                 # Real hostnames/URLs live ONLY in those objects, never in this tracked chart.
                 - name: PHANTOM_INCLUSTER_DEV_HOST
@@ -116,9 +123,14 @@ spec:
               volumeMounts:
                 - name: src
                   mountPath: /src
+                - name: thresholds-state
+                  mountPath: {{ $thresholdsMountPath | quote }}
           volumes:
             - name: src
               emptyDir: {}
+            - name: thresholds-state
+              persistentVolumeClaim:
+                claimName: {{ $thresholdsClaim | quote }}
 ---
 # ServiceAccount + minimal RBAC: the script's ONLY in-cluster read is `kubectl get ingress
 # phantom-library-{blue,green}` to resolve which color is the dev host LIVE from the Ingress

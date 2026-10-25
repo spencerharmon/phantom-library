@@ -409,6 +409,13 @@ loadtimeDaily:
   # Secret carrying the Jellyfin admin ApiKey/AccessToken for the live measurement.
   adminTokenSecretName: phantom-loadtime-daily-token
   adminTokenSecretKey: admin-token
+  thresholds:
+    # Required when enabled. Provision the persistent claim and writable directory OUT OF BAND;
+    # the chart only mounts it. All daily writers must share this registry and serialize updates.
+    existingClaim: ""
+    # Absolute directory outside /src (and not /). The source checkout stays disposable.
+    # PHANTOM_LOADTIME_THRESHOLDS_PATH is <mountPath>/loadtime-thresholds.json.
+    mountPath: /var/lib/phantom-loadtime
   resources:
     requests: { cpu: "100m", memory: 128Mi }
     limits: { cpu: "1", memory: 512Mi }

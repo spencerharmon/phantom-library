@@ -50,6 +50,9 @@
 #                                    (passed straight through to
 #                                    scripts/phantom-loadtime-push.sh; never
 #                                    baked here — infra-identifier rule).
+#   PHANTOM_LOADTIME_THRESHOLDS_PATH Absolute durable JSON path outside the
+#                                    checkout; required live. Parent must exist.
+#                                    Dry runs read it without writing anything.
 #   PHANTOM_CI_DRYRUN=1              toolchain-agnostic dry run: no cluster/
 #                                    network access; a deterministic
 #                                    synthetic measurement is pushed/guarded
@@ -264,7 +267,8 @@ set +e
 if [ "${PHANTOM_CI_FORCE_GUARD_FAIL:-0}" = 1 ]; then
     guard_rc=2
 else
-    bash "$REPO_ROOT/tools/perf/loadtime-guard.sh" "${guard_args[@]}"
+    python3 "$REPO_ROOT/tools/ci/loadtime-daily-state.py" "$REPO_ROOT" "$DRYRUN" \
+        "${PHANTOM_LOADTIME_THRESHOLDS_PATH:-}" "${guard_args[@]}"
     guard_rc=$?
 fi
 set -e

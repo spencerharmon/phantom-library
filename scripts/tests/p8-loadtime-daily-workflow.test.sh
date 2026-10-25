@@ -28,7 +28,7 @@
 #     mutates the real thresholds registry from a synthetic fixture.
 #
 # This test does NOT need kubectl, cluster access, or a running rig — it
-# only needs bash + python3 (for YAML parsing).
+# needs bash, python3 + PyYAML, dotnet, and Helm. Missing tools are failures.
 # Exit 0 = all assertions passed; non-zero on the first failure.
 # ---------------------------------------------------------------------------
 
@@ -52,15 +52,20 @@ head_() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 fatal() { printf '\033[31mFATAL: %s\033[0m\n' "$*" >&2; exit 2; }
 
 assert_stage_payloads() {
-    python3 - "$1" "$2" <<'PY'
+    python3 - "$1" "$2" "${3:-dry}" <<'PY'
 import re
 import sys
 
 with open(sys.argv[1]) as f:
     output = f.read()
-payloads = re.findall(
-    r'^    \[stage-metric dry-run\] PUT \S+/metrics/job/phantom-loadtime-daily-run\n'
-    r'((?:    phantom_loadtime_daily_.*\n)+)', output, re.MULTILINE)
+if sys.argv[3] == 'live':
+    payloads = re.findall(
+        r'^PUT \S+/metrics/job/phantom-loadtime-daily-run\n'
+        r'((?:phantom_loadtime_daily_.*\n)+)--', output, re.MULTILINE)
+else:
+    payloads = re.findall(
+        r'^    \[stage-metric dry-run\] PUT \S+/metrics/job/phantom-loadtime-daily-run\n'
+        r'((?:    phantom_loadtime_daily_.*\n)+)', output, re.MULTILINE)
 assert len(payloads) == 3, f"expected three stage PUTs, got {len(payloads)}"
 run_start = None
 for index in (2, 1, 0):
@@ -97,14 +102,16 @@ PY
 [[ -f "$GUARD_SCRIPT" ]]  || fatal "regression guard not found: $GUARD_SCRIPT"
 [[ -f "$THRESHOLDS" ]]    || fatal "thresholds registry not found: $THRESHOLDS"
 
+head_ "required integration dependencies (no silent skips)"
+for tool in python3 dotnet helm; do
+    command -v "$tool" >/dev/null 2>&1 || fatal "$tool is required for daily workflow integration coverage"
+done
+python3 -c 'import yaml' || fatal "PyYAML is required; structural grep is not YAML validation"
+
 head_ "YAML parse"
-if command -v python3 >/dev/null 2>&1; then
-    if python3 - "$WORKFLOW" <<'PY'
+if python3 - "$WORKFLOW" <<'PY'
 import sys
-try:
-    import yaml
-except ImportError:
-    sys.exit(3)
+import yaml
 with open(sys.argv[1]) as f:
     try:
         yaml.safe_load(f)
@@ -113,23 +120,10 @@ with open(sys.argv[1]) as f:
         sys.exit(1)
 sys.exit(0)
 PY
-    then
-        ok "$WORKFLOW parses as valid YAML (PyYAML)"
-    else
-        rc=$?
-        if [ "$rc" -eq 3 ]; then
-            printf '  NOTE: PyYAML unavailable; falling back to a structural grep check.\n'
-            if grep -qP '^\S.*:\s*$|^\S.*:\s*\S' "$WORKFLOW" && ! grep -qP '\t' "$WORKFLOW"; then
-                ok "$WORKFLOW passes structural YAML sanity check (no PyYAML)"
-            else
-                bad "$WORKFLOW failed structural YAML sanity check"
-            fi
-        else
-            bad "$WORKFLOW is not valid YAML"
-        fi
-    fi
+then
+    ok "$WORKFLOW parses as valid YAML (PyYAML)"
 else
-    fatal "python3 not available; cannot YAML-lint the workflow"
+    bad "$WORKFLOW is not valid YAML"
 fi
 
 head_ "fires on a DAILY schedule (cron), not just workflow_dispatch"
@@ -376,13 +370,17 @@ rm -f "/tmp/p8-loadtime-daily-guard.$$.log"
 # record what was resolved/pushed/filed. Required — never silently skipped.
 # ---------------------------------------------------------------------------
 head_ "same-batch: daily wrapper guards the exact batch it pushed (real guard + converter + ratchet)"
-command -v dotnet >/dev/null 2>&1 || fatal "dotnet is required for the same-batch integration coverage (no silent skip)"
 SB="$(mktemp -d -t p8-same-batch.XXXXXX)"
-trap 'rm -rf "$SB"' EXIT
+trap 'chmod -R u+rwX "$SB"; rm -rf "$SB"' EXIT
 sb_root="$SB/root"; sb_bin="$SB/bin"
 mkdir -p "$sb_root/tools/ci" "$sb_root/tools/perf" "$sb_root/tools/rig-scenarios" "$sb_root/scripts" "$sb_bin"
 ln -s "$DAILY_SCRIPT" "$sb_root/tools/ci/loadtime-daily-run.sh"
 ln -s "$REPO_ROOT/tools/ci/lib-cleanup.sh" "$sb_root/tools/ci/lib-cleanup.sh"
+if [ -f "$REPO_ROOT/tools/ci/loadtime-daily-state.py" ]; then
+    cp "$REPO_ROOT/tools/ci/loadtime-daily-state.py" "$sb_root/tools/ci/"
+else
+    bad "durable state helper tools/ci/loadtime-daily-state.py is missing"
+fi
 ln -s "$GUARD_SCRIPT" "$sb_root/tools/perf/loadtime-guard.sh"
 ln -s "$REPO_ROOT/tools/perf/loadtime-expo-to-measurements.py" "$sb_root/tools/perf/loadtime-expo-to-measurements.py"
 # Real ratchet sources, copied (not symlinked) so its bin/obj build in scratch
@@ -390,7 +388,9 @@ ln -s "$REPO_ROOT/tools/perf/loadtime-expo-to-measurements.py" "$sb_root/tools/p
 mkdir -p "$sb_root/tools/perf/ratchet-guard"
 cp "$REPO_ROOT"/tools/perf/ratchet-guard/*.cs "$REPO_ROOT"/tools/perf/ratchet-guard/*.csproj "$sb_root/tools/perf/ratchet-guard/"
 ln -s "$PUSH_SCRIPT" "$sb_root/scripts/phantom-loadtime-push.sh"
-SB_THR="$sb_root/tools/perf/loadtime-thresholds.json"
+SB_SEED="$sb_root/tools/perf/loadtime-thresholds.json"
+mkdir -p "$SB/state"
+SB_THR="$SB/state/loadtime-thresholds.json"
 # Counting engine fixture: SB_CASE=<backend>:<A-breach|A-pass>. The named
 # backend's list_load is 2.0s (breach of 1000ms) in one batch and 0.5s
 # (improvement -> ratchet to 525ms) in the other; the other backend is a
@@ -401,10 +401,11 @@ set -euo pipefail
 n=$(( $(cat "$SB_COUNT" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$SB_COUNT"
 backend="${SB_CASE%%:*}"; mode="${SB_CASE#*:}"
 if [ "$n" = 1 ]; then batch=A; else batch=B; fi
-if [ "$mode" = A-breach ]; then [ "$batch" = A ] && v=2.0 || v=0.5
+if [ "$mode" = durable ]; then [ "$batch" = A ] && v="$SB_VALUE" || v=9.0
+elif [ "$mode" = A-breach ]; then [ "$batch" = A ] && v=2.0 || v=0.5
 else [ "$batch" = A ] && v=0.5 || v=2.0; fi
 for b in movie episode; do
-  val=0.95; [ "$b" = "$backend" ] && val=$v
+  val=0.95; [ "$mode" = durable ] && val=1.0; [ "$b" = "$backend" ] && val=$v
   printf 'phantom_loadtime_seconds{flow="list_load",item_type="%s",color="%s"} %s\n' "$b" "${PHANTOM_LOADTIME_COLOR:-green}" "$val"
 done
 ENG
@@ -421,11 +422,16 @@ C
 cat > "$sb_bin/beehive" <<'B'
 #!/usr/bin/env bash
 echo "$*" >> "$SB_BEEHIVE_LOG"
+if [ "$1 $2" = 'task add' ]; then
+  for ((i=1;i<=$#;i++)); do
+    if [ "${!i}" = --body-file ]; then j=$((i+1)); cat "${!j}" >> "$SB_BEEHIVE_LOG.body"; fi
+  done
+fi
 B
 chmod +x "$sb_root/tools/rig-scenarios/47-loadtime-flows.sh" "$sb_bin"/*
 
 sb_reset() {
-    cat > "$SB_THR" <<'T'
+    cat > "$SB_SEED" <<'T'
 {
   "improvement_margin_ratio": 0.1,
   "ratchet_headroom_ratio": 0.05,
@@ -435,12 +441,15 @@ sb_reset() {
   ]
 }
 T
-    rm -f "$SB/count" "$SB/curl.log" "$SB/beehive.log"; : > "$SB/curl.log"; : > "$SB/beehive.log"
+    cp "$SB_SEED" "$SB_THR"
+    rm -f "$SB/count" "$SB/curl.log" "$SB/beehive.log" "$SB/beehive.log.body"; : > "$SB/curl.log"; : > "$SB/beehive.log"
 }
 sb_thr() { python3 -c 'import json,sys; print([s["threshold_ms"] for s in json.load(open(sys.argv[1]))["scenarios"] if s["backend"]==sys.argv[2]][0])' "$SB_THR" "$1"; }
 sb_run() { # sb_run <case> <dryrun 0|1> -> sets sb_rc, log in $SB/out.log
     sb_rc=0
     env PATH="$sb_bin:$PATH" PHANTOM_REPO_ROOT="$sb_root" PHANTOM_CI_DRYRUN="$2" PHANTOM_CI_PKILL=0 \
+        PHANTOM_LOADTIME_THRESHOLDS_PATH="$SB_THR" \
+        SB_VALUE="${SB_VALUE:-1.0}" \
         SB_CASE="$1" SB_COUNT="$SB/count" SB_CURL_LOG="$SB/curl.log" SB_BEEHIVE_LOG="$SB/beehive.log" \
         SB_DEV_HOST=dev.example.com PHANTOM_INCLUSTER_DEV_HOST=dev.example.com \
         PHANTOM_INCLUSTER_PROD_HOST=example.com PHANTOM_INCLUSTER_ADMIN_TOKEN=tok \
@@ -471,6 +480,7 @@ for backend in movie episode; do
     sb_check "[$c live] Pushgateway received batch A ($backend=$a_val)" \
         grep -q "phantom_loadtime_seconds{flow=\"list_load\",item_type=\"$backend\",color=\"green\"} $a_val\$" "$SB/curl.log"
     sb_check "[$c live] stage=guard outcome is A-based ($want_guard)" test "$(sb_guard_stage "$SB/curl.log")" = "$want_guard"
+    sb_check "[$c live] all three PUTs retain cumulative stages" assert_stage_payloads "$SB/curl.log" "$want_guard" live
     sb_check "[$c live] $backend threshold written from A (${want_thr}ms)" test "$(sb_thr "$backend")" = "$want_thr"
     other=episode; [ "$backend" = episode ] && other=movie
     sb_check "[$c live] $other threshold unchanged (1000ms)" test "$(sb_thr "$other")" = 1000
@@ -513,6 +523,250 @@ sb_check "no engine invocation across all --exposition runs" test ! -e "$SB/coun
 sb_reset; sb_guard --no-file
 sb_check "standalone guard (no --exposition) still measures: engine once, A-breach -> exit 3" \
     test "$sb_rc" = 3 -a "$(cat "$SB/count" 2>/dev/null)" = 1
+
+# Each scheduled run starts with a new source tree, build outputs, fixture
+# counter and transport logs. Only the configured PVC JSON survives runs.
+head_ "durable thresholds: rendered claim mount drives three fresh daily checkouts"
+TEST_TMP="$SB"
+trap 'chmod -R u+rwX "$TEST_TMP"; rm -rf "$TEST_TMP"' EXIT
+fixture_engine="$sb_root/tools/rig-scenarios/47-loadtime-flows.sh"
+fixture_bin="$sb_bin"
+durable_mount="$TEST_TMP/thresholds-pvc"
+mkdir -p "$durable_mount"
+durable_path="$durable_mount/loadtime-thresholds.json"
+chart="$REPO_ROOT/deploy/helm/phantom-library"
+if helm template durable "$chart" --set loadtimeDaily.enabled=true \
+    --set-string loadtimeDaily.thresholds.existingClaim=daily-thresholds-test \
+    --set-string "loadtimeDaily.thresholds.mountPath=$durable_mount" > "$TEST_TMP/chart.yaml"; then
+    if python3 - "$TEST_TMP/chart.yaml" "$durable_mount" "$durable_path" "$chart/values.yaml" <<'PY'
+import sys, yaml
+assert yaml.safe_load(open(sys.argv[4]))['loadtimeDaily']['thresholds']['mountPath'] == '/var/lib/phantom-loadtime'
+docs = list(yaml.safe_load_all(open(sys.argv[1])))
+jobs = [d for d in docs if d and d.get('kind') == 'CronJob'
+        and d['metadata']['name'].endswith('-loadtime-daily')]
+assert len(jobs) == 1, 'expected one daily CronJob'
+pod = jobs[0]['spec']['jobTemplate']['spec']['template']['spec']
+container = next(c for c in pod['containers'] if c['name'] == 'loadtime-daily')
+env = [e for e in container['env'] if e['name'] == 'PHANTOM_LOADTIME_THRESHOLDS_PATH']
+assert env == [{'name': 'PHANTOM_LOADTIME_THRESHOLDS_PATH', 'value': sys.argv[3]}], env
+mounts = [m for m in container['volumeMounts'] if m['name'] == 'thresholds-state']
+assert len(mounts) == 1 and mounts[0]['mountPath'] == sys.argv[2], mounts
+assert not mounts[0].get('readOnly', False) and 'subPath' not in mounts[0], mounts
+volumes = [v for v in pod['volumes'] if v['name'] == 'thresholds-state']
+assert volumes == [{'name': 'thresholds-state', 'persistentVolumeClaim':
+                    {'claimName': 'daily-thresholds-test'}}], volumes
+assert all(m['name'] != 'thresholds-state' for c in pod.get('initContainers', [])
+           for m in c.get('volumeMounts', [])), 'checkout must not touch durable state'
+PY
+    then ok "rendered PVC, writable mount and env use the exact integration state path"
+    else bad "rendered daily CronJob does not wire the configured durable state path"; fi
+else
+    bad "Helm rendering failed for durable thresholds integration"
+fi
+
+durable_checkout() {
+    SB="$TEST_TMP/durable/$1"
+    sb_root="$SB/root"; sb_bin="$SB/bin"
+    mkdir -p "$sb_root/tools/ci" "$sb_root/tools/perf/ratchet-guard" \
+        "$sb_root/tools/rig-scenarios" "$sb_root/scripts" "$sb_bin" "$SB/tmp"
+    cp "$DAILY_SCRIPT" "$REPO_ROOT/tools/ci/lib-cleanup.sh" "$sb_root/tools/ci/"
+    if [ -f "$REPO_ROOT/tools/ci/loadtime-daily-state.py" ]; then
+        cp "$REPO_ROOT/tools/ci/loadtime-daily-state.py" "$sb_root/tools/ci/"
+    fi
+    cp "$GUARD_SCRIPT" "$REPO_ROOT/tools/perf/loadtime-expo-to-measurements.py" "$THRESHOLDS" "$sb_root/tools/perf/"
+    cp "$REPO_ROOT"/tools/perf/ratchet-guard/*.cs "$REPO_ROOT"/tools/perf/ratchet-guard/*.csproj "$sb_root/tools/perf/ratchet-guard/"
+    cp "$PUSH_SCRIPT" "$sb_root/scripts/"
+    cp "$fixture_engine" "$sb_root/tools/rig-scenarios/47-loadtime-flows.sh"
+    cp "$fixture_bin"/* "$sb_bin/"
+    : > "$SB/curl.log"; : > "$SB/beehive.log"
+    SB_THR="$durable_path"
+    # Keep all per-invocation temp files separate, not just the checkout.
+    export TMPDIR="$SB/tmp"
+}
+
+durable_registry() {
+    python3 - "$SB_THR" "$THRESHOLDS" "$1" "$2" <<'PY'
+import json, sys
+state = json.load(open(sys.argv[1]))
+seed = json.load(open(sys.argv[2]))
+expected = seed
+assert len(expected['scenarios']) == 12, 'shipped registry must cover six flows x movie/episode'
+for scenario in expected['scenarios']:
+    if scenario['flow'] == 'list_load':
+        scenario['threshold_ms'] = float(sys.argv[3]) if scenario['backend'] == sys.argv[4] else 1050
+def canonical(value):
+    scenarios = [{k: v for k, v in s.items() if v is not None} for s in value['scenarios']]
+    return {**value, 'scenarios': sorted(scenarios, key=lambda s: (s['flow'], s['backend'], s['quantile']))}
+assert canonical(state) == canonical(expected), (state, expected)
+PY
+}
+
+durable_batch() {
+    python3 - "$SB/curl.log" "$1" "$2" <<'PY'
+import re, sys
+output = open(sys.argv[1]).read()
+payloads = re.findall(r'^PUT \S+/metrics/job/phantom-loadtime\n(.*?)^--$', output, re.M | re.S)
+assert len(payloads) == 1, f'expected exactly one measurement PUT, got {len(payloads)}'
+records = re.findall(r'^phantom_loadtime_seconds\{flow="list_load",item_type="(movie|episode)",color="green"\} ([0-9.]+)$', payloads[0], re.M)
+expected = {'movie': 1.0, 'episode': 1.0}
+expected[sys.argv[2]] = float(sys.argv[3])
+assert len(records) == 2 and {k: float(v) for k, v in records} == expected, records
+PY
+}
+
+durable_filing() {
+    python3 - "$SB/beehive.log" "$1" <<'PY'
+import pathlib, shlex, sys
+lines = [shlex.split(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+backend = sys.argv[2]
+if backend == 'none':
+    assert not lines, lines
+else:
+    task = f'p8-daily-perf-regression-list-load-{backend}-single'
+    assert len(lines) == 2, lines
+    assert lines[0][:4] == ['task', 'add', 'phantom-library', task], lines
+    assert lines[1] == ['task', 'block', 'phantom-library', 'p8-daily-regression-guard', '--on', task], lines
+    body = pathlib.Path(sys.argv[1] + '.body').read_text()
+    assert '800' in body and '525' in body and backend in body, body
+PY
+}
+
+for backend in movie episode; do
+    rm -f "$durable_path"
+    for run in 1 2 3; do
+        durable_checkout "$backend/$run"
+        case "$run" in
+            1) SB_VALUE=1.0; want_thr=1050; want_guard=0 ;;
+            2) SB_VALUE=0.5; want_thr=525; want_guard=0
+               # An open reader of the old inode must never observe a partial
+               # rewrite; a hard link preserves that inode for a deterministic check.
+               if [ -f "$SB_THR" ]; then
+                   cp "$SB_THR" "$SB/before.json"
+                   ln "$SB_THR" "$SB/old-inode.json"
+               fi ;;
+            3) SB_VALUE=0.8; want_thr=525; want_guard=3
+               if [ -f "$SB_THR" ]; then cp "$SB_THR" "$SB/before.json"; fi ;;
+        esac
+        sb_run "$backend:durable" 0
+        label="[$backend fresh checkout $run, ${SB_VALUE}s]"
+        sb_check "$label wrapper exits 0" test "$sb_rc" = 0
+        sb_check "$label measures once, never remeasures for guard" test "$(cat "$SB/count" 2>/dev/null)" = 1
+        sb_check "$label publishes exactly the guarded batch" durable_batch "$backend" "$SB_VALUE"
+        sb_check "$label cumulative stage PUTs end with guard=$want_guard" assert_stage_payloads "$SB/curl.log" "$want_guard" live
+        sb_check "$label durable 12-scenario registry preserves independent ceilings and metadata" durable_registry "$want_thr" "$backend"
+        sb_check "$label shipped seed remains byte-identical" cmp -s "$THRESHOLDS" "$sb_root/tools/perf/loadtime-thresholds.json"
+        if [ "$run" = 2 ]; then
+            sb_check "$label atomic replacement leaves the old inode byte-identical" cmp -s "$SB/before.json" "$SB/old-inode.json"
+        fi
+        if [ "$run" = 3 ]; then
+            sb_check "$label breach never loosens/replaces durable JSON" cmp -s "$SB/before.json" "$SB_THR"
+            sb_check "$label files and blocks only the breached backend with observed/ceiling evidence" durable_filing "$backend"
+        else
+            sb_check "$label initialization/improvement files nothing" durable_filing none
+        fi
+    done
+    durable_checkout "$backend/dry-existing"
+    SB_VALUE=0.8
+    if [ -f "$SB_THR" ]; then cp "$SB_THR" "$SB/before.json"; fi
+    chmod 444 "$SB_THR"
+    chmod 555 "$durable_mount"
+    sb_run "$backend:durable" 1
+    chmod 755 "$durable_mount"
+    chmod 644 "$SB_THR"
+    sb_check "[$backend dry existing] reads read-only durable 525ms ceiling, reports breach without failing wrapper" test "$sb_rc" = 0 -a "$(sb_guard_stage "$SB/out.log")" = 3
+    sb_check "[$backend dry existing] state byte-identical" cmp -s "$SB/before.json" "$SB_THR"
+    sb_check "[$backend dry existing] cumulative simulated stages retain breach" assert_stage_payloads "$SB/out.log" 3
+    sb_check "[$backend dry existing] no publication or filing" test ! -s "$SB/curl.log" -a ! -s "$SB/beehive.log"
+    durable_checkout "$backend/dry-improvement"
+    SB_VALUE=0.25
+    if [ -f "$SB_THR" ]; then cp "$SB_THR" "$SB/before.json"; fi
+    sb_run "$backend:durable" 1
+    sb_check "[$backend dry improvement] successful detect-only guard" test "$sb_rc" = 0 -a "$(sb_guard_stage "$SB/out.log")" = 0
+    sb_check "[$backend dry improvement] never persists tighter synthetic ceilings" cmp -s "$SB/before.json" "$SB_THR"
+    sb_check "[$backend dry improvement] no publication or filing" test ! -s "$SB/curl.log" -a ! -s "$SB/beehive.log"
+done
+
+durable_checkout dry-absent
+rm -f "$durable_path" "$durable_path.lock"
+SB_VALUE=0.5; sb_run movie:durable 1
+sb_check "[dry absent] uses seed without creating durable JSON" test "$sb_rc" = 0 -a ! -e "$SB_THR"
+sb_check "[dry absent] creates no lock sidecar" test ! -e "$SB_THR.lock"
+sb_check "[dry absent] no publication or filing" test ! -s "$SB/curl.log" -a ! -s "$SB/beehive.log"
+sb_check "[dry absent] seed unchanged" cmp -s "$THRESHOLDS" "$sb_root/tools/perf/loadtime-thresholds.json"
+
+durable_checkout dry-corrupt
+printf '{broken json\n' > "$SB_THR"
+cp "$SB_THR" "$SB/before.json"
+SB_VALUE=0.5; sb_run movie:durable 1
+sb_check "[dry corrupt] wrapper fails with guard=2" test "$sb_rc" != 0 -a "$(sb_guard_stage "$SB/out.log")" = 2
+sb_check "[dry corrupt] existing bytes unchanged" cmp -s "$SB/before.json" "$SB_THR"
+sb_check "[dry corrupt] no publication or filing" test ! -s "$SB/curl.log" -a ! -s "$SB/beehive.log"
+
+durable_checkout busy-lock
+command -v flock >/dev/null 2>&1 || fatal "flock is required for busy daily state lock coverage"
+cp "$THRESHOLDS" "$SB_THR"
+cp "$SB_THR" "$SB/before.json"
+# The harness owns the lock; closing its descriptor in the wrapper prevents
+# inheritance. Shell exit also releases it if this fixture fails early.
+exec 9> "$SB_THR.lock"
+flock -n 9 || fatal "could not acquire fixture threshold lock"
+SB_VALUE=0.5; sb_run movie:durable 0 9>&-
+flock -u 9
+exec 9>&-
+sb_check "[busy lock] wrapper fails with published guard=2" test "$sb_rc" != 0 -a "$(sb_guard_stage "$SB/curl.log")" = 2
+sb_check "[busy lock] cumulative stage outcomes retain lock failure" assert_stage_payloads "$SB/curl.log" 2 live
+sb_check "[busy lock] existing bytes unchanged" cmp -s "$SB/before.json" "$SB_THR"
+sb_check "[busy lock] no regression filing" test ! -s "$SB/beehive.log"
+
+head_ "durable state errors: visible guard=2, wrapper failure, no false breach filing"
+for invalid in corrupt missing-scenarios missing-entry missing-threshold duplicate negative unwritable-file unwritable-parent absent-parent relative in-checkout unset; do
+    durable_checkout "invalid-$invalid"
+    mkdir -p "$SB/state"
+    SB_THR="$SB/state/thresholds.json"
+    cp "$THRESHOLDS" "$SB_THR"
+    case "$invalid" in
+        corrupt) printf '{broken json\n' > "$SB_THR" ;;
+        missing-scenarios|missing-entry|missing-threshold|duplicate|negative)
+            python3 - "$SB_THR" "$invalid" <<'PY'
+import json, sys
+path, case = sys.argv[1:]
+state = json.load(open(path))
+if case == 'missing-scenarios': del state['scenarios']
+elif case == 'missing-entry': state['scenarios'].pop()
+elif case == 'missing-threshold': del state['scenarios'][0]['threshold_ms']
+elif case == 'duplicate': state['scenarios'].append(state['scenarios'][0].copy())
+elif case == 'negative': state['scenarios'][0]['threshold_ms'] = -1
+with open(path, 'w') as f: json.dump(state, f)
+PY
+            ;;
+        unwritable-file) chmod 444 "$SB_THR" ;;
+        unwritable-parent) chmod 555 "$SB/state" ;;
+        absent-parent) SB_THR="$SB/nonexistent/thresholds.json" ;;
+        relative) SB_THR=relative-thresholds.json ;;
+        in-checkout) SB_THR="$sb_root/tools/perf/loadtime-thresholds.json" ;;
+        unset) SB_THR="" ;;
+    esac
+    if [ -f "$SB_THR" ]; then cp "$SB_THR" "$SB/before.json"; fi
+    SB_VALUE=0.5; sb_run movie:durable 0
+    sb_check "[$invalid] wrapper fails visibly" test "$sb_rc" != 0
+    sb_check "[$invalid] guard outcome 2 published before failure" test "$(sb_guard_stage "$SB/curl.log")" = 2
+    sb_check "[$invalid] diagnostic identifies threshold/state failure" python3 - "$SB/out.log" <<'PY'
+import re, sys
+lines = open(sys.argv[1]).read().splitlines()
+assert any(re.search(r'(threshold|state)', line, re.I) and
+           re.search(r'(^|[\s:])(error|invalid|fail|cannot|required|refusing|not writable|must)([\s:]|$)', line, re.I)
+           for line in lines), 'missing actionable threshold/state error'
+PY
+    sb_check "[$invalid] tool failure never files regression tasks" test ! -s "$SB/beehive.log"
+    if [ -f "$SB/before.json" ]; then
+        sb_check "[$invalid] rejected state is not reset to seed" cmp -s "$SB/before.json" "$SB_THR"
+    else
+        rejected_path="$SB_THR"
+        [ "$invalid" = relative ] && rejected_path="$sb_root/$SB_THR"
+        sb_check "[$invalid] invalid path creates no state" test ! -e "$rejected_path"
+    fi
+    chmod u+rwx "$SB/state"
+done
 
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"
 [ "$fail_count" -eq 0 ]

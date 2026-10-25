@@ -94,6 +94,72 @@ rate(phantom_availability_probes_total[10m])
 histogram_quantile(0.95, rate(phantom_availability_probe_seconds_bucket[10m]))
 ```
 
+## Daily load-time threshold state
+
+The daily CronJob and Gitea Actions trigger use `tools/ci/loadtime-daily-run.sh`.
+Live runs require an explicit `PHANTOM_LOADTIME_THRESHOLDS_PATH` pointing at a
+durable threshold registry, not the checkout's `tools/perf/loadtime-thresholds.json`.
+The tracked file is a seed, not the daily run's mutable state: replacing a Pod
+or checking out source must not reset the accumulated ratchet history.
+
+The chart remains disabled by default. When `loadtimeDaily.enabled=true`,
+`loadtimeDaily.thresholds.existingClaim` is required. The chart mounts that
+existing PVC as `thresholds-state` at `loadtimeDaily.thresholds.mountPath`
+(default `/var/lib/phantom-loadtime`) and sets
+`PHANTOM_LOADTIME_THRESHOLDS_PATH` to `<mountPath>/loadtime-thresholds.json`.
+The mount must be an absolute directory outside `/src`, and cannot be `/`;
+the template normalizes it before validation. The `/src` checkout remains an
+`emptyDir`, mounted separately, and the checkout init container does not mount
+the threshold volume. The chart neither creates the claim nor seeds its data.
+
+The daily Python helper serializes state access with a sidecar file lock
+(`flock`), validates the seeded schema, and rejects corrupt or unwritable state
+rather than silently resetting it. A concurrent writer fails visibly instead
+of waiting or overwriting another run. Ratchet saves are atomic; the daily
+helper also fsyncs the parent directory before reporting success. Dry runs do not
+write state and are not proof that the live volume is usable.
+
+### Infrastructure activation (separate from source delivery)
+
+1. Provision an existing persistent claim in the CronJob's namespace. Choose
+   storage whose retention, access mode, scheduling, advisory `flock` semantics,
+   and atomic rename support suit every writer. Set filesystem ownership and
+   permissions for the actual Job and Actions containers. Use the same filesystem
+   UID for all daily writers (including Actions); initialization is owner-only,
+   and replacement files inherit the writer's ownership, not prior ACLs. They need
+   registry read/write access and directory access to create the sidecar lock
+   and temporary files and atomically replace the registry. Workload Pod
+   security settings do not automatically apply to the daily Job.
+2. An absent registry initializes automatically from the reviewed
+   `tools/perf/loadtime-thresholds.json` on the first live guard. Preserve an
+   existing ratcheted registry; do not
+   re-copy the seed on each checkout or Job. Back up durable history and repair
+   corrupt state deliberately, never by falling back to a fresh checkout.
+3. Wire `loadtimeDaily.thresholds.existingClaim` and, if needed, `mountPath` in
+   the infrastructure values alongside the existing image/config/secret wiring.
+   Serialize all writers, including manual Jobs, other releases, and Actions.
+   `concurrencyPolicy: Forbid` only covers scheduled Jobs of this one CronJob;
+   it is not a cross-trigger lock. Every writer must use the same registry and
+   sidecar lock on a filesystem that shares locks across those writers.
+4. For Actions, mount persistent storage into the workflow's **job container**
+   through runner/infrastructure configuration, then set the repository variable
+   `PHANTOM_LOADTIME_THRESHOLDS_PATH` to its absolute registry path. It must name
+   the **same registry** as the CronJob, even if mounted at a different path.
+   An environment variable alone creates no mount. A disposable runner checkout,
+   container writable layer, or a per-run copy/artifact is not durable shared
+   state. Do not activate Actions as a second writer until this is wired.
+5. Verify the actual deployed Job/Pod, not only a rendered CronJob: record its
+   source revision, claim binding, `thresholds-state` mount and effective
+   `PHANTOM_LOADTIME_THRESHOLDS_PATH`. Run two sequential Jobs with replacement
+   Pods/checkouts and record the registry before/after each. Confirm the second
+   consumes the first run's saved history/thresholds without re-seeding, and that
+   guard outcomes match the persisted registry. If Actions is enabled, verify
+   its job container consumes that same state as well. A source merge or Helm
+   render is **not live proof** of persistence or activation.
+
+Keep concrete claim names, storage configuration, endpoints, and credentials
+in the infrastructure repository or Actions configuration, not shared source.
+
 ## Profiling
 
 Use live profiling only when needed; it can add overhead.
