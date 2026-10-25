@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Load-time pushes now reject incomplete, duplicate, mismatched or invalid
+  duration/run/error batches before replacing the Pushgateway group. All six
+  flows require movie and episode coverage for one color; N-sample counts and
+  measured errors remain intact, with accepted payloads passed through unchanged.
 - Plugin package 0.5.7.7 logs loaded-module and process provenance with the
   actual OTLP provider identity, preserving configured resource overrides.
   See [OTLP runtime provenance](docs/otlp-runtime-provenance.md) for correlating

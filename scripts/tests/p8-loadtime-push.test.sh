@@ -239,6 +239,10 @@ expect_refused "reserved samples via positional file (custom job)" \
     env PHANTOM_LOADTIME_PUSH_JOB=custom-job "$EMITTER" push "$FIXTURE"
 expect_refused "reserved samples via PHANTOM_LOADTIME_RECORDS (custom job)" \
     env PHANTOM_LOADTIME_RECORDS="$FIXTURE" PHANTOM_LOADTIME_PUSH_JOB=custom-job "$EMITTER" push
+if grep -q 'reserved phantom_playback_outcome_total samples' "$STUB_DIR/out" \
+    && grep -q 'use --dry-run' "$STUB_DIR/out"; then
+    ok "reserved-family refusal names the family and offline remedy"
+else bad "reserved-family refusal is not actionable"; fi
 reset_calls
 if PATH="$STUB_DIR:$PATH" PHANTOM_PUSHGATEWAY_URL="$LIVE_URL" PHANTOM_LOADTIME_PUSH_JOB=custom-job \
         "$EMITTER" push < "$FIXTURE" >/dev/null 2>&1; then
@@ -259,14 +263,19 @@ LEGIT="$STUB_DIR/legit.prom"
 cat > "$LEGIT" <<'EOP'
 # HELP phantom_loadtime_seconds Wall-clock duration.
 # TYPE phantom_loadtime_seconds gauge
-phantom_loadtime_seconds{flow="list_load",item_type="movie",color="blue"} 0.42
-phantom_loadtime_seconds{flow="list_load",item_type="episode",color="blue"} 0.51
 # HELP phantom_loadtime_rig_outcome_total not phantom_playback_outcome_total (renamed).
 # TYPE phantom_loadtime_rig_outcome_total counter
 phantom_loadtime_rig_outcome_total{flow="play_already_materialised",item_type="movie",cause="success"} 1
 phantom_loadtime_rig_outcome_total{flow="materialise_then_play",item_type="episode",cause="success"} 1
 phantom_playback_outcome_total_extra{cause="x"} 1
 EOP
+for it in movie episode; do
+    for flow in "${FLOWS[@]}"; do
+        printf 'phantom_loadtime_seconds{flow="%s",item_type="%s",color="blue"} 0.42\n' "$flow" "$it" >> "$LEGIT"
+        printf 'phantom_loadtime_runs_total{flow="%s",item_type="%s",color="blue"} 1\n' "$flow" "$it" >> "$LEGIT"
+        printf 'phantom_loadtime_errors_total{flow="%s",item_type="%s",color="blue"} 1\n' "$flow" "$it" >> "$LEGIT"
+    done
+done
 for mode in file env stdin; do
     reset_calls
     case "$mode" in
@@ -294,6 +303,118 @@ if [ "$(ncalls)" = 0 ] \
 else
     bad "explicit push dry-run regressed (calls=$(ncalls))"
 fi
+
+head_ "I. complete measurement batches gate every real PUT (offline engine + intercepted curl)"
+if python3 - "$EMITTER" "$STUB_DIR" "$LEGIT" "$LIVE_URL" <<'PY'
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+
+emitter, stub, fixture, url = sys.argv[1:]
+stub = Path(stub)
+env = dict(os.environ, PATH=f"{stub}:{os.environ['PATH']}",
+           PHANTOM_PUSHGATEWAY_URL=url, PHANTOM_LOADTIME_PUSH_JOB="batch-test",
+           PHANTOM_LOADTIME_PUSH_DRY_RUN="0", PHANTOM_CI_DRYRUN="0",
+           PHANTOM_LOADTIME_RECORDS="",
+           P8_ENGINE=f"{Path(emitter).parent}/../tools/rig-scenarios/47-loadtime-flows.sh",
+           P8_BASH=shutil.which("bash"), P8_BATCH=str(stub / "batch.prom"))
+# Intercept only the engine subprocess; the emitter and curl stub still use real bash.
+(stub / "bash").write_text('''#!/bin/sh
+if [ "$1" = "$P8_ENGINE" ]; then
+    exec /bin/cat "$P8_BATCH"
+fi
+exec "$P8_BASH" "$@"
+''')
+(stub / "bash").chmod(0o755)
+base = Path(fixture).read_text()
+failures = []
+checks = 0
+
+def check(name, body, accepted):
+    global checks
+    for mode in ("file", "env", "stdin", "run"):
+        checks += 1
+        for path in [stub / "calls", *stub.glob("call.*")]:
+            path.unlink(missing_ok=True)
+        (stub / "batch.prom").write_text(body)
+        run_env = env.copy()
+        args = [emitter, "push"]
+        if mode == "file":
+            args.append(str(stub / "batch.prom"))
+        elif mode == "env":
+            run_env["PHANTOM_LOADTIME_RECORDS"] = str(stub / "batch.prom")
+        elif mode == "run":
+            args = [emitter, "run"]
+        result = subprocess.run(args, input=body if mode == "stdin" else "",
+                                text=True, capture_output=True, env=run_env)
+        calls = (stub / "calls").read_text().splitlines() if (stub / "calls").exists() else []
+        if accepted:
+            valid = (result.returncode == 0 and len(calls) == 1
+                     and calls[0].endswith(f"-X PUT {url}/metrics/job/batch-test")
+                     and (stub / "call.1.body").read_bytes() == body.encode())
+        else:
+            valid = result.returncode != 0 and not calls
+        if not valid:
+            failures.append(f"{name} ({mode}): rc={result.returncode}, calls={len(calls)}")
+
+check("complete N=1, all measured errors retained", base, True)
+check("zero durations and zero errors", re.sub(r'(phantom_loadtime_errors_total\{[^\n]+\}) 1',
+    r'\1 0', base.replace('} 0.42\n', '} 0\n')), True)
+check("trailing blank lines preserved", base + '\n\n', True)
+multi = base.replace('} 1\n', '} 3\n')
+# All counters remain 3 except one mixed-error tuple; duration is unrelated to count.
+multi = multi.replace('phantom_loadtime_errors_total{flow="list_load",item_type="movie",color="blue"} 3',
+                      'phantom_loadtime_errors_total{flow="list_load",item_type="movie",color="blue"} 1')
+check("complete N=3 with mixed and all-failed tuples", multi, True)
+check("reordered labels and scientific numbers", multi.replace(
+    'flow="list_load",item_type="movie",color="blue"',
+    'color="blue", item_type="movie", flow="list_load"').replace('} 3\n', '} 3e0\n'), True)
+
+for item in ("movie", "episode"):
+    labels = f'{{flow="list_load",item_type="{item}",color="blue"}}'
+    records = {family: f'phantom_loadtime_{family}{labels} {value}\n'
+               for family, value in (("seconds", "0.42"), ("runs_total", "1"), ("errors_total", "1"))}
+    for family, record in records.items():
+        check(f"missing {family}/{item}", base.replace(record, ""), False)
+        check(f"duplicate {family}/{item}", base + record, False)
+        check(f"mismatched color {family}/{item}", base.replace(record, record.replace('"blue"', '"green"')), False)
+        check(f"mismatched item {family}/{item}", base.replace(record, record.replace(f'"{item}"', '"series"')), False)
+        check(f"missing label {family}/{item}", base.replace(record, record.replace(',color="blue"', '')), False)
+        for value in ({"seconds": ("-1", "NaN", "+Inf", "-Inf", "1e999", "oops"),
+                       "runs_total": ("0", "-1", "1.5", "NaN", "+Inf"),
+                       "errors_total": ("-1", "2", "0.5", "NaN", "+Inf")}[family]):
+            replacement = record.rsplit(' ', 1)[0] + f' {value}\n'
+            check(f"invalid {family}={value}/{item}", base.replace(record, replacement), False)
+    check(f"missing whole tuple/{item}", base.replace(''.join(records.values()), ''), False)
+    check(f"missing whole item/{item}", ''.join(line for line in base.splitlines(True)
+                                               if f'item_type="{item}"' not in line), False)
+    check(f"duplicate reordered labels/{item}", base + records["seconds"].replace(
+        labels, f'{{color="blue",item_type="{item}",flow="list_load"}}'), False)
+    check(f"duplicate label/{item}", base.replace(records["seconds"], records["seconds"].replace(
+        'color="blue"', 'color="blue",color="blue"')), False)
+    check(f"unexpected flow/{item}", base.replace(f'flow="list_load",item_type="{item}"',
+                                                 f'flow="unknown",item_type="{item}"'), False)
+check("single duration only", next(line for line in base.splitlines(True)
+                                   if line.startswith("phantom_loadtime_seconds{")), False)
+check("two complete colors", base + base.replace('color="blue"', 'color="green"'), False)
+check("carriage returns cannot turn comments into measurement records",
+      '# comment\r' + base.replace('\n', '\r') + '\n', False)
+check("large reserved payload cannot bypass synthetic guard",
+      'phantom_playback_outcome_total 1\n' + base + '# ' + 'x' * 200000 + '\n', False)
+for flow in ("list_load", "sort_change", "info_open", "get_sources", "materialise", "play_materialised"):
+    check(f"missing whole flow/{flow}", ''.join(line for line in base.splitlines(True)
+                                               if f'flow="{flow}"' not in line), False)
+for failure in failures[:8]:
+    print(f"  FAIL {failure}")
+if len(failures) > 8:
+    print(f"  ... {len(failures) - 8} more failures")
+print(f"  Batch transport assertions: {checks - len(failures)} passed, {len(failures)} failed")
+sys.exit(bool(failures))
+PY
+then ok "complete-batch transport matrix"; else bad "complete-batch transport matrix"; fi
 
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"
 [ "$fail_count" -eq 0 ]

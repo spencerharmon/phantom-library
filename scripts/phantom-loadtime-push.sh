@@ -123,14 +123,77 @@ read_records() {
     fi
 }
 
-# --- validate the exposition is non-empty and carries the expected metric ----
-# family names, so a truncated/garbled harness run is refused rather than
-# silently pushing an empty or malformed batch.
+# PUT replaces the whole group: require all 12 duration/run/error tuples.
+# Validate only these families; unrelated records and comments pass unchanged.
 validate_records() {
     local payload="$1"
     [ -n "$payload" ] || die "no exposition records given (empty input)"
-    printf '%s\n' "$payload" | grep -q '^phantom_loadtime_seconds{' \
-        || die "exposition carries no phantom_loadtime_seconds record — refusing to push"
+    python3 - 3<<<"$payload" <<'PY' || die "invalid load-time batch; refusing to replace the Pushgateway group"
+from decimal import Decimal
+import math
+import os
+import re
+import sys
+
+families = {"seconds", "runs_total", "errors_total"}
+flows = {"list_load", "sort_change", "info_open", "get_sources", "materialise", "play_materialised"}
+items = {"movie", "episode"}
+metric = re.compile(r"phantom_loadtime_(seconds|runs_total|errors_total)(?=[\s{]|$)")
+sample = re.compile(r'phantom_loadtime_(seconds|runs_total|errors_total)\s*\{(.*)\}\s+(\S+)(?:\s+[+-]?[0-9]+)?\s*')
+label = re.compile(r'\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*"((?:[^"\\]|\\[\\"n])*)"\s*(,|$)')
+number = re.compile(r'[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?')
+records = {}
+colors = set()
+try:
+    for line_number, line in enumerate(os.fdopen(3, newline="\n"), 1):
+        line = line.strip()
+        if not metric.match(line):
+            continue
+        match = sample.fullmatch(line)
+        if not match:
+            raise ValueError(f"line {line_number}: malformed load-time record")
+        family, raw_labels, raw_value = match.groups()
+        labels = {}
+        rest = raw_labels
+        while rest.strip():
+            part = label.match(rest)
+            if not part:
+                raise ValueError(f"line {line_number}: malformed labels")
+            name, value, _ = part.groups()
+            if name in labels:
+                raise ValueError(f"line {line_number}: duplicate label {name}")
+            labels[name] = re.sub(r'\\([\\"n])', lambda m: {'n': '\n', '\\': '\\', '"': '"'}[m[1]], value)
+            rest = rest[part.end():]
+        if set(labels) != {"flow", "item_type", "color"}:
+            raise ValueError(f"line {line_number}: expected flow, item_type and color labels")
+        flow, item, color = (labels[k] for k in ("flow", "item_type", "color"))
+        if flow not in flows or item not in items or not color:
+            raise ValueError(f"line {line_number}: invalid flow/item_type/color")
+        colors.add(color)
+        key = (flow, item, family)
+        if key in records:
+            raise ValueError(f"line {line_number}: duplicate tuple {key}")
+        if not number.fullmatch(raw_value) or not math.isfinite(float(raw_value)):
+            raise ValueError(f"line {line_number}: {family} must be finite numeric data")
+        value = Decimal(raw_value)
+        if value < 0 or (family != "seconds" and value != value.to_integral_value()):
+            raise ValueError(f"line {line_number}: invalid {family} value")
+        if family == "runs_total" and value == 0:
+            raise ValueError(f"line {line_number}: runs_total must be positive")
+        records[key] = value
+    if len(colors) != 1:
+        raise ValueError("expected exactly one batch color")
+    expected = {(flow, item, family) for flow in flows for item in items for family in families}
+    missing = expected - records.keys()
+    if missing:
+        raise ValueError(f"incomplete batch; missing tuples: {sorted(missing)}")
+    for flow in flows:
+        for item in items:
+            if records[flow, item, "errors_total"] > records[flow, item, "runs_total"]:
+                raise ValueError(f"{flow}/{item}: errors_total exceeds runs_total")
+except ValueError as error:
+    sys.exit(f"phantom-loadtime-push: {error}")
+PY
 }
 
 # --- refuse a LIVE push carrying a sample of the reserved real-playback family.
@@ -139,7 +202,7 @@ validate_records() {
 RESERVED_FAMILY="phantom_playback_outcome_total"
 reject_reserved_samples() {
     local payload="$1"
-    if printf '%s\n' "$payload" | grep -Eq "^[[:space:]]*${RESERVED_FAMILY}([{[:space:]]|\$)"; then
+    if grep -Eq "^[[:space:]]*${RESERVED_FAMILY}([{[:space:]]|\$)" <<<"$payload"; then
         die "payload carries reserved ${RESERVED_FAMILY} samples (synthetic/offline fixture data) — refusing the whole live push to job=${PUSH_JOB}; use --dry-run / PHANTOM_LOADTIME_PUSH_DRY_RUN=1 for fixture output"
     fi
 }
@@ -148,8 +211,9 @@ reject_reserved_samples() {
 # the whole group so a later batch never leaves a stale prior flow behind.
 push() {
     local file="${1:-}" payload url
-    payload="$(read_records "$file")"
-    validate_records "$payload"
+    # The sentinel preserves trailing newlines through command substitution.
+    payload="$(read_records "$file" && printf .)" || die "could not read exposition records"
+    payload="${payload%.}"
     if [ -z "$PUSHGATEWAY" ]; then
         if [ "$DRY_RUN" = "1" ]; then
             PUSHGATEWAY="$DRY_RUN_PLACEHOLDER"
@@ -158,14 +222,17 @@ push() {
         fi
     fi
     url="${PUSHGATEWAY%/}/metrics/job/${PUSH_JOB}"
+    if [ "$DRY_RUN" != "1" ]; then
+        reject_reserved_samples "$payload"
+    fi
+    validate_records "$payload"
     if [ "$DRY_RUN" = "1" ]; then
         echo "PUT ${url}"
-        printf '%s\n' "$payload"
+        printf '%s' "$payload"
         return 0
     fi
-    reject_reserved_samples "$payload"
     log "pushing load-time metrics to ${url}"
-    printf '%s\n' "$payload" | curl -sf --max-time 30 --data-binary @- -X PUT "$url" \
+    printf '%s' "$payload" | curl -sf --max-time 30 --data-binary @- -X PUT "$url" \
         || die "push to Pushgateway failed: $url"
     log "pushed load-time batch to job=${PUSH_JOB}"
 }
@@ -176,8 +243,8 @@ run() {
     if [ "${PHANTOM_CI_DRYRUN:-0}" = "1" ] && [ "$DRY_RUN" != "1" ]; then
         die "PHANTOM_CI_DRYRUN=1 produces a SYNTHETIC engine run, but push dry-run is disabled — refusing to send synthetic records to the Pushgateway; add --dry-run (or PHANTOM_LOADTIME_PUSH_DRY_RUN=1) for offline fixture output, or unset PHANTOM_CI_DRYRUN for a live measurement"
     fi
-    payload="$(bash "$ENGINE")" || die "measurement engine failed"
-    push <(printf '%s\n' "$payload")
+    payload="$(bash "$ENGINE" && printf .)" || die "measurement engine failed"
+    push <(printf '%s' "${payload%.}")
 }
 
 usage() {
