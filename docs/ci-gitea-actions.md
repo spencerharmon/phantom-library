@@ -32,10 +32,19 @@ confirming the `gitea-actions-runner` label is registered, and wiring the
 workflow's already-declared secrets/vars
 (`PHANTOM_INCLUSTER_KUBECONFIG_B64`, `PHANTOM_INCLUSTER_ADMIN_TOKEN`,
 `PHANTOM_INCLUSTER_DEV_HOST`, `PHANTOM_INCLUSTER_PROD_HOST`,
-`PHANTOM_INCLUSTER_NAMESPACE`, `PHANTOM_PUSHGATEWAY_URL`) are operator-side
+`PHANTOM_INCLUSTER_NAMESPACE`, `PHANTOM_PUSHGATEWAY_URL`,
+`PHANTOM_LOADTIME_THRESHOLDS_PATH`) are operator-side
 Gitea-instance actions outside this repo's own tracked state — see the
 `ttfb-daily-rig-gitea-mirror-wiring` change doc for the current status of
 that provisioning step.
+
+The daily workflow's `PHANTOM_LOADTIME_THRESHOLDS_PATH` variable must point
+into a persistent volume mounted in the Actions job container, outside the
+disposable checkout, sharing the CronJob's threshold registry and writer lock.
+Setting the variable does not provision or mount storage. See
+[daily threshold state and infrastructure activation](performance.md#daily-load-time-threshold-state)
+for filesystem permissions, writer serialization, and sequential live-Job
+verification required separately from merging this source.
 
 ## What lands in this repo
 

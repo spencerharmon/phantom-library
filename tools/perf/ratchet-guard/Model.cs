@@ -98,7 +98,28 @@ public sealed class RatchetThresholds
 
     public static RatchetThresholds Load(string path) => Parse(File.ReadAllText(path));
 
-    public void Save(string path) => File.WriteAllText(path, Serialize() + "\n");
+    public void Save(string path)
+    {
+        // A sibling file keeps replacement atomic on the registry's filesystem.
+        var temporary = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(path))!,
+            $".ratchet-{Guid.NewGuid():N}.tmp");
+        try
+        {
+            using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write))
+            {
+                var bytes = System.Text.Encoding.UTF8.GetBytes(Serialize() + "\n");
+                stream.Write(bytes);
+                stream.Flush(flushToDisk: true);
+            }
+            if (!OperatingSystem.IsWindows() && File.Exists(path))
+                File.SetUnixFileMode(temporary, File.GetUnixFileMode(path));
+            File.Move(temporary, path, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(temporary)) File.Delete(temporary);
+        }
+    }
 }
 
 /// <summary>A single measured latency for one scenario, produced by a perf run.</summary>

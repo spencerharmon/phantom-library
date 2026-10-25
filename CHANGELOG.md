@@ -33,6 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in `PhantomDbPostgresIntegrationTests`.
 
 ### Changed
+- Daily load-time chart wiring now requires `loadtimeDaily.thresholds.existingClaim`
+  when enabled, mounts it as `thresholds-state` outside the disposable `/src`
+  checkout (default `/var/lib/phantom-loadtime`), and supplies the explicit
+  `PHANTOM_LOADTIME_THRESHOLDS_PATH`. The Gitea daily workflow forwards the same
+  variable from repository vars. Existing enabled deployments must provision
+  and wire persistent storage; Actions must share that registry, not a checkout
+  copy. See [activation and live verification](docs/performance.md#daily-load-time-threshold-state)
+  for permissions, serialized writers, and sequential Job evidence. Source
+  delivery alone does not activate or prove durable state.
 - **Batch the per-orphan gostream tmdb/metadata/hidden-set lookups in the
   movie browse list (ttfb-list-load-movie-render-profile, ROI Priority 9).**
   Profiling the first genuinely-fresh `phantom_loadtime_seconds` sample

@@ -72,7 +72,7 @@ public static class Program
             Console.Error.WriteLine(CliOptions.Usage);
             return 2;
         }
-        catch (Exception ex) when (ex is IOException or FormatException or JsonException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or FormatException or JsonException)
         {
             Console.Error.WriteLine($"ratchet-guard: {ex.Message}");
             return 2;
