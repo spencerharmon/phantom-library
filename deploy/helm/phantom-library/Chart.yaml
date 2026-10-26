@@ -45,7 +45,12 @@ type: application
 # `loadtimeDaily.*` values, added by ttfb-daily-rig-incluster-cronjob) as a NEW chart version so flux
 # re-pulls it. No functional/template/values change vs 2.10.0 — version bump only, to carry the
 # in-cluster daily TTFB load-time CronJob into a publishable chart tip.
-version: 2.11.0
+# 2.12.0: publish the already-merged durable load-time thresholds capability (source merge 35da569 —
+# `loadtimeDaily.thresholds.existingClaim`/`mountPath`, the `thresholds-state` PVC volume and
+# PHANTOM_LOADTIME_THRESHOLDS_PATH env in templates/loadtime-daily-cronjob.yaml) as a NEW OCI chart
+# version; the published 2.11.0 predates it and chart versions are immutable. BREAKING when
+# loadtimeDaily.enabled=true: thresholds.existingClaim is now required.
+version: 2.12.0
 # Tracks the app milestone, not a container tag (images are digest-pinned in values).
 appVersion: "m14"
 keywords:
