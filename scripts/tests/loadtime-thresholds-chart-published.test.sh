@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # DoD for phantom-loadtime-thresholds-chart-publish: the chart version declared in source
-# Chart.yaml (> 2.11.0) is PUBLISHED to the zuul OCI registry and the published bytes carry the
+# Chart.yaml (> 2.11.0) is PUBLISHED to the configured OCI registry and the published bytes carry the
 # durable-thresholds capability (thresholds-state PVC volume + PHANTOM_LOADTIME_THRESHOLDS_PATH),
 # which the published 2.11.0 lacks. Pulls the real artifact and renders it.
-# Run from the repo root: scripts/tests/loadtime-thresholds-chart-published.test.sh
+# Supply REGISTRY at runtime from deployment/CI configuration, for example:
+# REGISTRY=oci://registry.example.com/charts scripts/tests/loadtime-thresholds-chart-published.test.sh
 set -euo pipefail
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "ok: $*"; }
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-REGISTRY="${REGISTRY:-oci://git.spencerharmon.com/zuul}"
+[[ -n "${REGISTRY:-}" ]] || fail "REGISTRY is required (e.g. oci://registry.example.com/charts)"
 CHART=phantom-library
 command -v helm >/dev/null || fail "helm required"
 
