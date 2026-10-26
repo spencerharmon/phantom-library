@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Add an offline playback-outcome coverage report that distinguishes missing
+  serving instrumentation, stale samples, and zero observed attempts from a
+  measured error rate. See the [input contract and usage](docs/tasks/playback-outcome-coverage-report-001.md).
 - Load-time pushes now reject incomplete, duplicate, mismatched or invalid
   duration/run/error batches before replacing the Pushgateway group. All six
   flows require movie and episode coverage for one color; N-sample counts and
