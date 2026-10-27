@@ -260,5 +260,153 @@ G5="$(run_eng)" || G5=""
 if [ "$(rec "$G5" runs_total sort_change episode)" = 3 ]; then ok "default sample count is 3"; else bad "default sample count is not 3 (runs=$(rec "$G5" runs_total sort_change episode))"; fi
 if run_eng PHANTOM_LOADTIME_SAMPLES=0 >/dev/null; then bad "engine accepted sample count 0"; else ok "engine refuses a non-positive sample count"; fi
 
+head_ "H. LIVE engine discovers typed, user-scoped targets and fails closed (offline curl)"
+LIVE_TMP="$(mktemp -d)"
+trap 'rm -rf "$LIVE_TMP"' EXIT
+mkdir "$LIVE_TMP/bin"
+cat > "$LIVE_TMP/bin/curl" <<'PY'
+#!/usr/bin/env python3
+import json, os, sys
+from urllib.parse import parse_qs, urlsplit
+
+args = sys.argv[1:]
+url = next(a for a in args if a.startswith('http://'))
+parsed = urlsplit(url)
+query = parse_qs(parsed.query)
+method = args[args.index('-X') + 1] if '-X' in args else 'GET'
+with open(os.environ['CURL_LOG'], 'a') as log:
+    log.write(json.dumps([method, parsed.path, query]) + '\n')
+ids = dict(user='1' * 32, movie='2' * 32, series='3' * 32,
+           season='4' * 32, episode='5' * 32)
+stage = None
+if parsed.path == '/Users':
+    stage = 'user'
+    body = [{'Id': ids['user']}]
+elif parsed.path == '/Channels':
+    stage = 'channels'
+    body = {'Items': [{'Name': 'Phantom Movies', 'Id': 'movies'},
+                      {'Name': 'Phantom Shows', 'Id': 'shows'}]}
+elif parsed.path.startswith('/Channels/'):
+    if query.get('Limit') == ['1']:
+        if '/movies/' in parsed.path:
+            stage = 'movie'
+        else:
+            folder = query.get('FolderId', [''])[0]
+            stage = {ids['series']: 'season', ids['season']: 'episode'}.get(folder, 'series')
+        body = {'Items': [{'Id': ids[stage], 'Type': stage.title()}]}
+    else:
+        # Root list/sort semantics are deliberately not changed by this fix.
+        body = {'Items': [], 'TotalRecordCount': 0}
+elif parsed.path.startswith(('/Items/', '/Videos/', '/Plugins/')):
+    body = {}
+else:
+    raise SystemExit('unexpected stub URL: ' + url)
+
+fault_stage, _, fault = os.environ.get('CURL_FAULT', '').partition(':')
+exit_code = 0
+if stage == fault_stage:
+    if fault == 'http':
+        # A valid-looking body MUST NOT mask the failed HTTP status.
+        exit_code = 22
+    elif fault == 'empty':
+        body = [] if stage == 'user' else {'Items': []}
+    elif fault in ('empty-id', 'null-id', 'numeric-id'):
+        item = body[0] if stage == 'user' else body['Items'][0]
+        item['Id'] = {'empty-id': '', 'null-id': None, 'numeric-id': 42}[fault]
+    elif fault == 'wrong-type':
+        body['Items'][0]['Type'] = 'Season' if stage == 'episode' else 'Episode'
+    elif fault == 'missing-type':
+        del body['Items'][0]['Type']
+text = '{broken' if stage == fault_stage and fault == 'malformed' else json.dumps(body)
+if '-o' in args:
+    with open(args[args.index('-o') + 1], 'w') as output:
+        output.write(text)
+else:
+    print(text)
+sys.exit(exit_code)
+PY
+chmod +x "$LIVE_TMP/bin/curl"
+if python3 - "$ENGINE" "$LIVE_TMP" <<'PY'
+import json, os, pathlib, re, subprocess, sys, uuid
+
+engine, tmp = sys.argv[1], pathlib.Path(sys.argv[2])
+env = dict(os.environ, PATH=str(tmp / 'bin') + os.pathsep + os.environ['PATH'],
+           PHANTOM_CI_DRYRUN='0', PHANTOM_LOADTIME_API='http://example.com:18096',
+           PHANTOM_LOADTIME_TOKEN='offline-secret-not-for-logs',
+           PHANTOM_LOADTIME_COLOR='rigtest', PHANTOM_LOADTIME_SAMPLES='1')
+ids = dict(user='1' * 32, movie='2' * 32, series='3' * 32,
+           season='4' * 32, episode='5' * 32)
+
+def run(name, fault=''):
+    directory = tmp / name
+    directory.mkdir()
+    scratch = directory / 'scratch'
+    scratch.mkdir()
+    log, out = directory / 'requests', directory / 'metrics'
+    result = subprocess.run(['bash', engine], env=dict(
+        env, CURL_LOG=str(log), CURL_FAULT=fault, TMPDIR=str(scratch),
+        PHANTOM_LOADTIME_OUT=str(out)), text=True, capture_output=True, timeout=30)
+    requests = [json.loads(line) for line in log.read_text().splitlines()]
+    assert not list(scratch.iterdir()), (name, 'temporary files leaked')
+    assert env['PHANTOM_LOADTIME_TOKEN'] not in result.stderr, 'credential logged'
+    return result, requests, out
+
+result, requests, out = run('success')
+assert result.returncode == 0, result.stderr
+discovery = [r for r in requests if r[2].get('Limit') == ['1']]
+assert [(r[1], r[2].get('FolderId')) for r in discovery] == [
+    ('/Channels/movies/Items', None), ('/Channels/shows/Items', None),
+    ('/Channels/shows/Items', [ids['series']]),
+    ('/Channels/shows/Items', [ids['season']])], discovery
+assert all(r[2].get('userId') == [ids['user']] for r in discovery), discovery
+actual = [r for r in requests if r[1].startswith(('/Items/', '/Videos/'))]
+expected = []
+for kind in ('movie', 'episode'):
+    item = ids[kind]
+    guid = str(uuid.UUID(item))
+    expected.extend([
+        ['GET', f'/Items/{item}', {'userId': [ids['user']]}],
+        ['GET', f'/Items/{item}/PlaybackInfo', {}],
+        ['POST', f'/Items/{guid}/PlaybackInfo', {'AutoOpenLiveStream': ['true']}],
+        ['GET', f'/Videos/{guid}/stream.mkv', {'static': ['true']}],
+    ])
+assert actual == expected, actual
+for kind in ('movie', 'series', 'season', 'episode'):
+    assert f'target type={kind.title()} id={ids[kind]}' in result.stderr, result.stderr
+assert out.read_text() == result.stdout, 'file/stdout exposition mismatch'
+flows = ('list_load', 'sort_change', 'info_open', 'get_sources', 'materialise', 'play_materialised')
+for metric in ('seconds', 'runs_total', 'errors_total'):
+    lines = [line for line in result.stdout.splitlines()
+             if line.startswith(f'phantom_loadtime_{metric}' + '{')]
+    assert len(lines) == 12, (metric, lines)
+    for kind in ('movie', 'episode'):
+        for flow in flows:
+            prefix = f'phantom_loadtime_{metric}{{flow="{flow}",item_type="{kind}",color="rigtest"}} '
+            value, = [line[len(prefix):] for line in lines if line.startswith(prefix)]
+            assert re.fullmatch(r'\d+(\.\d+)?', value), value
+            if metric != 'seconds':
+                assert value == ('1' if metric == 'runs_total' else '0'), value
+print('LIVE: user-scoped Series -> Season -> Episode; exact movie/episode endpoints; twelve flows; audit logs; cleanup: PASS')
+
+cases = [(stage, fault) for stage in ('movie', 'series', 'season', 'episode')
+         for fault in ('malformed', 'empty', 'wrong-type', 'missing-type',
+                       'http', 'empty-id', 'null-id', 'numeric-id')]
+cases += [(stage, fault) for stage in ('user', 'channels')
+          for fault in ('malformed', 'empty', 'http', 'empty-id', 'null-id', 'numeric-id')]
+for stage, fault in cases:
+    result, requests, out = run(stage + '-' + fault, stage + ':' + fault)
+    assert result.returncode != 0, (stage, fault, 'discovery unexpectedly succeeded')
+    assert not result.stdout and not out.exists(), (stage, fault, 'batch emitted')
+    assert 'FAIL:' in result.stderr, (stage, fault, result.stderr)
+    assert not any(r[1].startswith(('/Items/', '/Videos/', '/Plugins/')) or
+                   r[2].get('Limit') == ['200'] for r in requests), (stage, fault, requests)
+print(f'LIVE: {len(cases)} discovery failures rejected before timing/emission; cleanup: PASS')
+PY
+then
+    ok "LIVE traversal, target IDs, type validation, failure isolation and cleanup"
+else
+    bad "LIVE target discovery regression"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"
 [ "$fail_count" -eq 0 ]

@@ -160,17 +160,13 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 # throws ArgumentException("Guid can't be empty") -> HTTP 400 when userId is
 # omitted from `GET /Items/{id}`, which is exactly what the info_open flow
 # below calls. Every real Jellyfin client always includes `?userId=...` on
-# this route, so resolve one real user id ONCE, near the top, alongside the
-# MOVIE_ID/SERIES_ID/EPISODE_ID resolution below. DRYRUN has no live server
+# this route, so resolve one real user id ONCE in LIVE discovery below,
+# before MOVIE_ID/SERIES_ID/EPISODE_ID resolution. DRYRUN has no live server
 # (no network access at all), so use a fixed deterministic placeholder GUID —
 # the assertion this backs only needs the CONSTRUCTED request URL to carry a
 # non-empty userId, never an actual request.
 if [ "$DRYRUN" = 1 ]; then
     USER_ID="00000000-0000-0000-0000-000000000001"
-else
-    USER_ID="$(curl -sS --fail -H "X-Emby-Token: $TOK" "$API/Users" \
-        | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['Id'] if d else '')" 2>/dev/null || true)"
-    [ -n "$USER_ID" ] || fail "could not resolve a Jellyfin user id"
 fi
 
 # --- prod-safety guard: refuse to measure against the production port -------
@@ -457,12 +453,38 @@ s=sys.argv[1]; print(f'{s[:8]}-{s[8:12]}-{s[12:16]}-{s[16:20]}-{s[20:]}')
 PY
 }
 
-# resolve the two channels once
-CH_JSON="$(api "$API/Channels" || true)"
-CH_MOVIES="$(printf '%s' "$CH_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(next((c['Id'] for c in d.get('Items',[]) if c.get('Name')=='Phantom Movies'),''))" 2>/dev/null || true)"
-CH_SHOWS="$(printf '%s' "$CH_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(next((c['Id'] for c in d.get('Items',[]) if c.get('Name')=='Phantom Shows'),''))" 2>/dev/null || true)"
-[ -n "$CH_MOVIES" ] || fail "Phantom Movies channel not registered on $API"
-[ -n "$CH_SHOWS" ]  || fail "Phantom Shows channel not registered on $API"
+# Install cleanup before creating scratch files or starting fallible discovery.
+WORK_DIR=""
+trap '[ -z "$WORK_DIR" ] || rm -rf "$WORK_DIR"' EXIT
+WORK_DIR="$(mktemp -d)"
+
+# Parse discovery only, never playback bodies. Reject malformed IDs rather than
+# allowing null/containers/query delimiters to become successful timing targets.
+discovery_id() {
+    python3 -c '
+import json, re, sys
+expected, name = sys.argv[1:]
+try:
+    data = json.load(sys.stdin)
+    items = data if expected == "User" else data["Items"]
+    if not isinstance(items, list) or not items:
+        raise ValueError()
+    item = next(i for i in items if i.get("Name") == name) if name else items[0]
+    if expected not in ("User", "Channel") and item.get("Type") != expected:
+        raise ValueError()
+    item_id = item["Id"]
+    if not isinstance(item_id, str) or not re.fullmatch(r"[A-Za-z0-9-]+", item_id):
+        raise ValueError()
+    print(item_id)
+except (ValueError, KeyError, TypeError, AttributeError, StopIteration):
+    sys.exit(1)
+' "$1" "${2:-}"
+}
+
+USER_ID="$(api "$API/Users" | discovery_id User)" || fail "could not resolve a Jellyfin user id"
+CH_JSON="$(api "$API/Channels?userId=$USER_ID")" || fail "channel discovery HTTP failure"
+CH_MOVIES="$(printf '%s' "$CH_JSON" | discovery_id Channel 'Phantom Movies')" || fail "invalid Phantom Movies channel discovery"
+CH_SHOWS="$(printf '%s' "$CH_JSON" | discovery_id Channel 'Phantom Shows')" || fail "invalid Phantom Shows channel discovery"
 
 # time_flow <flow> <item_type> <curl-cmd...>
 # Runs the command, times it, and emits a record; a non-zero command marks the
@@ -485,15 +507,18 @@ time_flow() {
 }
 
 # --- pick a movie + an episode to drive -------------------------------------
-api "$API/Channels/$CH_MOVIES/Items?Limit=1&Fields=ProviderIds" -o /tmp/p8-movies.$$.json || fail "movie list fetch failed"
-MOVIE_ID="$(python3 -c "import json; d=json.load(open('/tmp/p8-movies.$$.json')); print(d['Items'][0]['Id'])" 2>/dev/null || true)"
-[ -n "$MOVIE_ID" ] || fail "could not resolve a movie item from Phantom Movies"
-SERIES_ID="$(api "$API/Channels/$CH_SHOWS/Items?Limit=1" | python3 -c "import json,sys; print(json.load(sys.stdin)['Items'][0]['Id'])" 2>/dev/null || true)"
-[ -n "$SERIES_ID" ] || fail "could not resolve a series item from Phantom Shows"
-EPISODE_ID="$(api "$API/Channels/$CH_SHOWS/Items?Limit=1&FolderId=$SERIES_ID" | python3 -c "import json,sys; its=json.load(sys.stdin).get('Items',[]); print(its[0]['Id'] if its else '')" 2>/dev/null || true)"
-[ -n "$EPISODE_ID" ] || EPISODE_ID="$SERIES_ID"   # drill fallback: time against the series container
+MOVIE_ID="$(api "$API/Channels/$CH_MOVIES/Items?Limit=1&Fields=ProviderIds&userId=$USER_ID" | discovery_id Movie)" || fail "invalid Movie discovery"
+log "target type=Movie id=$MOVIE_ID"
+SERIES_ID="$(api "$API/Channels/$CH_SHOWS/Items?Limit=1&userId=$USER_ID" | discovery_id Series)" || fail "invalid Series discovery"
+log "target type=Series id=$SERIES_ID"
+SEASON_ID="$(api "$API/Channels/$CH_SHOWS/Items?Limit=1&userId=$USER_ID&FolderId=$SERIES_ID" | discovery_id Season)" || fail "invalid Season discovery"
+log "target type=Season id=$SEASON_ID"
+EPISODE_ID="$(api "$API/Channels/$CH_SHOWS/Items?Limit=1&userId=$USER_ID&FolderId=$SEASON_ID" | discovery_id Episode)" || fail "invalid Episode discovery"
+log "target type=Episode id=$EPISODE_ID"
 
-trap 'rm -f /tmp/p8-movies.$$.json /tmp/p8-pb.$$.json' EXIT
+# Only item-flow targets are corrected here. Root list/sort requests below still
+# omit userId and do not measure interactive series/season/episode navigation.
+# Playback flows still judge curl status, not MediaSources or stream-body validity.
 
 # time_full_list_flow <flow> <item_type> <channel> <sort_qs>
 # The fidelity fix: paginate the FULL uncapped item list (no Limit=50 cap),
@@ -506,11 +531,11 @@ _full_list_sample() {
     local flow="$1" item_type="$2" ch="$3" sort_qs="$4"
     local start errors=0 dur total=0 start_index=0 page=200
     local all_ids_file
-    all_ids_file="$(mktemp)"
+    all_ids_file="$(mktemp "$WORK_DIR/ids.XXXXXX")"
     start="$(now_s)"
     while :; do
         local page_json page_file
-        page_file="$(mktemp)"
+        page_file="$(mktemp "$WORK_DIR/page.XXXXXX")"
         if ! api "$API/Channels/$ch/Items?Limit=$page&StartIndex=$start_index${sort_qs}" -o "$page_file" 2>/dev/null; then
             errors=1; rm -f "$page_file"; break
         fi
