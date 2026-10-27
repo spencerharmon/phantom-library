@@ -119,6 +119,25 @@ of waiting or overwriting another run. Ratchet saves are atomic; the daily
 helper also fsyncs the parent directory before reporting success. Dry runs do not
 write state and are not proof that the live volume is usable.
 
+### Retained breach detail
+
+Guard exit 3 adds three gauges per breached `(flow, item_type)` to the same
+`job="phantom-loadtime-daily-run"` Pushgateway group as the cumulative stage
+outcomes: `phantom_loadtime_guard_breach` (1),
+`phantom_loadtime_guard_observed_seconds`, and
+`phantom_loadtime_guard_ceiling_seconds`. Values come from the ratchet's
+structured decision, before optional task filing, including when `--no-file`
+is used because the Job image has no beehive CLI. No thresholds are loosened.
+
+`loadtime-guard.sh --breach-out <file>` writes the JSON filing plan on exit 3
+and an empty `{"breach_count":0,"entries":[]}` on exit 0. Output is only valid
+on those exits. The wrapper converts milliseconds to seconds and PUTs the
+entire stage group. A guard=0 PUT contains no breach samples, removing stale
+series rather than accumulating past failures. Earlier stage PUTs also replace
+the previous run's group: absence alone is not proof of health. Check the
+run-start timestamp and require guard exit 0; a missing guard or exit 2 is not
+a passing result. Transport warnings retain their existing non-fatal behavior.
+
 ### Infrastructure activation (separate from source delivery)
 
 1. Provision an existing persistent claim in the CronJob's namespace. Choose

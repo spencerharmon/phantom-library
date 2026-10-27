@@ -60,7 +60,7 @@
 #                                    regression check).
 # Exit non-zero on any hard failure. A regression-guard BREACH is reported
 # (exit 3 from loadtime-guard.sh) but does not fail this wrapper's own exit
-# code — the guard already files its own follow-up task; the daily job's
+# code — breach detail is retained even when task filing is unavailable; the daily job's
 # purpose is to keep measuring, not to redundantly fail a schedule trigger.
 #
 # --- durable per-stage outcome metric (ttfb-loadtime-daily-stage-outcome-metric) ---
@@ -148,18 +148,20 @@ record_stage() {
 
 EXPO="$(mktemp -t loadtime-daily-expo.XXXXXX.txt)"
 STAGE_EXPO=""
+BREACH_OUT=""
 _torn_down=0
 teardown() {
     local ec=$?
     [ "$_torn_down" = 1 ] && exit "$ec"
     _torn_down=1
     log "mandatory cleanup"
-    rm -f "$EXPO" "$STAGE_EXPO"
+    rm -f "$EXPO" "$STAGE_EXPO" "$BREACH_OUT"
     phantom_ci_cleanup_dotnet "$([ "$ec" != 0 ] && echo 1 || echo 0)" || true
     exit "$ec"
 }
 trap teardown EXIT INT TERM
 STAGE_EXPO="$(mktemp -t loadtime-daily-stages.XXXXXX.txt)"
+BREACH_OUT="$(mktemp -t loadtime-daily-breaches.XXXXXX.json)"
 printf 'phantom_loadtime_daily_run_start_timestamp_seconds %s\n' "$RUN_START" > "$STAGE_EXPO"
 
 log "phantom-library daily load-time schedule job"
@@ -258,7 +260,7 @@ fi
 # EXACT batch stage 1 measured and stage 2 pushed — never a second engine
 # run, whose cache/materialisation state could disagree with what was
 # published. Both live and dry-run branches use the caller-owned $EXPO.
-guard_args+=(--exposition "$EXPO")
+guard_args+=(--exposition "$EXPO" --breach-out "$BREACH_OUT")
 set +e
 # PHANTOM_CI_FORCE_GUARD_FAIL=1 lets the in-repo regression harness
 # deterministically exercise the stage="guard" failure path (no live
@@ -272,11 +274,43 @@ else
     guard_rc=$?
 fi
 set -e
+if [ "$guard_rc" = 0 ] || [ "$guard_rc" = 3 ]; then
+    # Use the ratchet's decision, not a second comparison against possibly
+    # tightened thresholds. An empty set on success clears old series via PUT.
+    if breach_metrics="$(python3 - "$BREACH_OUT" "$guard_rc" <<'PY'
+import json, math, sys
+
+plan = json.load(open(sys.argv[1]))
+entries = plan['entries']
+if plan['breach_count'] != len(entries) or bool(entries) != (sys.argv[2] == '3'):
+    sys.exit('invalid guard breach count')
+seen = set()
+for entry in entries:
+    flow, item, quantile = entry['scenario'].split(':')
+    if (flow not in {'list_load', 'sort_change', 'info_open', 'get_sources', 'materialise', 'play_materialised'}
+            or item not in {'movie', 'episode'} or quantile != 'single' or (flow, item) in seen):
+        sys.exit('invalid guard breach scenario')
+    seen.add((flow, item))
+    observed, ceiling = entry['measured_ms'], entry['threshold_ms']
+    if not (math.isfinite(observed) and math.isfinite(ceiling) and observed > ceiling >= 0):
+        sys.exit('invalid guard breach values')
+    labels = f'{{flow="{flow}",item_type="{item}"}}'
+    print(f'phantom_loadtime_guard_breach{labels} 1')
+    print(f'phantom_loadtime_guard_observed_seconds{labels} {observed / 1000}')
+    print(f'phantom_loadtime_guard_ceiling_seconds{labels} {ceiling / 1000}')
+PY
+    )"; then
+        [ -z "$breach_metrics" ] || printf '%s\n' "$breach_metrics" >> "$STAGE_EXPO"
+    else
+        note "ERROR: cannot render guard breach metrics"
+        guard_rc=2
+    fi
+fi
 record_stage guard "$guard_rc" "$_stage_start"
 if [ "$guard_rc" = 0 ]; then
     note "regression guard: OK (no breach)"
 elif [ "$guard_rc" = 3 ]; then
-    note "regression guard: BREACH detected and filed (see loadtime-guard.sh output above)"
+    note "regression guard: BREACH detected (see breach metrics and loadtime-guard.sh filing output above)"
 else
     fail "regression guard exited $guard_rc (tool error, not a breach)"
 fi

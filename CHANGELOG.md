@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Daily load-time guard breaches now include per-flow/item-type breach, observed
+  seconds and ceiling seconds gauges in the retained stage Pushgateway group,
+  even without the beehive CLI. A successful guard clears stale breach series.
 - Accept raw `max_over_time` vectors without `__name__` in the offline playback
   outcome report; explicit foreign metric names are still rejected. All three
   query captures must share an explicit Prometheus `time=` value.

@@ -30,8 +30,11 @@
 #   loadtime-guard.sh [--live] [--api <url>] [--token <tok>] [--color <c>]
 #                      [--thresholds <file>] [--apply] [--source-task <id>]
 #                      [--task-prefix <prefix>] [--submodule <name>] [--no-file]
-#                      [--exposition <file>]
+#                      [--exposition <file>] [--breach-out <file>]
 #
+#   --breach-out    write the ratchet's JSON breach plan (breach_count, entries
+#                   with scenario, measured_ms, threshold_ms) before task filing;
+#                   exit 0 writes an empty plan. Only valid on exit 0 or 3.
 #   --exposition    guard a CALLER-OWNED, already-measured exposition file
 #                   instead of invoking the measurement engine (the daily
 #                   wrapper passes the exact batch it pushed, so the guard
@@ -73,6 +76,7 @@ API=""
 TOKEN=""
 COLOR=""
 EXPO_IN=""
+BREACH_OUT=""
 
 die() { echo "loadtime-guard.sh: $*" >&2; exit 2; }
 
@@ -89,6 +93,7 @@ while [ $# -gt 0 ]; do
     --submodule)    SUBMODULE=${2:?}; shift 2 ;;
     --no-file)      NO_FILE=1; shift ;;
     --exposition)   EXPO_IN=${2:?}; shift 2 ;;
+    --breach-out)   BREACH_OUT=${2:?}; shift 2 ;;
     -h|--help)      sed -n '2,45p' "$0"; exit 0 ;;
     *) die "unknown argument '$1'" ;;
   esac
@@ -142,6 +147,9 @@ rc=$?
 set -e
 
 if [ "$rc" = 0 ]; then
+  if [ -n "$BREACH_OUT" ]; then
+    printf '{"breach_count":0,"entries":[]}\n' > "$BREACH_OUT" || die "cannot write breach output: $BREACH_OUT"
+  fi
   echo "loadtime-guard: OK (no regression)"
   exit 0
 fi
@@ -152,6 +160,9 @@ if [ "$rc" != 3 ]; then
 fi
 
 echo "loadtime-guard: BREACH detected" >&2
+if [ -n "$BREACH_OUT" ]; then
+  cp "$PLAN" "$BREACH_OUT" || die "cannot write breach output: $BREACH_OUT"
+fi
 
 if [ "$NO_FILE" = 1 ]; then
   echo "loadtime-guard: --no-file set; not filing beehive tasks" >&2

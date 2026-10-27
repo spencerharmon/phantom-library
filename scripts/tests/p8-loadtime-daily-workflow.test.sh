@@ -61,16 +61,17 @@ with open(sys.argv[1]) as f:
 if sys.argv[3] == 'live':
     payloads = re.findall(
         r'^PUT \S+/metrics/job/phantom-loadtime-daily-run\n'
-        r'((?:phantom_loadtime_daily_.*\n)+)--', output, re.MULTILINE)
+        r'((?:phantom_loadtime_.*\n)+)--', output, re.MULTILINE)
 else:
     payloads = re.findall(
         r'^    \[stage-metric dry-run\] PUT \S+/metrics/job/phantom-loadtime-daily-run\n'
-        r'((?:    phantom_loadtime_daily_.*\n)+)', output, re.MULTILINE)
+        r'((?:    phantom_loadtime_.*\n)+)', output, re.MULTILINE)
 assert len(payloads) == 3, f"expected three stage PUTs, got {len(payloads)}"
 run_start = None
 for index in (2, 1, 0):
     payload = payloads[index]
-    samples = dict(line.strip().split() for line in payload.splitlines())
+    lines = [line for line in payload.splitlines() if 'phantom_loadtime_daily_' in line]
+    samples = dict(line.strip().split() for line in lines)
     stages = ('measure', 'push', 'guard')[:index + 1]
     expected = {'phantom_loadtime_daily_run_start_timestamp_seconds'}
     for stage in stages:
@@ -85,12 +86,44 @@ for index in (2, 1, 0):
                 allowed = {int(v) for v in sys.argv[2].split(',')} if stage == 'guard' else {0}
                 assert value in allowed, f"unexpected exit code: {key} {value}"
     assert set(samples) == expected, f"PUT {index + 1} has missing or unexpected samples"
-    assert len(payload.splitlines()) == len(expected), "duplicate samples"
+    assert len(lines) == len(expected), "duplicate samples"
+    if index < 2 or sys.argv[2] == '2':
+        assert 'phantom_loadtime_guard_' not in payload, 'breaches emitted without a valid guard result'
     timestamp = int(samples['phantom_loadtime_daily_run_start_timestamp_seconds'])
     assert timestamp > 0, "run start must be an epoch timestamp"
     if run_start is None:
         run_start = timestamp
     assert timestamp == run_start, "run start changed between stage PUTs"
+PY
+}
+
+assert_breach_payload() {
+    python3 - "$1" "$2" "$3" "${4:-dry}" <<'PY'
+import re, sys
+output = open(sys.argv[1]).read()
+if sys.argv[4] == 'live':
+    payloads = re.findall(r'^PUT \S+/metrics/job/phantom-loadtime-daily-run\n'
+                          r'((?:phantom_loadtime_.*\n)+)--', output, re.M)
+else:
+    payloads = re.findall(
+        r'^    \[stage-metric dry-run\] PUT \S+/metrics/job/phantom-loadtime-daily-run\n'
+        r'((?:    phantom_loadtime_.*\n)+)', output, re.M)
+assert len(payloads) == 3, 'expected three retained-group PUTs'
+# Model Pushgateway PUT replacement, including a previous run's stale breach.
+retained = {'phantom_loadtime_guard_breach{flow="list_load",item_type="movie"}': '1'}
+for payload in payloads:
+    lines = payload.splitlines()
+    retained = dict(line.strip().split() for line in lines)
+    assert len(retained) == len(lines), 'duplicate samples'
+actual = {k: float(v) for k, v in retained.items() if k.startswith('phantom_loadtime_guard_')}
+expected = {}
+if sys.argv[3] == 'A-breach':
+    labels = f'{{flow="list_load",item_type="{sys.argv[2]}"}}'
+    expected = {'phantom_loadtime_guard_breach' + labels: 1,
+                'phantom_loadtime_guard_observed_seconds' + labels: 2,
+                'phantom_loadtime_guard_ceiling_seconds' + labels: 1}
+assert actual == expected, (actual, expected)
+assert int(retained['phantom_loadtime_daily_stage_exit_code{stage="guard"}']) == (3 if expected else 0)
 PY
 }
 
@@ -406,7 +439,12 @@ elif [ "$mode" = A-breach ]; then [ "$batch" = A ] && v=2.0 || v=0.5
 else [ "$batch" = A ] && v=0.5 || v=2.0; fi
 for b in movie episode; do
   val=0.95; [ "$mode" = durable ] && val=1.0; [ "$b" = "$backend" ] && val=$v
-  printf 'phantom_loadtime_seconds{flow="list_load",item_type="%s",color="%s"} %s\n' "$b" "${PHANTOM_LOADTIME_COLOR:-green}" "$val"
+  for flow in list_load sort_change info_open get_sources materialise play_materialised; do
+    seconds=1.0; [ "$flow" = list_load ] && seconds="$val"
+    printf 'phantom_loadtime_seconds{flow="%s",item_type="%s",color="%s"} %s\n' "$flow" "$b" "${PHANTOM_LOADTIME_COLOR:-green}" "$seconds"
+    printf 'phantom_loadtime_runs_total{flow="%s",item_type="%s",color="%s"} 1\n' "$flow" "$b" "${PHANTOM_LOADTIME_COLOR:-green}"
+    printf 'phantom_loadtime_errors_total{flow="%s",item_type="%s",color="%s"} 0\n' "$flow" "$b" "${PHANTOM_LOADTIME_COLOR:-green}"
+  done
 done
 ENG
 cat > "$sb_bin/kubectl" <<'K'
@@ -481,6 +519,8 @@ for backend in movie episode; do
         grep -q "phantom_loadtime_seconds{flow=\"list_load\",item_type=\"$backend\",color=\"green\"} $a_val\$" "$SB/curl.log"
     sb_check "[$c live] stage=guard outcome is A-based ($want_guard)" test "$(sb_guard_stage "$SB/curl.log")" = "$want_guard"
     sb_check "[$c live] all three PUTs retain cumulative stages" assert_stage_payloads "$SB/curl.log" "$want_guard" live
+    sb_check "[$c live] retained PUT contains exact breach gauges or clears stale breaches" \
+        assert_breach_payload "$SB/curl.log" "$backend" "$mode" live
     sb_check "[$c live] $backend threshold written from A (${want_thr}ms)" test "$(sb_thr "$backend")" = "$want_thr"
     other=episode; [ "$backend" = episode ] && other=movie
     sb_check "[$c live] $other threshold unchanged (1000ms)" test "$(sb_thr "$other")" = 1000
@@ -497,6 +537,8 @@ for backend in movie episode; do
     sb_check "[$c dry-run] pushed (dry-run) batch A ($backend=$a_val)" \
         grep -q "phantom_loadtime_seconds{flow=\"list_load\",item_type=\"$backend\",color=\"green\"} $a_val\$" "$SB/out.log"
     sb_check "[$c dry-run] stage=guard outcome is A-based ($want_guard)" test "$(sb_guard_stage "$SB/out.log")" = "$want_guard"
+    sb_check "[$c dry-run] retained PUT contains exact breach gauges or clears stale breaches" \
+        assert_breach_payload "$SB/out.log" "$backend" "$mode"
     sb_check "[$c dry-run] thresholds byte-identical, nothing filed/curl'd" \
         test "$before" = "$(sha256sum "$SB_THR" | awk '{print $1}')" -a ! -s "$SB/beehive.log" -a ! -s "$SB/curl.log"
   done
@@ -508,9 +550,23 @@ sb_guard() { sb_rc=0; env PATH="$sb_bin:$PATH" PHANTOM_REPO_ROOT="$sb_root" SB_C
 sb_reset; SB_CASE_G=movie:A-breach
 printf 'phantom_loadtime_seconds{flow="list_load",item_type="movie",color="green"} 2.0\nphantom_loadtime_seconds{flow="list_load",item_type="episode",color="green"} 0.95\n' > "$SB/in.expo"
 in_sha="$(sha256sum "$SB/in.expo" | awk '{print $1}')"
-sb_guard --exposition "$SB/in.expo" --no-file
+sb_guard --exposition "$SB/in.expo" --no-file --breach-out "$SB/breaches.json"
 sb_check "supplied breach exposition -> exit 3 without invoking the engine" test "$sb_rc" = 3 -a ! -e "$SB/count"
 sb_check "supplied exposition file preserved byte-identical" test -f "$SB/in.expo" -a "$in_sha" = "$(sha256sum "$SB/in.expo" | awk '{print $1}')"
+sb_check "--breach-out survives --no-file with exact ratchet decision" python3 - "$SB/breaches.json" <<'PY'
+import json, sys
+plan = json.load(open(sys.argv[1]))
+assert plan['breach_count'] == len(plan['entries']) == 1
+entry = plan['entries'][0]
+assert (entry['scenario'], entry['measured_ms'], entry['threshold_ms']) == ('list_load:movie:single', 2000, 1000)
+PY
+printf 'phantom_loadtime_seconds{flow="list_load",item_type="movie",color="green"} 0.5\n' > "$SB/pass.expo"
+sb_guard --exposition "$SB/pass.expo" --no-file --breach-out "$SB/breaches.json"
+sb_check "passing guard replaces the previous breach output with an empty plan" test "$sb_rc" = 0
+sb_check "--breach-out contains no stale entries after success" python3 - "$SB/breaches.json" <<'PY'
+import json, sys
+assert json.load(open(sys.argv[1])) == {'breach_count': 0, 'entries': []}
+PY
 sb_guard --exposition "$SB/missing.expo" --no-file
 sb_check "missing --exposition file -> exit 2" test "$sb_rc" = 2
 : > "$SB/empty.expo"; sb_guard --exposition "$SB/empty.expo" --no-file
@@ -594,6 +650,8 @@ assert len(expected['scenarios']) == 12, 'shipped registry must cover six flows 
 for scenario in expected['scenarios']:
     if scenario['flow'] == 'list_load':
         scenario['threshold_ms'] = float(sys.argv[3]) if scenario['backend'] == sys.argv[4] else 1050
+    else:
+        scenario['threshold_ms'] = 1020 if scenario['flow'] in ('materialise', 'play_materialised') else 1050
 def canonical(value):
     scenarios = [{k: v for k, v in s.items() if v is not None} for s in value['scenarios']]
     return {**value, 'scenarios': sorted(scenarios, key=lambda s: (s['flow'], s['backend'], s['quantile']))}
