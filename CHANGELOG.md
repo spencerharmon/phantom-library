@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Accept raw `max_over_time` vectors without `__name__` in the offline playback
+  outcome report; explicit foreign metric names are still rejected. All three
+  query captures must share an explicit Prometheus `time=` value.
 - Add an offline playback-outcome coverage report that distinguishes missing
   serving instrumentation, stale samples, and zero observed attempts from a
   measured error rate. See the [input contract and usage](docs/tasks/playback-outcome-coverage-report-001.md).

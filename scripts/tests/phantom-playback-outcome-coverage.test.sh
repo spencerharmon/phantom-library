@@ -63,6 +63,18 @@ case("window-only failures are not improvement", fixture(window=historical), 0,
      ["aged-out/stale", "window_max=19; not improvement; excluded from rate/ranking", "attempts=0 errors=0"],
      ["cause_ranking=first_byte_timeout"])
 case("window does not instrument serving", fixture(rows(1), rows()), 2, ["UNINSTRUMENTED"])
+raw_window = rows()
+for row in raw_window:
+    row["metric"].pop("__name__")
+case("raw max_over_time window", fixture(window=raw_window), 0,
+     ["coverage=32/32", "attempts=0 errors=0 error_rate=undefined (no observed attempts)"],
+     ["aged-out/stale", "cause_ranking="])
+raw_historical = copy.deepcopy(historical)
+raw_historical[0]["metric"].pop("__name__")
+case("raw window-only failures are not improvement", fixture(window=raw_historical), 0,
+     ["aged-out/stale", "window_max=19; not improvement; excluded from rate/ranking", "attempts=0 errors=0"],
+     ["cause_ranking=first_byte_timeout"])
+case("raw window does not instrument serving", fixture(rows(1), raw_window), 2, ["UNINSTRUMENTED"])
 
 for flow, item in itertools.product(flows, items):
     positive = rows()
@@ -123,10 +135,14 @@ for kind in ("instant", "timestamps"):
     future = fixture()
     future[kind]["data"]["result"][0]["value"][0 if kind == "instant" else 1] = 1001
     case(f"future {kind}", future, 1, ["future timestamp"])
-for family in ("phantom_runtime_info", "phantom_loadtime_rig_outcome_total", "phantom_playback_outcome_total_extra"):
-    invalid = fixture()
-    invalid["instant"]["data"]["result"][0]["metric"]["__name__"] = family
-    case(f"wrong family {family}", invalid, 1, ["expected phantom_playback_outcome_total family"])
+missing_name = fixture()
+missing_name["instant"]["data"]["result"][0]["metric"].pop("__name__")
+case("instant requires metric name", missing_name, 1, ["instant: expected phantom_playback_outcome_total family"])
+for kind in ("instant", "window", "timestamps"):
+    for family in ("phantom_runtime_info", "phantom_loadtime_rig_outcome_total", "phantom_playback_outcome_total_extra", ""):
+        invalid = fixture(window=copy.deepcopy(raw_window))
+        invalid[kind]["data"]["result"][0]["metric"]["__name__"] = family
+        case(f"wrong family {kind} {family!r}", invalid, 1, [f"{kind}: expected phantom_playback_outcome_total family"])
 for kind in ("instant", "window", "timestamps"):
     extra = fixture(window=rows())
     extra[kind]["data"]["result"][0]["metric"]["other_job"] = "unexpected"
@@ -134,9 +150,10 @@ for kind in ("instant", "window", "timestamps"):
 missing_timestamp = fixture()
 missing_timestamp["timestamps"]["data"]["result"].pop()
 case("missing sample timestamp", missing_timestamp, 1, ["timestamp coverage must exactly match"])
-mismatched = fixture()
-mismatched["timestamps"]["data"]["result"][0]["value"][0] = 999
-case("different evaluation times", mismatched, 1, ["one common Prometheus evaluation time"])
+for kind in ("window", "timestamps"):
+    mismatched = fixture(window=copy.deepcopy(raw_window))
+    mismatched[kind]["data"]["result"][0]["value"][0] = 999
+    case(f"different evaluation times {kind}", mismatched, 1, ["one common Prometheus evaluation time"])
 warned = fixture()
 warned["instant"]["warnings"] = ["partial data"]
 case("partial API warning", warned, 1, ["expected successful, unannotated API vector"])

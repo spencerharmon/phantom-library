@@ -45,7 +45,9 @@ def number(value):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Offline playback outcome coverage and cumulative error ratio")
+    parser = argparse.ArgumentParser(
+        description="Offline playback outcome coverage and cumulative error ratio",
+        epilog="Capture all three vectors with the same explicit Prometheus time= value; --now only controls age checks.")
     parser.add_argument("--instant", required=True, help="raw outcome instant-vector API JSON")
     parser.add_argument("--window", required=True, help="max_over_time outcome vector API JSON (context only)")
     parser.add_argument("--timestamps", required=True, help="timestamp(outcome selector) vector API JSON")
@@ -95,8 +97,8 @@ def main():
             if (not isinstance(labels, dict) or any(not isinstance(v, str) for v in labels.values())
                     or not isinstance(sample, list) or len(sample) != 2):
                 raise ValueError(f"{kind}: malformed labels/sample")
-            # timestamp() drops __name__; other families are never volume.
-            if labels.get("__name__", METRIC if kind == "timestamps" else None) != METRIC:
+            # max_over_time() and timestamp() drop __name__; reject any explicit foreign family.
+            if labels.get("__name__", METRIC if kind in ("window", "timestamps") else None) != METRIC:
                 raise ValueError(f"{kind}: expected {METRIC} family")
             key = tuple(labels.get(d) for d in DIMENSIONS)
             if key not in CANONICAL:

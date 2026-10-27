@@ -70,21 +70,32 @@ beehive submodule worktree exec phantom-library bee-playback-outcome-coverage-re
 
 `--now` defaults to the current Unix time. Set it to the capture time when
 analysing archived evidence; a historical report does not establish live health.
+It controls offline age checks only, not the evaluation times in the input files.
 Any one input may be `-` to read stdin. All others must be local files.
 
 The caller supplies three successful Prometheus API **vector** responses,
 queried at the same explicit evaluation time and with the same scope selector:
+send the same `time=<evaluation_timestamp>` parameter to `/api/v1/query` for
+all three requests, including `max_over_time(...)`. Do not let each request
+independently default to "now"; differing outer sample timestamps are rejected.
 
 - `--instant`: `phantom_playback_outcome_total{...}`. Raw cumulative counters,
   never a sum, rate, increase, synthetic rig family, or runtime-info gauge.
 - `--window`: `max_over_time(phantom_playback_outcome_total{...}[30d])` (or the
   caller's chosen window). Context only: maxima are not attempts in the window,
   not reset-adjusted deltas, and never added to current totals.
+  This function drops `__name__`; raw output is accepted without `label_replace`.
 - `--timestamps`: `timestamp(phantom_playback_outcome_total{...})`. Values are
   actual source sample times; this function drops `__name__`. The API's outer
   sample timestamp is query evaluation time and **does not prove freshness**.
   This companion is mandatory, with exactly the same identities/tuples as the
   instant result. There is deliberately no fallback to evaluation timestamps.
+
+For `--window` and `--timestamps`, a missing `__name__` is treated as the outcome
+family. A present name must still be exactly `phantom_playback_outcome_total`;
+`--instant` always requires that name. The caller must use the outcome queries
+above: once a function drops the name, the analyser cannot prove the source
+family from labels alone.
 
 Example `expected.json`:
 
