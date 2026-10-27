@@ -30,7 +30,14 @@
 #   loadtime-guard.sh [--live] [--api <url>] [--token <tok>] [--color <c>]
 #                      [--thresholds <file>] [--apply] [--source-task <id>]
 #                      [--task-prefix <prefix>] [--submodule <name>] [--no-file]
-#                      [--exposition <file>]
+#                      [--exposition <file>] [--breach-out <file>]
+#
+#   --breach-out    write a machine-readable breach list (one TAB-separated
+#                   line per breached scenario: flow, item_type, observed
+#                   seconds, ceiling seconds). Written EMPTY on a pass (exit 0),
+#                   populated on a breach (exit 3), removed on a tool error
+#                   (exit 2) so callers never read a stale/partial list. The
+#                   daily wrapper turns it into durable Pushgateway series.
 #
 #   --exposition    guard a CALLER-OWNED, already-measured exposition file
 #                   instead of invoking the measurement engine (the daily
@@ -73,8 +80,9 @@ API=""
 TOKEN=""
 COLOR=""
 EXPO_IN=""
+BREACH_OUT=""
 
-die() { echo "loadtime-guard.sh: $*" >&2; exit 2; }
+die() { [ -n "${BREACH_OUT:-}" ] && rm -f "$BREACH_OUT"; echo "loadtime-guard.sh: $*" >&2; exit 2; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -89,6 +97,7 @@ while [ $# -gt 0 ]; do
     --submodule)    SUBMODULE=${2:?}; shift 2 ;;
     --no-file)      NO_FILE=1; shift ;;
     --exposition)   EXPO_IN=${2:?}; shift 2 ;;
+    --breach-out)   BREACH_OUT=${2:?}; shift 2 ;;
     -h|--help)      sed -n '2,45p' "$0"; exit 0 ;;
     *) die "unknown argument '$1'" ;;
   esac
@@ -142,6 +151,7 @@ rc=$?
 set -e
 
 if [ "$rc" = 0 ]; then
+  [ -n "$BREACH_OUT" ] && : > "$BREACH_OUT"
   echo "loadtime-guard: OK (no regression)"
   exit 0
 fi
@@ -152,6 +162,23 @@ if [ "$rc" != 3 ]; then
 fi
 
 echo "loadtime-guard: BREACH detected" >&2
+
+# Machine-readable breach list (flow, item_type, observed s, ceiling s) from
+# the ratchet's filing plan — the SAME breach set the filing below acts on.
+if [ -n "$BREACH_OUT" ]; then
+  python3 - "$PLAN" "$BREACH_OUT" <<'PY' || die "could not write breach list to $BREACH_OUT"
+import json, sys
+plan = json.load(open(sys.argv[1]))
+lines = []
+for e in plan["entries"]:
+    flow, item, _quantile = e["scenario"].split(":", 2)
+    lines.append(f"{flow}\t{item}\t{e['measured_ms'] / 1000:.6g}\t{e['threshold_ms'] / 1000:.6g}\n")
+if not lines:
+    sys.exit("breach exit without breach entries")
+with open(sys.argv[2], "w") as f:
+    f.writelines(lines)
+PY
+fi
 
 if [ "$NO_FILE" = 1 ]; then
   echo "loadtime-guard: --no-file set; not filing beehive tasks" >&2

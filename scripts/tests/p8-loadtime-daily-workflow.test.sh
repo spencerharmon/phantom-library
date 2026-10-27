@@ -61,16 +61,20 @@ with open(sys.argv[1]) as f:
 if sys.argv[3] == 'live':
     payloads = re.findall(
         r'^PUT \S+/metrics/job/phantom-loadtime-daily-run\n'
-        r'((?:phantom_loadtime_daily_.*\n)+)--', output, re.MULTILINE)
+        r'((?:phantom_loadtime_(?:daily|guard)_.*\n)+)--', output, re.MULTILINE)
 else:
     payloads = re.findall(
         r'^    \[stage-metric dry-run\] PUT \S+/metrics/job/phantom-loadtime-daily-run\n'
-        r'((?:    phantom_loadtime_daily_.*\n)+)', output, re.MULTILINE)
+        r'((?:    phantom_loadtime_(?:daily|guard)_.*\n)+)', output, re.MULTILINE)
 assert len(payloads) == 3, f"expected three stage PUTs, got {len(payloads)}"
 run_start = None
 for index in (2, 1, 0):
     payload = payloads[index]
-    samples = dict(line.strip().split() for line in payload.splitlines())
+    lines = [l for l in payload.splitlines() if 'phantom_loadtime_guard_' not in l]
+    breach_lines = len(payload.splitlines()) - len(lines)
+    # Guard breach series ride ONLY in the guard PUT (index 2).
+    assert index == 2 or breach_lines == 0, f"PUT {index + 1} carries guard breach series early"
+    samples = dict(line.strip().split() for line in lines)
     stages = ('measure', 'push', 'guard')[:index + 1]
     expected = {'phantom_loadtime_daily_run_start_timestamp_seconds'}
     for stage in stages:
@@ -85,7 +89,7 @@ for index in (2, 1, 0):
                 allowed = {int(v) for v in sys.argv[2].split(',')} if stage == 'guard' else {0}
                 assert value in allowed, f"unexpected exit code: {key} {value}"
     assert set(samples) == expected, f"PUT {index + 1} has missing or unexpected samples"
-    assert len(payload.splitlines()) == len(expected), "duplicate samples"
+    assert len(lines) == len(expected), "duplicate samples"
     timestamp = int(samples['phantom_loadtime_daily_run_start_timestamp_seconds'])
     assert timestamp > 0, "run start must be an epoch timestamp"
     if run_start is None:
@@ -404,9 +408,19 @@ if [ "$n" = 1 ]; then batch=A; else batch=B; fi
 if [ "$mode" = durable ]; then [ "$batch" = A ] && v="$SB_VALUE" || v=9.0
 elif [ "$mode" = A-breach ]; then [ "$batch" = A ] && v=2.0 || v=0.5
 else [ "$batch" = A ] && v=0.5 || v=2.0; fi
+c="${PHANTOM_LOADTIME_COLOR:-green}"
 for b in movie episode; do
   val=0.95; [ "$mode" = durable ] && val=1.0; [ "$b" = "$backend" ] && val=$v
-  printf 'phantom_loadtime_seconds{flow="list_load",item_type="%s",color="%s"} %s\n' "$b" "${PHANTOM_LOADTIME_COLOR:-green}" "$val"
+  printf 'phantom_loadtime_seconds{flow="list_load",item_type="%s",color="%s"} %s\n' "$b" "$c" "$val"
+  # Complete batch (the push emitter refuses a partial group). Other flows
+  # measure 0s against 0ms (unseeded) ceilings: never a breach or ratchet.
+  for f in sort_change info_open get_sources materialise play_materialised; do
+    printf 'phantom_loadtime_seconds{flow="%s",item_type="%s",color="%s"} 0\n' "$f" "$b" "$c"
+  done
+  for f in list_load sort_change info_open get_sources materialise play_materialised; do
+    printf 'phantom_loadtime_runs_total{flow="%s",item_type="%s",color="%s"} 1\n' "$f" "$b" "$c"
+    printf 'phantom_loadtime_errors_total{flow="%s",item_type="%s",color="%s"} 0\n' "$f" "$b" "$c"
+  done
 done
 ENG
 cat > "$sb_bin/kubectl" <<'K'
@@ -437,7 +451,17 @@ sb_reset() {
   "ratchet_headroom_ratio": 0.05,
   "scenarios": [
     { "flow": "list_load", "backend": "movie", "quantile": "single", "threshold_ms": 1000 },
-    { "flow": "list_load", "backend": "episode", "quantile": "single", "threshold_ms": 1000 }
+    { "flow": "list_load", "backend": "episode", "quantile": "single", "threshold_ms": 1000 },
+    { "flow": "sort_change", "backend": "movie", "quantile": "single", "threshold_ms": 0 },
+    { "flow": "sort_change", "backend": "episode", "quantile": "single", "threshold_ms": 0 },
+    { "flow": "info_open", "backend": "movie", "quantile": "single", "threshold_ms": 0 },
+    { "flow": "info_open", "backend": "episode", "quantile": "single", "threshold_ms": 0 },
+    { "flow": "get_sources", "backend": "movie", "quantile": "single", "threshold_ms": 0 },
+    { "flow": "get_sources", "backend": "episode", "quantile": "single", "threshold_ms": 0 },
+    { "flow": "materialise", "backend": "movie", "quantile": "single", "threshold_ms": 0 },
+    { "flow": "materialise", "backend": "episode", "quantile": "single", "threshold_ms": 0 },
+    { "flow": "play_materialised", "backend": "movie", "quantile": "single", "threshold_ms": 0 },
+    { "flow": "play_materialised", "backend": "episode", "quantile": "single", "threshold_ms": 0 }
   ]
 }
 T
@@ -460,6 +484,36 @@ sb_check() { # sb_check <label> <cond-cmd...>
     local label="$1"; shift
     if "$@"; then ok "$label"; else bad "$label"; sed 's/^/      /' "$SB/out.log" | tail -40 >&2; fi
 }
+sb_breaches() { # sb_breaches <log> <expected: none | count0 | backend:observed:ceiling>
+    python3 - "$1" "$2" <<'PY'
+import re, sys
+t = open(sys.argv[1]).read()
+if 'stage-metric dry-run' in t:
+    puts = re.findall(r'^    \[stage-metric dry-run\] PUT \S+/metrics/job/phantom-loadtime-daily-run\n((?:    phantom_loadtime_.*\n)+)', t, re.M)
+else:
+    puts = re.findall(r'^PUT \S+/metrics/job/phantom-loadtime-daily-run\n(.*?)^--$', t, re.M | re.S)
+assert puts, 'no stage-group PUT'
+body = {}
+for line in puts[-1].splitlines():
+    if 'phantom_loadtime_guard_' in line:
+        k, v = line.strip().rsplit(' ', 1)
+        body[k] = float(v)
+want = sys.argv[2]
+if want == 'none':
+    assert body == {}, body
+elif want == 'count0':
+    assert body == {'phantom_loadtime_guard_breach_count': 0.0}, body
+else:
+    item, obs, ceil = want.split(':')
+    lbl = f'{{flow="list_load",item_type="{item}"}}'
+    assert body == {
+        'phantom_loadtime_guard_breach' + lbl: 1.0,
+        'phantom_loadtime_guard_breach_observed_seconds' + lbl: float(obs),
+        'phantom_loadtime_guard_breach_ceiling_seconds' + lbl: float(ceil),
+        'phantom_loadtime_guard_breach_count': 1.0,
+    }, body
+PY
+}
 sb_guard_stage() { # final stage-outcome PUT's guard exit code
     python3 - "$1" <<'PY'
 import re,sys
@@ -481,6 +535,8 @@ for backend in movie episode; do
         grep -q "phantom_loadtime_seconds{flow=\"list_load\",item_type=\"$backend\",color=\"green\"} $a_val\$" "$SB/curl.log"
     sb_check "[$c live] stage=guard outcome is A-based ($want_guard)" test "$(sb_guard_stage "$SB/curl.log")" = "$want_guard"
     sb_check "[$c live] all three PUTs retain cumulative stages" assert_stage_payloads "$SB/curl.log" "$want_guard" live
+    if [ "$mode" = A-breach ]; then want_b="$backend:2:1"; else want_b=count0; fi
+    sb_check "[$c live] guard PUT carries durable breach series ($want_b)" sb_breaches "$SB/curl.log" "$want_b"
     sb_check "[$c live] $backend threshold written from A (${want_thr}ms)" test "$(sb_thr "$backend")" = "$want_thr"
     other=episode; [ "$backend" = episode ] && other=movie
     sb_check "[$c live] $other threshold unchanged (1000ms)" test "$(sb_thr "$other")" = 1000
@@ -497,6 +553,7 @@ for backend in movie episode; do
     sb_check "[$c dry-run] pushed (dry-run) batch A ($backend=$a_val)" \
         grep -q "phantom_loadtime_seconds{flow=\"list_load\",item_type=\"$backend\",color=\"green\"} $a_val\$" "$SB/out.log"
     sb_check "[$c dry-run] stage=guard outcome is A-based ($want_guard)" test "$(sb_guard_stage "$SB/out.log")" = "$want_guard"
+    sb_check "[$c dry-run] guard PUT carries breach series / cleared set ($want_b)" sb_breaches "$SB/out.log" "$want_b"
     sb_check "[$c dry-run] thresholds byte-identical, nothing filed/curl'd" \
         test "$before" = "$(sha256sum "$SB_THR" | awk '{print $1}')" -a ! -s "$SB/beehive.log" -a ! -s "$SB/curl.log"
   done
@@ -653,6 +710,8 @@ for backend in movie episode; do
         sb_check "$label measures once, never remeasures for guard" test "$(cat "$SB/count" 2>/dev/null)" = 1
         sb_check "$label publishes exactly the guarded batch" durable_batch "$backend" "$SB_VALUE"
         sb_check "$label cumulative stage PUTs end with guard=$want_guard" assert_stage_payloads "$SB/curl.log" "$want_guard" live
+        if [ "$run" = 3 ]; then want_b="$backend:0.8:0.525"; else want_b=count0; fi
+        sb_check "$label guard PUT breach series ($want_b)" sb_breaches "$SB/curl.log" "$want_b"
         sb_check "$label durable 12-scenario registry preserves independent ceilings and metadata" durable_registry "$want_thr" "$backend"
         sb_check "$label shipped seed remains byte-identical" cmp -s "$THRESHOLDS" "$sb_root/tools/perf/loadtime-thresholds.json"
         if [ "$run" = 2 ]; then
@@ -715,6 +774,7 @@ flock -u 9
 exec 9>&-
 sb_check "[busy lock] wrapper fails with published guard=2" test "$sb_rc" != 0 -a "$(sb_guard_stage "$SB/curl.log")" = 2
 sb_check "[busy lock] cumulative stage outcomes retain lock failure" assert_stage_payloads "$SB/curl.log" 2 live
+sb_check "[busy lock] tool error publishes no breach series" sb_breaches "$SB/curl.log" none
 sb_check "[busy lock] existing bytes unchanged" cmp -s "$SB/before.json" "$SB_THR"
 sb_check "[busy lock] no regression filing" test ! -s "$SB/beehive.log"
 

@@ -146,7 +146,27 @@ record_stage() {
     fi
 }
 
+# record_breaches <guard_rc> — append phantom_loadtime_guard_breach* series
+# (from loadtime-guard.sh --breach-out) to the stage group payload.
+record_breaches() {
+    local rc="$1" n=0 flow item observed ceiling
+    [ "$rc" = 0 ] || [ "$rc" = 3 ] || return 0
+    if [ "$rc" = 3 ]; then
+        # Never fail() here: that would skip record_stage guard's push.
+        [ -s "$BREACH_OUT" ] || note "WARNING: guard reported BREACH but wrote no breach list"
+        while IFS=$'\t' read -r flow item observed ceiling; do
+            [ -n "$flow" ] || continue
+            n=$((n + 1))
+            printf 'phantom_loadtime_guard_breach{flow="%s",item_type="%s"} 1\n' "$flow" "$item"
+            printf 'phantom_loadtime_guard_breach_observed_seconds{flow="%s",item_type="%s"} %s\n' "$flow" "$item" "$observed"
+            printf 'phantom_loadtime_guard_breach_ceiling_seconds{flow="%s",item_type="%s"} %s\n' "$flow" "$item" "$ceiling"
+        done < "$BREACH_OUT" >> "$STAGE_EXPO"
+    fi
+    printf 'phantom_loadtime_guard_breach_count %s\n' "$n" >> "$STAGE_EXPO"
+}
+
 EXPO="$(mktemp -t loadtime-daily-expo.XXXXXX.txt)"
+BREACH_OUT="$(mktemp -t loadtime-daily-breaches.XXXXXX.tsv)"
 STAGE_EXPO=""
 _torn_down=0
 teardown() {
@@ -154,7 +174,7 @@ teardown() {
     [ "$_torn_down" = 1 ] && exit "$ec"
     _torn_down=1
     log "mandatory cleanup"
-    rm -f "$EXPO" "$STAGE_EXPO"
+    rm -f "$EXPO" "$STAGE_EXPO" "$BREACH_OUT"
     phantom_ci_cleanup_dotnet "$([ "$ec" != 0 ] && echo 1 || echo 0)" || true
     exit "$ec"
 }
@@ -258,7 +278,7 @@ fi
 # EXACT batch stage 1 measured and stage 2 pushed — never a second engine
 # run, whose cache/materialisation state could disagree with what was
 # published. Both live and dry-run branches use the caller-owned $EXPO.
-guard_args+=(--exposition "$EXPO")
+guard_args+=(--exposition "$EXPO" --breach-out "$BREACH_OUT")
 set +e
 # PHANTOM_CI_FORCE_GUARD_FAIL=1 lets the in-repo regression harness
 # deterministically exercise the stage="guard" failure path (no live
@@ -272,6 +292,13 @@ else
     guard_rc=$?
 fi
 set -e
+# Durable per-flow breach detail (ttfb-loadtime-guard-breach-metric): the
+# pod (and the guard's log) is GC'd long before the next daily pass, and a
+# --no-file run files no task, so the breach list goes into the SAME retained
+# job=phantom-loadtime-daily-run group as the stage outcome. The guard PUT
+# replaces the group, so a clean run (count 0, no per-flow series) clears any
+# stale breach from a previous day. Tool error (rc=2): no breach series.
+record_breaches "$guard_rc"
 record_stage guard "$guard_rc" "$_stage_start"
 if [ "$guard_rc" = 0 ]; then
     note "regression guard: OK (no breach)"
