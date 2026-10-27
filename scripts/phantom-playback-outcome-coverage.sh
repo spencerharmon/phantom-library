@@ -18,6 +18,7 @@ ITEMS = ("movie", "episode")
 CAUSES = ("success", "availability_abstain", "no_candidate", "magnet_dead_stale",
           "gostream_register_fail", "gostream_cannot_fetch", "first_byte_timeout",
           "plugin_host_error")
+TEMPERATURE = {"materialise_then_play": "cold", "play_already_materialised": "warm"}
 CANONICAL = set(itertools.product(FLOWS, ITEMS, CAUSES))
 
 
@@ -44,9 +45,20 @@ def number(value):
     return result
 
 
+def rate(errors, attempts):
+    return f"{Decimal(errors) / Decimal(attempts):.6%}" if attempts else "undefined (no observed attempts)"
+
+
+def ranking(values):
+    counts = {cause: sum(int(v) for key, v in values.items() if key[2] == cause)
+              for cause in CAUSES if cause != "success"}
+    ordered = sorted(((c, n) for c, n in counts.items() if n), key=lambda p: (-p[1], p[0]))
+    return ", ".join(f"{c}:{n}" for c, n in ordered) or "none (no errors)"
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Offline playback outcome coverage and cumulative error ratio",
+        description="Offline playback outcome coverage and cumulative error ratio: labelled per-instance aggregate plus four flow/item slices (cold=materialise_then_play, warm=play_already_materialised; movie/episode), each ranked only on its own volume",
         epilog="Capture all three vectors with the same explicit Prometheus time= value; --now only controls age checks.")
     parser.add_argument("--instant", required=True, help="raw outcome instant-vector API JSON")
     parser.add_argument("--window", required=True, help="max_over_time outcome vector API JSON (context only)")
@@ -54,7 +66,7 @@ def main():
     parser.add_argument("--expected", required=True, help="JSON array of {labels: {identity labels}, role: serving|inactive}")
     parser.add_argument("--now", default=str(time.time()), help="Unix time; override for reproducible offline analysis")
     parser.add_argument("--max-age", default="120", help="maximum sample/evaluation age in seconds (default 120)")
-    parser.add_argument("--min-attempts", default="100", help="rank serving causes only ABOVE this volume (default 100)")
+    parser.add_argument("--min-attempts", default="100", help="rank serving causes only ABOVE this volume, applied independently to the aggregate and to each slice (default 100)")
     args = parser.parse_args()
     now, max_age, minimum = map(number, (args.now, args.max_age, args.min_attempts))
     if [args.instant, args.window, args.timestamps, args.expected].count("-") > 1:
@@ -144,18 +156,26 @@ def main():
         if complete and not stale:
             attempts = sum(int(v) for v in current.values())
             errors = sum(int(v) for key, v in current.items() if key[2] != "success")
-            rate = f"{Decimal(errors) / Decimal(attempts):.6%}" if attempts else "undefined (no observed attempts)"
-            print(f"  attempts={attempts} errors={errors} error_rate={rate}")
+            print(f"  aggregate(all flows/items) attempts={attempts} errors={errors} error_rate={rate(errors, attempts)}")
             if role == "serving" and attempts > minimum:
-                counts = {cause: sum(int(v) for key, v in current.items() if key[2] == cause)
-                          for cause in CAUSES if cause != "success"}
-                ranking = sorted(((c, n) for c, n in counts.items() if n), key=lambda p: (-p[1], p[0]))
-                print("  cause_ranking=" + (", ".join(f"{c}:{n}" for c, n in ranking) or "none (no errors)"))
+                print("  cause_ranking=" + ranking(current))
             elif role == "serving":
                 reason = "no organic traffic yet observed" if not attempts else "insufficient attributed volume"
                 print(f"  {reason} (ranking suppressed: attempts <= {minimum})")
             else:
                 print("  cause_ranking=withheld (inactive; not attributed serving traffic)")
+            for flow, item in itertools.product(FLOWS, ITEMS):
+                part = {key: v for key, v in current.items() if key[:2] == (flow, item)}
+                s_attempts = sum(int(v) for v in part.values())
+                s_errors = sum(int(v) for key, v in part.items() if key[2] != "success")
+                if role != "serving":
+                    decision = "withheld (inactive)"
+                elif s_attempts > minimum:
+                    decision = ranking(part)
+                else:
+                    decision = f"suppressed (slice attempts <= {minimum})"
+                print(f"  slice[{TEMPERATURE[flow]}-{item}] flow={flow} item_type={item} attempts={s_attempts}"
+                      f" errors={s_errors} error_rate={rate(s_errors, s_attempts)} slice_ranking={decision}")
         else:
             print("  attempts=unavailable errors=unavailable error_rate=unavailable (coverage/freshness not established)")
         for (who, key), (_, value) in sorted(window.items()):

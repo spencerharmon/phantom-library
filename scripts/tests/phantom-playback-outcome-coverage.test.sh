@@ -45,8 +45,8 @@ def fixture(current=None, window=None):
 cases = []
 
 
-def case(name, data, code, contains, excludes=(), options=(), stdin=None):
-    cases.append((name, data, code, contains, excludes, options, stdin))
+def case(name, data, code, contains, excludes=(), options=(), stdin=None, exact_slices=None):
+    cases.append((name, data, code, contains, excludes, options, stdin, exact_slices))
 
 
 case("fresh zeros", fixture(), 0,
@@ -94,6 +94,68 @@ for flow, item in itertools.product(flows, items):
     incomplete = [r for r in rows() if not (r["metric"]["flow"] == flow and r["metric"]["item_type"] == item)]
     case(f"incomplete parity {flow}/{item}", fixture(incomplete), 2,
          ["status=INCOMPLETE coverage=24/32", "missing_tuples=", "error_rate=unavailable"], ["cause_ranking="])
+
+slice_names = {("materialise_then_play", "movie"): "cold-movie", ("materialise_then_play", "episode"): "cold-episode",
+               ("play_already_materialised", "movie"): "warm-movie", ("play_already_materialised", "episode"): "warm-episode"}
+
+
+def slice_line(flow, item, attempts, errors, rate, decision):
+    return (f"slice[{slice_names[flow, item]}] flow={flow} item_type={item} attempts={attempts} errors={errors}"
+            f" error_rate={rate} slice_ranking={decision}")
+
+
+undefined = "undefined (no observed attempts)"
+for sparse in itertools.product(flows, items):
+    dense = next(p for p in itertools.product(flows, items) if p[0] != sparse[0] and p[1] != sparse[1])
+    mixed = rows()
+    for row in mixed:
+        m = row["metric"]
+        if (m["flow"], m["item_type"], m["cause"]) == (*dense, "success"):
+            row["value"][1] = "1000"
+        if (m["flow"], m["item_type"], m["cause"]) == (*sparse, "magnet_dead_stale"):
+            row["value"][1] = "2"
+    lines = [slice_line(*dense, 1000, 0, "0.000000%", "none (no errors)"),
+             slice_line(*sparse, 2, 2, "100.000000%", "suppressed (slice attempts <= 100)")]
+    lines += [slice_line(f, i, 0, 0, undefined, "suppressed (slice attempts <= 100)")
+              for f, i in itertools.product(flows, items) if (f, i) not in (dense, sparse)]
+    case(f"mixed population sparse {slice_names[sparse]}", fixture(mixed), 0,
+         ["aggregate(all flows/items) attempts=1002 errors=2 error_rate=0.199601%",
+          "cause_ranking=magnet_dead_stale:2", *lines],
+         ["slice_ranking=magnet_dead_stale", "error_rate=0.000000% slice_ranking=suppressed"],
+         exact_slices=1)
+    above = copy.deepcopy(mixed)
+    for row in above:
+        m = row["metric"]
+        if (m["flow"], m["item_type"]) == sparse:
+            row["value"][1] = {"magnet_dead_stale": "60", "no_candidate": "41"}.get(m["cause"], "0")
+    case(f"slice strictly above threshold {slice_names[sparse]}", fixture(above), 0,
+         [slice_line(*sparse, 101, 101, "100.000000%", "magnet_dead_stale:60, no_candidate:41")], exact_slices=1)
+    at = copy.deepcopy(above)
+    for row in at:
+        m = row["metric"]
+        if (m["flow"], m["item_type"], m["cause"]) == (*sparse, "no_candidate"):
+            row["value"][1] = "40"
+    case(f"slice equality suppressed {slice_names[sparse]}", fixture(at), 0,
+         [slice_line(*sparse, 100, 100, "100.000000%", "suppressed (slice attempts <= 100)")],
+         ["slice_ranking=magnet_dead_stale"], exact_slices=1)
+    other = fixture(at + [dict(r, value=[1000, "5000" if r["metric"]["cause"] == "no_candidate" else "0"])
+                          for r in rows(1)])
+    other["expected"][1]["role"] = "serving"
+    case(f"other identity volume cannot unlock slice {slice_names[sparse]}", other, 0,
+         [slice_line(*sparse, 100, 100, "100.000000%", "suppressed (slice attempts <= 100)")],
+         ["slice_ranking=magnet_dead_stale"], exact_slices=2)
+inactive_mixed = rows(1)
+for row in inactive_mixed:
+    if row["metric"]["cause"] == "no_candidate":
+        row["value"][1] = "500"
+case("inactive slices measured but never ranked", fixture(rows() + inactive_mixed), 0,
+     [slice_line("materialise_then_play", "movie", 500, 500, "100.000000%", "withheld (inactive)")],
+     ["slice_ranking=no_candidate"], exact_slices=2)
+stale_slices = fixture()
+stale_slices["timestamps"]["data"]["result"][0]["value"][1] = "879"
+case("stale instance withholds slices", stale_slices, 2, ["error_rate=unavailable"], ["slice["], exact_slices=0)
+incomplete_slices = fixture(rows()[1:])
+case("incomplete instance withholds slices", incomplete_slices, 2, ["status=INCOMPLETE"], ["slice["], exact_slices=0)
 
 inactive = rows(1)
 inactive[0]["value"][1] = "10000"
@@ -171,7 +233,7 @@ with tempfile.TemporaryDirectory(prefix="outcome-coverage-") as temp:
     stub = directory / "zero-percent-stub.sh"
     stub.write_text("#!/bin/sh\nprintf '0%%\\n'\n")
     stub.chmod(0o755)
-    for name, data, code, contains, excludes, options, stdin in cases:
+    for name, data, code, contains, excludes, options, stdin, exact_slices in cases:
         args = ["--now", "1000", "--max-age", "120", "--min-attempts", "100"]
         originals = {}
         for kind, payload in data.items():
@@ -187,6 +249,10 @@ with tempfile.TemporaryDirectory(prefix="outcome-coverage-") as temp:
         assert result.returncode == code, (name, result.returncode, code, output)
         assert all(s in output for s in contains), (name, contains, output)
         assert not any(s in output for s in excludes), (name, excludes, output)
+        if exact_slices is not None:
+            for label in slice_names.values():
+                count = sum(line.startswith(f"  slice[{label}] ") for line in result.stdout.splitlines())
+                assert count == exact_slices, (name, label, count, output)
         assert all(path.read_bytes() == original for path, original in originals.items()), "input mutated"
         fake = subprocess.run([str(stub), *args], text=True, capture_output=True, check=True)
         assert not (fake.returncode == code and all(s in fake.stdout for s in contains)), f"stub survived: {name}"
