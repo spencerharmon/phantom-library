@@ -516,8 +516,10 @@ log "target type=Season id=$SEASON_ID"
 EPISODE_ID="$(api "$API/Channels/$CH_SHOWS/Items?Limit=1&userId=$USER_ID&FolderId=$SEASON_ID" | discovery_id Episode)" || fail "invalid Episode discovery"
 log "target type=Episode id=$EPISODE_ID"
 
-# Only item-flow targets are corrected here. Root list/sort requests below still
-# omit userId and do not measure interactive series/season/episode navigation.
+# Root list/sort pages carry the SAME resolved userId as discovery on every
+# page (incl. descending sort + pagination): an unscoped channel request returns
+# latest-media results, not the interactive user catalogue. Series/season/episode
+# navigation is still not timed.
 # Playback flows still judge curl status, not MediaSources or stream-body validity.
 
 # time_full_list_flow <flow> <item_type> <channel> <sort_qs>
@@ -536,7 +538,7 @@ _full_list_sample() {
     while :; do
         local page_json page_file
         page_file="$(mktemp "$WORK_DIR/page.XXXXXX")"
-        if ! api "$API/Channels/$ch/Items?Limit=$page&StartIndex=$start_index${sort_qs}" -o "$page_file" 2>/dev/null; then
+        if ! api "$API/Channels/$ch/Items?Limit=$page&StartIndex=$start_index&userId=$USER_ID${sort_qs}" -o "$page_file" 2>/dev/null; then
             errors=1; rm -f "$page_file"; break
         fi
         local got total_records

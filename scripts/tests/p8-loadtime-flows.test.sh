@@ -274,8 +274,9 @@ url = next(a for a in args if a.startswith('http://'))
 parsed = urlsplit(url)
 query = parse_qs(parsed.query)
 method = args[args.index('-X') + 1] if '-X' in args else 'GET'
+post_body = json.loads(args[args.index('-d') + 1]) if '-d' in args else None
 with open(os.environ['CURL_LOG'], 'a') as log:
-    log.write(json.dumps([method, parsed.path, query]) + '\n')
+    log.write(json.dumps([method, parsed.path, query, post_body]) + '\n')
 ids = dict(user='1' * 32, movie='2' * 32, series='3' * 32,
            season='4' * 32, episode='5' * 32)
 stage = None
@@ -295,8 +296,21 @@ elif parsed.path.startswith('/Channels/'):
             stage = {ids['series']: 'season', ids['season']: 'episode'}.get(folder, 'series')
         body = {'Items': [{'Id': ids[stage], 'Type': stage.title()}]}
     else:
-        # Root list/sort semantics are deliberately not changed by this fix.
-        body = {'Items': [], 'TotalRecordCount': 0}
+        # Root list/sort pages: a user-scoped catalogue of 401+ items per root
+        # (forces >1 page of 200 AND >1 badge batch of 400); an unscoped
+        # request gets a DISTINCT small latest-media result so a missing
+        # userId can never masquerade as the interactive catalogue.
+        root = parsed.path.split('/')[2]
+        if query.get('userId') == [ids['user']]:
+            n = {'movies': 405, 'shows': 413}[root]
+            items = [{'Id': f'{root}-{i:04d}'} for i in range(n)]
+            if query.get('SortOrder') == ['Descending']:
+                items.reverse()
+        else:
+            items = [{'Id': f'latest-{root}-{i}'} for i in range(3)]
+        start = int(query.get('StartIndex', ['0'])[0])
+        limit = int(query.get('Limit', ['0'])[0])
+        body = {'Items': items[start:start + limit], 'TotalRecordCount': len(items)}
 elif parsed.path.startswith(('/Items/', '/Videos/', '/Plugins/')):
     body = {}
 else:
@@ -346,7 +360,9 @@ def run(name, fault=''):
     result = subprocess.run(['bash', engine], env=dict(
         env, CURL_LOG=str(log), CURL_FAULT=fault, TMPDIR=str(scratch),
         PHANTOM_LOADTIME_OUT=str(out)), text=True, capture_output=True, timeout=30)
-    requests = [json.loads(line) for line in log.read_text().splitlines()]
+    requests = [json.loads(line)[:3] for line in log.read_text().splitlines()]
+    posts = [json.loads(line) for line in log.read_text().splitlines()]
+    run.badges = [r[3]['ids'] for r in posts if r[1] == '/Plugins/PhantomLibrary/States']
     assert not list(scratch.iterdir()), (name, 'temporary files leaked')
     assert env['PHANTOM_LOADTIME_TOKEN'] not in result.stderr, 'credential logged'
     return result, requests, out
@@ -374,6 +390,25 @@ assert actual == expected, actual
 for kind in ('movie', 'series', 'season', 'episode'):
     assert f'target type={kind.title()} id={ids[kind]}' in result.stderr, result.stderr
 assert out.read_text() == result.stdout, 'file/stdout exposition mismatch'
+# Root list/sort pages: every page user-scoped, complete pagination, exact
+# descending sort, exact badge-batched IDs (ttfb-loadtime-root-list-user-context).
+pages = [r for r in requests if r[1].startswith('/Channels/') and r[2].get('Limit') == ['200']]
+assert all(r[2].get('userId') == [ids['user']] for r in pages), [r for r in pages if r[2].get('userId') != [ids['user']]]
+expected_pages, expected_badges = [], []
+for root, n in (('movies', 405), ('shows', 413)):
+    for desc in (False, True):
+        sort = {'SortBy': ['SortName'], 'SortOrder': ['Descending']} if desc else {}
+        for start in range(0, n, 200):
+            expected_pages.append([f'/Channels/{root}/Items', dict(
+                {'Limit': ['200'], 'StartIndex': [str(start)], 'userId': [ids['user']]}, **sort)])
+        order = [f'{root}-{i:04d}' for i in range(n)]
+        if desc:
+            order.reverse()
+        expected_badges += [order[i:i + 400] for i in range(0, n, 400)]
+assert [[r[1], r[2]] for r in pages] == expected_pages, pages
+assert run.badges == expected_badges, [len(b) for b in run.badges]
+assert not any(i.startswith('latest-') for b in run.badges for i in b), 'unscoped latest leaked'
+assert 'items=405' in result.stderr and 'items=413' in result.stderr, result.stderr
 flows = ('list_load', 'sort_change', 'info_open', 'get_sources', 'materialise', 'play_materialised')
 for metric in ('seconds', 'runs_total', 'errors_total'):
     lines = [line for line in result.stdout.splitlines()
