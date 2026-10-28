@@ -174,8 +174,48 @@ stale = fixture()
 stale["timestamps"]["data"]["result"][0]["value"][1] = "879"
 case("fresh evaluation cannot hide stale sample", stale, 2, ["status=STALE", "sample_age_seconds=121", "error_rate=unavailable"])
 boundary = fixture()
-boundary["timestamps"]["data"]["result"][0]["value"][1] = "880"
-case("freshness boundary inclusive", boundary, 0, ["status=OK", "sample_age_seconds=120"])
+for row in boundary["timestamps"]["data"]["result"]:
+    row["value"][1] = "880"
+case("freshness boundary inclusive", boundary, 0, ["status=OK", "sample_age_seconds=120"], ["INCOHERENT"])
+
+
+def day19(identity, flow, item, stamp_errors="990", stamp_success="880"):
+    current = rows(identity)
+    for row in current:
+        m = row["metric"]
+        if (m["flow"], m["item_type"]) == (flow, item):
+            row["value"][1] = {"success": "1000", "first_byte_timeout": "101"}.get(m["cause"], "0")
+    data = fixture(current)
+    for row in data["timestamps"]["data"]["result"]:
+        row["value"][1] = stamp_success if row["metric"]["cause"] == "success" else stamp_errors
+    return data
+
+
+for flow, item in itertools.product(flows, items):
+    label = slice_names[flow, item]
+    for identity, role in ((0, "serving"), (1, "inactive")):
+        mixed_source = day19(identity, flow, item)
+        healthy = rows(1 - identity)
+        mixed_source["instant"]["data"]["result"] += healthy
+        for row in copy.deepcopy(healthy):
+            row["metric"].pop("__name__")
+            row["value"][1] = "990"
+            mixed_source["timestamps"]["data"]["result"].append(row)
+        case(f"day19 mixed source {role} {label}", mixed_source, 2,
+             [f"role={role} status=INCOHERENT coverage=32/32",
+              "INCOHERENT source timestamps: min=880 max=990 skew_seconds=110",
+              f"role={'inactive' if role == 'serving' else 'serving'} status=OK coverage=32/32",
+              "attempts=0 errors=0 error_rate=undefined (no observed attempts)"],
+             ["9.173479%", "first_byte_timeout:101", "attempts=1101"], exact_slices=1)
+    case(f"coherent control {label}", day19(0, flow, item, "880", "880"), 0,
+         ["status=OK", "error_rate=9.173479%", "cause_ranking=first_byte_timeout:101",
+          slice_line(flow, item, 1101, 101, "9.173479%", "first_byte_timeout:101")],
+         ["INCOHERENT"], exact_slices=1)
+independent = fixture(rows() + rows(1))
+for row in independent["timestamps"]["data"]["result"]:
+    row["value"][1] = "880" if row["metric"]["instance"] == "serving.example.com" else "990"
+case("independently timed identities stay coherent", independent, 0,
+     ["role=serving status=OK", "role=inactive status=OK"], ["INCOHERENT"], exact_slices=2)
 case("old capture", fixture(), 2, ["STALE capture evaluation", "error_rate=unavailable"], options=("--now", "2000"))
 for kind in ("instant", "window", "timestamps"):
     duplicate = fixture(window=rows())

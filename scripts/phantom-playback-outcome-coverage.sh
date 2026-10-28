@@ -143,17 +143,26 @@ def main():
         ages = [now - timestamps[identity, key][1] for key in current]
         stale = bool(ages) and max(ages) > max_age
         complete = set(current) == CANONICAL
+        # Source coherence is per identity only: independent exporters may differ.
+        stamps = [timestamps[identity, key][1] for key in current]
+        incoherent = len(set(stamps)) > 1
         status = ("UNINSTRUMENTED" if not current and role == "serving" else
                   "ABSENT (inactive)" if not current else
-                  "INCOMPLETE" if not complete else "STALE" if stale else "OK")
-        unhealthy |= (role == "serving" and not current) or (bool(current) and (not complete or stale))
+                  "INCOMPLETE" if not complete else "STALE" if stale else
+                  "INCOHERENT" if incoherent else "OK")
+        unhealthy |= (role == "serving" and not current) or (
+            bool(current) and (not complete or stale or incoherent))
         print(f"instance={name} role={role} status={status} coverage={len(current)}/32")
         print(f"  sample_age_seconds={max(ages) if ages else 'unavailable'}")
         if current and not complete:
             print(f"  missing_tuples={sorted(CANONICAL - current.keys())}")
         if stale:
             print("  STALE samples: rate and ranking withheld")
-        if complete and not stale:
+        if incoherent:
+            low, high = min(stamps), max(stamps)
+            print(f"  INCOHERENT source timestamps: min={low} max={high} skew_seconds={high - low};"
+                  " counters not from one source sample, rate and ranking withheld")
+        if complete and not stale and not incoherent:
             attempts = sum(int(v) for v in current.values())
             errors = sum(int(v) for key, v in current.items() if key[2] != "success")
             print(f"  aggregate(all flows/items) attempts={attempts} errors={errors} error_rate={rate(errors, attempts)}")
@@ -177,7 +186,7 @@ def main():
                 print(f"  slice[{TEMPERATURE[flow]}-{item}] flow={flow} item_type={item} attempts={s_attempts}"
                       f" errors={s_errors} error_rate={rate(s_errors, s_attempts)} slice_ranking={decision}")
         else:
-            print("  attempts=unavailable errors=unavailable error_rate=unavailable (coverage/freshness not established)")
+            print("  attempts=unavailable errors=unavailable error_rate=unavailable (coverage/freshness/coherence not established)")
         for (who, key), (_, value) in sorted(window.items()):
             if who == identity and (who, key) not in instant and value > 0:
                 print(f"  aged-out/stale tuple={key} window_max={value}; not improvement; excluded from rate/ranking")
