@@ -216,6 +216,75 @@ for row in independent["timestamps"]["data"]["result"]:
     row["value"][1] = "880" if row["metric"]["instance"] == "serving.example.com" else "990"
 case("independently timed identities stay coherent", independent, 0,
      ["role=serving status=OK", "role=inactive status=OK"], ["INCOHERENT"], exact_slices=2)
+
+# Coherent source times do not establish continuity of the counter lifetime.
+for flow, item, cause, identity in itertools.product(flows, items, causes, (0, 1)):
+    current = rows(identity)
+    for row in current:
+        m = row["metric"]
+        if (m["flow"], m["item_type"], m["cause"]) == (flow, item, "success"):
+            row["value"][1] = "1000"
+    history = copy.deepcopy(current)
+    for row in history:
+        row["metric"].pop("__name__")
+        m = row["metric"]
+        if (m["flow"], m["item_type"], m["cause"]) == (flow, item, cause):
+            row["value"][1] = "1101" if cause == "success" else "101"
+    data = fixture(current + (rows() if identity else []), history)
+    role = expected[identity]["role"]
+    diagnostic = (f"COUNTER_DISCONTINUITY tuple={(flow, item, cause)} "
+                  f"current={1000 if cause == 'success' else 0} window_max={1101 if cause == 'success' else 101}")
+    case(f"counter discontinuity {role} {slice_names[flow, item]} {cause}", data, 2,
+         [f"role={role} status=COUNTER_DISCONTINUITY coverage=32/32", diagnostic,
+          "counter continuity not established", "error_rate=unavailable"],
+         ["error_rate=0.000000%", "none (no errors)", "aged-out/stale"], exact_slices=identity)
+
+continuity_current = rows()
+continuity_current[0]["value"][1] = "1000"
+continuity_history = copy.deepcopy(continuity_current)
+for row in continuity_history:
+    row["metric"].pop("__name__")
+continuity_history[2]["value"][1] = "101"
+continuity_diagnostic = ("COUNTER_DISCONTINUITY tuple=('materialise_then_play', 'movie', 'no_candidate') "
+                        "current=0 window_max=101")
+case("day20 exact reproduction", fixture(continuity_current, continuity_history), 2,
+     [continuity_diagnostic, "error_rate=unavailable"], ["aggregate(", "cause_ranking=", "slice["], exact_slices=0)
+case("partial window detects discontinuity", fixture(continuity_current, [continuity_history[2]]), 2,
+     [continuity_diagnostic], ["aggregate(", "cause_ranking="], exact_slices=0)
+for maximum in ("1000", "999", "0"):
+    control = copy.deepcopy(continuity_history[:1])
+    control[0]["value"][1] = maximum
+    case(f"equal or lower window maximum {maximum}", fixture(continuity_current, control), 0,
+         ["status=OK", "aggregate(all flows/items) attempts=1000 errors=0 error_rate=0.000000%",
+          "cause_ranking=none (no errors)"], ["COUNTER_DISCONTINUITY"], exact_slices=1)
+case("empty window retains current totals", fixture(continuity_current), 0,
+     ["status=OK", "attempts=1000 errors=0 error_rate=0.000000%"], ["COUNTER_DISCONTINUITY"], exact_slices=1)
+healthy = rows(1)
+healthy[0]["value"][1] = "900"
+healthy[2]["value"][1] = "101"
+isolated = fixture(continuity_current + healthy, continuity_history + copy.deepcopy(healthy))
+isolated["expected"][1]["role"] = "serving"
+case("healthy serving identity survives discontinuous peer", isolated, 2,
+     [continuity_diagnostic, 'instance={"instance": "inactive.example.com", "job": "playback"} role=serving status=OK',
+      "aggregate(all flows/items) attempts=1001 errors=101 error_rate=10.089910%",
+      "cause_ranking=no_candidate:101"], ["attempts=1000 errors=0"], exact_slices=1)
+same_instance = copy.deepcopy(isolated)
+for kind in ("instant", "window", "timestamps"):
+    for row in same_instance[kind]["data"]["result"]:
+        if row["metric"]["instance"] == "inactive.example.com":
+            row["metric"].update(instance="serving.example.com", job="other-playback")
+same_instance["expected"][1]["labels"].update(instance="serving.example.com", job="other-playback")
+case("full identity includes job for continuity", same_instance, 2,
+     [continuity_diagnostic, '"job": "other-playback"} role=serving status=OK',
+      "attempts=1001 errors=101 error_rate=10.089910%", "cause_ranking=no_candidate:101"], exact_slices=1)
+combined = fixture(continuity_current[:-1], continuity_history)
+combined["timestamps"]["data"]["result"][0]["value"][1] = "879"
+combined["window"]["data"]["result"][-1]["value"][1] = "19"
+case("continuity preserves other failure and aging diagnostics", combined, 2,
+     ["status=INCOMPLETE", "missing_tuples=", "STALE samples", "INCOHERENT source timestamps",
+      continuity_diagnostic, "aged-out/stale", "window_max=19; not improvement; excluded from rate/ranking"],
+     ["aggregate(", "cause_ranking="], exact_slices=0)
+
 case("old capture", fixture(), 2, ["STALE capture evaluation", "error_rate=unavailable"], options=("--now", "2000"))
 for kind in ("instant", "window", "timestamps"):
     duplicate = fixture(window=rows())
@@ -289,6 +358,11 @@ with tempfile.TemporaryDirectory(prefix="outcome-coverage-") as temp:
         assert result.returncode == code, (name, result.returncode, code, output)
         assert all(s in output for s in contains), (name, contains, output)
         assert not any(s in output for s in excludes), (name, excludes, output)
+        for block in result.stdout.split("instance=")[1:]:
+            if "COUNTER_DISCONTINUITY" in block:
+                assert "status=OK" not in block, (name, block)
+                assert "error_rate=unavailable" in block, (name, block)
+                assert not any(s in block for s in ("aggregate(", "slice[", "cause_ranking=")), (name, block)
         if exact_slices is not None:
             for label in slice_names.values():
                 count = sum(line.startswith(f"  slice[{label}] ") for line in result.stdout.splitlines())

@@ -59,9 +59,9 @@ def ranking(values):
 def main():
     parser = argparse.ArgumentParser(
         description="Offline playback outcome coverage and cumulative error ratio: labelled per-instance aggregate plus four flow/item slices (cold=materialise_then_play, warm=play_already_materialised; movie/episode), each ranked only on its own volume",
-        epilog="Capture all three vectors with the same explicit Prometheus time= value; --now only controls age checks.")
+        epilog="Capture all three vectors with the same explicit Prometheus time= value; --now only controls age checks. A matched window maximum above current reports COUNTER_DISCONTINUITY (exit 2), withholding that identity's aggregate/slice rates and rankings. Partial/empty windows are valid but do not prove continuity; equal/lower maxima do not trigger this guard. No reset cause, time, count, or adjusted totals are inferred.")
     parser.add_argument("--instant", required=True, help="raw outcome instant-vector API JSON")
-    parser.add_argument("--window", required=True, help="max_over_time outcome vector API JSON (context only)")
+    parser.add_argument("--window", required=True, help="max_over_time outcome vector API JSON (continuity/aging evidence only, never added to totals)")
     parser.add_argument("--timestamps", required=True, help="timestamp(outcome selector) vector API JSON")
     parser.add_argument("--expected", required=True, help="JSON array of {labels: {identity labels}, role: serving|inactive}")
     parser.add_argument("--now", default=str(time.time()), help="Unix time; override for reproducible offline analysis")
@@ -146,12 +146,15 @@ def main():
         # Source coherence is per identity only: independent exporters may differ.
         stamps = [timestamps[identity, key][1] for key in current]
         incoherent = len(set(stamps)) > 1
+        discontinuities = {key: window[identity, key][1] for key, value in current.items()
+                           if (identity, key) in window and window[identity, key][1] > value}
         status = ("UNINSTRUMENTED" if not current and role == "serving" else
                   "ABSENT (inactive)" if not current else
                   "INCOMPLETE" if not complete else "STALE" if stale else
-                  "INCOHERENT" if incoherent else "OK")
+                  "INCOHERENT" if incoherent else
+                  "COUNTER_DISCONTINUITY" if discontinuities else "OK")
         unhealthy |= (role == "serving" and not current) or (
-            bool(current) and (not complete or stale or incoherent))
+            bool(current) and (not complete or stale or incoherent or bool(discontinuities)))
         print(f"instance={name} role={role} status={status} coverage={len(current)}/32")
         print(f"  sample_age_seconds={max(ages) if ages else 'unavailable'}")
         if current and not complete:
@@ -162,7 +165,10 @@ def main():
             low, high = min(stamps), max(stamps)
             print(f"  INCOHERENT source timestamps: min={low} max={high} skew_seconds={high - low};"
                   " counters not from one source sample, rate and ranking withheld")
-        if complete and not stale and not incoherent:
+        for key, maximum in sorted(discontinuities.items()):
+            print(f"  COUNTER_DISCONTINUITY tuple={key} current={current[key]} window_max={maximum};"
+                  " counter continuity not established; aggregate/slice rates and rankings withheld")
+        if complete and not stale and not incoherent and not discontinuities:
             attempts = sum(int(v) for v in current.values())
             errors = sum(int(v) for key, v in current.items() if key[2] != "success")
             print(f"  aggregate(all flows/items) attempts={attempts} errors={errors} error_rate={rate(errors, attempts)}")
@@ -186,7 +192,7 @@ def main():
                 print(f"  slice[{TEMPERATURE[flow]}-{item}] flow={flow} item_type={item} attempts={s_attempts}"
                       f" errors={s_errors} error_rate={rate(s_errors, s_attempts)} slice_ranking={decision}")
         else:
-            print("  attempts=unavailable errors=unavailable error_rate=unavailable (coverage/freshness/coherence not established)")
+            print("  attempts=unavailable errors=unavailable error_rate=unavailable (coverage/freshness/coherence/continuity not established)")
         for (who, key), (_, value) in sorted(window.items()):
             if who == identity and (who, key) not in instant and value > 0:
                 print(f"  aged-out/stale tuple={key} window_max={value}; not improvement; excluded from rate/ranking")

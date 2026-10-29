@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Offline playback outcome reports now detect exact-tuple historical maxima above
+  current counters as `COUNTER_DISCONTINUITY` (exit 2), withholding the affected
+  identity's aggregate/slice rates and rankings without altering current totals.
 - Daily load-time guard breaches now include per-flow/item-type breach, observed
   seconds and ceiling seconds gauges in the retained stage Pushgateway group,
   even without the beehive CLI. A successful guard clears stale breach series.
