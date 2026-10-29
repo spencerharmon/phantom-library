@@ -82,7 +82,7 @@ independently default to "now"; differing outer sample timestamps are rejected.
 - `--instant`: `phantom_playback_outcome_total{...}`. Raw cumulative counters,
   never a sum, rate, increase, synthetic rig family, or runtime-info gauge.
 - `--window`: `max_over_time(phantom_playback_outcome_total{...}[30d])` (or the
-  caller's chosen window). Context only: maxima are not attempts in the window,
+  caller's chosen window). Continuity/aging evidence only: maxima are not attempts in the window,
   not reset-adjusted deltas, and never added to current totals.
   This function drops `__name__`; raw output is accepted without `label_replace`.
 - `--timestamps`: `timestamp(phantom_playback_outcome_total{...})`. Values are
@@ -130,11 +130,28 @@ timestamps, and mismatched captures fail closed. Source ages equal to max-age
 are accepted; older samples withhold the entire instance's rate and ranking.
 Missing/partial data is unavailable, never an assumed zero denominator.
 
+For each exact identity + flow + item_type + cause present in both current and
+window, a numerically greater `window_max` than `current` reports
+`COUNTER_DISCONTINUITY` with the tuple and both values. This fails the report
+(exit 2) for serving and inactive identities alike, for success and every failure
+cause across cold/warm movie/episode slices. The affected identity's aggregate
+and all slice rates, totals and rankings are unavailable; unaffected identities
+remain independently gated. Coverage, freshness, source-coherence and window-only
+aging diagnostics remain visible when several conditions fail together.
+
+This is evidence only that **counter continuity is not established**: possible
+reset/reseed, identity reuse, or capture inconsistency. It does not identify a
+reset cause, time or count, or establish an improvement. Maxima never replace or
+augment current totals, and no reset-adjusted rate is computed. Equal or lower
+maxima do not trigger the guard. Partial and empty windows remain valid: missing
+historical matches are neither errors nor proof of continuity. `OK` means no
+guard detected a problem in the supplied evidence, not proven lifetime continuity.
+
 Exit codes: **0** valid report (including complete fresh zero counters and an
 absent inactive instance); **1** invalid input; **2** instrumentation/coverage
-or freshness failure (also argparse usage errors). A serving instance absent
+or freshness/coherence/continuity failure (also argparse usage errors). A serving instance absent
 from the instant vector is `UNINSTRUMENTED` even if it exists in the window.
-Any present but incomplete/stale instance also fails the report. Inactive
+Any present but incomplete/stale/incoherent/discontinuous instance also fails the report. Inactive
 series are shown separately and never unlock a serving instance's ranking.
 
 Rates are cumulative **errors / attempts**, with every non-success cause
