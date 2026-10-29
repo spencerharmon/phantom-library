@@ -489,7 +489,21 @@ PY
 
 # Install cleanup before creating scratch files or starting fallible discovery.
 WORK_DIR=""
-trap '[ -z "$WORK_DIR" ] || rm -rf "$WORK_DIR"' EXIT
+DISCOVERY_START="$(date +%s)"
+DISCOVERY_DONE=0
+evidence() {
+    [ -n "${PHANTOM_LOADTIME_EVIDENCE_FILE:-}" ] || return 0
+    python3 "$HERE/../ci/loadtime-evidence.py" "$1" "$PHANTOM_LOADTIME_EVIDENCE_FILE" "${@:2}"
+}
+cleanup() {
+    local ec=$?
+    if [ "$DISCOVERY_DONE" = 0 ]; then
+        evidence stage discovery "$ec" "$DISCOVERY_START" || ec=1
+    fi
+    [ -z "$WORK_DIR" ] || rm -rf "$WORK_DIR"
+    exit "$ec"
+}
+trap cleanup EXIT
 WORK_DIR="$(mktemp -d)"
 
 # Parse discovery only, never playback bodies. Reject malformed IDs rather than
@@ -528,13 +542,16 @@ CH_SHOWS="$(printf '%s' "$CH_JSON" | discovery_id Channel 'Phantom Shows')" || f
 LAST_FLOW_ERRORS=0
 time_flow() {
     local flow="$1" item_type="$2"; shift 2
-    local start errors=0 dur s
+    local start errors=0 dur s code rc
     sample_reset
     for ((s = 0; s < SAMPLES; s++)); do
         start="$(now_s)"
-        if "$@" >/dev/null 2>&1; then errors=0; else errors=1; fi
+        if code="$("$@" -o /dev/null -w '%{http_code}' 2>/dev/null)"; then rc=0; errors=0; else rc=$?; errors=1; fi
         dur="$(elapsed "$start")"
         sample_add "$dur" "$errors"
+        if [ "$errors" = 1 ]; then
+            evidence failure "$flow" "$item_type" "$((s + 1))" "$id" "$rc" "$(http_code_of "$code")" request
+        fi
     done
     sample_emit "$flow" "$item_type"
     if [ "$SAMPLE_ERRORS_TOTAL" -gt 0 ]; then LAST_FLOW_ERRORS=1; else LAST_FLOW_ERRORS=0; fi
@@ -543,12 +560,18 @@ time_flow() {
 # --- pick a movie + an episode to drive -------------------------------------
 MOVIE_ID="$(api "$API/Channels/$CH_MOVIES/Items?Limit=1&Fields=ProviderIds&userId=$USER_ID" | discovery_id Movie)" || fail "invalid Movie discovery"
 log "target type=Movie id=$MOVIE_ID"
+evidence target Movie "$MOVIE_ID"
 SERIES_ID="$(api "$API/Channels/$CH_SHOWS/Items?Limit=1&userId=$USER_ID" | discovery_id Series)" || fail "invalid Series discovery"
 log "target type=Series id=$SERIES_ID"
+evidence target Series "$SERIES_ID"
 SEASON_ID="$(api "$API/Channels/$CH_SHOWS/Items?Limit=1&userId=$USER_ID&FolderId=$SERIES_ID" | discovery_id Season)" || fail "invalid Season discovery"
 log "target type=Season id=$SEASON_ID"
+evidence target Season "$SEASON_ID"
 EPISODE_ID="$(api "$API/Channels/$CH_SHOWS/Items?Limit=1&userId=$USER_ID&FolderId=$SEASON_ID" | discovery_id Episode)" || fail "invalid Episode discovery"
 log "target type=Episode id=$EPISODE_ID"
+evidence target Episode "$EPISODE_ID"
+evidence stage discovery 0 "$DISCOVERY_START"
+DISCOVERY_DONE=1
 
 # Root list/sort pages carry the SAME resolved userId as discovery on every
 # page (incl. descending sort + pagination): an unscoped channel request returns
@@ -568,7 +591,7 @@ _full_list_sample() {
     local start errors=0 dur total=0 start_index=0 page=200
     # Attribution of a failed sample (ttfb-loadtime-list-error-stage-attribution):
     # the FIRST failing stage + its HTTP status (000 = transport/timeout).
-    local fail_stage="" fail_code=""
+    local fail_stage="" fail_code="" fail_rc=0
     local all_ids_file
     all_ids_file="$(mktemp "$WORK_DIR/ids.XXXXXX")"
     start="$(now_s)"
@@ -576,7 +599,8 @@ _full_list_sample() {
         local page_json page_file
         page_file="$(mktemp "$WORK_DIR/page.XXXXXX")"
         local code
-        if ! code="$(api "$API/Channels/$ch/Items?Limit=$page&StartIndex=$start_index&userId=$USER_ID${sort_qs}" -o "$page_file" -w '%{http_code}' 2>/dev/null)"; then
+        if code="$(api "$API/Channels/$ch/Items?Limit=$page&StartIndex=$start_index&userId=$USER_ID${sort_qs}" -o "$page_file" -w '%{http_code}' 2>/dev/null)"; then :; else
+            fail_rc=$?
             errors=1; fail_stage=page_fetch; fail_code="$(http_code_of "$code")"
             rm -f "$page_file"; break
         fi
@@ -598,8 +622,10 @@ ids=[l.strip() for l in open('$all_ids_file') if l.strip()]
 print(json.dumps(ids[$off:$off+$lim]))
 " 2>/dev/null || echo '[]')"
         local bcode
-        if ! bcode="$(json_post -d "{\"ids\": $chunk_ids}" -o /dev/null -w '%{http_code}' "$API/Plugins/PhantomLibrary/States" 2>/dev/null)"; then
+        if bcode="$(json_post -d "{\"ids\": $chunk_ids}" -o /dev/null -w '%{http_code}' "$API/Plugins/PhantomLibrary/States" 2>/dev/null)"; then :; else
+            local rc=$?
             if [ "$errors" -eq 0 ]; then
+                fail_rc="$rc"
                 fail_stage=badge_states; fail_code="$(http_code_of "$bcode")"
             fi
             errors=1
@@ -612,6 +638,7 @@ print(json.dumps(ids[$off:$off+$lim]))
     log "flow=$flow item_type=$item_type sample_s=$dur errors=$errors items=$total"
     if [ "$errors" -eq 1 ]; then
         list_error_add "$flow" "$item_type" "$fail_stage" "$fail_code"
+        evidence failure "$flow" "$item_type" "$((s + 1))" "$ch" "$fail_rc" "$fail_code" "$fail_stage"
         log "flow=$flow item_type=$item_type list_error stage=$fail_stage http_code=$fail_code"
     fi
 }

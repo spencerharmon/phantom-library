@@ -53,6 +53,8 @@
 #   PHANTOM_LOADTIME_THRESHOLDS_PATH Absolute durable JSON path outside the
 #                                    checkout; required live. Parent must exist.
 #                                    Dry runs read it without writing anything.
+#   PHANTOM_LOADTIME_EVIDENCE_DIR    Override sibling loadtime-evidence directory.
+#   PHANTOM_LOADTIME_EVIDENCE_KEEP   Completed attempts to retain (default 32).
 #   PHANTOM_CI_DRYRUN=1              toolchain-agnostic dry run: no cluster/
 #                                    network access; a deterministic
 #                                    synthetic measurement is pushed/guarded
@@ -103,6 +105,17 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
 kube() { kubectl "${KCTX[@]}" -n "$NAMESPACE" "$@"; }
 
+EVIDENCE=""
+EVIDENCE_ERROR=0
+COLOR=""
+evidence() {
+    [ -n "$EVIDENCE" ] || return 0
+    python3 "$REPO_ROOT/tools/ci/loadtime-evidence.py" "$1" "$EVIDENCE" "${@:2}" || {
+        EVIDENCE_ERROR=1
+        return 1
+    }
+}
+
 # --- durable per-stage outcome metric --------------------------------------
 # job="phantom-loadtime-daily-run" — a DISTINCT Pushgateway group from the
 # flow-metric job="phantom-loadtime" this script's own stage 2 pushes into,
@@ -127,6 +140,7 @@ record_stage() {
     local stage="$1" ec="$2" start="$3" now dur url
     now="$(date +%s)"
     dur=$(( now - start ))
+    evidence stage "$stage" "$ec" "$start" "$dur" || fail "cannot retain stage evidence"
     # PUT replaces the whole group; retain every completed stage from this run.
     printf 'phantom_loadtime_daily_stage_exit_code{stage="%s"} %s\nphantom_loadtime_daily_stage_seconds{stage="%s"} %s\n' \
         "$stage" "$ec" "$stage" "$dur" >> "$STAGE_EXPO"
@@ -154,15 +168,38 @@ teardown() {
     local ec=$?
     [ "$_torn_down" = 1 ] && exit "$ec"
     _torn_down=1
+    [ "$EVIDENCE_ERROR" = 0 ] || ec=1
+    if [ -z "$COLOR" ] && [ "$ec" != 0 ]; then
+        evidence stage discovery "$ec" "$RUN_START" || ec=1
+    fi
+    evidence finish "$ec" || ec=1
     log "mandatory cleanup"
     rm -f "$EXPO" "$STAGE_EXPO" "$BREACH_OUT"
     phantom_ci_cleanup_dotnet "$([ "$ec" != 0 ] && echo 1 || echo 0)" || true
     exit "$ec"
 }
-trap teardown EXIT INT TERM
+trap teardown EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 STAGE_EXPO="$(mktemp -t loadtime-daily-stages.XXXXXX.txt)"
 BREACH_OUT="$(mktemp -t loadtime-daily-breaches.XXXXXX.json)"
 printf 'phantom_loadtime_daily_run_start_timestamp_seconds %s\n' "$RUN_START" > "$STAGE_EXPO"
+
+# Initialize before any fallible discovery. Dry runs never open durable state.
+if [ "$DRYRUN" != 1 ]; then
+    evidence_dir="${PHANTOM_LOADTIME_EVIDENCE_DIR:-}"
+    if [ -z "$evidence_dir" ] && [ -n "${PHANTOM_LOADTIME_THRESHOLDS_PATH:-}" ]; then
+        evidence_dir="$(dirname "$PHANTOM_LOADTIME_THRESHOLDS_PATH")/loadtime-evidence"
+    fi
+    if [ -n "$evidence_dir" ]; then
+        EVIDENCE="$(python3 "$REPO_ROOT/tools/ci/loadtime-evidence.py" init "$evidence_dir" \
+            "$REPO_ROOT" "$RUN_START" "${PHANTOM_LOADTIME_EVIDENCE_KEEP:-32}")" || {
+            EVIDENCE_ERROR=1
+            fail "cannot initialize durable evidence state"
+        }
+    fi
+fi
+export PHANTOM_LOADTIME_EVIDENCE_FILE="$EVIDENCE"
 
 log "phantom-library daily load-time schedule job"
 note "namespace:  $NAMESPACE"
@@ -200,6 +237,7 @@ resolve_color() {
 
 log "resolving dev color from the live Ingress (never a cached/CNAME guess)"
 COLOR="$(resolve_color "$DEV_HOST")" || fail "no phantom-library-{blue,green} Ingress carries host $DEV_HOST — cannot resolve the dev color live."
+evidence color "$COLOR" || fail "cannot retain resolved color"
 note "dev host $DEV_HOST -> color=$COLOR"
 
 if [ "$DRYRUN" != 1 ]; then
