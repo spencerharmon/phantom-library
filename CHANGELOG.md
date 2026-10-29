@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Daily load-time attempts now retain sanitized checkout SHA, typed targets,
+  sample failures and stage outcomes in `loadtime-evidence/` beside durable
+  thresholds. Partial runs survive scratch deletion; storage failures fail the
+  job. Retention defaults to 32 completed attempts and never touches thresholds
+  or another attempt's partial files. Dry runs write no evidence.
 - Daily load-time guard breaches now include per-flow/item-type breach, observed
   seconds and ceiling seconds gauges in the retained stage Pushgateway group,
   even without the beehive CLI. A successful guard clears stale breach series.

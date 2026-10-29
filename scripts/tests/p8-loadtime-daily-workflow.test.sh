@@ -136,7 +136,7 @@ PY
 [[ -f "$THRESHOLDS" ]]    || fatal "thresholds registry not found: $THRESHOLDS"
 
 head_ "required integration dependencies (no silent skips)"
-for tool in python3 dotnet helm; do
+for tool in python3 dotnet helm git; do
     command -v "$tool" >/dev/null 2>&1 || fatal "$tool is required for daily workflow integration coverage"
 done
 python3 -c 'import yaml' || fatal "PyYAML is required; structural grep is not YAML validation"
@@ -301,15 +301,18 @@ fi
 
 head_ "shared script: mandatory build/test process cleanup trap"
 if grep -q 'lib-cleanup.sh' "$DAILY_SCRIPT" && grep -q 'phantom_ci_cleanup_dotnet' "$DAILY_SCRIPT" \
-    && grep -qE 'trap teardown EXIT INT TERM' "$DAILY_SCRIPT"; then
+    && grep -qE 'trap teardown EXIT' "$DAILY_SCRIPT" \
+    && grep -q "trap 'exit 130' INT" "$DAILY_SCRIPT" \
+    && grep -q "trap 'exit 143' TERM" "$DAILY_SCRIPT"; then
     ok "$DAILY_SCRIPT sources tools/ci/lib-cleanup.sh and traps EXIT/INT/TERM"
 else
     bad "$DAILY_SCRIPT is missing the mandatory build/test process cleanup trap"
 fi
 
 head_ "toolchain-agnostic dry run of the shared daily script"
+initial_evidence="$(mktemp -d -t p8-daily-evidence.XXXXXX)"
 before_thresholds_sha="$(sha256sum "$THRESHOLDS" | awk '{print $1}')"
-if PHANTOM_CI_DRYRUN=1 PHANTOM_CI_PKILL=0 PHANTOM_REPO_ROOT="$REPO_ROOT" bash "$DAILY_SCRIPT" \
+if PHANTOM_LOADTIME_EVIDENCE_DIR="$initial_evidence" PHANTOM_CI_DRYRUN=1 PHANTOM_CI_PKILL=0 PHANTOM_REPO_ROOT="$REPO_ROOT" bash "$DAILY_SCRIPT" \
     >/tmp/p8-loadtime-daily-dryrun.$$.log 2>&1; then
     ok "PHANTOM_CI_DRYRUN=1 tools/ci/loadtime-daily-run.sh exits 0"
 else
@@ -360,7 +363,7 @@ fi
 
 head_ "shared script: a forced stage=guard failure pushes its outcome BEFORE the wrapper's own non-zero exit (no live cluster needed)"
 rc=0
-PHANTOM_CI_DRYRUN=1 PHANTOM_CI_PKILL=0 PHANTOM_REPO_ROOT="$REPO_ROOT" PHANTOM_CI_FORCE_GUARD_FAIL=1 \
+PHANTOM_LOADTIME_EVIDENCE_DIR="$initial_evidence" PHANTOM_CI_DRYRUN=1 PHANTOM_CI_PKILL=0 PHANTOM_REPO_ROOT="$REPO_ROOT" PHANTOM_CI_FORCE_GUARD_FAIL=1 \
     bash "$DAILY_SCRIPT" >/tmp/p8-loadtime-daily-guardfail.$$.log 2>&1 || rc=$?
 if [ "$rc" = 0 ]; then
     bad "daily script did NOT fail when PHANTOM_CI_FORCE_GUARD_FAIL=1 forced a stage=guard failure"
@@ -380,7 +383,7 @@ fi
 rm -f "/tmp/p8-loadtime-daily-guardfail.$$.log"
 
 head_ "prod-safety self-test: dry run REFUSES when dev host equals prod host"
-if PHANTOM_CI_DRYRUN=1 PHANTOM_CI_PKILL=0 PHANTOM_REPO_ROOT="$REPO_ROOT" \
+if PHANTOM_LOADTIME_EVIDENCE_DIR="$initial_evidence" PHANTOM_CI_DRYRUN=1 PHANTOM_CI_PKILL=0 PHANTOM_REPO_ROOT="$REPO_ROOT" \
     PHANTOM_INCLUSTER_DEV_HOST=example.com PHANTOM_INCLUSTER_PROD_HOST=example.com \
     bash "$DAILY_SCRIPT" >/tmp/p8-loadtime-daily-guard.$$.log 2>&1; then
     bad "daily script did NOT refuse when dev host equals prod host (prod-safety guard broken)"
@@ -392,6 +395,7 @@ else
     fi
 fi
 rm -f "/tmp/p8-loadtime-daily-guard.$$.log"
+rm -rf "$initial_evidence"
 
 # ---------------------------------------------------------------------------
 # same-batch behavioral integration (ttfb-loadtime-daily-same-batch-guard)
@@ -413,6 +417,11 @@ if [ -f "$REPO_ROOT/tools/ci/loadtime-daily-state.py" ]; then
     cp "$REPO_ROOT/tools/ci/loadtime-daily-state.py" "$sb_root/tools/ci/"
 else
     bad "durable state helper tools/ci/loadtime-daily-state.py is missing"
+fi
+if [ -f "$REPO_ROOT/tools/ci/loadtime-evidence.py" ]; then
+    cp "$REPO_ROOT/tools/ci/loadtime-evidence.py" "$sb_root/tools/ci/"
+else
+    bad "retained evidence helper tools/ci/loadtime-evidence.py is missing"
 fi
 ln -s "$GUARD_SCRIPT" "$sb_root/tools/perf/loadtime-guard.sh"
 ln -s "$REPO_ROOT/tools/perf/loadtime-expo-to-measurements.py" "$sb_root/tools/perf/loadtime-expo-to-measurements.py"
@@ -487,6 +496,7 @@ sb_run() { # sb_run <case> <dryrun 0|1> -> sets sb_rc, log in $SB/out.log
     sb_rc=0
     env PATH="$sb_bin:$PATH" PHANTOM_REPO_ROOT="$sb_root" PHANTOM_CI_DRYRUN="$2" PHANTOM_CI_PKILL=0 \
         PHANTOM_LOADTIME_THRESHOLDS_PATH="$SB_THR" \
+        PHANTOM_LOADTIME_EVIDENCE_DIR="$SB/evidence" \
         SB_VALUE="${SB_VALUE:-1.0}" \
         SB_CASE="$1" SB_COUNT="$SB/count" SB_CURL_LOG="$SB/curl.log" SB_BEEHIVE_LOG="$SB/beehive.log" \
         SB_DEV_HOST=dev.example.com PHANTOM_INCLUSTER_DEV_HOST=dev.example.com \
@@ -628,6 +638,9 @@ durable_checkout() {
     cp "$DAILY_SCRIPT" "$REPO_ROOT/tools/ci/lib-cleanup.sh" "$sb_root/tools/ci/"
     if [ -f "$REPO_ROOT/tools/ci/loadtime-daily-state.py" ]; then
         cp "$REPO_ROOT/tools/ci/loadtime-daily-state.py" "$sb_root/tools/ci/"
+    fi
+    if [ -f "$REPO_ROOT/tools/ci/loadtime-evidence.py" ]; then
+        cp "$REPO_ROOT/tools/ci/loadtime-evidence.py" "$sb_root/tools/ci/"
     fi
     cp "$GUARD_SCRIPT" "$REPO_ROOT/tools/perf/loadtime-expo-to-measurements.py" "$THRESHOLDS" "$sb_root/tools/perf/"
     cp "$REPO_ROOT"/tools/perf/ratchet-guard/*.cs "$REPO_ROOT"/tools/perf/ratchet-guard/*.csproj "$sb_root/tools/perf/ratchet-guard/"
@@ -825,6 +838,417 @@ PY
     fi
     chmod u+rwx "$SB/state"
 done
+
+# Unlike the counting fixtures above, this runs the LIVE 47 engine, emitter,
+# converter and guard unchanged. Only network/cluster/process cleanup and task
+# filing boundaries are intercepted. Git belongs to the synthetic checkout.
+head_ "retained evidence: real LIVE engine through the daily wrapper"
+unset TMPDIR
+if python3 - "$REPO_ROOT" "$TEST_TMP/retained" <<'PY'
+import json, math, os, pathlib, re, shutil, subprocess, sys, time
+
+source, tmp = map(pathlib.Path, sys.argv[1:])
+tmp.mkdir()
+bin_dir = tmp / 'bin'
+bin_dir.mkdir()
+root = tmp / 'checkout'
+state = tmp / 'state'
+state.mkdir()
+thresholds = state / 'thresholds.json'
+evidence = state / 'loadtime-evidence'
+ids = dict(Movie='2' * 32, Series='3' * 32, Season='4' * 32, Episode='5' * 32)
+flows = ('list_load', 'sort_change', 'info_open', 'get_sources', 'materialise', 'play_materialised')
+secrets = ('token-DO-NOT-RETAIN', 'signed-DO-NOT-RETAIN', 'body-DO-NOT-RETAIN')
+
+(bin_dir / 'curl').write_text(r'''#!/usr/bin/env python3
+import json, os, pathlib, sys
+from urllib.parse import parse_qs, urlsplit
+args = sys.argv[1:]
+url = next(a for a in args if a.startswith(('http://', 'https://')))
+p = urlsplit(url)
+q = parse_qs(p.query)
+mode = os.environ.get('EVIDENCE_FAULT', '')
+method = args[args.index('-X') + 1] if '-X' in args else 'GET'
+data = args[args.index('-d') + 1] if '-d' in args else ''
+entry = dict(method=method, path=p.path, query=q)
+code, http, stage = 0, '200', ''
+ids = dict(Movie='2'*32, Series='3'*32, Season='4'*32, Episode='5'*32)
+body = {'secret': 'body-DO-NOT-RETAIN',
+        'url': 'https://media.example.net/stream?signature=signed-DO-NOT-RETAIN'}
+if '/metrics/job/' in p.path:
+    assert method == 'PUT', args
+    payload = args[args.index('--data-binary') + 1]
+    entry['payload'] = sys.stdin.read() if payload == '@-' else pathlib.Path(payload[1:]).read_text()
+    if mode == 'push' and p.path.endswith('/phantom-loadtime'):
+        code, http = 22, '503'
+elif p.path == '/Users':
+    body = [{'Id': '1'*32}]
+elif p.path == '/Channels':
+    body = {'Items': [{'Name': 'Phantom Movies', 'Id': 'movies'},
+                      {'Name': 'Phantom Shows', 'Id': 'shows'}]}
+elif p.path.startswith('/Channels/'):
+    if q.get('Limit') == ['1']:
+        stage = 'Movie' if '/movies/' in p.path else {
+            ids['Series']: 'Season', ids['Season']: 'Episode'
+        }.get(q.get('FolderId', [''])[0], 'Series')
+        body = {'Items': [{'Id': ids[stage], 'Type': stage}]}
+    else:
+        channel = p.path.split('/')[2]
+        body = {'Items': [{'Id': channel + '-card'}], 'TotalRecordCount': 1}
+        if mode == 'requests' and channel == 'movies' and 'SortOrder' not in q:
+            code, http = 22, '500'
+elif p.path == '/Plugins/PhantomLibrary/States':
+    if mode == 'requests' and 'shows-card' in data:
+        code, http = 28, '000'
+elif p.path.startswith(('/Items/', '/Videos/')):
+    if mode == 'requests':
+        code, http = (22, '404') if p.path.split('/')[2].replace('-', '') == ids['Movie'] else (28, '000')
+else:
+    raise SystemExit('unexpected test URL: ' + url)
+fault_type, _, fault = mode.partition(':')
+if stage and fault_type == stage:
+    if fault == 'wrong-type': body['Items'][0]['Type'] = 'Season' if stage == 'Episode' else 'Episode'
+    elif fault == 'missing-type': del body['Items'][0]['Type']
+    elif fault == 'null-id': body['Items'][0]['Id'] = None
+    elif fault == 'unsafe-id': body['Items'][0]['Id'] = 'bad?signature=signed-DO-NOT-RETAIN'
+    elif fault == 'empty': body['Items'] = []
+    elif fault == 'http': code, http = 22, '503'
+text = '{broken' if stage and fault_type == stage and fault == 'malformed' else json.dumps(body)
+with open(os.environ['EVIDENCE_REQUESTS'], 'a') as log:
+    log.write(json.dumps(entry) + '\n')
+# Observe the actual active file BEFORE any engine discovery request returns.
+if p.path == '/Users':
+    active = list(pathlib.Path(os.environ['EVIDENCE_EXPECT_DIR']).glob('.run-*.partial.json'))
+    with open(os.environ['EVIDENCE_ACTIVE'], 'w') as log:
+        json.dump([{'name': f.name, 'manifest': json.loads(f.read_text())} for f in active], log)
+if mode == 'storage-loss' and stage == 'Episode':
+    pathlib.Path(os.environ['EVIDENCE_EXPECT_DIR']).chmod(0o555)
+if '-o' in args:
+    pathlib.Path(args[args.index('-o') + 1]).write_text(text)
+else:
+    sys.stdout.write(text)
+if '-w' in args:
+    sys.stdout.write(http)
+sys.exit(code)
+''')
+(bin_dir / 'kubectl').write_text('''#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$EVIDENCE_KUBE"
+[ "${EVIDENCE_FAULT:-}" != color ] || exit 1
+case "$*" in *phantom-library-green*) printf '%s\n' dev.example.com ;; esac
+''')
+(bin_dir / 'beehive').write_text('''#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$EVIDENCE_FILING"
+''')
+for path in bin_dir.iterdir():
+    path.chmod(0o755)
+
+def checkout(label):
+    if root.exists():
+        shutil.rmtree(root)
+    for rel in ('tools/ci/loadtime-daily-run.sh', 'tools/ci/loadtime-daily-state.py',
+                'tools/ci/loadtime-evidence.py', 'tools/rig-scenarios/47-loadtime-flows.sh',
+                'tools/rig-scenarios/48-list-materialise-dom.mjs',
+                'tools/perf/loadtime-guard.sh', 'tools/perf/loadtime-expo-to-measurements.py',
+                'tools/perf/loadtime-thresholds.json', 'scripts/phantom-loadtime-push.sh'):
+        dest = root / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source / rel, dest)
+    ratchet = root / 'tools/perf/ratchet-guard'
+    ratchet.mkdir()
+    for path in (source / 'tools/perf/ratchet-guard').iterdir():
+        if path.suffix in ('.cs', '.csproj'):
+            shutil.copy2(path, ratchet / path.name)
+    (root / 'tools/ci/lib-cleanup.sh').write_text('''phantom_ci_cleanup_dotnet() {
+    printf '%s\\n' "$*" >> "$EVIDENCE_CLEANUP"
+}
+''')
+    (root / 'fixture-version').write_text(label)
+    git_env = dict(os.environ, GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null',
+                   GIT_AUTHOR_NAME='Fixture', GIT_AUTHOR_EMAIL='fixture@example.com',
+                   GIT_COMMITTER_NAME='Fixture', GIT_COMMITTER_EMAIL='fixture@example.com')
+    for args in (('init', '-q'), ('add', '.'), ('-c', 'core.hooksPath=/dev/null', 'commit', '-qm', label)):
+        subprocess.run(['git', '-C', str(root), *args], env=git_env, check=True, capture_output=True)
+    return subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip()
+
+def seed():
+    shutil.copy2(source / 'tools/perf/loadtime-thresholds.json', thresholds)
+
+base_env = {k: v for k, v in os.environ.items() if not k.startswith(('PHANTOM_', 'SB_', 'GIT_'))}
+base_env.update(PATH=str(bin_dir) + os.pathsep + os.environ['PATH'],
+                PHANTOM_REPO_ROOT=str(root), PHANTOM_CI_DRYRUN='0', PHANTOM_CI_PKILL='0',
+                PHANTOM_LOADTIME_THRESHOLDS_PATH=str(thresholds), PHANTOM_LOADTIME_SAMPLES='2',
+                PHANTOM_INCLUSTER_DEV_HOST='dev.example.com', PHANTOM_INCLUSTER_PROD_HOST='example.com',
+                PHANTOM_INCLUSTER_ADMIN_TOKEN=secrets[0],
+                PHANTOM_PUSHGATEWAY_URL='http://pushgateway.example.com:9091',
+                MSBUILDDISABLENODEREUSE='1', DOTNET_CLI_USE_MSBUILD_SERVER='0')
+
+def run(name, fault='', directory=None, **overrides):
+    directory = evidence if directory is None else directory
+    logs = tmp / name
+    logs.mkdir()
+    scratch = logs / 'scratch'
+    scratch.mkdir()
+    before = set(directory.glob('run-*.json'))
+    env = dict(base_env, EVIDENCE_FAULT=fault, EVIDENCE_EXPECT_DIR=str(directory),
+               EVIDENCE_REQUESTS=str(logs / 'requests'), EVIDENCE_ACTIVE=str(logs / 'active'),
+               EVIDENCE_KUBE=str(logs / 'kube'), EVIDENCE_FILING=str(logs / 'filing'),
+               EVIDENCE_CLEANUP=str(logs / 'cleanup'), TMPDIR=str(scratch), **overrides)
+    started = int(time.time())
+    result = subprocess.run(['bash', str(root / 'tools/ci/loadtime-daily-run.sh')],
+                            env=env, text=True, capture_output=True, timeout=120)
+    (logs / 'output').write_text(result.stdout + result.stderr)
+    fresh = set(directory.glob('run-*.json')) - before
+    if overrides.get('PHANTOM_CI_DRYRUN') == '1':
+        assert not fresh and not directory.exists(), 'dry run wrote durable evidence'
+        return result, None, None, [], logs
+    assert len(fresh) == 1, (name, 'expected one finalized manifest', fresh, result.stdout, result.stderr)
+    path, = fresh
+    manifest = json.loads(path.read_text())
+    assert re.fullmatch(r'run-[0-9a-f]{32}\.json', path.name), path
+    assert manifest['version'] == 1
+    assert manifest['attempt_id'] == path.name[4:-5]
+    assert type(manifest['run_start']) is int and started <= manifest['run_start'] <= int(time.time())
+    assert manifest['checkout_sha'] == sha, (name, manifest)
+    assert type(manifest['exit_code']) is int and manifest['exit_code'] == result.returncode
+    assert manifest['status'] == ('complete' if result.returncode == 0 else 'failed'), manifest
+    assert manifest['color'] == ('unknown' if fault == 'color' else 'green'), manifest
+    assert isinstance(manifest['targets'], dict) and isinstance(manifest['failures'], list)
+    for failure in manifest['failures']:
+        assert type(failure['sample_index']) is int and failure['sample_index'] > 0, failure
+        assert type(failure['curl_exit_code']) is int, failure
+        assert re.fullmatch(r'[0-9]{3}', failure['http_status']), failure
+    assert not (directory / ('.' + path.stem + '.partial.json')).exists(), 'active file not finalized'
+    for stage, outcome in manifest['stages'].items():
+        assert stage in ('discovery', 'measure', 'push', 'guard'), stage
+        assert set(outcome) == {'exit_code', 'start', 'seconds'}, outcome
+        assert all(type(v) is int for v in outcome.values()), outcome
+        assert started <= outcome['start'] <= int(time.time()) and outcome['seconds'] >= 0, outcome
+    for secret in secrets:
+        assert secret not in path.read_text(), (name, 'secret in retained manifest')
+    assert (logs / 'cleanup').read_text().splitlines() in (['0'], ['1']), 'cleanup not called once'
+    assert not list(scratch.glob('loadtime-daily-*')), (name, 'wrapper scratch leaked')
+    requests = [json.loads(s) for s in (logs / 'requests').read_text().splitlines()] if (logs / 'requests').exists() else []
+    if (logs / 'active').exists():
+        active = json.loads((logs / 'active').read_text())
+        current, = [a for a in active if a['manifest']['attempt_id'] == manifest['attempt_id']]
+        assert current['name'] == f'.run-{manifest["attempt_id"]}.partial.json'
+        assert current['manifest']['status'] == 'running' and current['manifest']['targets'] == {}, current
+        assert current['manifest']['checkout_sha'] == sha
+    return result, manifest, path, requests, logs
+
+def stages(manifest, expected):
+    assert set(manifest['stages']) == set(expected), manifest
+    for stage, code in expected.items():
+        assert manifest['stages'][stage]['exit_code'] == code, manifest
+
+sha = checkout('first executing checkout')
+seed()
+result, first, first_path, requests, logs = run('first', 'requests')
+assert result.returncode == 0, (result.stdout, result.stderr)
+assert first['targets'] == ids, first
+stages(first, dict(discovery=0, measure=0, push=0, guard=0))
+expected_failures = []
+for item_type, target, code, http in (('movie', ids['Movie'], 22, '404'), ('episode', ids['Episode'], 28, '000')):
+    for flow in flows[2:]:
+        for sample in (1, 2):
+            expected_failures.append(dict(flow=flow, item_type=item_type, sample_index=sample,
+                target=target, curl_exit_code=code, http_status=http,
+                response='http' if code == 22 else 'transport/no-response', stage='request'))
+for flow, item_type, channel, stage, code, http in (
+        ('list_load', 'movie', 'movies', 'page_fetch', 22, '500'),
+        ('list_load', 'episode', 'shows', 'badge_states', 28, '000'),
+        ('sort_change', 'episode', 'shows', 'badge_states', 28, '000')):
+    for sample in (1, 2):
+        expected_failures.append(dict(flow=flow, item_type=item_type, sample_index=sample,
+            target=channel, curl_exit_code=code, http_status=http,
+            response='http' if code == 22 else 'transport/no-response', stage=stage))
+canonical = lambda items: sorted(json.dumps(i, sort_keys=True) for i in items)
+assert canonical(first['failures']) == canonical(expected_failures), first['failures']
+payload, = [r['payload'] for r in requests if r['path'].endswith('/phantom-loadtime')]
+samples = {}
+for line in payload.splitlines():
+    if line and not line.startswith('#'):
+        key, value = line.split()
+        assert key not in samples, ('duplicate metric', key)
+        samples[key] = float(value)
+expected_keys = set()
+for item_type in ('movie', 'episode'):
+    for flow in flows:
+        for metric in ('seconds', 'runs_total', 'errors_total'):
+            key = f'phantom_loadtime_{metric}{{flow="{flow}",item_type="{item_type}",color="green"}}'
+            expected_keys.add(key)
+            assert key in samples and math.isfinite(samples[key]) and samples[key] >= 0, key
+            if metric == 'runs_total': assert samples[key] == 2, key
+            if metric == 'errors_total': assert samples[key] == (0 if (flow, item_type) == ('sort_change', 'movie') else 2), key
+    key = f'phantom_loadtime_rig_outcome_total{{flow="materialise_then_play",item_type="{item_type}",cause="gostream_register_fail"}}'
+    expected_keys.add(key)
+    assert samples[key] == 1, key
+for flow, item_type, stage, http in (('list_load', 'movie', 'page_fetch', '500'),
+        ('list_load', 'episode', 'badge_states', '000'), ('sort_change', 'episode', 'badge_states', '000')):
+    key = f'phantom_loadtime_list_errors_total{{flow="{flow}",item_type="{item_type}",stage="{stage}",http_code="{http}"}}'
+    expected_keys.add(key)
+    assert samples[key] == 2, key
+assert set(samples) == expected_keys, ('metric names/labels changed', set(samples) ^ expected_keys)
+stage_puts = [r['payload'] for r in requests if r['path'].endswith('/phantom-loadtime-daily-run')]
+assert len(stage_puts) == 3, stage_puts
+for index, payload in enumerate(stage_puts, 1):
+    actual = dict(line.split() for line in payload.splitlines())
+    expected = {'phantom_loadtime_daily_run_start_timestamp_seconds'}
+    for stage in ('measure', 'push', 'guard')[:index]:
+        for metric in ('exit_code', 'seconds'):
+            key = f'phantom_loadtime_daily_stage_{metric}{{stage="{stage}"}}'
+            expected.add(key)
+            assert int(actual[key]) == first['stages'][stage][metric], (key, actual, first)
+    assert set(actual) == expected, ('stage metric contract changed', actual)
+    assert int(actual['phantom_loadtime_daily_run_start_timestamp_seconds']) == first['run_start']
+print('EVIDENCE PASS: LIVE movie HTTP404/curl22 vs episode timeout28/000, list attribution, 1-based samples, unchanged metrics')
+
+first_bytes = first_path.read_bytes()
+old_sha = sha
+shutil.rmtree(root)
+assert first_path.read_bytes() == first_bytes, 'evidence died with executing checkout'
+sha = checkout('second executing checkout')
+assert sha != old_sha
+seed()
+result, second, second_path, requests, logs = run('second', 'Series:wrong-type')
+assert result.returncode != 0 and second['targets'] == {'Movie': ids['Movie']}, second
+assert second['attempt_id'] != first['attempt_id'] and second['failures'] == [], second
+assert first_path.read_bytes() == first_bytes and second_path != first_path
+assert not any(r['path'].startswith(('/Items/', '/Videos/')) for r in requests), requests
+print('EVIDENCE PASS: checkout deletion/recreation preserves prior artifact/SHA; partial discovery has no stale targets')
+
+for kind in ids:
+    for fault in ('wrong-type', 'missing-type', 'null-id', 'unsafe-id', 'empty', 'malformed', 'http'):
+        result, manifest, _, requests, _ = run(f'discovery-{kind}-{fault}', f'{kind}:{fault}')
+        assert result.returncode != 0, (kind, fault)
+        preceding = list(ids)[:list(ids).index(kind)]
+        assert manifest['targets'] == {k: ids[k] for k in preceding}, (kind, fault, manifest)
+        assert 'push' not in manifest['stages'] and 'guard' not in manifest['stages'], manifest
+        assert not any(r['path'].startswith(('/Items/', '/Videos/', '/Plugins/', '/metrics/job/phantom-loadtime/'))
+                       or r['query'].get('Limit') == ['200'] or r['path'].endswith('/phantom-loadtime')
+                       for r in requests), (kind, fault, requests)
+print('EVIDENCE PASS: 28 typed discovery failures retain exactly the validated prefix and never time/push a batch')
+
+result, manifest, _, requests, _ = run('color-failure', 'color')
+assert result.returncode != 0 and manifest['targets'] == {} and not requests, manifest
+assert manifest['stages']['discovery']['exit_code'] != 0, manifest
+result, manifest, _, _, _ = run('measure-failure', PHANTOM_LOADTIME_SAMPLES='invalid')
+assert result.returncode != 0 and manifest['targets'] == {}, manifest
+assert manifest['stages']['measure']['exit_code'] == 2, manifest
+assert 'push' not in manifest['stages'] and 'guard' not in manifest['stages'], manifest
+seed()
+result, manifest, _, _, _ = run('push-failure', 'push')
+assert result.returncode != 0 and manifest['targets'] == ids, manifest
+assert manifest['stages']['measure']['exit_code'] == 0 and manifest['stages']['push']['exit_code'] != 0, manifest
+assert 'guard' not in manifest['stages'], manifest
+thresholds.write_text('{broken registry')
+result, manifest, _, _, logs = run('guard-failure')
+assert result.returncode != 0, manifest
+stages(manifest, dict(discovery=0, measure=0, push=0, guard=2))
+assert thresholds.read_text() == '{broken registry' and not (logs / 'filing').exists()
+print('EVIDENCE PASS: color/discovery, measure, real emitter transport, real guard failures finalize with stage outcomes')
+
+shutil.rmtree(root / '.git')
+sha = 'unavailable'
+result, manifest, _, _, _ = run('checkout-sha-unavailable', PHANTOM_LOADTIME_SAMPLES='invalid')
+assert result.returncode != 0 and manifest['checkout_sha'] == 'unavailable', manifest
+sha = checkout('restored executing checkout')
+print('EVIDENCE PASS: source archive without git records unavailable, never a guessed checkout SHA')
+
+seed()
+for absent in (False, True):
+    explicit = tmp / ('dry-absent' if absent else 'dry-existing')
+    retained_before = {p.name: p.read_bytes() for p in evidence.iterdir()}
+    if absent: thresholds.unlink()
+    before = thresholds.read_bytes() if thresholds.exists() else None
+    lock = pathlib.Path(str(thresholds) + '.lock')
+    if lock.exists(): lock.unlink()
+    result, manifest, _, requests, logs = run('dry-run-' + str(absent), directory=explicit,
+        PHANTOM_CI_DRYRUN='1', PHANTOM_LOADTIME_EVIDENCE_DIR=str(explicit))
+    assert result.returncode == 0 and manifest is None, (result.stdout, result.stderr)
+    assert not requests and not (logs / 'kube').exists() and not (logs / 'filing').exists()
+    assert (thresholds.read_bytes() if thresholds.exists() else None) == before
+    assert not lock.exists(), 'dry-run created threshold lock'
+    assert {p.name: p.read_bytes() for p in evidence.iterdir()} == retained_before
+    assert (root / 'tools/perf/loadtime-thresholds.json').read_bytes() == (source / 'tools/perf/loadtime-thresholds.json').read_bytes()
+print('EVIDENCE PASS: dry-run creates no artifacts; existing evidence/registry immutable; no cluster/network/filing')
+
+# Fast real-wrapper failures exercise pruning without replacing the engine.
+retained = tmp / 'bounded'
+retained.mkdir()
+partial = retained / ('.run-' + 'a' * 32 + '.partial.json')
+partial.write_text(json.dumps(dict(first, status='running', attempt_id='a' * 32)))
+partial_bytes = partial.read_bytes()
+unrelated = retained / 'operator-notes.json'
+unrelated.write_text('leave unrelated files alone')
+for index in range(35):
+    attempt = f'{index:032x}'
+    path = retained / f'run-{attempt}.json'
+    path.write_text(json.dumps(dict(first, attempt_id=attempt, run_start=index + 1)))
+    os.utime(path, (index + 1, index + 1))
+result, manifest, latest, _, _ = run('default-retention', directory=retained,
+    PHANTOM_LOADTIME_EVIDENCE_DIR=str(retained), PHANTOM_LOADTIME_SAMPLES='invalid')
+assert result.returncode != 0 and len(list(retained.glob('run-*.json'))) == 32
+assert latest.exists() and not (retained / ('run-' + '0' * 32 + '.json')).exists()
+for index in range(3):
+    result, manifest, latest, _, _ = run(f'bounded-{index}', directory=retained,
+        PHANTOM_LOADTIME_EVIDENCE_DIR=str(retained), PHANTOM_LOADTIME_EVIDENCE_KEEP='2',
+        PHANTOM_LOADTIME_SAMPLES='invalid')
+    assert len(list(retained.glob('run-*.json'))) == 2 and latest.exists()
+    assert partial.read_bytes() == partial_bytes and unrelated.read_text() == 'leave unrelated files alone'
+print('EVIDENCE PASS: default32/configured2 retention bounds completed files, preserves partial/unrelated files')
+
+for invalid in ('0', '-1', 'nope', '1.5'):
+    logs = tmp / ('keep-invalid-' + invalid)
+    logs.mkdir()
+    before = {p.name: p.read_bytes() for p in retained.iterdir()}
+    result = subprocess.run(['bash', str(root / 'tools/ci/loadtime-daily-run.sh')], env=dict(base_env,
+        PHANTOM_LOADTIME_EVIDENCE_DIR=str(retained), PHANTOM_LOADTIME_EVIDENCE_KEEP=invalid,
+        EVIDENCE_CLEANUP=str(logs / 'cleanup'), EVIDENCE_KUBE=str(logs / 'kube'),
+        EVIDENCE_REQUESTS=str(logs / 'requests')), text=True, capture_output=True, timeout=30)
+    assert result.returncode != 0 and not (logs / 'requests').exists() and not (logs / 'kube').exists(), invalid
+    assert {p.name: p.read_bytes() for p in retained.iterdir()} == before, invalid
+    assert re.search(r'(evidence|keep|retention)', result.stdout + result.stderr, re.I), result
+
+blocked = tmp / 'unwritable'
+blocked.mkdir()
+blocked.chmod(0o555)
+try:
+    result = subprocess.run(['bash', str(root / 'tools/ci/loadtime-daily-run.sh')], env=dict(base_env,
+        PHANTOM_LOADTIME_EVIDENCE_DIR=str(blocked), EVIDENCE_CLEANUP=str(tmp / 'blocked-cleanup'),
+        EVIDENCE_KUBE=str(tmp / 'blocked-kube'), EVIDENCE_REQUESTS=str(tmp / 'blocked-requests')),
+        text=True, capture_output=True, timeout=30)
+    assert result.returncode != 0, 'unwritable evidence storage silently accepted'
+    assert not list(blocked.iterdir()) and not (tmp / 'blocked-requests').exists() and not (tmp / 'blocked-kube').exists()
+    assert re.search(r'evidence', result.stdout + result.stderr, re.I), result
+finally:
+    blocked.chmod(0o755)
+print('EVIDENCE PASS: invalid retention/unwritable storage fail before discovery, never prune or publish')
+
+seed()
+interrupted = tmp / 'storage-loss'
+interrupted.mkdir()
+try:
+    result = subprocess.run(['bash', str(root / 'tools/ci/loadtime-daily-run.sh')], env=dict(base_env,
+        PHANTOM_LOADTIME_EVIDENCE_DIR=str(interrupted), EVIDENCE_FAULT='storage-loss',
+        EVIDENCE_EXPECT_DIR=str(interrupted), EVIDENCE_ACTIVE=str(tmp / 'loss-active'),
+        EVIDENCE_CLEANUP=str(tmp / 'loss-cleanup'), EVIDENCE_KUBE=str(tmp / 'loss-kube'),
+        EVIDENCE_REQUESTS=str(tmp / 'loss-requests')), text=True, capture_output=True, timeout=30)
+    assert result.returncode != 0 and 'evidence' in result.stderr
+    assert not list(interrupted.glob('run-*.json')), 'storage failure reported a completed manifest'
+    active, = interrupted.glob('.run-*.partial.json')
+    partial = json.loads(active.read_text())
+    assert partial['status'] == 'running' and partial['targets'] == {k: ids[k] for k in ('Movie', 'Series', 'Season')}
+    assert thresholds.read_bytes() == (source / 'tools/perf/loadtime-thresholds.json').read_bytes()
+finally:
+    interrupted.chmod(0o755)
+print('EVIDENCE PASS: mid-discovery storage loss fails visibly, retains readable prefix, never completes or ratchets')
+PY
+then
+    ok "retained run evidence through real daily wrapper/engine/emitter/guard"
+else
+    bad "retained run evidence integration"
+fi
 
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"
 [ "$fail_count" -eq 0 ]

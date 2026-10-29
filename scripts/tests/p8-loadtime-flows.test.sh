@@ -372,9 +372,15 @@ def run(name, fault=''):
     scratch = directory / 'scratch'
     scratch.mkdir()
     log, out = directory / 'requests', directory / 'metrics'
+    helper = pathlib.Path(engine).parent.parent / 'ci/loadtime-evidence.py'
+    evidence_dir = directory / 'evidence'
+    active = subprocess.check_output(['python3', str(helper), 'init', str(evidence_dir),
+        str(pathlib.Path(engine).parents[2]), '1234567890', '32'], text=True).strip()
     result = subprocess.run(['bash', engine], env=dict(
         env, CURL_LOG=str(log), CURL_FAULT=fault, TMPDIR=str(scratch),
+        PHANTOM_LOADTIME_EVIDENCE_FILE=active,
         PHANTOM_LOADTIME_OUT=str(out)), text=True, capture_output=True, timeout=30)
+    run.evidence = json.loads(pathlib.Path(active).read_text())
     requests = [json.loads(line)[:3] for line in log.read_text().splitlines()]
     posts = [json.loads(line) for line in log.read_text().splitlines()]
     run.badges = [r[3]['ids'] for r in posts if r[1] == '/Plugins/PhantomLibrary/States']
@@ -384,6 +390,8 @@ def run(name, fault=''):
 
 result, requests, out = run('success')
 assert result.returncode == 0, result.stderr
+assert run.evidence['targets'] == {k.title(): v for k, v in ids.items() if k != 'user'}
+assert run.evidence['failures'] == []
 discovery = [r for r in requests if r[2].get('Limit') == ['1']]
 assert [(r[1], r[2].get('FolderId')) for r in discovery] == [
     ('/Channels/movies/Items', None), ('/Channels/shows/Items', None),
@@ -462,6 +470,10 @@ assert '# TYPE phantom_loadtime_list_errors_total counter' in result.stdout
 assert result.stderr.count('flow=list_load item_type=movie list_error stage=page_fetch http_code=500') == 2, result.stderr
 assert result.stderr.count('flow=sort_change item_type=episode list_error stage=badge_states http_code=404') == 2, result.stderr
 assert out.read_text() == result.stdout
+assert len(run.evidence['failures']) == 4, run.evidence
+for failure in run.evidence['failures']:
+    assert failure['curl_exit_code'] == 22 and failure['sample_index'] in (1, 2)
+    assert (failure['stage'], failure['http_status']) in (('page_fetch', '500'), ('badge_states', '404'))
 print('LIVE: list/sort failures attributed by stage+http_code (page_fetch 500, badge_states 404); errors_total unchanged: PASS')
 
 cases = [(stage, fault) for stage in ('movie', 'series', 'season', 'episode')
@@ -474,6 +486,11 @@ for stage, fault in cases:
     assert result.returncode != 0, (stage, fault, 'discovery unexpectedly succeeded')
     assert not result.stdout and not out.exists(), (stage, fault, 'batch emitted')
     assert 'FAIL:' in result.stderr, (stage, fault, result.stderr)
+    kinds = ['movie', 'series', 'season', 'episode']
+    preceding = kinds[:kinds.index(stage)] if stage in kinds else []
+    assert run.evidence['targets'] == {k.title(): ids[k] for k in preceding}, run.evidence
+    assert run.evidence['stages']['discovery']['exit_code'] != 0
+    assert env['PHANTOM_LOADTIME_TOKEN'] not in json.dumps(run.evidence)
     assert not any(r[1].startswith(('/Items/', '/Videos/', '/Plugins/')) or
                    r[2].get('Limit') == ['200'] for r in requests), (stage, fault, requests)
 print(f'LIVE: {len(cases)} discovery failures rejected before timing/emission; cleanup: PASS')
