@@ -235,6 +235,37 @@ EOF
 "
 }
 
+# --- list/sort failure attribution (ttfb-loadtime-list-error-stage-attribution)
+# Every erroring list_load/sort_change sample adds EXACTLY ONE increment to
+# phantom_loadtime_list_errors_total{flow,item_type,stage,http_code}
+# (stage: page_fetch | badge_states; http_code: curl %{http_code}, 000 =
+# transport/timeout). Success samples add none. Emitted in the same batch as
+# phantom_loadtime_errors_total; the push validator ignores this family.
+# http_code_of <curl -w output> -> 3-digit code (000 when absent/garbled)
+http_code_of() {
+    local c="${1:-}"
+    c="${c: -3}"
+    if [[ "$c" =~ ^[0-9]{3}$ ]]; then printf '%s' "$c"; else printf '000'; fi
+}
+declare -A _list_err_counts=()
+_list_err_order=""
+list_error_add() {
+    local key="flow=\"$1\",item_type=\"$2\",stage=\"$3\",http_code=\"$4\""
+    if [ -z "${_list_err_counts[$key]:-}" ]; then
+        _list_err_counts[$key]=0
+        _list_err_order="${_list_err_order}${key}
+"
+    fi
+    _list_err_counts[$key]=$(( _list_err_counts[$key] + 1 ))
+}
+list_error_records() {
+    local key
+    while IFS= read -r key; do
+        [ -n "$key" ] || continue
+        printf 'phantom_loadtime_list_errors_total{%s} %s\n' "$key" "${_list_err_counts[$key]}"
+    done <<<"$_list_err_order"
+}
+
 # --- N-sample aggregation (median duration, summed errors) ------------------
 # sample_reset; sample_add <dur> <err> (x N); sample_emit <flow> <item_type>
 # Emits ONE record per flow: the median of the sample durations (mean of the
@@ -307,6 +338,8 @@ flush_records() {
 # TYPE phantom_loadtime_runs_total counter
 # HELP phantom_loadtime_errors_total Number of runs of a flow that returned an error in this batch.
 # TYPE phantom_loadtime_errors_total counter
+# HELP phantom_loadtime_list_errors_total Erroring list_load/sort_change samples attributed to the failing stage (page_fetch|badge_states) and curl HTTP status (000 = transport/timeout).
+# TYPE phantom_loadtime_list_errors_total counter
 EOF
 )"
     outcome_header=""
@@ -338,6 +371,7 @@ EOF
         printf '%s\n' "$header"
         [ -n "$outcome_header" ] && printf '%s' "$outcome_header"
         [ -n "$_records" ] && printf '%s' "$_records"
+        list_error_records
         [ -n "$_outcome_records" ] && printf '%s' "$_outcome_records"
     }
     _emit_exposition
@@ -532,14 +566,19 @@ log "target type=Episode id=$EPISODE_ID"
 _full_list_sample() {
     local flow="$1" item_type="$2" ch="$3" sort_qs="$4"
     local start errors=0 dur total=0 start_index=0 page=200
+    # Attribution of a failed sample (ttfb-loadtime-list-error-stage-attribution):
+    # the FIRST failing stage + its HTTP status (000 = transport/timeout).
+    local fail_stage="" fail_code=""
     local all_ids_file
     all_ids_file="$(mktemp "$WORK_DIR/ids.XXXXXX")"
     start="$(now_s)"
     while :; do
         local page_json page_file
         page_file="$(mktemp "$WORK_DIR/page.XXXXXX")"
-        if ! api "$API/Channels/$ch/Items?Limit=$page&StartIndex=$start_index&userId=$USER_ID${sort_qs}" -o "$page_file" 2>/dev/null; then
-            errors=1; rm -f "$page_file"; break
+        local code
+        if ! code="$(api "$API/Channels/$ch/Items?Limit=$page&StartIndex=$start_index&userId=$USER_ID${sort_qs}" -o "$page_file" -w '%{http_code}' 2>/dev/null)"; then
+            errors=1; fail_stage=page_fetch; fail_code="$(http_code_of "$code")"
+            rm -f "$page_file"; break
         fi
         local got total_records
         got="$(python3 -c "import json; d=json.load(open('$page_file')); print(len(d.get('Items',[])))" 2>/dev/null || echo 0)"
@@ -558,13 +597,23 @@ import json,sys
 ids=[l.strip() for l in open('$all_ids_file') if l.strip()]
 print(json.dumps(ids[$off:$off+$lim]))
 " 2>/dev/null || echo '[]')"
-        json_post -d "{\"ids\": $chunk_ids}" "$API/Plugins/PhantomLibrary/States" >/dev/null 2>&1 || errors=1
+        local bcode
+        if ! bcode="$(json_post -d "{\"ids\": $chunk_ids}" -o /dev/null -w '%{http_code}' "$API/Plugins/PhantomLibrary/States" 2>/dev/null)"; then
+            if [ "$errors" -eq 0 ]; then
+                fail_stage=badge_states; fail_code="$(http_code_of "$bcode")"
+            fi
+            errors=1
+        fi
     }
     badge_fanout_and_materialise "$total" live_batch_runner
     rm -f "$all_ids_file"
     dur="$(elapsed "$start")"
     sample_add "$dur" "$errors"
     log "flow=$flow item_type=$item_type sample_s=$dur errors=$errors items=$total"
+    if [ "$errors" -eq 1 ]; then
+        list_error_add "$flow" "$item_type" "$fail_stage" "$fail_code"
+        log "flow=$flow item_type=$item_type list_error stage=$fail_stage http_code=$fail_code"
+    fi
 }
 time_full_list_flow() {
     local s

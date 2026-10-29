@@ -331,12 +331,27 @@ if stage == fault_stage:
         body['Items'][0]['Type'] = 'Season' if stage == 'episode' else 'Episode'
     elif fault == 'missing-type':
         del body['Items'][0]['Type']
+http_code = '200'
+if exit_code == 22:
+    http_code = '503'
+# List/sort failure attribution faults (ttfb-loadtime-list-error-stage-attribution):
+# the movie list_load 2nd page answers 500; the episode sort_change first badge
+# POST answers 404.
+if os.environ.get('CURL_LIST_FAULT'):
+    if (parsed.path == '/Channels/movies/Items' and query.get('Limit') == ['200']
+            and query.get('StartIndex') == ['200'] and 'SortOrder' not in query):
+        exit_code, http_code = 22, '500'
+    elif (parsed.path == '/Plugins/PhantomLibrary/States' and post_body
+            and post_body['ids'][:1] == ['shows-0412']):
+        exit_code, http_code = 22, '404'
 text = '{broken' if stage == fault_stage and fault == 'malformed' else json.dumps(body)
 if '-o' in args:
     with open(args[args.index('-o') + 1], 'w') as output:
         output.write(text)
 else:
     print(text)
+if '-w' in args:
+    sys.stdout.write(http_code)
 sys.exit(exit_code)
 PY
 chmod +x "$LIVE_TMP/bin/curl"
@@ -422,6 +437,32 @@ for metric in ('seconds', 'runs_total', 'errors_total'):
             if metric != 'seconds':
                 assert value == ('1' if metric == 'runs_total' else '0'), value
 print('LIVE: user-scoped Series -> Season -> Episode; exact movie/episode endpoints; twelve flows; audit logs; cleanup: PASS')
+assert 'phantom_loadtime_list_errors_total{' not in result.stdout, 'success sample attributed an error'
+
+# Failing list page (500) and failing badge POST (404): each erroring list/sort
+# sample is attributed exactly once by stage + http_code; errors_total unchanged.
+env['PHANTOM_LOADTIME_SAMPLES'] = '2'
+env['CURL_LIST_FAULT'] = '1'
+result, requests, out = run('list-faults')
+del env['CURL_LIST_FAULT']
+env['PHANTOM_LOADTIME_SAMPLES'] = '1'
+assert result.returncode == 0, result.stderr
+attributed = sorted(l for l in result.stdout.splitlines()
+                    if l.startswith('phantom_loadtime_list_errors_total{'))
+assert attributed == sorted([
+    'phantom_loadtime_list_errors_total{flow="list_load",item_type="movie",stage="page_fetch",http_code="500"} 2',
+    'phantom_loadtime_list_errors_total{flow="sort_change",item_type="episode",stage="badge_states",http_code="404"} 2',
+]), attributed
+for flow in ('list_load', 'sort_change', 'info_open', 'get_sources', 'materialise', 'play_materialised'):
+    for kind in ('movie', 'episode'):
+        want = '2' if (flow, kind) in (('list_load', 'movie'), ('sort_change', 'episode')) else '0'
+        line = f'phantom_loadtime_errors_total{{flow="{flow}",item_type="{kind}",color="rigtest"}} {want}'
+        assert line in result.stdout.splitlines(), (line, result.stdout)
+assert '# TYPE phantom_loadtime_list_errors_total counter' in result.stdout
+assert result.stderr.count('flow=list_load item_type=movie list_error stage=page_fetch http_code=500') == 2, result.stderr
+assert result.stderr.count('flow=sort_change item_type=episode list_error stage=badge_states http_code=404') == 2, result.stderr
+assert out.read_text() == result.stdout
+print('LIVE: list/sort failures attributed by stage+http_code (page_fetch 500, badge_states 404); errors_total unchanged: PASS')
 
 cases = [(stage, fault) for stage in ('movie', 'series', 'season', 'episode')
          for fault in ('malformed', 'empty', 'wrong-type', 'missing-type',
