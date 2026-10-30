@@ -941,6 +941,35 @@ public class PhantomShowsChannelTests : IDisposable
     }
 
     [Fact]
+    public async Task GetChannelItems_ChannelBaseItemWarmupScope_ReturnsSeriesRootNotLatestEpisodes()
+    {
+        // ttfb-warmup-userless-root-churn: TV parity — the warmup's userless
+        // root browse persists the canonical series-folder root, never the
+        // latest-episode subset (which made core delete every series BaseItem).
+        await SeedSeriesMetaAsync(1399, "Game of Thrones");
+        await _db.UpsertTmdbEpisodeAsync(
+            new TmdbEpisodeRow(1399, 1, 1, "Winter Is Coming", "Pilot synopsis", null, null, 50, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+        var fusePath = Path.Combine(_splashHome, "s01e01.mkv");
+        File.WriteAllText(fusePath, string.Empty);
+        await _db.InsertMaterialisedStateAsync(1399, "episode", 1, 1, "/stub/e1", fusePath, CancellationToken.None);
+
+        ChannelItemResult result;
+        using (ChannelWarmupScope.Enter())
+        {
+            Assert.Equal(ChannelWarmupScope.CacheKey, _channel.GetCacheKey(string.Empty));
+            result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        }
+
+        Assert.NotEmpty(result.Items);
+        Assert.All(result.Items, i => Assert.Equal(ChannelItemType.Folder, i.Type));
+        Assert.DoesNotContain(result.Items, i => i.Id == "episode_1399_s01e01");
+
+        var latest = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        Assert.Equal("episode_1399_s01e01", Assert.Single(latest.Items).Id);
+    }
+
+    [Fact]
     public async Task GetLatestMedia_ReturnsMaterialisedEpisodes()
     {
         await SeedSeriesMetaAsync(1399, "Game of Thrones");

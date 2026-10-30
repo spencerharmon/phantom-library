@@ -51,6 +51,9 @@ public class ChannelBaseItemWarmupWorkerTests
                 // Root browse: scoped to exactly one phantom channel, no parent folder.
                 Assert.Single(q.ChannelIds);
                 Assert.True(q.ParentId == Guid.Empty);
+                // ttfb-warmup-userless-root-churn: the userless root browse must
+                // run inside the warmup scope so the channels emit the full root.
+                Assert.True(ChannelWarmupScope.IsActive);
                 seen.Add(q.ChannelIds[0]);
             })
             .ReturnsAsync(Result(40));
@@ -61,6 +64,7 @@ public class ChannelBaseItemWarmupWorkerTests
         Assert.Contains(ChannelIds.Movies, seen);
         Assert.Contains(ChannelIds.Shows, seen);
         Assert.Equal(2, seen.Count);
+        Assert.False(ChannelWarmupScope.IsActive); // scope never leaks past the warmup
     }
 
     [Fact]

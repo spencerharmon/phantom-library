@@ -163,7 +163,7 @@ public sealed partial class PhantomShowsChannel
     /// see <see cref="PhantomMoviesChannel.GetCacheKey"/> for the full rationale
     /// (REQ-M14-PER-USER Surface 3 cache cross-contamination fix).
     /// </summary>
-    public string? GetCacheKey(string? userId) => userId;
+    public string? GetCacheKey(string? userId) => ChannelWarmupScope.CacheKeyFor(userId);
 
     /// <inheritdoc />
     public string HomePageUrl => string.Empty;
@@ -224,7 +224,8 @@ public sealed partial class PhantomShowsChannel
         // episodes on every Home load. Route this shape to a flat, bounded,
         // Media-typed (never Folder) episode list instead — nothing in it is a
         // Folder, so core never recurses into it.
-        if (string.IsNullOrEmpty(query.FolderId) && userId == Guid.Empty)
+        // ttfb-warmup-userless-root-churn: warmup gets the full series root.
+        if (string.IsNullOrEmpty(query.FolderId) && userId == Guid.Empty && !ChannelWarmupScope.IsActive)
         {
             var latestEpisodes = await BuildLatestEpisodeItemsAsync(cancellationToken).ConfigureAwait(false);
             return new ChannelItemResult { Items = latestEpisodes, TotalRecordCount = latestEpisodes.Count };

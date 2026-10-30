@@ -112,7 +112,7 @@ public sealed class PhantomMoviesChannel
     /// next user who happens to hit the same folder before the cache entry
     /// expires (eval Surface 3's "cache cross-contamination" risk).
     /// </summary>
-    public string? GetCacheKey(string? userId) => userId;
+    public string? GetCacheKey(string? userId) => ChannelWarmupScope.CacheKeyFor(userId);
 
     /// <inheritdoc />
     public string HomePageUrl => string.Empty;
@@ -186,7 +186,11 @@ public sealed class PhantomMoviesChannel
         // the full orphan-enumerating, TMDB-calling BuildFlatMovieItemsAsync
         // build — that O(catalogue) cost on every Home load, for every client,
         // is exactly what forced ISupportsLatestMedia off in the first place.
-        if (query.UserId == Guid.Empty)
+        // ttfb-warmup-userless-root-churn: the warmup worker's userless root
+        // browse must persist the FULL catalogue (flat build, Guid.Empty = no
+        // hidden subtraction), never the latest-only subset that makes core
+        // delete every other channel BaseItem.
+        if (query.UserId == Guid.Empty && !ChannelWarmupScope.IsActive)
         {
             var latest = await BuildLatestMovieItemsAsync(cancellationToken).ConfigureAwait(false);
             return new ChannelItemResult { Items = latest, TotalRecordCount = latest.Count };

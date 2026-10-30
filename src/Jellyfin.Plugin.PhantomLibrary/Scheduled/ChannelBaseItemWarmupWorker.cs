@@ -5,6 +5,7 @@ using Jellyfin.Plugin.PhantomLibrary.Channels;
 using Jellyfin.Plugin.PhantomLibrary.Configuration;
 using MediaBrowser.Controller.Channels;
 using MediaBrowser.Controller.Entities;
+using MediaBrowser.Model.Querying;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -140,9 +141,16 @@ public sealed class ChannelBaseItemWarmupWorker : IHostedService, IDisposable
                 EnableTotalRecordCount = false,
             };
 
-            var result = await _channelManager
-                .GetChannelItemsInternal(query, new Progress<double>(), ct)
-                .ConfigureAwait(false);
+            // ttfb-warmup-userless-root-churn: mark this flow as warmup so the
+            // channels emit the full canonical root, not the latest-only subset.
+            QueryResult<BaseItem> result;
+            using (ChannelWarmupScope.Enter())
+            {
+                result = await _channelManager
+                    .GetChannelItemsInternal(query, new Progress<double>(), ct)
+                    .ConfigureAwait(false);
+            }
+
             total += result.Items.Count;
             _logger.LogDebug("Channel {ChannelId} warmup wrapped {Count} root items", channelId, result.Items.Count);
         }

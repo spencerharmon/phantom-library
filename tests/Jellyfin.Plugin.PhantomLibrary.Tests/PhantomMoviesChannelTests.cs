@@ -697,6 +697,37 @@ public class PhantomMoviesChannelTests : IDisposable
     }
 
     [Fact]
+    public async Task GetChannelItems_ChannelBaseItemWarmupScope_ReturnsFullCatalogueNotLatestOnly()
+    {
+        // ttfb-warmup-userless-root-churn: the warmup worker's userless root
+        // browse must persist the FULL catalogue; the latest-only subset made
+        // core delete every other channel BaseItem each tick.
+        await SeedMetaAsync(202, "Materialised Movie");
+        var fusePath = Path.Combine(_moviesRoot, "202.mkv");
+        File.WriteAllText(fusePath, string.Empty);
+        await _db.InsertMaterialisedStateAsync(202, "movie", -1, -1, "/stub/202.mkv", fusePath, CancellationToken.None);
+
+        await SeedMetaAsync(203, "Available Only Movie");
+        await SeedAvailableMovieAsync(203);
+
+        ChannelItemResult result;
+        using (ChannelWarmupScope.Enter())
+        {
+            Assert.Equal(ChannelWarmupScope.CacheKey, _channel.GetCacheKey(string.Empty));
+            result = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        }
+
+        var ids = result.Items.Select(i => i.Id).ToList();
+        Assert.Contains("movie_202", ids);
+        Assert.Contains("movie_203", ids);
+
+        // Outside the scope the real Home Latest path stays bounded/latest-only.
+        Assert.Equal(string.Empty, _channel.GetCacheKey(string.Empty));
+        var latest = await _channel.GetChannelItems(new InternalChannelItemQuery(), CancellationToken.None);
+        Assert.Equal("movie_202", Assert.Single(latest.Items).Id);
+    }
+
+    [Fact]
     public async Task GetLatestMedia_ReturnsMaterialisedItems()
     {
         await SeedMetaAsync(202, "Materialised Movie");
