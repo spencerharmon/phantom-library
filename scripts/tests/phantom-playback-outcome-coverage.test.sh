@@ -362,6 +362,61 @@ uneven = interval_fixture(now_rows, then_rows)
 uneven["previous-timestamps"]["data"]["result"].pop()
 case("interval previous timestamp coverage", uneven, 1, ["previous timestamp coverage must exactly match"])
 
+# Previous-endpoint freshness relative to its OWN evaluation (never --now).
+stale_line = "INTERVAL_STALE_PREVIOUS previous_sample_age_seconds=200 max_age=120"
+case("interval stale previous endpoint", interval_fixture(now_rows, then_rows, 600, "400"), 2,
+     [stale_line, "aggregate(all flows/items) attempts=1000 errors=100 error_rate=10.000000%",
+      "interval attempts=unavailable errors=unavailable error_rate=unavailable (stale previous endpoint)"],
+     [interval_line, "interval slice[", "interval_ranking="], exact_slices=1)
+for age, code in ((120, 0), (121, 2)):
+    for role in ("serving", "inactive"):
+        data = interval_fixture(copy.deepcopy(now_rows), then_rows, 600, str(600 - age))
+        data["expected"][0]["role"] = role
+        data["expected"][1]["role"] = "serving" if role == "inactive" else "inactive"
+        if role == "inactive":
+            data["instant"]["data"]["result"] += rows(1)
+            stamps = copy.deepcopy(rows(1))
+            for row in stamps:
+                row["metric"].pop("__name__")
+                row["value"][1] = "990"
+            data["timestamps"]["data"]["result"] += stamps
+            peer_prev = copy.deepcopy(rows(1))
+            for row in peer_prev:
+                row["value"][0] = 600
+            data["previous-instant"]["data"]["result"] += peer_prev
+            peer_stamps = copy.deepcopy(peer_prev)
+            for row in peer_stamps:
+                row["metric"].pop("__name__")
+                row["value"][1] = "590"
+            data["previous-timestamps"]["data"]["result"] += peer_stamps
+        if code == 0:
+            want = [interval_line] + [f"interval slice[{slice_names[f, i]}] " for f, i in itertools.product(flows, items)]
+            case(f"interval previous age {age} {role} fresh", data, 0, want, ["INTERVAL_STALE_PREVIOUS"])
+        else:
+            case(f"interval previous age {age} {role} stale", data, 2,
+                 [f"INTERVAL_STALE_PREVIOUS previous_sample_age_seconds={age} max_age=120", "status=OK"],
+                 [interval_line, "interval slice[cold-movie] flow=materialise_then_play item_type=movie attempts=550"]
+                 + (["interval slice[", "interval_ranking="] if role == "serving" else []))
+peer_now = set_values(rows(1), {(*cold, "no_candidate"): "300"})
+peer_then = set_values(rows(1), {(*cold, "no_candidate"): "100"})
+peer_data = interval_fixture(now_rows + peer_now, then_rows + peer_then)
+peer_data["expected"][1]["role"] = "serving"
+for row in peer_data["previous-timestamps"]["data"]["result"][:32]:
+    row["value"][1] = "479"
+case("interval stale previous preserves healthy peer", peer_data, 2,
+     ["INTERVAL_STALE_PREVIOUS previous_sample_age_seconds=121 max_age=120",
+      "interval aggregate(all flows/items) attempts=200 errors=200 error_rate=100.000000% interval_ranking=no_candidate:200",
+      "aggregate(all flows/items) attempts=1000 errors=100"], [interval_line])
+daily = interval_fixture(copy.deepcopy(now_rows), then_rows, 3600, "3500")
+for kind in ("instant", "timestamps"):
+    for row in daily[kind]["data"]["result"]:
+        row["value"][0] = 90000
+for row in daily["timestamps"]["data"]["result"]:
+    row["value"][1] = "89990"
+case("interval daily-old fresh baseline", daily, 0,
+     [interval_line + " interval_ranking=first_byte_timeout:50", "interval source_seconds=86490"],
+     ["INTERVAL_STALE_PREVIOUS", "STALE"], options=("--now", "90000"))
+
 case("old capture", fixture(), 2, ["STALE capture evaluation", "error_rate=unavailable"], options=("--now", "2000"))
 for kind in ("instant", "window", "timestamps"):
     duplicate = fixture(window=rows())
@@ -440,7 +495,7 @@ with tempfile.TemporaryDirectory(prefix="outcome-coverage-") as temp:
                 assert "status=OK" not in block, (name, block)
                 assert "error_rate=unavailable" in block, (name, block)
                 assert not any(s in block for s in ("aggregate(", "slice[", "cause_ranking=")), (name, block)
-            if "INTERVAL_DISCONTINUITY" in block:
+            if "INTERVAL_DISCONTINUITY" in block or "INTERVAL_STALE_PREVIOUS" in block:
                 assert not any(s in block for s in ("interval aggregate(", "interval slice[")), (name, block)
         if exact_slices is not None:
             for label in slice_names.values():

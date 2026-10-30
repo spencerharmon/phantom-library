@@ -75,15 +75,26 @@ def interval_reasons(identity, current, timestamps, previous, previous_stamps):
     return before, reasons
 
 
-def report_interval(identity, role, current, timestamps, previous, previous_stamps, healthy, minimum):
-    """Print interval (current minus previous) rates; return True when interval is discontinuous."""
+def previous_staleness(identity, previous_stamps, max_age):
+    """Previous-endpoint freshness relative to ITS OWN evaluation time (never --now)."""
+    ages = [evaluation - source for (who, _), (evaluation, source) in previous_stamps.items() if who == identity]
+    return max(ages) if ages and max(ages) > max_age else None
+
+
+def report_interval(identity, role, current, timestamps, previous, previous_stamps, healthy, minimum, max_age):
+    """Print interval (current minus previous) rates; return True when interval is discontinuous or stale."""
     before, reasons = interval_reasons(identity, current, timestamps, previous, previous_stamps)
     for reason in reasons:
         print(f"  INTERVAL_DISCONTINUITY {reason}; interval rates and rankings withheld")
-    if reasons or not healthy:
-        why = "interval discontinuity" if reasons else "cumulative status not OK"
+    stale_age = previous_staleness(identity, previous_stamps, max_age)
+    if stale_age is not None:
+        print(f"  INTERVAL_STALE_PREVIOUS previous_sample_age_seconds={stale_age} max_age={max_age}"
+              " (age at previous evaluation); interval rates and rankings withheld")
+    if reasons or stale_age is not None or not healthy:
+        why = ("interval discontinuity" if reasons else "stale previous endpoint" if stale_age is not None
+               else "cumulative status not OK")
         print(f"  interval attempts=unavailable errors=unavailable error_rate=unavailable ({why})")
-        return bool(reasons)
+        return bool(reasons) or stale_age is not None
     delta = {key: int(current[key]) - int(before[key]) for key in current}
     old = next(iter({previous_stamps[identity, key][1] for key in before}))
     new = next(iter({timestamps[identity, key][1] for key in current}))
@@ -116,16 +127,16 @@ def report_interval(identity, role, current, timestamps, previous, previous_stam
 def main():
     parser = argparse.ArgumentParser(
         description="Offline playback outcome coverage and cumulative error ratio: labelled per-instance aggregate plus four flow/item slices (cold=materialise_then_play, warm=play_already_materialised; movie/episode), each ranked only on its own volume",
-        epilog="Capture all three vectors with the same explicit Prometheus time= value; --now only controls age checks. A matched window maximum above current reports COUNTER_DISCONTINUITY (exit 2), withholding that identity's aggregate/slice rates and rankings. Partial/empty windows are valid but do not prove continuity; equal/lower maxima do not trigger this guard. No reset cause, time, count, or adjusted totals are inferred. With --previous-instant/--previous-timestamps (an earlier capture), interval rates (current minus previous) are reported per identity; any tuple decrease, tuple-set mismatch, incoherent previous source time, or previous source time not earlier than current reports INTERVAL_DISCONTINUITY (exit 2) and withholds that identity's interval rates.")
+        epilog="Capture all three vectors with the same explicit Prometheus time= value; --now only controls age checks. A matched window maximum above current reports COUNTER_DISCONTINUITY (exit 2), withholding that identity's aggregate/slice rates and rankings. Partial/empty windows are valid but do not prove continuity; equal/lower maxima do not trigger this guard. No reset cause, time, count, or adjusted totals are inferred. With --previous-instant/--previous-timestamps (an earlier capture), interval rates (current minus previous) are reported per identity; any tuple decrease, tuple-set mismatch, incoherent previous source time, or previous source time not earlier than current reports INTERVAL_DISCONTINUITY (exit 2) and withholds that identity's interval rates. Previous-endpoint freshness is judged per identity against the previous capture's OWN evaluation time (not --now, so day-old baselines are valid): a previous sample older than --max-age at its evaluation (age <= max-age is fresh) reports INTERVAL_STALE_PREVIOUS (exit 2) and withholds that identity's interval aggregate and all four interval slice rates/rankings; current cumulative reports and healthy peers are unaffected.")
     parser.add_argument("--instant", required=True, help="raw outcome instant-vector API JSON")
     parser.add_argument("--window", required=True, help="max_over_time outcome vector API JSON (continuity/aging evidence only, never added to totals)")
     parser.add_argument("--timestamps", required=True, help="timestamp(outcome selector) vector API JSON")
     parser.add_argument("--expected", required=True, help="JSON array of {labels: {identity labels}, role: serving|inactive}")
     parser.add_argument("--now", default=str(time.time()), help="Unix time; override for reproducible offline analysis")
-    parser.add_argument("--max-age", default="120", help="maximum sample/evaluation age in seconds (default 120)")
+    parser.add_argument("--max-age", default="120", help="maximum sample/evaluation age in seconds (default 120); also bounds previous-endpoint sample age at its own evaluation")
     parser.add_argument("--min-attempts", default="100", help="rank serving causes only ABOVE this volume, applied independently to the aggregate and to each slice (default 100)")
     parser.add_argument("--previous-instant", help="optional earlier raw outcome instant-vector API JSON (requires --previous-timestamps); enables per-identity interval (current minus previous) rates")
-    parser.add_argument("--previous-timestamps", help="optional timestamp(outcome selector) vector API JSON at the --previous-instant evaluation time")
+    parser.add_argument("--previous-timestamps", help="optional timestamp(outcome selector) vector API JSON at the --previous-instant evaluation time; each identity's sample age at that evaluation must be <= --max-age")
     args = parser.parse_args()
     if (args.previous_instant is None) != (args.previous_timestamps is None):
         raise ValueError("--previous-instant and --previous-timestamps must be given together")
@@ -272,7 +283,7 @@ def main():
             print("  attempts=unavailable errors=unavailable error_rate=unavailable (coverage/freshness/coherence/continuity not established)")
         if interval and (current or any(who == identity for who, _ in previous)):
             unhealthy |= report_interval(identity, role, current, timestamps, previous, previous_stamps,
-                                         healthy, minimum)
+                                         healthy, minimum, max_age)
         for (who, key), (_, value) in sorted(window.items()):
             if who == identity and (who, key) not in instant and value > 0:
                 print(f"  aged-out/stale tuple={key} window_max={value}; not improvement; excluded from rate/ranking")
