@@ -56,10 +56,67 @@ def ranking(values):
     return ", ".join(f"{c}:{n}" for c, n in ordered) or "none (no errors)"
 
 
+def interval_reasons(identity, current, timestamps, previous, previous_stamps):
+    before = {key: value for (who, key), (_, value) in previous.items() if who == identity}
+    reasons = []
+    if set(before) != set(current):
+        reasons.append(f"tuple-set mismatch previous={len(before)}/32 current={len(current)}/32"
+                       f" only_previous={sorted(set(before) - set(current))}"
+                       f" only_current={sorted(set(current) - set(before))}")
+    old = {previous_stamps[identity, key][1] for key in before}
+    if len(old) > 1:
+        reasons.append(f"incoherent previous source timestamps min={min(old)} max={max(old)}")
+    for key in sorted(set(before) & set(current)):
+        if not previous_stamps[identity, key][1] < timestamps[identity, key][1]:
+            reasons.append(f"tuple={key} previous source time {previous_stamps[identity, key][1]}"
+                           f" not earlier than current {timestamps[identity, key][1]}")
+        if current[key] < before[key]:
+            reasons.append(f"tuple={key} current={current[key]} < previous={before[key]}")
+    return before, reasons
+
+
+def report_interval(identity, role, current, timestamps, previous, previous_stamps, healthy, minimum):
+    """Print interval (current minus previous) rates; return True when interval is discontinuous."""
+    before, reasons = interval_reasons(identity, current, timestamps, previous, previous_stamps)
+    for reason in reasons:
+        print(f"  INTERVAL_DISCONTINUITY {reason}; interval rates and rankings withheld")
+    if reasons or not healthy:
+        why = "interval discontinuity" if reasons else "cumulative status not OK"
+        print(f"  interval attempts=unavailable errors=unavailable error_rate=unavailable ({why})")
+        return bool(reasons)
+    delta = {key: int(current[key]) - int(before[key]) for key in current}
+    old = next(iter({previous_stamps[identity, key][1] for key in before}))
+    new = next(iter({timestamps[identity, key][1] for key in current}))
+    attempts = sum(delta.values())
+    errors = sum(v for key, v in delta.items() if key[2] != "success")
+    print(f"  interval source_seconds={new - old} (current minus previous; not cumulative)")
+    if role != "serving":
+        decision = "withheld (inactive)"
+    elif attempts > minimum:
+        decision = ranking(delta)
+    else:
+        decision = f"suppressed (interval attempts <= {minimum})"
+    print(f"  interval aggregate(all flows/items) attempts={attempts} errors={errors}"
+          f" error_rate={rate(errors, attempts)} interval_ranking={decision}")
+    for flow, item in itertools.product(FLOWS, ITEMS):
+        part = {key: v for key, v in delta.items() if key[:2] == (flow, item)}
+        s_attempts = sum(part.values())
+        s_errors = sum(v for key, v in part.items() if key[2] != "success")
+        if role != "serving":
+            decision = "withheld (inactive)"
+        elif s_attempts > minimum:
+            decision = ranking(part)
+        else:
+            decision = f"suppressed (interval slice attempts <= {minimum})"
+        print(f"  interval slice[{TEMPERATURE[flow]}-{item}] flow={flow} item_type={item} attempts={s_attempts}"
+              f" errors={s_errors} error_rate={rate(s_errors, s_attempts)} interval_slice_ranking={decision}")
+    return False
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Offline playback outcome coverage and cumulative error ratio: labelled per-instance aggregate plus four flow/item slices (cold=materialise_then_play, warm=play_already_materialised; movie/episode), each ranked only on its own volume",
-        epilog="Capture all three vectors with the same explicit Prometheus time= value; --now only controls age checks. A matched window maximum above current reports COUNTER_DISCONTINUITY (exit 2), withholding that identity's aggregate/slice rates and rankings. Partial/empty windows are valid but do not prove continuity; equal/lower maxima do not trigger this guard. No reset cause, time, count, or adjusted totals are inferred.")
+        epilog="Capture all three vectors with the same explicit Prometheus time= value; --now only controls age checks. A matched window maximum above current reports COUNTER_DISCONTINUITY (exit 2), withholding that identity's aggregate/slice rates and rankings. Partial/empty windows are valid but do not prove continuity; equal/lower maxima do not trigger this guard. No reset cause, time, count, or adjusted totals are inferred. With --previous-instant/--previous-timestamps (an earlier capture), interval rates (current minus previous) are reported per identity; any tuple decrease, tuple-set mismatch, incoherent previous source time, or previous source time not earlier than current reports INTERVAL_DISCONTINUITY (exit 2) and withholds that identity's interval rates.")
     parser.add_argument("--instant", required=True, help="raw outcome instant-vector API JSON")
     parser.add_argument("--window", required=True, help="max_over_time outcome vector API JSON (continuity/aging evidence only, never added to totals)")
     parser.add_argument("--timestamps", required=True, help="timestamp(outcome selector) vector API JSON")
@@ -67,9 +124,14 @@ def main():
     parser.add_argument("--now", default=str(time.time()), help="Unix time; override for reproducible offline analysis")
     parser.add_argument("--max-age", default="120", help="maximum sample/evaluation age in seconds (default 120)")
     parser.add_argument("--min-attempts", default="100", help="rank serving causes only ABOVE this volume, applied independently to the aggregate and to each slice (default 100)")
+    parser.add_argument("--previous-instant", help="optional earlier raw outcome instant-vector API JSON (requires --previous-timestamps); enables per-identity interval (current minus previous) rates")
+    parser.add_argument("--previous-timestamps", help="optional timestamp(outcome selector) vector API JSON at the --previous-instant evaluation time")
     args = parser.parse_args()
+    if (args.previous_instant is None) != (args.previous_timestamps is None):
+        raise ValueError("--previous-instant and --previous-timestamps must be given together")
     now, max_age, minimum = map(number, (args.now, args.max_age, args.min_attempts))
-    if [args.instant, args.window, args.timestamps, args.expected].count("-") > 1:
+    if [args.instant, args.window, args.timestamps, args.expected,
+            args.previous_instant, args.previous_timestamps].count("-") > 1:
         raise ValueError("only one input may use stdin (-)")
     expected = load(args.expected)
     if not isinstance(expected, list) or not expected:
@@ -93,7 +155,12 @@ def main():
 
     vectors = {}
     evaluation_times = set()
-    for kind, path in (("instant", args.instant), ("window", args.window), ("timestamps", args.timestamps)):
+    previous_times = set()
+    sources = [("instant", args.instant), ("window", args.window), ("timestamps", args.timestamps)]
+    if args.previous_instant is not None:
+        sources += [("previous-instant", args.previous_instant), ("previous-timestamps", args.previous_timestamps)]
+    for kind, path in sources:
+        base = kind.replace("previous-", "")
         payload = load(path)
         if (not isinstance(payload, dict) or payload.get("status") != "success"
                 or payload.get("warnings") or payload.get("infos")
@@ -110,7 +177,7 @@ def main():
                     or not isinstance(sample, list) or len(sample) != 2):
                 raise ValueError(f"{kind}: malformed labels/sample")
             # max_over_time() and timestamp() drop __name__; reject any explicit foreign family.
-            if labels.get("__name__", METRIC if kind in ("window", "timestamps") else None) != METRIC:
+            if labels.get("__name__", METRIC if base in ("window", "timestamps") else None) != METRIC:
                 raise ValueError(f"{kind}: expected {METRIC} family")
             key = tuple(labels.get(d) for d in DIMENSIONS)
             if key not in CANONICAL:
@@ -122,11 +189,11 @@ def main():
             if full_key in records:
                 raise ValueError(f"{kind}: duplicate tuple {full_key}")
             evaluation, value = map(number, sample)
-            if evaluation > now or (kind == "timestamps" and value > evaluation):
+            if evaluation > now or (base == "timestamps" and value > evaluation):
                 raise ValueError(f"{kind}: future timestamp")
-            if kind != "timestamps" and value != value.to_integral_value():
+            if base != "timestamps" and value != value.to_integral_value():
                 raise ValueError(f"{kind}: counter must be integral")
-            evaluation_times.add(evaluation)
+            (previous_times if base != kind else evaluation_times).add(evaluation)
             records[full_key] = (evaluation, value)
         vectors[kind] = records
     if len(evaluation_times) > 1:
@@ -134,6 +201,15 @@ def main():
     instant, window, timestamps = (vectors[k] for k in ("instant", "window", "timestamps"))
     if instant.keys() != timestamps.keys():
         raise ValueError("timestamp coverage must exactly match instant series")
+    interval = args.previous_instant is not None
+    if interval:
+        previous, previous_stamps = vectors["previous-instant"], vectors["previous-timestamps"]
+        if len(previous_times) > 1:
+            raise ValueError("previous inputs must use one common Prometheus evaluation time")
+        if previous.keys() != previous_stamps.keys():
+            raise ValueError("previous timestamp coverage must exactly match previous instant series")
+        if previous_times and evaluation_times and not max(previous_times) < min(evaluation_times):
+            raise ValueError("previous evaluation time must be strictly earlier than current evaluation time")
 
     unhealthy = False
     print("Cumulative counter snapshot, NOT a window increase or improvement measurement.")
@@ -168,7 +244,8 @@ def main():
         for key, maximum in sorted(discontinuities.items()):
             print(f"  COUNTER_DISCONTINUITY tuple={key} current={current[key]} window_max={maximum};"
                   " counter continuity not established; aggregate/slice rates and rankings withheld")
-        if complete and not stale and not incoherent and not discontinuities:
+        healthy = complete and not stale and not incoherent and not discontinuities
+        if healthy:
             attempts = sum(int(v) for v in current.values())
             errors = sum(int(v) for key, v in current.items() if key[2] != "success")
             print(f"  aggregate(all flows/items) attempts={attempts} errors={errors} error_rate={rate(errors, attempts)}")
@@ -193,6 +270,9 @@ def main():
                       f" errors={s_errors} error_rate={rate(s_errors, s_attempts)} slice_ranking={decision}")
         else:
             print("  attempts=unavailable errors=unavailable error_rate=unavailable (coverage/freshness/coherence/continuity not established)")
+        if interval and (current or any(who == identity for who, _ in previous)):
+            unhealthy |= report_interval(identity, role, current, timestamps, previous, previous_stamps,
+                                         healthy, minimum)
         for (who, key), (_, value) in sorted(window.items()):
             if who == identity and (who, key) not in instant and value > 0:
                 print(f"  aged-out/stale tuple={key} window_max={value}; not improvement; excluded from rate/ranking")

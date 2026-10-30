@@ -285,6 +285,83 @@ case("continuity preserves other failure and aging diagnostics", combined, 2,
       continuity_diagnostic, "aged-out/stale", "window_max=19; not improvement; excluded from rate/ranking"],
      ["aggregate(", "cause_ranking="], exact_slices=0)
 
+
+
+# Interval (current minus previous) measurement from an earlier capture.
+def interval_fixture(current, previous, evaluation=600, stamp="500"):
+    data = fixture(current)
+    previous = copy.deepcopy(previous)
+    for row in previous:
+        row["value"][0] = evaluation
+    stamps = copy.deepcopy(previous)
+    for row in stamps:
+        row["metric"].pop("__name__", None)
+        row["value"][1] = stamp
+    data["previous-instant"] = vector(previous)
+    data["previous-timestamps"] = vector(stamps)
+    return data
+
+
+def set_values(records, values):
+    for row in records:
+        m = row["metric"]
+        row["value"][1] = values.get((m["flow"], m["item_type"], m["cause"]), row["value"][1])
+    return records
+
+
+cold = ("materialise_then_play", "movie")
+now_rows = set_values(rows(), {(*cold, "success"): "900", (*cold, "first_byte_timeout"): "100"})
+then_rows = set_values(rows(), {(*cold, "success"): "400", (*cold, "first_byte_timeout"): "50"})
+interval_line = "interval aggregate(all flows/items) attempts=550 errors=50 error_rate=9.090909%"
+case("interval green delta", interval_fixture(now_rows, then_rows), 0,
+     ["aggregate(all flows/items) attempts=1000 errors=100 error_rate=10.000000%",
+      interval_line + " interval_ranking=first_byte_timeout:50", "interval source_seconds=490",
+      "interval slice[cold-movie] flow=materialise_then_play item_type=movie attempts=550 errors=50"
+      " error_rate=9.090909% interval_slice_ranking=first_byte_timeout:50",
+      "interval slice[warm-episode] flow=play_already_materialised item_type=episode attempts=0 errors=0"
+      f" error_rate={undefined} interval_slice_ranking=suppressed (interval slice attempts <= 100)"],
+     ["INTERVAL_DISCONTINUITY"], exact_slices=1)
+case("interval slice independent threshold", interval_fixture(now_rows, then_rows), 0,
+     ["interval_ranking=suppressed (interval attempts <= 600)",
+      "interval_slice_ranking=suppressed (interval slice attempts <= 600)"],
+     ["interval_ranking=first_byte_timeout"], options=("--min-attempts", "600"))
+case("no previous flags leaves output unchanged", fixture(now_rows), 0,
+     ["attempts=1000 errors=100 error_rate=10.000000%"], ["interval", "INTERVAL_DISCONTINUITY"])
+for flow, item, cause in itertools.product(flows, items, causes):
+    decreased = set_values(copy.deepcopy(then_rows), {(flow, item, cause): "1001"})
+    peer_now = set_values(rows(1), {(*cold, "no_candidate"): "300"})
+    peer_then = set_values(rows(1), {(*cold, "no_candidate"): "100"})
+    data = interval_fixture(now_rows + peer_now, decreased + peer_then)
+    data["expected"][1]["role"] = "serving"
+    case(f"interval decrease {slice_names[flow, item]} {cause}", data, 2,
+         [f"INTERVAL_DISCONTINUITY tuple={(flow, item, cause)}", "< previous=1001",
+          "interval attempts=unavailable errors=unavailable error_rate=unavailable (interval discontinuity)",
+          "interval aggregate(all flows/items) attempts=200 errors=200 error_rate=100.000000%"
+          " interval_ranking=no_candidate:200"],
+         [interval_line])
+case("interval mismatch missing previous tuple", interval_fixture(now_rows, then_rows[1:]), 2,
+     ["INTERVAL_DISCONTINUITY tuple-set mismatch previous=31/32 current=32/32"], ["interval aggregate("])
+case("interval mismatch inactive vanished", interval_fixture(now_rows, then_rows + rows(1)), 2,
+     ["INTERVAL_DISCONTINUITY tuple-set mismatch previous=32/32 current=0/32"], [])
+case("interval equal source time", interval_fixture(now_rows, then_rows, 995, "990"), 2,
+     ["INTERVAL_DISCONTINUITY tuple=", "not earlier than current 990"], ["interval aggregate("])
+incoherent_previous = interval_fixture(now_rows, then_rows)
+incoherent_previous["previous-timestamps"]["data"]["result"][3]["value"][1] = "499"
+case("interval incoherent previous source", incoherent_previous, 2,
+     ["INTERVAL_DISCONTINUITY incoherent previous source timestamps"], ["interval aggregate("])
+stale_interval = interval_fixture(now_rows, then_rows)
+stale_interval["timestamps"]["data"]["result"][0]["value"][1] = "879"
+case("interval withheld when cumulative unhealthy", stale_interval, 2,
+     ["status=STALE", "error_rate=unavailable (cumulative status not OK)"], ["interval aggregate("])
+case("interval previous evaluation not earlier", interval_fixture(now_rows, then_rows, 1000, "500"), 1,
+     ["previous evaluation time must be strictly earlier"])
+lone = interval_fixture(now_rows, then_rows)
+del lone["previous-timestamps"]
+case("interval flags both or neither", lone, 1, ["must be given together"])
+uneven = interval_fixture(now_rows, then_rows)
+uneven["previous-timestamps"]["data"]["result"].pop()
+case("interval previous timestamp coverage", uneven, 1, ["previous timestamp coverage must exactly match"])
+
 case("old capture", fixture(), 2, ["STALE capture evaluation", "error_rate=unavailable"], options=("--now", "2000"))
 for kind in ("instant", "window", "timestamps"):
     duplicate = fixture(window=rows())
@@ -363,6 +440,8 @@ with tempfile.TemporaryDirectory(prefix="outcome-coverage-") as temp:
                 assert "status=OK" not in block, (name, block)
                 assert "error_rate=unavailable" in block, (name, block)
                 assert not any(s in block for s in ("aggregate(", "slice[", "cause_ranking=")), (name, block)
+            if "INTERVAL_DISCONTINUITY" in block:
+                assert not any(s in block for s in ("interval aggregate(", "interval slice[")), (name, block)
         if exact_slices is not None:
             for label in slice_names.values():
                 count = sum(line.startswith(f"  slice[{label}] ") for line in result.stdout.splitlines())
