@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Offline playback cause rankings now require explicit per-identity historical
+  organic-serving receipts for the entire cumulative population or exact source
+  interval. Current serving role cannot relabel historical dev traffic; missing
+  receipts retain unattributed numeric observations without rankings. See the
+  [receipt contract](docs/tasks/playback-outcome-coverage-report-001.md#historical-attribution-receipts).
 - Offline playback outcome reports now detect exact-tuple historical maxima above
   current counters as `COUNTER_DISCONTINUITY` (exit 2), withholding the affected
   identity's aggregate/slice rates and rankings without altering current totals.

@@ -112,7 +112,89 @@ labels that actually exist in the capture; labels are not guessed, normalized,
 partially matched, or stripped. This prevents mixing jobs or exporters with
 similar instance names. Every captured identity (including historical ones)
 must be listed. The list must contain at least one serving identity. Role is
-operator-supplied attribution, not something telemetry can infer.
+the caller's CURRENT routing role, not historical traffic attribution. A promotion
+without a process restart must not relabel prior dev counters as organic serving.
+
+### Historical attribution receipts
+
+Rankings additionally require optional `--attribution attribution.json`. Omitting
+this input (or supplying `[]`) remains valid: healthy counts and ratios are printed
+as **unattributed observations**, but cumulative/interval aggregate and all four
+slice rankings are withheld. `status=OK` and exit 0 describe valid observations,
+not proven organic traffic. Current role, loaded build, matching endpoint roles,
+volume, coherent timestamps and monotonic counters never establish role history.
+
+The caller must independently establish organic provenance and uninterrupted
+serving throughout the **entire population** attested. These are caller-supplied
+receipts, not evidence inferred or verified by the analyser against live routing.
+Do not manufacture them from current `role` or the two endpoint roles: an
+intervening dev/serving flip invalidates continuous organic attribution.
+
+```json
+[
+  {
+    "labels": {"instance": "serving.example.com", "job": "playback"},
+    "scope": "cumulative",
+    "attribution": "organic-serving",
+    "source_end": "990"
+  },
+  {
+    "labels": {"instance": "serving.example.com", "job": "playback"},
+    "scope": "interval",
+    "attribution": "organic-serving",
+    "source_start": "590",
+    "source_end": "990"
+  }
+]
+```
+
+- `labels` must exactly match an expected identity, including job and every other
+  identity label. There is at most one receipt per identity/scope; peers cannot
+  lend authorization to one another.
+- `scope=cumulative` asserts ALL counts in that identity's snapshot, across all
+  32 tuples, from the actual counter population's origin through `source_end`.
+  No `source_start` is allowed: attesting only a recent span is not lifetime
+  evidence. The caller must know the population's origin; the tool does not infer
+  it from evaluation time, exporter identity, a baseline or a window maximum.
+- `scope=interval` asserts the whole current-minus-previous population. Both
+  `source_start` and `source_end` must equal that identity's actual previous and
+  current source sample times, NOT evaluation times. They are finite nonnegative
+  timestamps, with start strictly earlier than end. Partial or larger enclosing
+  spans do not match. Requires the existing previous capture pair to produce an
+  interval report; otherwise the receipt is unused.
+- The scopes are independent. An interval-only receipt NEVER enables cumulative
+  rankings; a cumulative-only receipt does not substitute for an interval receipt.
+- `attribution` is `organic-serving`, `unknown`, `non-serving` (the entire
+  population is non-serving), or `mixed` (contains both serving and non-serving).
+  Only `organic-serving` with a matching source span and current serving role
+  authorizes rankings. A promotion after the samples cannot authorize history;
+  a currently inactive identity is never ranked, even with historical receipts.
+- Missing, unknown, non-serving, mixed, expired or partial/mismatched receipts
+  print an explicit `cumulative attribution=unattributed` or
+  `interval attribution=unattributed` diagnostic. Valid numbers are retained,
+  never described as organic or improvement. Missing attribution alone does not
+  change exit status. Old no-receipt invocations remain usable but never rank.
+- Malformed fields, extra fields, invalid enums/numbers, unknown/partial identity
+  labels, duplicate receipts and contradictory assertions are input errors (1).
+  For example, an all-organic cumulative population cannot contain a non-serving
+  or mixed interval ending at or before its endpoint; an entirely non-serving
+  cumulative population cannot contain an organic or mixed such interval.
+  A mixed cumulative population CAN contain an entirely organic interval.
+
+For the example above, use current evaluation/source `1000/990` and previous
+`600/590`, and set `--now 1000`. Add `--attribution attribution.json` and the
+existing `--previous-instant previous.json --previous-timestamps previous-times.json`
+flags to the invocation. With cold-movie success/timeout `900/100` versus `400/50`,
+the cumulative observations remain `1000` attempts, `100` errors, `10.000000%`;
+interval observations remain `550`, `50`, `9.090909%`. Without receipts neither
+timeout ranking is emitted; interval-only evidence enables only the `50` ranking.
+
+All coverage, source-coherence, freshness (including previous-endpoint freshness)
+and continuity guards still apply before receipt authorization. Each aggregate
+and each cold/warm movie/episode slice must independently exceed `--min-attempts`.
+Attribution never resets counters, adjusts totals, deploys, contacts a network,
+or discovers infrastructure. Receipts share the single-input stdin option and
+are read-only like all other inputs.
 
 Canonical tuples are the exact Cartesian product of:
 
@@ -157,7 +239,8 @@ series are shown separately and never unlock a serving instance's ranking.
 Rates are cumulative **errors / attempts**, with every non-success cause
 included as an error. They are not time rates, window increases, evidence of
 improvement, or complete accounting of uninstrumented requests. No reset or
-cross-capture delta is inferred. A ranking is per serving identity, only when
+cross-capture delta is inferred without explicit previous capture inputs. A ranking
+is per serving identity with a matching whole-population attribution receipt, only when
 fresh complete attempts are strictly greater than `--min-attempts` (default
 100); positive non-success causes are sorted by count descending, then name.
 Below-threshold positive counts remain visible without claiming no traffic.

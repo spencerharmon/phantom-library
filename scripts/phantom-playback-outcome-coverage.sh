@@ -81,7 +81,64 @@ def previous_staleness(identity, previous_stamps, max_age):
     return max(ages) if ages and max(ages) > max_age else None
 
 
-def report_interval(identity, role, current, timestamps, previous, previous_stamps, healthy, minimum, max_age):
+def load_attribution(path, roles):
+    receipts = load(path) if path is not None else []
+    if not isinstance(receipts, list):
+        raise ValueError("attribution must be an array of receipts")
+    result = {}
+    for receipt in receipts:
+        if not isinstance(receipt, dict) or receipt.get("scope") not in ("cumulative", "interval"):
+            raise ValueError("attribution receipt requires cumulative or interval scope")
+        scope = receipt["scope"]
+        fields = {"labels", "scope", "attribution", "source_end"}
+        if scope == "interval":
+            fields.add("source_start")
+        if set(receipt) != fields:
+            raise ValueError("attribution receipt has missing or unexpected fields")
+        labels = receipt["labels"]
+        if not isinstance(labels, dict) or any(not isinstance(v, str) for v in labels.values()):
+            raise ValueError("attribution receipt requires exact identity labels")
+        identity = tuple(sorted(labels.items()))
+        if identity not in roles:
+            raise ValueError("attribution receipt has unlisted identity/extra labels")
+        if receipt["attribution"] not in ("organic-serving", "unknown", "non-serving", "mixed"):
+            raise ValueError("invalid attribution (expected organic-serving, unknown, non-serving or mixed)")
+        key = identity, scope
+        if key in result:
+            raise ValueError("duplicate attribution receipt for identity/scope")
+        end = number(receipt["source_end"])
+        start = number(receipt["source_start"]) if scope == "interval" else None
+        if start is not None and start >= end:
+            raise ValueError("attribution source_start must be earlier than source_end")
+        result[key] = (receipt["attribution"], start, end)
+    for identity in roles:
+        cumulative = result.get((identity, "cumulative"))
+        interval = result.get((identity, "interval"))
+        if (cumulative and interval and interval[2] <= cumulative[2]
+                and ((cumulative[0] == "organic-serving" and interval[0] in ("non-serving", "mixed"))
+                     or (cumulative[0] == "non-serving" and interval[0] in ("organic-serving", "mixed")))):
+            raise ValueError("contradictory cumulative and interval attribution receipts")
+    return result
+
+
+def attributed(receipts, identity, role, scope, end, start=None):
+    receipt = receipts.get((identity, scope))
+    if role != "serving":
+        reason = "inactive"
+    elif receipt is None:
+        reason = "missing receipt"
+    elif receipt[0] != "organic-serving":
+        reason = receipt[0]
+    elif receipt[1:] != (start, end):
+        reason = "source span mismatch (expired or partial receipt)"
+    else:
+        print(f"  {scope} attribution=organic-serving (caller receipt covers entire population)")
+        return True
+    print(f"  {scope} attribution=unattributed ({reason}); counts/ratios are unattributed observations; rankings withheld")
+    return False
+
+
+def report_interval(identity, role, current, timestamps, previous, previous_stamps, healthy, minimum, max_age, receipts):
     """Print interval (current minus previous) rates; return True when interval is discontinuous or stale."""
     before, reasons = interval_reasons(identity, current, timestamps, previous, previous_stamps)
     for reason in reasons:
@@ -101,8 +158,11 @@ def report_interval(identity, role, current, timestamps, previous, previous_stam
     attempts = sum(delta.values())
     errors = sum(v for key, v in delta.items() if key[2] != "success")
     print(f"  interval source_seconds={new - old} (current minus previous; not cumulative)")
+    authorized = attributed(receipts, identity, role, "interval", new, old)
     if role != "serving":
         decision = "withheld (inactive)"
+    elif not authorized:
+        decision = "withheld (unattributed)"
     elif attempts > minimum:
         decision = ranking(delta)
     else:
@@ -115,6 +175,8 @@ def report_interval(identity, role, current, timestamps, previous, previous_stam
         s_errors = sum(v for key, v in part.items() if key[2] != "success")
         if role != "serving":
             decision = "withheld (inactive)"
+        elif not authorized:
+            decision = "withheld (unattributed)"
         elif s_attempts > minimum:
             decision = ranking(part)
         else:
@@ -132,6 +194,7 @@ def main():
     parser.add_argument("--window", required=True, help="max_over_time outcome vector API JSON (continuity/aging evidence only, never added to totals)")
     parser.add_argument("--timestamps", required=True, help="timestamp(outcome selector) vector API JSON")
     parser.add_argument("--expected", required=True, help="JSON array of {labels: {identity labels}, role: serving|inactive}")
+    parser.add_argument("--attribution", help="optional JSON receipt array: exact labels, scope cumulative|interval, attribution organic-serving|unknown|non-serving|mixed, source_end; interval also requires source_start. Cumulative asserts the ENTIRE counter population; interval asserts continuous organic serving throughout the EXACT source-time span, not just endpoint roles. Caller must establish provenance; current role alone never authorizes rankings. Missing/mismatched evidence leaves numeric observations unattributed. See docs/tasks/playback-outcome-coverage-report-001.md")
     parser.add_argument("--now", default=str(time.time()), help="Unix time; override for reproducible offline analysis")
     parser.add_argument("--max-age", default="120", help="maximum sample/evaluation age in seconds (default 120); also bounds previous-endpoint sample age at its own evaluation")
     parser.add_argument("--min-attempts", default="100", help="rank serving causes only ABOVE this volume, applied independently to the aggregate and to each slice (default 100)")
@@ -142,7 +205,7 @@ def main():
         raise ValueError("--previous-instant and --previous-timestamps must be given together")
     now, max_age, minimum = map(number, (args.now, args.max_age, args.min_attempts))
     if [args.instant, args.window, args.timestamps, args.expected,
-            args.previous_instant, args.previous_timestamps].count("-") > 1:
+            args.previous_instant, args.previous_timestamps, args.attribution].count("-") > 1:
         raise ValueError("only one input may use stdin (-)")
     expected = load(args.expected)
     if not isinstance(expected, list) or not expected:
@@ -163,6 +226,7 @@ def main():
         roles[identity] = entry["role"]
     if "serving" not in roles.values():
         raise ValueError("expected list must name at least one serving instance")
+    receipts = load_attribution(args.attribution, roles)
 
     vectors = {}
     evaluation_times = set()
@@ -257,10 +321,13 @@ def main():
                   " counter continuity not established; aggregate/slice rates and rankings withheld")
         healthy = complete and not stale and not incoherent and not discontinuities
         if healthy:
+            authorized = attributed(receipts, identity, role, "cumulative", stamps[0])
             attempts = sum(int(v) for v in current.values())
             errors = sum(int(v) for key, v in current.items() if key[2] != "success")
             print(f"  aggregate(all flows/items) attempts={attempts} errors={errors} error_rate={rate(errors, attempts)}")
-            if role == "serving" and attempts > minimum:
+            if role == "serving" and not authorized:
+                print("  cause_ranking=withheld (unattributed)")
+            elif role == "serving" and attempts > minimum:
                 print("  cause_ranking=" + ranking(current))
             elif role == "serving":
                 reason = "no organic traffic yet observed" if not attempts else "insufficient attributed volume"
@@ -273,6 +340,8 @@ def main():
                 s_errors = sum(int(v) for key, v in part.items() if key[2] != "success")
                 if role != "serving":
                     decision = "withheld (inactive)"
+                elif not authorized:
+                    decision = "withheld (unattributed)"
                 elif s_attempts > minimum:
                     decision = ranking(part)
                 else:
@@ -283,7 +352,7 @@ def main():
             print("  attempts=unavailable errors=unavailable error_rate=unavailable (coverage/freshness/coherence/continuity not established)")
         if interval and (current or any(who == identity for who, _ in previous)):
             unhealthy |= report_interval(identity, role, current, timestamps, previous, previous_stamps,
-                                         healthy, minimum, max_age)
+                                         healthy, minimum, max_age, receipts)
         for (who, key), (_, value) in sorted(window.items()):
             if who == identity and (who, key) not in instant and value > 0:
                 print(f"  aged-out/stale tuple={key} window_max={value}; not improvement; excluded from rate/ranking")
