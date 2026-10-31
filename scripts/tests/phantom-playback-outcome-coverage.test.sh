@@ -45,8 +45,42 @@ def fixture(current=None, window=None):
 cases = []
 
 
-def case(name, data, code, contains, excludes=(), options=(), stdin=None, exact_slices=None):
+def receipt(identity=0, scope="cumulative", attribution="organic-serving", end="990", start="590"):
+    result = {"labels": copy.deepcopy(expected[identity]["labels"]), "scope": scope,
+              "attribution": attribution, "source_end": end}
+    if scope == "interval":
+        result["source_start"] = start
+    return result
+
+
+def case(name, data, code, contains, excludes=(), options=(), stdin=None, exact_slices=None, attributed_fixture=True):
+    data = copy.deepcopy(data)
+    # Legacy numeric/health/threshold cases now explicitly attest their synthetic
+    # populations. Attribution regressions below opt out; the CLI never infers this.
+    if attributed_fixture:
+        data["attribution"] = []
+        for entry in data["expected"]:
+            stamps = [r["value"][1] for r in data["timestamps"]["data"]["result"]
+                      if all(r["metric"].get(k) == v for k, v in entry["labels"].items())]
+            if not stamps:
+                continue
+            cumulative = dict(receipt(end=stamps[0]), labels=entry["labels"])
+            data["attribution"].append(cumulative)
+            if "previous-timestamps" in data:
+                before = [r["value"][1] for r in data["previous-timestamps"]["data"]["result"]
+                          if all(r["metric"].get(k) == v for k, v in entry["labels"].items())]
+                if before and float(before[0]) < float(stamps[0]):
+                    data["attribution"].append(dict(cumulative, scope="interval", source_start=before[0]))
     cases.append((name, data, code, contains, excludes, options, stdin, exact_slices))
+
+
+promotion = rows()
+promotion[0]["value"][1] = "900"
+promotion[6]["value"][1] = "100"
+case("current serving role cannot attribute historical dev traffic", fixture(promotion), 0,
+     ["attempts=1000 errors=100 error_rate=10.000000%", "cumulative attribution=unattributed",
+      "cause_ranking=withheld (unattributed)"], ["first_byte_timeout:100", "no organic traffic"],
+     attributed_fixture=False)
 
 
 case("fresh zeros", fixture(), 0,
@@ -469,6 +503,122 @@ case("bad option", fixture(), 1, ["expected finite nonnegative number"], options
 case("truncated JSON", dict(fixture(), instant='{"status":'), 1, ["phantom-playback-outcome-coverage:"])
 case("duplicate JSON label", dict(fixture(), instant='{"status":"success","status":"success"}'), 1, ["duplicate JSON key"])
 
+# Attribution is independent of valid counters, current role, volume and peers.
+for flow, item in itertools.product(flows, items):
+    current = set_values(rows(), {(flow, item, "success"): "900", (flow, item, "first_byte_timeout"): "100"})
+    previous = set_values(rows(), {(flow, item, "success"): "400", (flow, item, "first_byte_timeout"): "50"})
+    base = interval_fixture(current, previous, stamp="590")
+    for label, receipts in (
+            ("missing", None), ("empty", []),
+            ("unknown", [receipt(attribution="unknown"), receipt(scope="interval", attribution="unknown")]),
+            ("dev-to-serving promotion after sample", [receipt(scope="interval", start="995", end="999")]),
+            ("intervening role change", [receipt(attribution="mixed"), receipt(scope="interval", attribution="mixed")]),
+            ("non-serving history", [receipt(attribution="non-serving"), receipt(scope="interval", attribution="non-serving")]),
+            ("partial interval", [receipt(scope="interval", start="700")]),
+            ("expired", [receipt(end="980"), receipt(scope="interval", end="980")]),
+            ("wrong source start", [receipt(scope="interval", start="589")]),
+            ("evaluation not source", [receipt(end="1000"), receipt(scope="interval", start="600", end="1000")]),
+            ("other identity", [receipt(identity=1), receipt(identity=1, scope="interval")])):
+        data = copy.deepcopy(base)
+        if receipts is not None:
+            data["attribution"] = receipts
+        case(f"attribution {label} {slice_names[flow, item]}", data, 0,
+             ["cumulative attribution=unattributed", "interval attribution=unattributed",
+              "attempts=1000 errors=100 error_rate=10.000000%", interval_line,
+              "cause_ranking=withheld (unattributed)", "interval_ranking=withheld (unattributed)"],
+             ["first_byte_timeout:", "no organic traffic"], exact_slices=1, attributed_fixture=False)
+    for scopes in (("cumulative",), ("interval",), ("cumulative", "interval")):
+        data = dict(base, attribution=[receipt(scope=scope) for scope in scopes])
+        want = [interval_line, "attempts=1000 errors=100 error_rate=10.000000%"]
+        avoid = []
+        for scope, field, count in (("cumulative", "cause_ranking", 100), ("interval", "interval_ranking", 50)):
+            want += [f"{scope} attribution={'organic-serving' if scope in scopes else 'unattributed'}",
+                     f"{field}=" + (f"first_byte_timeout:{count}" if scope in scopes else "withheld (unattributed)")]
+            if scope not in scopes:
+                avoid += [f"first_byte_timeout:{count}"]
+        want += [f"interval slice[{slice_names[flow, item]}] flow={flow} item_type={item} attempts=550 errors=50"
+                 " error_rate=9.090909% interval_slice_ranking="
+                 + ("first_byte_timeout:50" if "interval" in scopes else "withheld (unattributed)")]
+        case(f"attribution explicit scopes {scopes} {slice_names[flow, item]}", data, 0, want, avoid,
+             exact_slices=1, attributed_fixture=False)
+    for count in (99, 100, 101):
+        dense = next(pair for pair in itertools.product(flows, items) if pair != (flow, item))
+        sparse_current = set_values(rows(), {(*dense, "success"): "1000", (flow, item, "no_candidate"): str(count)})
+        data = interval_fixture(sparse_current, rows(), stamp="590")
+        data["attribution"] = [receipt(scope="interval")]
+        decision = f"no_candidate:{count}" if count > 100 else "suppressed (interval slice attempts <= 100)"
+        case(f"attributed interval sparse threshold {count} {slice_names[flow, item]}", data, 0,
+             [f"interval_ranking=no_candidate:{count}", "cause_ranking=withheld (unattributed)",
+              f"interval slice[{slice_names[flow, item]}] flow={flow} item_type={item} attempts={count} errors={count}"
+              f" error_rate=100.000000% interval_slice_ranking={decision}"], attributed_fixture=False)
+
+base = interval_fixture(now_rows, then_rows, stamp="590")
+case("mixed lifetime can contain an organic interval", dict(base, attribution=[receipt(attribution="mixed"), receipt(scope="interval")]), 0,
+     ["cumulative attribution=unattributed (mixed)", "interval attribution=organic-serving",
+      "interval_ranking=first_byte_timeout:50"], ["cause_ranking=first_byte_timeout:100"], attributed_fixture=False)
+peer = interval_fixture(now_rows + peer_now, then_rows + peer_then, stamp="590")
+peer["expected"][1]["role"] = "serving"
+peer["attribution"] = [receipt(identity=1), receipt(identity=1, scope="interval")]
+case("attributed peer cannot authorize unattributed identity", peer, 0,
+     ["cause_ranking=no_candidate:300", "interval_ranking=no_candidate:200",
+      "cause_ranking=withheld (unattributed)", "interval_ranking=withheld (unattributed)"],
+     ["first_byte_timeout:"], exact_slices=2, attributed_fixture=False)
+demoted = copy.deepcopy(peer)
+demoted["expected"][0]["role"] = "inactive"
+demoted["attribution"] += [receipt(), receipt(scope="interval")]
+case("serving-to-dev suppresses even historical organic receipts", demoted, 0,
+     ["cumulative attribution=unattributed (inactive)", "interval attribution=unattributed (inactive)",
+      "cause_ranking=withheld (inactive", "interval_ranking=withheld (inactive)", interval_line],
+     ["first_byte_timeout:"], attributed_fixture=False)
+same_host = copy.deepcopy(peer)
+for kind in ("instant", "timestamps", "previous-instant", "previous-timestamps"):
+    for row in same_host[kind]["data"]["result"]:
+        if row["metric"]["instance"] == expected[1]["labels"]["instance"]:
+            row["metric"].update(instance=expected[0]["labels"]["instance"], job="other-playback")
+same_host["expected"][1]["labels"].update(instance=expected[0]["labels"]["instance"], job="other-playback")
+for entry in same_host["attribution"]:
+    entry["labels"] = copy.deepcopy(same_host["expected"][1]["labels"])
+case("attribution requires full identity including job", same_host, 0,
+     ["interval_ranking=no_candidate:200", "interval_ranking=withheld (unattributed)"],
+     ["first_byte_timeout:"], attributed_fixture=False)
+case("no previous compatibility without receipts", fixture(now_rows), 0,
+     ["cumulative attribution=unattributed", "attempts=1000 errors=100 error_rate=10.000000%"],
+     ["interval", "first_byte_timeout:"], attributed_fixture=False)
+case("interval receipt alone without previous never authorizes cumulative", dict(fixture(now_rows), attribution=[receipt(scope="interval")]), 0,
+     ["cumulative attribution=unattributed", "cause_ranking=withheld (unattributed)"],
+     ["interval attribution=", "first_byte_timeout:"], attributed_fixture=False)
+case("stdin attribution", dict(base, attribution=[receipt(), receipt(scope="interval")]), 0,
+     ["cause_ranking=first_byte_timeout:100", "interval_ranking=first_byte_timeout:50"],
+     stdin="attribution", attributed_fixture=False)
+case("attribution shares single stdin limit", dict(base, attribution=[]), 1,
+     ["only one input may use stdin"], stdin="instant", options=("--attribution", "-"), attributed_fixture=False)
+for label, receipts, message in (
+        ("not array", {}, "must be an array"),
+        ("nonobject", [None], "requires cumulative or interval scope"),
+        ("unknown scope", [dict(receipt(), scope="window")], "requires cumulative or interval scope"),
+        ("missing field", [{k: v for k, v in receipt().items() if k != "attribution"}], "missing or unexpected fields"),
+        ("partial cumulative", [dict(receipt(), source_start="590")], "missing or unexpected fields"),
+        ("endpoint roles", [dict(receipt(scope="interval"), start_role="serving", end_role="serving")], "missing or unexpected fields"),
+        ("invalid assertion", [dict(receipt(), attribution=True)], "invalid attribution"),
+        ("invalid labels", [dict(receipt(), labels=[])], "exact identity labels"),
+        ("partial labels", [dict(receipt(), labels={"instance": "serving.example.com"})], "unlisted identity"),
+        ("extra labels", [dict(receipt(), labels=dict(expected[0]["labels"], region="other"))], "unlisted identity"),
+        ("duplicate", [receipt(), receipt()], "duplicate attribution receipt"),
+        ("conflicting duplicate", [receipt(), receipt(attribution="mixed")], "duplicate attribution receipt"),
+        ("contradictory populations", [receipt(), receipt(scope="interval", attribution="mixed")], "contradictory"),
+        ("contradictory non-serving population", [receipt(attribution="non-serving"), receipt(scope="interval")], "contradictory"),
+        ("contradictory non-serving mixed subset", [receipt(attribution="non-serving"), receipt(scope="interval", attribution="mixed")], "contradictory"),
+        ("reversed span", [receipt(scope="interval", start="991")], "must be earlier"),
+        ("zero span", [receipt(scope="interval", start="990")], "must be earlier"),
+        ("duplicate JSON key", '[{"scope":"cumulative","scope":"interval"}]', "duplicate JSON key")):
+    case(f"malformed attribution {label}", dict(base, attribution=receipts), 1, [message], attributed_fixture=False)
+for value in ("NaN", "Infinity", "-1", True, None, [], {}):
+    for field in ("source_start", "source_end"):
+        invalid = receipt(scope="interval")
+        invalid[field] = value
+        case(f"malformed attribution timestamp {field} {value}", dict(base, attribution=[invalid]), 1,
+             ["expected finite nonnegative number"], attributed_fixture=False)
+
 with tempfile.TemporaryDirectory(prefix="outcome-coverage-") as temp:
     directory = Path(temp)
     stub = directory / "zero-percent-stub.sh"
@@ -491,6 +641,14 @@ with tempfile.TemporaryDirectory(prefix="outcome-coverage-") as temp:
         assert all(s in output for s in contains), (name, contains, output)
         assert not any(s in output for s in excludes), (name, excludes, output)
         for block in result.stdout.split("instance=")[1:]:
+            if "cumulative attribution=unattributed" in block:
+                assert "cause_ranking=withheld" in block, (name, block)
+                assert all("slice_ranking=withheld" in line for line in block.splitlines()
+                           if line.startswith("  slice[")), (name, block)
+            if "interval attribution=unattributed" in block:
+                assert "interval_ranking=withheld" in block, (name, block)
+                assert all("interval_slice_ranking=withheld" in line for line in block.splitlines()
+                           if line.startswith("  interval slice[")), (name, block)
             if "COUNTER_DISCONTINUITY" in block:
                 assert "status=OK" not in block, (name, block)
                 assert "error_rate=unavailable" in block, (name, block)
