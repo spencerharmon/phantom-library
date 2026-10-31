@@ -118,14 +118,40 @@ fi
 
 POD=""
 find_pod() {
+    local pods
     if [ "$DRYRUN" = 1 ]; then
         POD="phantom-library-$COLOR-dryrun-pod"
         return 0
     fi
-    POD="$(kube get pods -l "app.kubernetes.io/instance=phantom-library-$COLOR" \
-        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-    [ -n "$POD" ] || POD="$(kube get pods -o name 2>/dev/null | grep "phantom-library-$COLOR-[0-9a-f]\{6,10\}-" | head -1 | sed 's#^pod/##')"
-    [ -n "$POD" ] || return 1
+    # Release labels and pod names are not controller identity. The component
+    # filter excludes splash workloads; ownership must also match the live UID.
+    pods="$(kube get pods -l app.kubernetes.io/component=jellyfin -o json)" || return 1
+    POD="$(python3 -c '
+import json, sys
+name, uid, namespace = sys.argv[1:]
+candidates = []
+for pod in json.load(sys.stdin)["items"]:
+    meta = pod["metadata"]
+    owners = [o for o in meta.get("ownerReferences", []) if o.get("controller") is True]
+    if len(owners) != 1:
+        continue
+    owner = owners[0]
+    if (owner.get("apiVersion"), owner.get("kind"), owner.get("name"), owner.get("uid")) != ("apps/v1", "StatefulSet", name, uid):
+        continue
+    status = pod.get("status", {})
+    if (meta.get("namespace") != namespace or not meta.get("name")
+            or meta.get("deletionTimestamp")
+            or meta.get("labels", {}).get("app.kubernetes.io/component") != "jellyfin"
+            or status.get("phase") != "Running"
+            or not any(c.get("type") == "Ready" and c.get("status") == "True" for c in status.get("conditions", []))
+            or not any(c.get("name") == "jellyfin" for c in pod.get("spec", {}).get("containers", []))
+            or not any(c.get("name") == "jellyfin" and c.get("ready") is True for c in status.get("containerStatuses", []))):
+        continue
+    candidates.append(meta["name"])
+if len(candidates) != 1:
+    sys.exit("expected exactly one Ready, non-terminating Jellyfin pod owned by StatefulSet " + name + "; found " + str(len(candidates)))
+print(candidates[0])
+' "phantom-library-$COLOR" "$WORKLOAD_UID" "$NAMESPACE" <<<"$pods")" || return 1
 }
 
 kpod() {
@@ -161,22 +187,41 @@ teardown() {
 }
 trap teardown EXIT
 
-log "locating the $COLOR color's Jellyfin Pod"
-find_pod || fail "no Running phantom-library-$COLOR Pod found in namespace $NAMESPACE"
-note "pod: $POD"
-
 # =========================================================================
 # 1. rollout Ready
 # =========================================================================
-log "[1] deployment rollout status"
+log "[1] StatefulSet rollout status"
+# The chart only supports StatefulSet for Jellyfin. Do not fall back to a
+# Deployment (including a splash Deployment) when discovery or rollout fails.
+WORKLOAD="statefulset/phantom-library-$COLOR"
 if [ "$DRYRUN" = 1 ]; then
-    note "DRYRUN: kubectl rollout status deploy/phantom-library-$COLOR"
+    note "DRYRUN: kubectl rollout status $WORKLOAD"
     result "rollout: DRYRUN skipped"
 else
-    kube rollout status "deploy/phantom-library-$COLOR" --timeout=60s \
-        || fail "phantom-library-$COLOR deployment did not report Ready"
-    result "rollout: phantom-library-$COLOR Ready"
+    CONTROLLER="$(kube get statefulset "phantom-library-$COLOR" -o json)" \
+        || fail "cannot read $WORKLOAD"
+    WORKLOAD_UID="$(python3 -c '
+import json, sys
+c = json.load(sys.stdin)
+m = c["metadata"]
+s = c["spec"]
+if (c.get("apiVersion") != "apps/v1" or c.get("kind") != "StatefulSet"
+        or m.get("name") != sys.argv[1] or m.get("namespace") != sys.argv[2]
+        or not m.get("uid") or m.get("deletionTimestamp")
+        or s.get("selector", {}).get("matchLabels", {}).get("app.kubernetes.io/component") != "jellyfin"
+        or not any(v.get("name") == "jellyfin" for v in s.get("template", {}).get("spec", {}).get("containers", []))):
+    sys.exit("expected a live Jellyfin StatefulSet with a stable controller identity")
+print(m["uid"])
+' "phantom-library-$COLOR" "$NAMESPACE" <<<"$CONTROLLER")" \
+        || fail "invalid Jellyfin controller: $WORKLOAD"
+    kube rollout status "$WORKLOAD" --timeout=60s \
+        || fail "$WORKLOAD did not report Ready"
+    result "rollout: $WORKLOAD Ready"
 fi
+
+log "locating the $COLOR color's Jellyfin Pod after rollout"
+find_pod || fail "cannot select a unique Ready phantom-library-$COLOR Jellyfin Pod in namespace $NAMESPACE"
+note "pod: $POD"
 
 # =========================================================================
 # 2. HTTPS + cert SAN on the dev host
