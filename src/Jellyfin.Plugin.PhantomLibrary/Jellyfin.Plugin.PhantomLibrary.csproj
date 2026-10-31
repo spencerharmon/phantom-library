@@ -3,8 +3,8 @@
   <PropertyGroup>
     <TargetFramework>net9.0</TargetFramework>
     <RootNamespace>Jellyfin.Plugin.PhantomLibrary</RootNamespace>
-    <AssemblyVersion>0.5.7.7</AssemblyVersion>
-    <FileVersion>0.5.7.7</FileVersion>
+    <AssemblyVersion>0.5.7.8</AssemblyVersion>
+    <FileVersion>0.5.7.8</FileVersion>
     <Version>0.5.7</Version>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
