@@ -56,3 +56,21 @@ Usage: {{ include "phantom-library.image" (dict "which" "gostream" "root" $) }}
 {{- $img := index .root.Values.images .which -}}
 {{- printf "%s@%s" $img.repository $img.digest -}}
 {{- end -}}
+
+{{/*
+gostream GOMEMLIMIT derived from gostream.memory (limitMiB * gomemlimitPercent / 100), plus a
+render-time guard that the limit covers baseline + maxConcurrentStreams * perStreamBudgetMiB.
+*/}}
+{{- define "phantom-library.gostreamGomemlimit" -}}
+{{- $m := .Values.gostream.memory -}}
+{{- $limit := int $m.limitMiB -}}
+{{- $need := add (int $m.baselineMiB) (mul (int $m.maxConcurrentStreams) (int $m.perStreamBudgetMiB)) -}}
+{{- if lt $limit (int $need) -}}
+{{- fail (printf "gostream.memory.limitMiB=%d < baselineMiB + maxConcurrentStreams*perStreamBudgetMiB = %d" $limit (int $need)) -}}
+{{- end -}}
+{{- printf "%dMiB" (div (mul $limit (int $m.gomemlimitPercent)) 100) -}}
+{{- end -}}
+
+{{- define "phantom-library.gostreamMemoryLimit" -}}
+{{- printf "%dMi" (int .Values.gostream.memory.limitMiB) -}}
+{{- end -}}

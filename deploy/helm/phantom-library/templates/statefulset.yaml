@@ -130,6 +130,9 @@ spec:
             - name: {{ $k }}
               value: {{ $v | quote }}
             {{- end }}
+            # Derived soft heap limit: a fraction of gostream's memory budget, never a literal.
+            - name: GOMEMLIMIT
+              value: {{ include "phantom-library.gostreamGomemlimit" . | quote }}
             # ----- jellyfin-metadata generation caps (cut cache growth at the source) -----
             # Read by the patched jellyfin-phantom entrypoint at startup to bound trickplay/
             # person-image/artwork generation — see values.yaml `jellyfin.metadataGeneration` (the

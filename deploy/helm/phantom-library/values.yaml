@@ -134,14 +134,30 @@ gostream:
     MKV_PROXY_CONFIG_PATH: /etc/gostream/config.json
     MKV_PROXY_CONFIG_TUNING_PATH: /config-src/tuning/config.tuning.json
     MKV_PROXY_CONFIG_SECRET_PATH: /config-src/secret/config.secret.json
-    GOMEMLIMIT: 2200MiB
+    # GOMEMLIMIT is NOT set here: the chart DERIVES it from `gostream.memory` below (see
+    # gostream-shared-oom-stream-drop-001). A literal here would silently stop tracking the limit.
+  # Per-stream memory budget (gostream-shared-oom-stream-drop-001). Incident 2026-10-31: the shared
+  # gostream OOMKilled at limit 3Gi / GOMEMLIMIT=2200MiB with a 2160p+1080p pump pair active — idle
+  # RSS ~2091MiB, peak ~2858MiB, i.e. ~380MiB per active pump of non-GC-bounded pump/read-ahead
+  # buffers on top of a baseline already AT the soft limit. GOMEMLIMIT only bounds the Go heap; pump
+  # buffers + runtime overhead live in the gap (limit - GOMEMLIMIT), so the limit must be sized as
+  #   limitMiB >= baselineMiB + maxConcurrentStreams * perStreamBudgetMiB
+  # and GOMEMLIMIT = limitMiB * gomemlimitPercent / 100, leaving >= config.read_ahead_budget_mb of
+  # headroom. scripts/tests/gostream-memory-headroom.test.sh enforces all of it on the rendered chart.
+  memory:
+    limitMiB: 4096
+    gomemlimitPercent: 70
+    baselineMiB: 2100
+    perStreamBudgetMiB: 400
+    maxConcurrentStreams: 4
   ports:
     proxy: 8080
     metrics: 9080
     gostorm: 8090
   resources:
+    # memory limit is rendered from gostream.memory.limitMiB (single source of truth).
     requests: { cpu: "500m", memory: 1Gi }
-    limits: { cpu: "2", memory: 3Gi }
+    limits: { cpu: "2" }
   # Library-API token the plugin sends as X-Gostream-Token on every gostream
   # /api/library/* call. Wired onto the jellyfin container env as
   # GOSTREAM_LIBRARY_TOKEN via secretKeyRef; the plugin's
@@ -504,6 +520,7 @@ persistence:
 # warmup.quotaGb by the template, so DO NOT set it here.
 config:
   master_concurrency_limit: 25
+  # Global (all-streams) read-ahead cap; must fit in gostream.memory headroom (limit - GOMEMLIMIT).
   read_ahead_budget_mb: 256
   metadata_cache_size_mb: 50
   write_buffer_size_kb: 64
@@ -522,7 +539,8 @@ config:
   preload_workers_count: 4
   preload_initial_delay_ms: 1000
   warm_start_idle_seconds: 6
-  max_concurrent_prefetch: 3
+  # Bounds concurrent pumps; 2 prefetch + active plays stays within gostream.memory.maxConcurrentStreams.
+  max_concurrent_prefetch: 2
   cache_cleanup_interval_min: 5
   max_cache_entries: 10000
   gostorm_url: "http://127.0.0.1:8090"
