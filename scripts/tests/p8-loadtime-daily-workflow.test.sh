@@ -602,6 +602,7 @@ mkdir -p "$durable_mount"
 durable_path="$durable_mount/loadtime-thresholds.json"
 chart="$REPO_ROOT/deploy/helm/phantom-library"
 if helm template durable "$chart" --set loadtimeDaily.enabled=true \
+    --set loadtimeDaily.activeDeadlineSeconds=5400 \
     --set-string loadtimeDaily.thresholds.existingClaim=daily-thresholds-test \
     --set-string "loadtimeDaily.thresholds.mountPath=$durable_mount" > "$TEST_TMP/chart.yaml"; then
     if python3 - "$TEST_TMP/chart.yaml" "$durable_mount" "$durable_path" "$chart/values.yaml" <<'PY'
@@ -613,6 +614,9 @@ jobs = [d for d in docs if d and d.get('kind') == 'CronJob'
 assert len(jobs) == 1, 'expected one daily CronJob'
 pod = jobs[0]['spec']['jobTemplate']['spec']['template']['spec']
 container = next(c for c in pod['containers'] if c['name'] == 'loadtime-daily')
+deadline = jobs[0]['spec']['jobTemplate']['spec']['activeDeadlineSeconds']
+assert deadline == 5400
+assert {'name': 'PHANTOM_LOADTIME_ACTIVE_DEADLINE_SECONDS', 'value': str(deadline)} in container['env']
 env = [e for e in container['env'] if e['name'] == 'PHANTOM_LOADTIME_THRESHOLDS_PATH']
 assert env == [{'name': 'PHANTOM_LOADTIME_THRESHOLDS_PATH', 'value': sys.argv[3]}], env
 mounts = [m for m in container['volumeMounts'] if m['name'] == 'thresholds-state']

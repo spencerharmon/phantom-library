@@ -389,6 +389,8 @@ loadtimeDaily:
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
   # A daily measurement run must be bounded so a hung network probe never wedges the CronJob.
+  # Must exceed 300: the measure stage is capped at this minus 300 seconds,
+  # reserving time to persist/push its result before Kubernetes kills the Job.
   activeDeadlineSeconds: 1800
   backoffLimit: 1
   # Init container that clones the phantom-library source (the daily script sources a whole tree

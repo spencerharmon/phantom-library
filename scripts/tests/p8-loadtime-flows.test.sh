@@ -7,7 +7,7 @@
 # Mirrors migration-rig.test.sh / in-cluster-acceptance-rig.test.sh: the live
 # rig can only run on the self-hosted runner / in-cluster acceptance rig; THIS
 # harness is the in-sandbox, deterministic machine gate (bash + python3 only,
-# NO live Jellyfin, NO cluster, NO network).
+# NO live Jellyfin or cluster; timeout coverage uses a loopback HTTP server).
 #
 # Asserts:
 #   A. The engine exists, is executable, and is `bash -n` syntax-clean.
@@ -499,6 +499,13 @@ then
     ok "LIVE traversal, target IDs, type validation, failure isolation and cleanup"
 else
     bad "LIVE target discovery regression"
+fi
+
+head_ "I. real curl timeouts and whole-list budgets (loopback HTTP server)"
+if python3 "$HERE/p8-loadtime-timeouts.py" "$ENGINE"; then
+    ok "hung requests and unbounded pagination terminate with attributed failures"
+else
+    bad "request/sample timeout regression"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"

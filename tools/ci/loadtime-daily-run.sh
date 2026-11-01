@@ -103,6 +103,22 @@ log()  { printf '\n=== %s\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
+# Reserve five minutes for outcome publication, push/guard and cleanup. The
+# chart supplies its actual Job deadline; standalone CI uses the chart default.
+MEASURE_TIMEOUT="$(python3 - "${PHANTOM_LOADTIME_ACTIVE_DEADLINE_SECONDS:-1800}" \
+    "${PHANTOM_LOADTIME_MEASURE_TIMEOUT_SECONDS:-}" <<'PY'
+import math, sys
+try:
+    available = float(sys.argv[1]) - 300
+    requested = float(sys.argv[2]) if sys.argv[2] else available
+    assert math.isfinite(available) and math.isfinite(requested)
+    assert 0 < requested <= available
+    print(requested)
+except (ValueError, AssertionError):
+    sys.exit('FAIL: measure timeout must be positive and at least 300s below the Job deadline')
+PY
+)" || exit 2
+
 kube() { kubectl "${KCTX[@]}" -n "$NAMESPACE" "$@"; }
 
 EVIDENCE=""
@@ -259,7 +275,7 @@ PHANTOM_LOADTIME_TOKEN="$ADMIN_TOKEN" \
 PHANTOM_LOADTIME_COLOR="$COLOR" \
 PHANTOM_CI_DRYRUN="$DRYRUN" \
 PHANTOM_LOADTIME_SAMPLES="${PHANTOM_LOADTIME_SAMPLES:-3}" \
-    bash "$REPO_ROOT/tools/rig-scenarios/47-loadtime-flows.sh" > "$EXPO"
+    timeout --kill-after=5 "$MEASURE_TIMEOUT" bash "$REPO_ROOT/tools/rig-scenarios/47-loadtime-flows.sh" > "$EXPO"
 measure_rc=$?
 set -e
 record_stage measure "$measure_rc" "$_stage_start"

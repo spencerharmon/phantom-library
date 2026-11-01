@@ -118,6 +118,9 @@ OUT="${PHANTOM_LOADTIME_OUT:-}"
 # noise no longer drives trend/guard/ratchet verdicts. Metric names/labels are
 # unchanged. Env PHANTOM_LOADTIME_SAMPLES or flag --samples N (flag wins).
 SAMPLES="${PHANTOM_LOADTIME_SAMPLES:-3}"
+# Positive seconds (fractions allowed). List budget covers pages, badges and DOM.
+REQUEST_TIMEOUT="${PHANTOM_LOADTIME_REQUEST_TIMEOUT_SECONDS:-60}"
+LIST_TIMEOUT="${PHANTOM_LOADTIME_LIST_TIMEOUT_SECONDS:-120}"
 # DRYRUN-only controlled timing fixture (regression harness): comma-separated
 # per-sample durations / error markers, applied to EVERY flow in place of the
 # synthetic duration (sample i uses element i). Ignored in LIVE mode.
@@ -133,6 +136,13 @@ done
 case "$SAMPLES" in
     ''|*[!0-9]*|0) printf 'FAIL: sample count must be a positive integer, got %q\n' "$SAMPLES" >&2; exit 2 ;;
 esac
+python3 - "$REQUEST_TIMEOUT" "$LIST_TIMEOUT" <<'PY' || exit 2
+import math, sys
+try:
+    assert all(math.isfinite(float(v)) and float(v) > 0 for v in sys.argv[1:])
+except (ValueError, AssertionError):
+    sys.exit('FAIL: request/list timeout seconds must be finite and positive')
+PY
 
 # The canonical flow-label vocabulary the emitter/ratchet/dashboard key on.
 # (Order matters only for readability; the labels are the contract.)
@@ -203,19 +213,29 @@ badge_fanout_and_materialise() {
     local total="$1" batch_runner="$2"
     local i=0
     while [ "$i" -lt "$total" ]; do
-        "$batch_runner" "$i" "$BADGE_BATCH_LIMIT"
+        "$batch_runner" "$i" "$BADGE_BATCH_LIMIT" || return 1
         i=$((i + BADGE_BATCH_LIMIT))
     done
     if command -v node >/dev/null 2>&1 && [ -f "$DOM_MATERIALISE_JS" ]; then
-        node "$DOM_MATERIALISE_JS" "$total" >/dev/null 2>&1 || true
+        if [ "$DRYRUN" = 1 ]; then
+            node "$DOM_MATERIALISE_JS" "$total" >/dev/null 2>&1
+        else
+            list_request_budget || return 124
+            timeout --kill-after=1 "$request_budget" node "$DOM_MATERIALISE_JS" "$total" >/dev/null 2>&1
+        fi
     else
         # node unavailable: fall back to a real (if cruder) per-item CPU cost
         # so the measurement still reflects O(item_count) materialisation
         # work rather than silently skipping it.
-        python3 -c "
+        local -a bound=()
+        if [ "$DRYRUN" != 1 ]; then
+            list_request_budget || return 124
+            bound=(timeout --kill-after=1 "$request_budget")
+        fi
+        "${bound[@]}" python3 -c "
 for _ in range(int(${total})):
     str(_) + 'x'
-" >/dev/null 2>&1 || true
+" >/dev/null 2>&1
     fi
 }
 
@@ -479,8 +499,8 @@ fi
 [ -n "$COLOR" ] || COLOR="rig"
 log "live load-time measurement against $API (color=$COLOR); rig :18096, never prod"
 
-api()      { curl -sS --fail -H "X-Emby-Token: $TOK" "$@"; }
-json_post(){ curl -sS --fail -X POST -H "X-Emby-Token: $TOK" -H 'Content-Type: application/json' "$@"; }
+api()      { curl -sS --fail --max-time "$REQUEST_TIMEOUT" -H "X-Emby-Token: $TOK" "$@"; }
+json_post(){ curl -sS --fail --max-time "$REQUEST_TIMEOUT" -X POST -H "X-Emby-Token: $TOK" -H 'Content-Type: application/json' "$@"; }
 hyphen()   { python3 - "$1" <<'PY'
 import sys
 s=sys.argv[1]; print(f'{s[:8]}-{s[8:12]}-{s[12:16]}-{s[16:20]}-{s[20:]}')
@@ -550,6 +570,7 @@ time_flow() {
         dur="$(elapsed "$start")"
         sample_add "$dur" "$errors"
         if [ "$errors" = 1 ]; then
+            [ "$rc" != 28 ] || code=000
             evidence failure "$flow" "$item_type" "$((s + 1))" "$id" "$rc" "$(http_code_of "$code")" request
         fi
     done
@@ -586,6 +607,17 @@ DISCOVERY_DONE=1
 # batching), then hand the total count to the DOM-materialise helper. The
 # summed wall clock across fetch + fan-out + materialise is the flow's
 # duration — full user-perceived load, not one capped round trip.
+list_request_budget() {
+    # Bash dynamic scope: deadline/request_budget belong to _full_list_sample.
+    request_budget="$(python3 - "$deadline" "$REQUEST_TIMEOUT" <<'PY'
+import sys, time
+remaining = float(sys.argv[1]) - time.monotonic()
+if remaining <= 0:
+    sys.exit(1)
+print(min(remaining, float(sys.argv[2])))
+PY
+)"
+}
 _full_list_sample() {
     local flow="$1" item_type="$2" ch="$3" sort_qs="$4"
     local start errors=0 dur total=0 start_index=0 page=200
@@ -595,13 +627,19 @@ _full_list_sample() {
     local all_ids_file
     all_ids_file="$(mktemp "$WORK_DIR/ids.XXXXXX")"
     start="$(now_s)"
+    local deadline request_budget
+    deadline="$(python3 -c 'import sys,time; print(time.monotonic()+float(sys.argv[1]))' "$LIST_TIMEOUT")"
     while :; do
+        if ! list_request_budget; then
+            errors=1; fail_stage=page_fetch; fail_code=000; fail_rc=28; break
+        fi
         local page_json page_file
         page_file="$(mktemp "$WORK_DIR/page.XXXXXX")"
         local code
-        if code="$(api "$API/Channels/$ch/Items?Limit=$page&StartIndex=$start_index&userId=$USER_ID${sort_qs}" -o "$page_file" -w '%{http_code}' 2>/dev/null)"; then :; else
+        if code="$(api --max-time "$request_budget" "$API/Channels/$ch/Items?Limit=$page&StartIndex=$start_index&userId=$USER_ID${sort_qs}" -o "$page_file" -w '%{http_code}' 2>/dev/null)"; then :; else
             fail_rc=$?
             errors=1; fail_stage=page_fetch; fail_code="$(http_code_of "$code")"
+            [ "$fail_rc" != 28 ] || fail_code=000
             rm -f "$page_file"; break
         fi
         local got total_records
@@ -611,6 +649,9 @@ _full_list_sample() {
         rm -f "$page_file"
         total=$((total + got))
         start_index=$((start_index + page))
+        if ! list_request_budget; then
+            errors=1; fail_stage=page_fetch; fail_code=000; fail_rc=28; break
+        fi
         if [ "$got" -eq 0 ] || [ "$start_index" -ge "$total_records" ]; then break; fi
     done
     live_batch_runner() {
@@ -622,16 +663,34 @@ ids=[l.strip() for l in open('$all_ids_file') if l.strip()]
 print(json.dumps(ids[$off:$off+$lim]))
 " 2>/dev/null || echo '[]')"
         local bcode
-        if bcode="$(json_post -d "{\"ids\": $chunk_ids}" -o /dev/null -w '%{http_code}' "$API/Plugins/PhantomLibrary/States" 2>/dev/null)"; then :; else
+        if ! list_request_budget; then
+            errors=1; fail_stage=badge_states; fail_code=000; fail_rc=28; return 1
+        fi
+        if bcode="$(json_post --max-time "$request_budget" -d "{\"ids\": $chunk_ids}" -o /dev/null -w '%{http_code}' "$API/Plugins/PhantomLibrary/States" 2>/dev/null)"; then :; else
             local rc=$?
             if [ "$errors" -eq 0 ]; then
                 fail_rc="$rc"
                 fail_stage=badge_states; fail_code="$(http_code_of "$bcode")"
+                [ "$rc" != 28 ] || fail_code=000
             fi
             errors=1
+            return 1
         fi
     }
-    badge_fanout_and_materialise "$total" live_batch_runner
+    if [ "$errors" = 0 ]; then
+        if badge_fanout_and_materialise "$total" live_batch_runner; then
+            if ! list_request_budget; then
+                errors=1; fail_stage=badge_states; fail_code=000; fail_rc=28
+            fi
+        else
+            local rc=$?
+            # The DOM tail shares the badge-stage budget/attribution vocabulary.
+            if [ "$errors" = 0 ]; then
+                errors=1; fail_stage=badge_states; fail_code=000; fail_rc="$rc"
+                if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then fail_rc=28; fi
+            fi
+        fi
+    fi
     rm -f "$all_ids_file"
     dur="$(elapsed "$start")"
     sample_add "$dur" "$errors"
