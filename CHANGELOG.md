@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Reduce chart gostream tuning defaults to six native pumps and 64 MiB logical
+  read-ahead. Add a rendered Helm/standalone-workload memory-contract regression;
+  no memory-limit increase or shared-service rollout. See
+  [memory scope and verification](deploy/helm/phantom-library/MEMORY.md).
 - Offline playback cause rankings now require explicit per-identity historical
   organic-serving receipts for the entire cumulative population or exact source
   interval. Current serving role cannot relabel historical dev traffic; missing

@@ -134,11 +134,15 @@ gostream:
     MKV_PROXY_CONFIG_PATH: /etc/gostream/config.json
     MKV_PROXY_CONFIG_TUNING_PATH: /config-src/tuning/config.tuning.json
     MKV_PROXY_CONFIG_SECRET_PATH: /config-src/secret/config.secret.json
+    # Combined Jellyfin/Go container only; this is NOT the standalone service's
+    # budget. Its limit is jellyfin.resources and must also accommodate .NET.
     GOMEMLIMIT: 2200MiB
   ports:
     proxy: 8080
     metrics: 9080
     gostorm: 8090
+  # Not consumed by the combined StatefulSet. Standalone workload resources and
+  # limit-derived GOMEMLIMIT belong to the deployment composition, not this map.
   resources:
     requests: { cpu: "500m", memory: 1Gi }
     limits: { cpu: "2", memory: 3Gi }
@@ -503,8 +507,11 @@ persistence:
 # is the structured form of gostream's reference config; disk_warmup_quota_gb is injected from
 # warmup.quotaGb by the template, so DO NOT set it here.
 config:
-  master_concurrency_limit: 25
-  read_ahead_budget_mb: 256
+  # Six native pumps preserves one background slot (engine reserves five).
+  # Read-ahead is logical cache accounting, NOT a per-stream allocation ceiling.
+  # See deploy/helm/phantom-library/MEMORY.md before changing either budget.
+  master_concurrency_limit: 6
+  read_ahead_budget_mb: 64
   metadata_cache_size_mb: 50
   write_buffer_size_kb: 64
   read_buffer_size_kb: 1024
