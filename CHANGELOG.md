@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Add read-only pinned playback capture bundles with exact raw evidence,
+  explicit full-label roles, retained previous bundles and hash-verified offline
+  replay. Preserve unhealthy coverage reports without inferring organic
+  attribution. See the [capture guide](docs/tasks/playback-outcome-capture-bundle-001.md).
 - Reduce chart gostream tuning defaults to six native pumps and 64 MiB logical
   read-ahead. Add a rendered Helm/standalone-workload memory-contract regression;
   no memory-limit increase or shared-service rollout. See
