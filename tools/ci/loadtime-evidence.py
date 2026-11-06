@@ -69,6 +69,13 @@ def main():
                     response="transport/no-response" if status == "000" else "http", stage=stage))
             else:
                 data["failures_omitted"] = data.get("failures_omitted", 0) + 1
+        elif action == "discovery-failure":
+            reason, code = args
+            if reason not in ("kube-lookup-timeout", "kube-lookup-error",
+                              "host-not-found", "evidence-write-failed"):
+                raise ValueError("invalid discovery failure reason")
+            # Enumerated reason + exit code only; never kubectl stderr or URLs.
+            data["discovery_failure"] = dict(reason=reason, kubectl_exit_code=int(code))
         elif action == "stage":
             stage, code, started, *duration = args
             if stage not in ("discovery", "measure", "push", "guard"):

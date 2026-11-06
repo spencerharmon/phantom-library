@@ -55,6 +55,10 @@
 #                                    Dry runs read it without writing anything.
 #   PHANTOM_LOADTIME_EVIDENCE_DIR    Override sibling loadtime-evidence directory.
 #   PHANTOM_LOADTIME_EVIDENCE_KEEP   Completed attempts to retain (default 32).
+#   PHANTOM_LOADTIME_KUBE_TIMEOUT_SECONDS  per-call kubectl --request-timeout
+#                                    for the Ingress lookup (default 15).
+#   PHANTOM_LOADTIME_KUBE_ATTEMPTS   bounded lookup attempts (default 3, max 10).
+#   PHANTOM_LOADTIME_KUBE_BACKOFF_SECONDS  pause between attempts (default 2).
 #   PHANTOM_CI_DRYRUN=1              toolchain-agnostic dry run: no cluster/
 #                                    network access; a deterministic
 #                                    synthetic measurement is pushed/guarded
@@ -234,26 +238,75 @@ fi
 [ -n "$DEV_HOST" ] || fail "PHANTOM_INCLUSTER_DEV_HOST is required"
 
 # --- resolve which color is the dev host, LIVE from the Ingress -----------
+# Bounded, attributed Ingress lookup (ttfb-loadtime-discovery-failure-attribution).
+# Every kubectl call carries --request-timeout and a hard `timeout` wall bound,
+# is retried a small bounded number of times, and its stderr is DISCARDED (it
+# may carry URLs/identifiers) — only an enumerated reason + exit code survive.
+KUBE_TIMEOUT="${PHANTOM_LOADTIME_KUBE_TIMEOUT_SECONDS:-15}"
+KUBE_ATTEMPTS="${PHANTOM_LOADTIME_KUBE_ATTEMPTS:-3}"
+KUBE_BACKOFF="${PHANTOM_LOADTIME_KUBE_BACKOFF_SECONDS:-2}"
+case "$KUBE_TIMEOUT$KUBE_ATTEMPTS$KUBE_BACKOFF" in *[!0-9]*) fail "kube timeout/attempts/backoff must be non-negative integers" ;; esac
+[ "$KUBE_TIMEOUT" -ge 1 ] && [ "$KUBE_ATTEMPTS" -ge 1 ] && [ "$KUBE_ATTEMPTS" -le 10 ] \
+    || fail "kube timeout must be >=1s and attempts 1..10"
+DISCOVERY_REASON=""
+DISCOVERY_KUBE_EXIT=0
+# resolve_color <host> — sets COLOR on success; otherwise DISCOVERY_REASON is
+# one of kube-lookup-timeout | kube-lookup-error | host-not-found.
 resolve_color() {
-    local host="$1" color
+    local host="$1" color out rc attempt err_rc=0 timed_out=0
     if [ "$DRYRUN" = 1 ]; then
-        echo "green"
+        COLOR="green"
         return 0
     fi
     for color in blue green; do
-        if kube get ingress "phantom-library-$color" \
-            -o jsonpath='{range .spec.rules[*]}{.host}{"\n"}{end}' 2>/dev/null \
-            | grep -qx "$host"; then
-            echo "$color"
+        for (( attempt = 1; attempt <= KUBE_ATTEMPTS; attempt++ )); do
+            rc=0
+            out="$(timeout -k 5 "$((KUBE_TIMEOUT + 5))" kubectl "${KCTX[@]}" -n "$NAMESPACE" \
+                --request-timeout="${KUBE_TIMEOUT}s" get ingress "phantom-library-$color" \
+                --ignore-not-found \
+                -o jsonpath='{range .spec.rules[*]}{.host}{"\n"}{end}' 2>/dev/null)" || rc=$?
+            [ "$rc" = 0 ] && break
+            err_rc="$rc"
+            case "$rc" in 124|137) timed_out=1 ;; esac
+            note "ingress lookup phantom-library-$color attempt $attempt/$KUBE_ATTEMPTS failed (kubectl exit $rc)"
+            [ "$attempt" -lt "$KUBE_ATTEMPTS" ] && sleep "$KUBE_BACKOFF"
+        done
+        if [ "$rc" = 0 ] && printf '%s\n' "$out" | grep -qxF -- "$host"; then
+            COLOR="$color"
             return 0
         fi
     done
+    DISCOVERY_KUBE_EXIT="$err_rc"
+    if [ "$err_rc" = 0 ]; then
+        DISCOVERY_REASON="host-not-found"
+    elif [ "$timed_out" = 1 ]; then
+        DISCOVERY_REASON="kube-lookup-timeout"
+    else
+        DISCOVERY_REASON="kube-lookup-error"
+    fi
     return 1
 }
 
+discovery_fail() { # discovery_fail <reason> <kubectl_exit> <message>
+    # One-line enumerated reason on stdout so the (soon reaped) pod log names it.
+    printf 'FAIL: discovery reason=%s kubectl_exit=%s\n' "$1" "$2"
+    evidence discovery-failure "$1" "$2" || true
+    fail "$3"
+}
+
 log "resolving dev color from the live Ingress (never a cached/CNAME guess)"
-COLOR="$(resolve_color "$DEV_HOST")" || fail "no phantom-library-{blue,green} Ingress carries host $DEV_HOST — cannot resolve the dev color live."
-evidence color "$COLOR" || fail "cannot retain resolved color"
+if ! resolve_color "$DEV_HOST"; then
+    case "$DISCOVERY_REASON" in
+        host-not-found) msg="no phantom-library-{blue,green} Ingress carries host $DEV_HOST — cannot resolve the dev color live." ;;
+        kube-lookup-timeout) msg="Ingress lookup timed out after $KUBE_ATTEMPTS attempt(s) of ${KUBE_TIMEOUT}s — cannot resolve the dev color live." ;;
+        *) msg="Ingress lookup failed (kubectl exit $DISCOVERY_KUBE_EXIT) after $KUBE_ATTEMPTS attempt(s) — cannot resolve the dev color live." ;;
+    esac
+    discovery_fail "$DISCOVERY_REASON" "$DISCOVERY_KUBE_EXIT" "$msg"
+fi
+if ! evidence color "$COLOR"; then
+    COLOR=""
+    discovery_fail evidence-write-failed 0 "cannot retain resolved color"
+fi
 note "dev host $DEV_HOST -> color=$COLOR"
 
 if [ "$DRYRUN" != 1 ]; then

@@ -937,7 +937,11 @@ sys.exit(code)
 ''')
 (bin_dir / 'kubectl').write_text('''#!/usr/bin/env bash
 printf '%s\n' "$*" >> "$EVIDENCE_KUBE"
-[ "${EVIDENCE_FAULT:-}" != color ] || exit 1
+case "${EVIDENCE_FAULT:-}" in
+    color) printf '%s\n' 'error: https://kube.example.com secret-stderr-DO-NOT-RETAIN' >&2; exit 1 ;;
+    hang) exec sleep 300 ;;
+    nohost) exit 0 ;;
+esac
 case "$*" in *phantom-library-green*) printf '%s\n' dev.example.com ;; esac
 ''')
 (bin_dir / 'beehive').write_text('''#!/usr/bin/env bash
@@ -984,6 +988,7 @@ base_env.update(PATH=str(bin_dir) + os.pathsep + os.environ['PATH'],
                 PHANTOM_INCLUSTER_DEV_HOST='dev.example.com', PHANTOM_INCLUSTER_PROD_HOST='example.com',
                 PHANTOM_INCLUSTER_ADMIN_TOKEN=secrets[0],
                 PHANTOM_PUSHGATEWAY_URL='http://pushgateway.example.com:9091',
+                PHANTOM_LOADTIME_KUBE_BACKOFF_SECONDS='0',
                 MSBUILDDISABLENODEREUSE='1', DOTNET_CLI_USE_MSBUILD_SERVER='0')
 
 def run(name, fault='', directory=None, **overrides):
@@ -1016,7 +1021,9 @@ def run(name, fault='', directory=None, **overrides):
     assert manifest['checkout_sha'] == sha, (name, manifest)
     assert type(manifest['exit_code']) is int and manifest['exit_code'] == result.returncode
     assert manifest['status'] == ('complete' if result.returncode == 0 else 'failed'), manifest
-    assert manifest['color'] == ('unknown' if fault == 'color' else 'green'), manifest
+    assert manifest['color'] == ('unknown' if fault in ('color', 'hang', 'nohost') else 'green'), manifest
+    if fault not in ('color', 'hang', 'nohost'):
+        assert 'discovery_failure' not in manifest, manifest
     assert isinstance(manifest['targets'], dict) and isinstance(manifest['failures'], list)
     for failure in manifest['failures']:
         assert type(failure['sample_index']) is int and failure['sample_index'] > 0, failure
@@ -1137,6 +1144,25 @@ print('EVIDENCE PASS: 28 typed discovery failures retain exactly the validated p
 result, manifest, _, requests, _ = run('color-failure', 'color')
 assert result.returncode != 0 and manifest['targets'] == {} and not requests, manifest
 assert manifest['stages']['discovery']['exit_code'] != 0, manifest
+# ttfb-loadtime-discovery-failure-attribution: enumerated, sanitized reason.
+assert manifest['discovery_failure'] == dict(reason='kube-lookup-error', kubectl_exit_code=1), manifest
+assert 'FAIL: discovery reason=kube-lookup-error kubectl_exit=1' in result.stdout, result.stdout
+assert 'DO-NOT-RETAIN' not in json.dumps(manifest) and 'kube.example.com' not in json.dumps(manifest)
+kube_calls = (tmp / 'color-failure' / 'kube').read_text().splitlines()
+assert len(kube_calls) == 6 and all('--request-timeout=15s' in c for c in kube_calls), kube_calls
+hang_start = time.time()
+result, manifest, _, requests, _ = run('hang-failure', 'hang', PHANTOM_LOADTIME_KUBE_TIMEOUT_SECONDS='1',
+                                       PHANTOM_LOADTIME_KUBE_ATTEMPTS='2')
+assert time.time() - hang_start < 60, 'hung kubectl lookup was not bounded'
+assert result.returncode != 0 and manifest['targets'] == {} and not requests, manifest
+assert manifest['discovery_failure'] == dict(reason='kube-lookup-timeout', kubectl_exit_code=124), manifest
+assert 'FAIL: discovery reason=kube-lookup-timeout kubectl_exit=124' in result.stdout, result.stdout
+assert len((tmp / 'hang-failure' / 'kube').read_text().splitlines()) == 4
+result, manifest, _, requests, _ = run('nohost-failure', 'nohost')
+assert result.returncode != 0 and manifest['targets'] == {} and not requests, manifest
+assert manifest['discovery_failure'] == dict(reason='host-not-found', kubectl_exit_code=0), manifest
+assert 'FAIL: discovery reason=host-not-found kubectl_exit=0' in result.stdout, result.stdout
+print('EVIDENCE PASS: discovery lookup-error/timeout/host-not-found are bounded and attributed in the manifest + stdout')
 result, manifest, _, _, _ = run('measure-failure', PHANTOM_LOADTIME_SAMPLES='invalid')
 assert result.returncode != 0 and manifest['targets'] == {}, manifest
 assert manifest['stages']['measure']['exit_code'] == 2, manifest
