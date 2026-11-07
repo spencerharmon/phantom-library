@@ -239,7 +239,10 @@ fi
 
 # --- resolve which color is the dev host, LIVE from the Ingress -----------
 # Bounded, attributed Ingress lookup (ttfb-loadtime-discovery-failure-attribution).
-# Every kubectl call carries --request-timeout and a hard `timeout` wall bound,
+# Every kubectl call is bounded by a hard `timeout -k` wall bound (NOT
+# --request-timeout: kubectl v1.31 skips in-cluster config when any
+# client-config override flag is set and falls back to localhost:8080 —
+# ttfb-loadtime-kubectl-incluster-config). Each call
 # is retried a small bounded number of times, and its stderr is DISCARDED (it
 # may carry URLs/identifiers) — only an enumerated reason + exit code survive.
 KUBE_TIMEOUT="${PHANTOM_LOADTIME_KUBE_TIMEOUT_SECONDS:-15}"
@@ -262,7 +265,7 @@ resolve_color() {
         for (( attempt = 1; attempt <= KUBE_ATTEMPTS; attempt++ )); do
             rc=0
             out="$(timeout -k 5 "$((KUBE_TIMEOUT + 5))" kubectl "${KCTX[@]}" -n "$NAMESPACE" \
-                --request-timeout="${KUBE_TIMEOUT}s" get ingress "phantom-library-$color" \
+                get ingress "phantom-library-$color" \
                 --ignore-not-found \
                 -o jsonpath='{range .spec.rules[*]}{.host}{"\n"}{end}' 2>/dev/null)" || rc=$?
             [ "$rc" = 0 ] && break

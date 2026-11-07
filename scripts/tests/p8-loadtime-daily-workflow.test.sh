@@ -458,6 +458,9 @@ done
 ENG
 cat > "$sb_bin/kubectl" <<'K'
 #!/usr/bin/env bash
+# ttfb-loadtime-kubectl-incluster-config: mimic kubectl v1.31 in-cluster —
+# any client-config override without a kubeconfig drops in-cluster creds.
+case " $* " in *" --request-timeout"*) case " $* " in *" --kubeconfig"*) ;; *) exit 1 ;; esac ;; esac
 case "$*" in *phantom-library-green*) echo "$SB_DEV_HOST" ;; esac
 K
 cat > "$sb_bin/curl" <<'C'
@@ -942,6 +945,9 @@ case "${EVIDENCE_FAULT:-}" in
     hang) exec sleep 300 ;;
     nohost) exit 0 ;;
 esac
+# ttfb-loadtime-kubectl-incluster-config: mimic kubectl v1.31 in-cluster —
+# any client-config override without a kubeconfig drops in-cluster creds.
+case " $* " in *" --request-timeout"*) case " $* " in *" --kubeconfig"*) ;; *) exit 1 ;; esac ;; esac
 case "$*" in *phantom-library-green*) printf '%s\n' dev.example.com ;; esac
 ''')
 (bin_dir / 'beehive').write_text('''#!/usr/bin/env bash
@@ -1149,7 +1155,7 @@ assert manifest['discovery_failure'] == dict(reason='kube-lookup-error', kubectl
 assert 'FAIL: discovery reason=kube-lookup-error kubectl_exit=1' in result.stdout, result.stdout
 assert 'DO-NOT-RETAIN' not in json.dumps(manifest) and 'kube.example.com' not in json.dumps(manifest)
 kube_calls = (tmp / 'color-failure' / 'kube').read_text().splitlines()
-assert len(kube_calls) == 6 and all('--request-timeout=15s' in c for c in kube_calls), kube_calls
+assert len(kube_calls) == 6 and not any('--request-timeout' in c for c in kube_calls), kube_calls
 hang_start = time.time()
 result, manifest, _, requests, _ = run('hang-failure', 'hang', PHANTOM_LOADTIME_KUBE_TIMEOUT_SECONDS='1',
                                        PHANTOM_LOADTIME_KUBE_ATTEMPTS='2')
