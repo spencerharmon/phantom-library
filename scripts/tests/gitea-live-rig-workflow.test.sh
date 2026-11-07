@@ -93,13 +93,11 @@ else
     fatal "python3 not available; cannot YAML-lint the workflow"
 fi
 
-head_ "self-hosted runner (never ubuntu-latest / a hosted runner)"
-if grep -qE '^\s*runs-on:\s*\[.*self-hosted' "$WORKFLOW"; then
-    ok "workflow declares runs-on: [self-hosted, ...]"
-elif grep -qE '^\s*runs-on:\s*self-hosted\s*$' "$WORKFLOW"; then
-    ok "workflow declares runs-on: self-hosted"
+head_ "self-hosted runner via k8s (not the ubuntu-latest alias)"
+if grep -qE '^\s*runs-on:\s*\[k8s\]\s*$' "$WORKFLOW"; then
+    ok "workflow declares runs-on: [k8s]"
 else
-    bad "workflow does not run on the self-hosted Gitea Actions runner"
+    bad "workflow does not select the Gitea Actions runner's k8s label"
 fi
 if grep -qE '^\s*runs-on:\s*ubuntu-latest\s*$' "$WORKFLOW"; then
     bad "workflow declares runs-on: ubuntu-latest (must be the self-hosted runner)"

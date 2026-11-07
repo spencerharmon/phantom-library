@@ -25,8 +25,8 @@ on:
 jobs:
   phantom-library-migration-rig:
     name: phantom-library-migration-rig
-    # The self-hosted runner that already backs the swarm's Gitea Actions.
-    runs-on: self-hosted
+    # Select the self-hosted Gitea runner by its advertised k8s label.
+    runs-on: [k8s]
     timeout-minutes: 60
     env:
       # Point the rig scripts at THIS checkout (rig-up.sh / the scenarios read

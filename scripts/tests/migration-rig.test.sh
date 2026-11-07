@@ -100,8 +100,8 @@ if [[ -f "$WORKFLOW" ]]; then ok "workflow present: $WORKFLOW"; else bad "workfl
 if [[ -f "$WORKFLOW" ]]; then
     grep -Eq '^\s*phantom-library-migration-rig:' "$WORKFLOW" \
         && ok "defines job phantom-library-migration-rig" || bad "job phantom-library-migration-rig not defined"
-    grep -Eq 'runs-on:\s*self-hosted' "$WORKFLOW" \
-        && ok "runs on the self-hosted runner" || bad "not pinned to a self-hosted runner"
+    grep -Eq '^\s*runs-on:\s*\[k8s\]\s*$' "$WORKFLOW" \
+        && ok "runs on the k8s runner" || bad "not pinned to the k8s runner"
     grep -Eq '44-migrate-v11-to-v12\.sh' "$WORKFLOW" \
         && ok "invokes scenario 44" || bad "does not invoke scenario 44"
     grep -Eq 'MIGRATION_RIG_OK' "$WORKFLOW" \

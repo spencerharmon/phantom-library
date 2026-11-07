@@ -9,8 +9,8 @@ name: phantom-library live rig
 # (nonrig-gate.yaml), this job exercises the real running server, not just
 # unit tests.
 #
-# Runs on the SELF-HOSTED Gitea Actions runner (already flux-deployed) —
-# NOT `ubuntu-latest` — because it needs podman (to pull/extract the
+# Runs on the self-hosted Gitea Actions runner via its advertised `k8s`
+# label, not the `ubuntu-latest` alias, because it needs podman (to pull/extract the
 # registry images) and a real filesystem the rig scripts can bind ports on.
 # It is NOT gated on any Zuul/Nodepool build-node: that provider never
 # existed for this tenant and is now retired outright, so unlike the
@@ -45,7 +45,7 @@ on:
 jobs:
   live-rig:
     name: live rig (movie/TV/source-safety)
-    runs-on: [self-hosted, gitea-actions-runner]
+    runs-on: [k8s]
     # Pinned .NET SDK toolchain, matching nonrig-gate.yaml's pin. podman is
     # installed explicitly (the base SDK image ships neither podman nor
     # sqlite3/curl), since this job pulls/extracts the registry images and

@@ -7,6 +7,8 @@
 #
 # Guards against the workflow silently rotting:
 #   - the workflow file exists and PARSES as valid YAML.
+#   - every .gitea/workflows/*.yml and *.yaml job selects only supported
+#     runner labels (ubuntu-latest or k8s), using parsed YAML, not grep.
 #   - it declares `container:` (runs inside a container, not bare on the
 #     Actions host) with a pinned, CONCRETE .NET SDK image tag (rejects
 #     `:latest` or a bare major-version floating tag like `:9.0`).
@@ -23,7 +25,7 @@
 #     or network access, so this harness runs on any CI node.
 #
 # This test does NOT need a dotnet SDK, network access, or a container
-# runtime — it only needs bash + python3 (for YAML parsing) or PyYAML.
+# runtime — it only needs bash + python3 with PyYAML.
 # Exit 0 = all assertions passed; non-zero on the first failure.
 # ---------------------------------------------------------------------------
 
@@ -46,41 +48,41 @@ fatal() { printf '\033[31mFATAL: %s\033[0m\n' "$*" >&2; exit 2; }
 [[ -f "$BUILD_SCRIPT" ]] || fatal "shared CI script not found: $BUILD_SCRIPT"
 [[ -x "$BUILD_SCRIPT" ]] || fatal "shared CI script not executable: $BUILD_SCRIPT"
 
-head_ "YAML parse"
-if command -v python3 >/dev/null 2>&1; then
-    if python3 - "$WORKFLOW" <<'PY'
+head_ "YAML parse and supported runner labels across all Gitea workflows"
+if python3 - "$REPO_ROOT/.gitea/workflows" <<'PY'
 import sys
-try:
-    import yaml
-except ImportError:
-    sys.exit(3)
-with open(sys.argv[1]) as f:
-    try:
-        yaml.safe_load(f)
-    except Exception as e:
-        print(f"YAML parse error: {e}", file=sys.stderr)
-        sys.exit(1)
-sys.exit(0)
+from pathlib import Path
+import yaml
+
+directory = Path(sys.argv[1])
+workflows = sorted([*directory.glob('*.yml'), *directory.glob('*.yaml')])
+assert workflows, 'no Gitea workflows found'
+supported = {'ubuntu-latest', 'k8s'}
+failures = 0
+job_count = 0
+for path in workflows:
+    with path.open() as f:
+        workflow = yaml.safe_load(f)
+    jobs = workflow['jobs']
+    assert isinstance(jobs, dict) and jobs, f'{path.name}: no jobs found'
+    for name, job in jobs.items():
+        job_count += 1
+        selector = job.get('runs-on')
+        labels = [selector] if isinstance(selector, str) else selector
+        if (not isinstance(labels, list) or not labels
+                or any(not isinstance(label, str) or label not in supported
+                       for label in labels)):
+            print(f'FAIL {path.name}:{name}: unsupported runs-on {selector!r}',
+                  file=sys.stderr)
+            failures += 1
+print(f'Checked {job_count} jobs in {len(workflows)} workflows; '
+      f'{failures} unsupported selectors')
+sys.exit(1 if failures else 0)
 PY
-    then
-        ok "$WORKFLOW parses as valid YAML (PyYAML)"
-    else
-        rc=$?
-        if [ "$rc" -eq 3 ]; then
-            printf '  NOTE: PyYAML unavailable; falling back to a structural grep check.\n'
-            # Toolchain-agnostic fallback: basic sanity that this looks like a
-            # YAML mapping document and not garbage (no tabs, has top-level keys).
-            if grep -qP '^\S.*:\s*$|^\S.*:\s*\S' "$WORKFLOW" && ! grep -qP '\t' "$WORKFLOW"; then
-                ok "$WORKFLOW passes structural YAML sanity check (no PyYAML)"
-            else
-                bad "$WORKFLOW failed structural YAML sanity check"
-            fi
-        else
-            bad "$WORKFLOW is not valid YAML"
-        fi
-    fi
+then
+    ok "all Gitea workflow jobs parse and use only ubuntu-latest/k8s labels"
 else
-    fatal "python3 not available; cannot YAML-lint the workflow"
+    bad "Gitea workflow YAML/runner-label validation failed (python3 + PyYAML required)"
 fi
 
 head_ "containerized (no host-tool dependence)"

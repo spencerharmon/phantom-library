@@ -33,7 +33,7 @@ on:
 jobs:
   loadtime-daily:
     name: daily load-time measurement (deployed dev color, live)
-    runs-on: [self-hosted, gitea-actions-runner]
+    runs-on: [k8s]
     container:
       image: mcr.microsoft.com/dotnet/sdk:9.0.305-noble
     steps:

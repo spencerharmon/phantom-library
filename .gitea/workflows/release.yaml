@@ -31,7 +31,7 @@ on:
 jobs:
   release:
     name: package + publish release
-    runs-on: [self-hosted, gitea-actions-runner]
+    runs-on: [k8s]
     # Pinned .NET SDK toolchain — same concrete tag as the other gitea
     # workflows so the release build cannot drift onto an untested SDK.
     container:

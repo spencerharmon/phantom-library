@@ -20,7 +20,7 @@ on:
 jobs:
   phantom-library-bluegreen-schema-overlap-rig:
     name: phantom-library-bluegreen-schema-overlap-rig
-    runs-on: self-hosted
+    runs-on: [k8s]
     timeout-minutes: 60
     env:
       PHANTOM_REPO_ROOT: ${{ gitea.workspace }}

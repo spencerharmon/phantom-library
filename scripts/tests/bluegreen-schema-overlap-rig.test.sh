@@ -167,8 +167,8 @@ if [[ -f "$WORKFLOW" ]]; then ok "workflow present: $WORKFLOW"; else bad "workfl
 if [[ -f "$WORKFLOW" ]]; then
     grep -Eq '^\s*phantom-library-bluegreen-schema-overlap-rig:' "$WORKFLOW" \
         && ok "defines job phantom-library-bluegreen-schema-overlap-rig" || bad "job not defined"
-    grep -Eq 'runs-on:\s*self-hosted' "$WORKFLOW" \
-        && ok "runs on the self-hosted runner" || bad "not pinned to a self-hosted runner"
+    grep -Eq '^\s*runs-on:\s*\[k8s\]\s*$' "$WORKFLOW" \
+        && ok "runs on the k8s runner" || bad "not pinned to the k8s runner"
     grep -Eq '46-bluegreen-schema-overlap\.sh' "$WORKFLOW" \
         && ok "invokes scenario 46" || bad "does not invoke scenario 46"
     grep -Eq 'BLUEGREEN_RIG_OK' "$WORKFLOW" \
