@@ -161,3 +161,64 @@ for name in ('PHANTOM_LOADTIME_REQUEST_TIMEOUT_SECONDS', 'PHANTOM_LOADTIME_LIST_
             capture_output=True, text=True, timeout=3)
         assert result.returncode == 2 and 'timeout seconds' in result.stderr, result
 print('TIMEOUT engine: non-positive/non-finite/invalid budgets rejected: PASS')
+
+for name in ('PHANTOM_LOADTIME_ENGINE_BUDGET_SECONDS',):
+    for value in ('0', '-1', 'nan', 'bad'):
+        result = subprocess.run(['bash', str(engine)], env=dict(
+            os.environ, PHANTOM_CI_DRYRUN='1', **{name: value}),
+            capture_output=True, text=True, timeout=3)
+        assert result.returncode == 2 and 'timeout seconds' in result.stderr, result
+print('TIMEOUT engine: invalid engine budget rejected: PASS')
+
+
+# loadtime-daily-list-load-timeout: (a) a timed-out list sample fails the rest
+# of that flow's samples fast instead of re-burning LIST_TIMEOUT per sample;
+# (b) an exhausted engine budget still exits 0 and flushes all twelve flows.
+def run_engine(server, extra, limit):
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        env = dict(os.environ, PHANTOM_CI_DRYRUN='0',
+                   PHANTOM_LOADTIME_API=f'http://127.0.0.1:{server.server_port}',
+                   PHANTOM_LOADTIME_COLOR='rigtest', TMPDIR=directory,
+                   PHANTOM_LOADTIME_REQUEST_TIMEOUT_SECONDS='0.2',
+                   PHANTOM_LOADTIME_LIST_TIMEOUT_SECONDS='0.6', **extra)
+        start = time.monotonic()
+        proc = subprocess.run(['bash', str(engine)], env=env, capture_output=True,
+                              text=True, timeout=limit)
+        return proc, time.monotonic() - start
+
+
+stop.clear()
+with ThreadingHTTPServer(('127.0.0.1', 0), Handler) as server:
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        server.mode = 'page'
+        proc, _ = run_engine(server, {'PHANTOM_LOADTIME_SAMPLES': '3'}, 30)
+        assert proc.returncode == 0, proc.stderr
+        for kind in ('movie', 'episode'):
+            for flow in ('list_load', 'sort_change'):
+                labels = f'flow="{flow}",item_type="{kind}",color="rigtest"'
+                assert f'phantom_loadtime_runs_total{{{labels}}} 3' in proc.stdout, proc.stdout
+                assert f'phantom_loadtime_errors_total{{{labels}}} 3' in proc.stdout, proc.stdout
+                # only ONE sample was actually attempted (and attributed)
+                assert (f'phantom_loadtime_list_errors_total{{flow="{flow}",item_type="{kind}",'
+                        f'stage="page_fetch",http_code="000"}} 1') in proc.stdout, proc.stdout
+        assert proc.stderr.count('skipped (prior sample timed out') == 8, proc.stderr
+        print('TIMEOUT fail-fast: timed-out list sample skips remaining samples: PASS')
+
+        proc, elapsed = run_engine(server, {'PHANTOM_LOADTIME_SAMPLES': '3',
+                                            'PHANTOM_LOADTIME_ENGINE_BUDGET_SECONDS': '0.4'}, 30)
+        assert proc.returncode == 0, proc.stderr
+        for kind in ('movie', 'episode'):
+            for flow in ('list_load', 'sort_change', 'info_open', 'get_sources',
+                         'materialise', 'play_materialised'):
+                labels = f'flow="{flow}",item_type="{kind}",color="rigtest"'
+                assert f'phantom_loadtime_runs_total{{{labels}}} 3' in proc.stdout, proc.stdout
+                assert f'phantom_loadtime_errors_total{{{labels}}} 3' in proc.stdout, proc.stdout
+        assert 'engine budget spent' in proc.stderr
+        print('TIMEOUT engine budget: spent budget still flushes all twelve flows, exit 0: PASS')
+    finally:
+        stop.set()
+        server.shutdown()
+        thread.join()
