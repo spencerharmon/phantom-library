@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pod, deployment and memory metrics, with explicit runtime/history coverage
   receipts. No deployment or memory-limit changes. See the
   [acceptance guide](docs/tasks/gostream-oom-acceptance.md).
+- Prevent offline OOM acceptance from treating config booleans as numbers or
+  accepting a previous termination later than the current process start.
 - Add read-only pinned playback capture bundles with exact raw evidence,
   explicit full-label roles, retained previous bundles and hash-verified offline
   replay. Preserve unhealthy coverage reports without inferring organic

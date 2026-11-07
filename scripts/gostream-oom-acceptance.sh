@@ -28,6 +28,19 @@ def load(path):
         return json.load(stream, object_pairs_hook=unique)
 
 
+def json_equal(left, right):
+    # JSON numbers share a type; Python booleans must not compare as 0/1.
+    if type(left) in (int, float) and type(right) in (int, float):
+        return left == right
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(json_equal(left[k], right[k]) for k in left)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(json_equal(a, b) for a, b in zip(left, right))
+    return left == right
+
+
 def stamp(value):
     require(isinstance(value, str) and re.fullmatch(
         r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)', value),
@@ -178,7 +191,9 @@ def analyse():
                     ooms.append(f"{meta['name']} finished_at={term['finishedAt']}")
         restarts = state['restartCount']
         require(type(restarts) is int and restarts >= 0, "invalid restart count")
-        if restarts > 1 or (restarts and not state.get('lastState', {}).get('terminated')):
+        previous = state.get('lastState', {}).get('terminated')
+        require(not previous or restarts > 0, "previous termination with zero restarts")
+        if restarts > 1 or (restarts and not previous):
             gaps.append('restart history truncated by Kubernetes lastState')
         running = state.get('state', {}).get('running')
         if not running or state.get('ready') is not True or pod['status']['phase'] != 'Running':
@@ -186,6 +201,9 @@ def analyse():
         started = stamp(running['startedAt']) if running else None
         if started is not None:
             require(created <= started <= now, "invalid container start time")
+            if previous:
+                require(stamp(previous['finishedAt']) <= started,
+                        "previous termination follows current start")
         receipt = runtime.pop((meta['uid'], container), None)
         if receipt is not None:
             require(receipt['container_id'] == state['containerID'] and started is not None
@@ -203,7 +221,7 @@ def analyse():
             gaps.append('runtime receipt required for loaded config')
         elif receipt is not None:
             for name, value in expected['config'].items():
-                if name not in receipt['config'] or receipt['config'][name] != value:
+                if name not in receipt['config'] or not json_equal(receipt['config'][name], value):
                     absent.append(f"{meta['name']}: config {name} mismatch")
         details.append((key, limit, created))
     require(not runtime, "foreign runtime receipt")

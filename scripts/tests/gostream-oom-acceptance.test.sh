@@ -114,11 +114,43 @@ case('process missing expected env', 3, 'TUNING_ABSENT', lambda d: (
      runtime(d), d['runtime'][0].update(env={})))
 case('loaded config wrong', 3, 'TUNING_ABSENT', lambda d: (
      runtime(d), d['runtime'][0]['config'].update(read_ahead_budget_mb=256)))
+for name, expected, loaded in (
+        ('true versus one', True, 1),
+        ('false versus zero', False, 0),
+        ('number versus boolean', 1, True),
+        ('nested object', {'enabled': True}, {'enabled': 1}),
+        ('nested array', [False], [0]),
+        ('nested mixed containers', {'items': [{'enabled': True}]}, {'items': [{'enabled': 1}]}),
+        ('number versus string', 1, '1'),
+        ('array length', [True], [True, False]),
+        ('object keys', {'enabled': True}, {'other': True})):
+    case(f'config type/value mismatch: {name}', 3, 'TUNING_ABSENT', lambda d, e=expected, v=loaded: (
+         runtime(d), d['expected-tuning'].update(config={'setting': e}),
+         d['runtime'][0].update(config={'setting': v})), ('config setting mismatch',))
+case('matching nested JSON types and numeric representations', 0, 'ACCEPTED', lambda d: (
+     runtime(d), d['expected-tuning'].update(config={'setting': {'items': [True, False, None, '1', 1]}}),
+     d['runtime'][0].update(config={'setting': {'items': [True, False, None, '1', 1.0]}})))
 case('old process receipt', 2, 'INCOMPLETE', lambda d: (
      runtime(d), d['runtime'][0].update(container_id='containerd://old')))
 case('stale process receipt', 2, 'INCOMPLETE', lambda d: (
      runtime(d), d['runtime'][0].update(captured_at=rollout)))
 case('truncated non-OOM restart history', 2, 'INCOMPLETE', lambda d: state(d).update(restartCount=10))
+
+
+def single_restart(d, started):
+    state(d).update(restartCount=1, lastState={'terminated': {
+        'reason': 'Completed', 'finishedAt': '2026-11-06T11:30:00Z'}},
+        state={'running': {'startedAt': started}})
+
+
+case('previous termination after current start', 2, 'INCOMPLETE',
+     lambda d: single_restart(d, rollout), ('previous termination follows current start',))
+case('valid single restart', 0, 'ACCEPTED',
+     lambda d: single_restart(d, '2026-11-06T11:31:00Z'))
+case('single restart at equal timestamp', 0, 'ACCEPTED',
+     lambda d: single_restart(d, '2026-11-06T11:30:00Z'))
+case('last termination with zero restarts', 2, 'INCOMPLETE', lambda d: (
+     single_restart(d, '2026-11-06T11:31:00Z'), state(d).update(restartCount=0)))
 case('unready container', 2, 'INCOMPLETE', lambda d: state(d).update(ready=False))
 case('unobserved deployment generation', 2, 'INCOMPLETE',
      lambda d: d['deployment']['status'].update(observedGeneration=1))

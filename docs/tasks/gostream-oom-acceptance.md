@@ -67,7 +67,9 @@ No service installation or restart is needed to use either script.
 
 These are illustrative tuning values, not defaults imposed by this tool. Supply
 the values from the intended fix for the actual container. Env values are strings;
-config values preserve JSON types. Empty env and config together are refused.
+config values preserve JSON types recursively, so booleans never match numbers
+(including inside objects and arrays). Equivalent JSON numbers such as `1` and
+`1.0` match. Empty env and config together are refused.
 
 ## Runtime Receipt
 
@@ -136,6 +138,9 @@ last-state OOM at/after rollout is still reported even with ten restarts (the da
 shape). A recent rollout's 24h maximum can include pre-rollout memory samples for
 an old pod, but old pods first yield TUNING_ABSENT. Broader historical acceptance
 needs additional historical captures, not a claim that one snapshot proves it.
+Contradictory restart evidence is INCOMPLETE: a previous termination requires a
+positive restart count and must finish at or before the current process starts.
+Equal timestamps are allowed for captures with coarse timestamp precision.
 
 The next daily measurement should retain these captures, run the analyser, and
 record the verdict. Non-ACCEPTED is not permission to deploy or raise limits:
