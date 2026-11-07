@@ -1076,7 +1076,9 @@ for flow, item_type, channel, stage, code, http in (
         ('list_load', 'movie', 'movies', 'page_fetch', 22, '500'),
         ('list_load', 'episode', 'shows', 'badge_states', 28, '000'),
         ('sort_change', 'episode', 'shows', 'badge_states', 28, '000')):
-    for sample in (1, 2):
+    # loadtime-daily-list-load-timeout: a timed-out (curl 28) list sample fails
+    # the flow's remaining samples fast (recorded as errors, not re-attempted).
+    for sample in ((1,) if code == 28 else (1, 2)):
         expected_failures.append(dict(flow=flow, item_type=item_type, sample_index=sample,
             target=channel, curl_exit_code=code, http_status=http,
             response='http' if code == 22 else 'transport/no-response', stage=stage))
@@ -1105,7 +1107,7 @@ for flow, item_type, stage, http in (('list_load', 'movie', 'page_fetch', '500')
         ('list_load', 'episode', 'badge_states', '000'), ('sort_change', 'episode', 'badge_states', '000')):
     key = f'phantom_loadtime_list_errors_total{{flow="{flow}",item_type="{item_type}",stage="{stage}",http_code="{http}"}}'
     expected_keys.add(key)
-    assert samples[key] == 2, key
+    assert samples[key] == (1 if http == '000' else 2), key
 assert set(samples) == expected_keys, ('metric names/labels changed', set(samples) ^ expected_keys)
 stage_puts = [r['payload'] for r in requests if r['path'].endswith('/phantom-loadtime-daily-run')]
 assert len(stage_puts) == 3, stage_puts

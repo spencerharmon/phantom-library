@@ -203,4 +203,50 @@ public class GostreamFilesystemEnumeratorTests : IDisposable
         var got = await e.EnumerateSeriesAsync(CancellationToken.None);
         Assert.Empty(got);
     }
+
+    [Fact]
+    public void MoviesVersion_IgnoresRootDirectoryMtime()
+    {
+        // The gostream FUSE mount reports the root directory mtime as "now";
+        // the version must stay stable so core's channel cache can hit.
+        File.WriteAllText(Path.Combine(_moviesRoot, "A (2020).mkv"), string.Empty);
+        File.SetLastWriteTimeUtc(Path.Combine(_moviesRoot, "A (2020).mkv"), new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        var e = NewEnumerator();
+        Directory.SetLastWriteTimeUtc(_moviesRoot, new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        var first = e.MoviesVersion();
+        Directory.SetLastWriteTimeUtc(_moviesRoot, new DateTime(2026, 6, 1, 0, 0, 0, DateTimeKind.Utc));
+        var second = e.MoviesVersion();
+        Assert.Equal(first, second);
+    }
+
+    [Fact]
+    public void ShowsVersion_IgnoresRootDirectoryMtime()
+    {
+        var dir = Path.Combine(_showsRoot, "Show", "Season 01");
+        Directory.CreateDirectory(dir);
+        var f = Path.Combine(dir, "Show S01E01.mkv");
+        File.WriteAllText(f, string.Empty);
+        File.SetLastWriteTimeUtc(f, new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        var e = NewEnumerator();
+        Directory.SetLastWriteTimeUtc(_showsRoot, new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        var first = e.ShowsVersion();
+        Directory.SetLastWriteTimeUtc(_showsRoot, new DateTime(2026, 6, 1, 0, 0, 0, DateTimeKind.Utc));
+        Assert.Equal(first, e.ShowsVersion());
+    }
+
+    [Fact]
+    public void MoviesVersion_ChangesWhenVideoFileAddedOrRewritten()
+    {
+        var a = Path.Combine(_moviesRoot, "A (2020).mkv");
+        File.WriteAllText(a, string.Empty);
+        File.SetLastWriteTimeUtc(a, new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        var e = NewEnumerator();
+        var v1 = e.MoviesVersion();
+        File.SetLastWriteTimeUtc(a, new DateTime(2024, 2, 1, 0, 0, 0, DateTimeKind.Utc));
+        var v2 = e.MoviesVersion();
+        Assert.NotEqual(v1, v2);
+        File.WriteAllText(Path.Combine(_moviesRoot, "B (2021).mkv"), string.Empty);
+        File.SetLastWriteTimeUtc(Path.Combine(_moviesRoot, "B (2021).mkv"), new DateTime(2023, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        Assert.NotEqual(v2, e.MoviesVersion());
+    }
 }

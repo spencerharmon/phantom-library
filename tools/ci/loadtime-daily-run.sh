@@ -323,6 +323,17 @@ API="https://$DEV_HOST"
 # =========================================================================
 # 1. measure the six flows against the DEPLOYED stack
 # =========================================================================
+# loadtime-daily-list-load-timeout: the engine gets its OWN wall budget,
+# strictly inside the hard `timeout` below (headroom for one in-flight bounded
+# request), so a slow/timing-out flow is recorded as erroring samples and the
+# engine still exits 0 with EVERY flow's record — the batch is pushed instead
+# of the hard timeout killing it (exit 124) with nothing published.
+ENGINE_BUDGET="$(python3 - "$MEASURE_TIMEOUT" <<'PY'
+import sys
+t = float(sys.argv[1])
+print(t - 90 if t > 180 else t * 0.5)
+PY
+)"
 log "[1] measuring six load-time flows against $API (color=$COLOR)"
 _stage_start="$(date +%s)"
 set +e
@@ -331,12 +342,30 @@ PHANTOM_LOADTIME_TOKEN="$ADMIN_TOKEN" \
 PHANTOM_LOADTIME_COLOR="$COLOR" \
 PHANTOM_CI_DRYRUN="$DRYRUN" \
 PHANTOM_LOADTIME_SAMPLES="${PHANTOM_LOADTIME_SAMPLES:-3}" \
+PHANTOM_LOADTIME_ENGINE_BUDGET_SECONDS="$ENGINE_BUDGET" \
     timeout --kill-after=5 "$MEASURE_TIMEOUT" bash "$REPO_ROOT/tools/rig-scenarios/47-loadtime-flows.sh" > "$EXPO"
 measure_rc=$?
 set -e
 record_stage measure "$measure_rc" "$_stage_start"
-[ "$measure_rc" = 0 ] || fail "measurement engine exited $measure_rc"
+if [ "$measure_rc" != 0 ]; then
+    # Last-resort partial publication: if the engine was killed after it had
+    # already flushed a complete exposition, still push it; never push an
+    # empty/partial-line file.
+    if [ -s "$EXPO" ] && grep -q '^phantom_loadtime_seconds{' "$EXPO" 2>/dev/null; then
+        note "engine exited $measure_rc but flushed a batch; pushing it before failing"
+        push_args=(push "$EXPO")
+        [ "$DRYRUN" = 1 ] && push_args=(--dry-run "${push_args[@]}")
+        bash "$REPO_ROOT/scripts/phantom-loadtime-push.sh" "${push_args[@]}" || note "partial push failed"
+    fi
+    fail "measurement engine exited $measure_rc"
+fi
 note "measurement batch written to $EXPO"
+erroring_flows="$(awk '/^phantom_loadtime_errors_total\{/ && $NF+0 > 0 {n++} END {print n+0}' "$EXPO")"
+if [ "$erroring_flows" -gt 0 ]; then
+    note "VERDICT: PARTIAL — $erroring_flows flow series recorded erroring samples (pushed as data; see phantom_loadtime_errors_total / phantom_loadtime_list_errors_total)"
+else
+    note "VERDICT: COMPLETE — all flow series measured without error"
+fi
 
 # =========================================================================
 # 2. push the batch to the Pushgateway

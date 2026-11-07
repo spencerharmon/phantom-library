@@ -98,8 +98,18 @@ public sealed class GostreamFilesystemEnumerator
 
         try
         {
+            // loadtime-daily-list-load-timeout: the version is derived from
+            // the VIDEO FILES only (count + newest file mtime) — never the root
+            // directory's own mtime. The gostream FUSE mount reports a
+            // directory mtime of "now" on every stat, so folding it in made
+            // DataVersion change every second; core's per-user channel-item
+            // cache (keyed on DataVersion) then missed on EVERY page request,
+            // forcing a full O(catalogue) rebuild + BaseItem upsert per page
+            // (~10-13s/page on a ~16k-item catalogue) and timing out deep
+            // list_load/sort_change pagination. A file add/remove still moves
+            // the count, and a rewritten file still moves the max mtime.
             var count = 0;
-            var maxTicks = Directory.GetLastWriteTimeUtc(root).Ticks;
+            var maxTicks = 0L;
             foreach (var path in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
             {
                 if (!IsVideoFile(path))

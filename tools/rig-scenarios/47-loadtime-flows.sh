@@ -121,6 +121,12 @@ SAMPLES="${PHANTOM_LOADTIME_SAMPLES:-3}"
 # Positive seconds (fractions allowed). List budget covers pages, badges and DOM.
 REQUEST_TIMEOUT="${PHANTOM_LOADTIME_REQUEST_TIMEOUT_SECONDS:-60}"
 LIST_TIMEOUT="${PHANTOM_LOADTIME_LIST_TIMEOUT_SECONDS:-120}"
+# loadtime-daily-list-load-timeout: optional whole-engine wall budget (seconds).
+# The caller (tools/ci/loadtime-daily-run.sh) sets it below its own hard
+# `timeout` so the engine ALWAYS finishes on its own and flushes every flow's
+# record: once the budget is spent, each remaining sample is recorded as an
+# erroring (not-run) sample instead of being attempted. Empty = unbounded.
+ENGINE_BUDGET="${PHANTOM_LOADTIME_ENGINE_BUDGET_SECONDS:-}"
 # DRYRUN-only controlled timing fixture (regression harness): comma-separated
 # per-sample durations / error markers, applied to EVERY flow in place of the
 # synthetic duration (sample i uses element i). Ignored in LIVE mode.
@@ -136,13 +142,22 @@ done
 case "$SAMPLES" in
     ''|*[!0-9]*|0) printf 'FAIL: sample count must be a positive integer, got %q\n' "$SAMPLES" >&2; exit 2 ;;
 esac
-python3 - "$REQUEST_TIMEOUT" "$LIST_TIMEOUT" <<'PY' || exit 2
+python3 - "$REQUEST_TIMEOUT" "$LIST_TIMEOUT" ${ENGINE_BUDGET:+"$ENGINE_BUDGET"} <<'PY' || exit 2
 import math, sys
 try:
     assert all(math.isfinite(float(v)) and float(v) > 0 for v in sys.argv[1:])
 except (ValueError, AssertionError):
-    sys.exit('FAIL: request/list timeout seconds must be finite and positive')
+    sys.exit('FAIL: request/list/engine timeout seconds must be finite and positive')
 PY
+ENGINE_DEADLINE=""
+if [ -n "$ENGINE_BUDGET" ]; then
+    ENGINE_DEADLINE="$(python3 -c 'import sys,time; print(time.monotonic()+float(sys.argv[1]))' "$ENGINE_BUDGET")"
+fi
+# engine_expired: true (0) once the engine wall budget is spent.
+engine_expired() {
+    [ -n "$ENGINE_DEADLINE" ] || return 1
+    python3 -c 'import sys,time; sys.exit(0 if time.monotonic() >= float(sys.argv[1]) else 1)' "$ENGINE_DEADLINE"
+}
 
 # The canonical flow-label vocabulary the emitter/ratchet/dashboard key on.
 # (Order matters only for readability; the labels are the contract.)
@@ -560,11 +575,17 @@ CH_SHOWS="$(printf '%s' "$CH_JSON" | discovery_id Channel 'Phantom Shows')" || f
 # Sets the global LAST_FLOW_ERRORS to this flow's error marker so the caller can
 # derive the definitive playback outcome for the materialise/play flows.
 LAST_FLOW_ERRORS=0
+LAST_LIST_TIMEOUT=0
 time_flow() {
     local flow="$1" item_type="$2"; shift 2
     local start errors=0 dur s code rc
     sample_reset
     for ((s = 0; s < SAMPLES; s++)); do
+        if engine_expired; then
+            sample_add 0 1
+            log "flow=$flow item_type=$item_type sample=$((s + 1)) skipped (engine budget spent)"
+            continue
+        fi
         start="$(now_s)"
         if code="$("$@" -o /dev/null -w '%{http_code}' 2>/dev/null)"; then rc=0; errors=0; else rc=$?; errors=1; fi
         dur="$(elapsed "$start")"
@@ -628,7 +649,12 @@ _full_list_sample() {
     all_ids_file="$(mktemp "$WORK_DIR/ids.XXXXXX")"
     start="$(now_s)"
     local deadline request_budget
-    deadline="$(python3 -c 'import sys,time; print(time.monotonic()+float(sys.argv[1]))' "$LIST_TIMEOUT")"
+    deadline="$(python3 -c '
+import sys, time
+d = time.monotonic() + float(sys.argv[1])
+if sys.argv[2]:
+    d = min(d, float(sys.argv[2]))
+print(d)' "$LIST_TIMEOUT" "$ENGINE_DEADLINE")"
     while :; do
         if ! list_request_budget; then
             errors=1; fail_stage=page_fetch; fail_code=000; fail_rc=28; break
@@ -697,15 +723,28 @@ print(json.dumps(ids[$off:$off+$lim]))
     log "flow=$flow item_type=$item_type sample_s=$dur errors=$errors items=$total"
     if [ "$errors" -eq 1 ]; then
         list_error_add "$flow" "$item_type" "$fail_stage" "$fail_code"
+        [ "$fail_rc" != 28 ] || LAST_LIST_TIMEOUT=1
         evidence failure "$flow" "$item_type" "$((s + 1))" "$ch" "$fail_rc" "$fail_code" "$fail_stage"
         log "flow=$flow item_type=$item_type list_error stage=$fail_stage http_code=$fail_code"
     fi
 }
+# A list sample that exhausted its budget (page_fetch/badge_states http 000)
+# proves the remaining samples of that flow would burn the same budget again,
+# so they are recorded as erroring not-run samples (fail fast) rather than
+# re-attempted: 3 samples x 4 list flows x LIST_TIMEOUT would otherwise exceed
+# the engine's wall budget and lose the whole batch.
 time_full_list_flow() {
-    local s
+    local s timed_out=0
     sample_reset
     for ((s = 0; s < SAMPLES; s++)); do
+        if [ "$timed_out" = 1 ] || engine_expired; then
+            sample_add 0 1
+            log "flow=$1 item_type=$2 sample=$((s + 1)) skipped (prior sample timed out or engine budget spent)"
+            continue
+        fi
+        LAST_LIST_TIMEOUT=0
         _full_list_sample "$@"
+        [ "$LAST_LIST_TIMEOUT" = 0 ] || timed_out=1
     done
     sample_emit "$1" "$2"
 }
