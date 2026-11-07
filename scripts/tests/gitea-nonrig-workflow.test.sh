@@ -9,6 +9,8 @@
 #   - the workflow file exists and PARSES as valid YAML.
 #   - every .gitea/workflows/*.yml and *.yaml job selects only supported
 #     runner labels (ubuntu-latest or k8s), using parsed YAML, not grep.
+#   - SDK-container jobs install Node, git, and CA certificates before
+#     actions/checkout (Gitea needs Node inside the job container).
 #   - it declares `container:` (runs inside a container, not bare on the
 #     Actions host) with a pinned, CONCRETE .NET SDK image tag (rejects
 #     `:latest` or a bare major-version floating tag like `:9.0`).
@@ -48,11 +50,45 @@ fatal() { printf '\033[31mFATAL: %s\033[0m\n' "$*" >&2; exit 2; }
 [[ -f "$BUILD_SCRIPT" ]] || fatal "shared CI script not found: $BUILD_SCRIPT"
 [[ -x "$BUILD_SCRIPT" ]] || fatal "shared CI script not executable: $BUILD_SCRIPT"
 
-head_ "YAML parse and supported runner labels across all Gitea workflows"
+head_ "YAML parse, supported runner labels, and SDK checkout bootstrap"
 if python3 - "$REPO_ROOT/.gitea/workflows" <<'PY'
+import re
+import shlex
 import sys
 from pathlib import Path
 import yaml
+
+def checkout_missing_packages(steps):
+    installed = set()
+    missing = set()
+    for step in steps:
+        if step.get('uses', '').startswith('actions/checkout@'):
+            missing.update({'nodejs', 'git', 'ca-certificates'} - installed)
+        if 'if' in step or step.get('continue-on-error'):
+            continue
+        script = step.get('run', '').replace('\\\n', ' ')
+        for packages in re.findall(r'(?m)^\s*apt-get\s+install\s+([^\n]+)', script):
+            installed.update(shlex.split(packages, comments=True))
+    return missing
+
+# Original nonrig ordering, kept in memory so dirty workflows are never restored.
+original_steps = yaml.safe_load('''
+- name: checkout
+  uses: actions/checkout@v4
+- name: install git + sqlite3 + Python/PyYAML (CI script and workflow checks)
+  run: |
+    set -euo pipefail
+    apt-get update -y
+    apt-get install -y --no-install-recommends git sqlite3 ca-certificates python3 python3-yaml
+    rm -rf /var/lib/apt/lists/*
+''')
+assert checkout_missing_packages(original_steps) == {'nodejs', 'git', 'ca-certificates'}
+fixed_steps = list(reversed(original_steps))
+assert checkout_missing_packages(fixed_steps) == {'nodejs'}
+fixed_steps[0]['run'] = fixed_steps[0]['run'].replace(' git ', ' nodejs git ')
+assert not checkout_missing_packages(fixed_steps)
+print('Regression red/green: original checkout-first rejected; '
+      'reordering alone rejected; Node + git before checkout accepted')
 
 directory = Path(sys.argv[1])
 workflows = sorted([*directory.glob('*.yml'), *directory.glob('*.yaml')])
@@ -75,14 +111,23 @@ for path in workflows:
             print(f'FAIL {path.name}:{name}: unsupported runs-on {selector!r}',
                   file=sys.stderr)
             failures += 1
+        container = job.get('container', {})
+        image = container.get('image', '') if isinstance(container, dict) else container
+        if not image.startswith('mcr.microsoft.com/dotnet/sdk:'):
+            continue
+        missing = checkout_missing_packages(job.get('steps', []))
+        if missing:
+            print(f'FAIL {path.name}:{name}: SDK checkout before '
+                  f'installing {", ".join(sorted(missing))}', file=sys.stderr)
+            failures += 1
 print(f'Checked {job_count} jobs in {len(workflows)} workflows; '
-      f'{failures} unsupported selectors')
+      f'{failures} runner-label/bootstrap failures')
 sys.exit(1 if failures else 0)
 PY
 then
-    ok "all Gitea workflow jobs parse and use only ubuntu-latest/k8s labels"
+    ok "all Gitea jobs parse, use supported labels, and bootstrap SDK checkout"
 else
-    bad "Gitea workflow YAML/runner-label validation failed (python3 + PyYAML required)"
+    bad "Gitea workflow YAML/runner-label/bootstrap validation failed (python3 + PyYAML required)"
 fi
 
 head_ "containerized (no host-tool dependence)"

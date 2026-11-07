@@ -37,18 +37,18 @@ jobs:
     container:
       image: mcr.microsoft.com/dotnet/sdk:9.0.305-noble
     steps:
+      - name: install nodejs + git + python3 + jprm (checkout and packaging)
+        run: |
+          set -euo pipefail
+          apt-get update -y
+          apt-get install -y --no-install-recommends nodejs git python3 python3-pip ca-certificates
+          rm -rf /var/lib/apt/lists/*
+          pip install --no-cache-dir --break-system-packages jprm
+
       - name: checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: install git + python3 + jprm (base SDK image ships neither)
-        run: |
-          set -euo pipefail
-          apt-get update -y
-          apt-get install -y --no-install-recommends git python3 python3-pip ca-certificates
-          rm -rf /var/lib/apt/lists/*
-          pip install --no-cache-dir --break-system-packages jprm
 
       - name: mark repo safe for git (container UID != checkout owner)
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"

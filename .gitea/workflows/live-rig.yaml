@@ -53,16 +53,16 @@ jobs:
     container:
       image: mcr.microsoft.com/dotnet/sdk:9.0.305-noble
     steps:
-      - name: checkout
-        uses: actions/checkout@v4
-
-      - name: install podman + git + sqlite3 + curl (needed by the rig + extract steps)
+      - name: install nodejs + podman + git + sqlite3 + curl (checkout, rig and extract steps)
         run: |
           set -euo pipefail
           apt-get update -y
           apt-get install -y --no-install-recommends \
-            podman git sqlite3 curl ca-certificates jellyfin-ffmpeg
+            nodejs podman git sqlite3 curl ca-certificates jellyfin-ffmpeg
           rm -rf /var/lib/apt/lists/*
+
+      - name: checkout
+        uses: actions/checkout@v4
 
       - name: mark repo safe for git (container UID != checkout owner)
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
