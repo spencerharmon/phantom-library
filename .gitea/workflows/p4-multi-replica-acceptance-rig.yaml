@@ -35,6 +35,9 @@ jobs:
   p4-multi-replica-acceptance:
     name: P4 multi-replica acceptance (deployed dev color, live, >=2 replicas)
     runs-on: [k8s]
+    defaults:
+      run:
+        shell: bash
     container:
       image: mcr.microsoft.com/dotnet/sdk:9.0.305-noble
     steps:

@@ -32,6 +32,9 @@ jobs:
   release:
     name: package + publish release
     runs-on: [k8s]
+    defaults:
+      run:
+        shell: bash
     # Pinned .NET SDK toolchain — same concrete tag as the other gitea
     # workflows so the release build cannot drift onto an untested SDK.
     container:

@@ -42,6 +42,9 @@ jobs:
   nonrig-build-test:
     name: nonrig build + test
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
     # Pinned .NET SDK toolchain — matches the net9.0 TargetFramework every
     # csproj in this repo declares (see Directory.Build.props /
     # src/**/*.csproj). A concrete tag (not `:9.0`/`:latest`) so the gate

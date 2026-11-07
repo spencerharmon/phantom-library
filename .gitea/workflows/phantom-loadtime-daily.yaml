@@ -34,6 +34,9 @@ jobs:
   loadtime-daily:
     name: daily load-time measurement (deployed dev color, live)
     runs-on: [k8s]
+    defaults:
+      run:
+        shell: bash
     container:
       image: mcr.microsoft.com/dotnet/sdk:9.0.305-noble
     steps:

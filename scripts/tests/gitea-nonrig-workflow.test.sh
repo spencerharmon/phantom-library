@@ -115,6 +115,8 @@ for path in workflows:
         image = container.get('image', '') if isinstance(container, dict) else container
         if not image.startswith('mcr.microsoft.com/dotnet/sdk:'):
             continue
+        assert job.get('defaults', {}).get('run', {}).get('shell') == 'bash', \
+            f'{path.name}:{name}: SDK steps require bash for pipefail'
         missing = checkout_missing_packages(job.get('steps', []))
         if missing:
             print(f'FAIL {path.name}:{name}: SDK checkout before '
