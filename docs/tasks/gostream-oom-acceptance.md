@@ -31,6 +31,66 @@ or proof that Go's soft memory limit prevents all future OOMs.
 Run the offline regression with `./scripts/tests/gostream-oom-acceptance.test.sh`.
 No service installation or restart is needed to use either script.
 
+## Pre-Rollout Diagnostics
+
+When tuning rollout is absent or unverified, use the same CLI with an explicit,
+separate observation interval. Do not invent a rollout time from Deployment
+creation, a restart, or the analysis clock. `expected.json` may carry
+`"rollout_at": null`; its container and intended tuning fields remain required.
+
+```bash
+./scripts/gostream-oom-acceptance.sh \
+  --diagnostic --observed-from 2026-11-07T00:55:28Z \
+  --observed-until 2026-11-08T00:55:28Z \
+  --pods pods.json --deployment deployment.json --replicasets replicasets.json \
+  --rss rss-24h-max.json --limits limits.json \
+  --expected-tuning expected.json --now 2026-11-08T00:55:28Z
+```
+
+`--replicasets` is raw ReplicaSet JSON or a List of the target Deployment's
+ReplicaSets. The namespace, controller Deployment name/UID, and pod controller
+ReplicaSet name/UID must match. This ownership proof is independent of tuning
+rollout or sampling coverage. No ready/updated Deployment status is needed, but
+the pod inventory must still contain exactly the desired replicas. Omit
+`--runtime` and `--coverage`: diagnostic mode refuses these acceptance receipts
+rather than implying it validated them. Supplying an interval without
+`--diagnostic` is an error; default acceptance is unchanged.
+
+Output is one verdict followed by a JSON report:
+
+- `DIAGNOSTIC_OOM_OBSERVED` (exit **6**): a validated current/last-state OOM
+  finished inside the inclusive observation interval. This is **not** an OOM
+  attributed to tuning rollout.
+- `DIAGNOSTIC_INCOMPLETE` (exit **2**): no retained OOM inside the interval.
+  This does **not** establish absence of OOMs. Out-of-interval events are retained
+  and labeled, and event history remains unknown, including truncated lastState.
+- `INCOMPLETE` (exit **2**): malformed or foreign evidence, including invalid
+  event timestamps, ownership, restart counts, or container identities.
+
+Diagnostics never return ACCEPTED/0, even with a supplied rollout timestamp.
+Rollout is `unknown` for null or `unverified` otherwise; coverage is always
+`unknown` and headroom always `unavailable`. Reports retain namespace, pod UID,
+container name/ID, event source, finish time, and current restart count. They do
+not infer a previous restart count from a single snapshot. This is shared-service
+evidence, equally applicable to movies and episodes, not playback attribution.
+
+Keep raw `id` cgroup labels on RSS and limit vectors, including old container IDs.
+Every RSS row is retained independently, with no summed maxima or extra pod count.
+Exact duplicate cgroup identities are refused. Container association recognizes
+complete containerd-style systemd or cgroupfs **burstable** paths containing the
+pod UID and a current/last-state container ID. Other layouts or older IDs remain
+visible as `unproved ID association`, not guessed from a suffix. A matching
+`name` label, when present, must agree with the container token. Limits are joined
+only by the full namespace/pod/container/cgroup identity and evaluation time;
+missing historical limits, differing limits, or unproved associations cannot
+produce headroom. Even matching limits cannot prove historical sampling coverage.
+RSS maxima still describe the input query's window, not necessarily the diagnostic
+event interval. Acceptance retains its stricter one-series-per-pod/container rule.
+
+Run `./scripts/tests/gostream-oom-prerollout.test.sh` for the sanitized day26
+offline replay, adversarial diagnostic cases, and the unchanged acceptance suite.
+No deployment, restart, traffic generation, promotion, or tuning changes occur.
+
 ## Required Evidence
 
 - `--pods`: raw `kubectl get pod -o json`, a Pod or List containing **all and only**

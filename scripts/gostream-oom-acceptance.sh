@@ -103,15 +103,35 @@ def analyse():
         parser.add_argument('--' + flag, required=True)
     parser.add_argument('--runtime', help='JSON array of retained process env/config receipts')
     parser.add_argument('--coverage', help='Retained rollout inventory and RSS sampling coverage receipt')
+    parser.add_argument('--diagnostic', action='store_true', help='Non-accepting pre-rollout observations')
+    parser.add_argument('--observed-from', help='Diagnostic interval start (RFC3339, inclusive)')
+    parser.add_argument('--observed-until', help='Diagnostic interval end (RFC3339, inclusive)')
+    parser.add_argument('--replicasets', help='Raw ReplicaSet or List proving diagnostic pod ownership')
     args = parser.parse_args()
     now = stamp(args.now)
+    require(args.diagnostic or not (args.observed_from or args.observed_until or args.replicasets),
+            'observation interval and ReplicaSets require --diagnostic')
+    if args.diagnostic:
+        require(args.observed_from and args.observed_until, 'diagnostic observation interval required')
+        first_observed, last_observed = stamp(args.observed_from), stamp(args.observed_until)
+        require(first_observed <= last_observed <= now, 'invalid observation interval')
+        require(not args.runtime and not args.coverage,
+                'diagnostics do not certify runtime or rollout coverage; omit --runtime/--coverage')
+        report = {'rollout': 'unknown', 'coverage': 'unknown', 'headroom': 'unavailable',
+                  'event_history': 'unknown', 'scope': 'shared-service',
+                  'observed_from': args.observed_from, 'observed_until': args.observed_until,
+                  'pods': [], 'events': [], 'rss': [],
+                  'rss_note': 'per-cgroup maxima are not summed; multiple IDs are not independent pods'}
     coverage = load(args.coverage) if args.coverage else None
     expected = load(args.expected_tuning)
     require(set(expected) == {'container', 'rollout_at', 'env', 'config'}, "invalid expected-tuning fields")
     container = expected['container']
     require(isinstance(container, str) and container, "missing expected container")
-    rollout = stamp(expected['rollout_at'])
-    require(rollout <= now, "future rollout")
+    rollout = None if args.diagnostic and expected['rollout_at'] is None else stamp(expected['rollout_at'])
+    require(rollout is None or rollout <= now, "future rollout")
+    if args.diagnostic:
+        report['rollout'] = 'unknown' if rollout is None else 'unverified'
+        report['rollout_at'] = expected['rollout_at']
     for key in ('env', 'config'):
         require(isinstance(expected[key], dict), f"expected {key} must be an object")
     require(expected['env'] or expected['config'], "empty tuning expectation")
@@ -123,16 +143,32 @@ def analyse():
     spec, status = deploy['spec'], deploy['status']
     desired = spec.get('replicas', 1)
     require(type(desired) is int and desired > 0, "no desired replicas")
-    require(status['observedGeneration'] == deploy['metadata']['generation'], "deployment generation not observed")
-    require(all(status.get(k, 0) == desired for k in
-                ('replicas', 'updatedReplicas', 'readyReplicas', 'availableReplicas'))
-            and status.get('unavailableReplicas', 0) == 0, "deployment rollout incomplete")
+    if not args.diagnostic:
+        require(status['observedGeneration'] == deploy['metadata']['generation'], "deployment generation not observed")
+        require(all(status.get(k, 0) == desired for k in
+                    ('replicas', 'updatedReplicas', 'readyReplicas', 'availableReplicas'))
+                and status.get('unavailableReplicas', 0) == 0, "deployment rollout incomplete")
     selector = spec['selector']
     require(selector.get('matchLabels') and not selector.get('matchExpressions'), "unsupported/empty deployment selector")
     template = named(spec['template']['spec']['containers'], container)
     payload = load(args.pods)
     pods = [payload] if payload.get('kind') == 'Pod' else payload['items']
     require(isinstance(pods, list) and len(pods) == desired, "pod set must cover exactly all deployment replicas")
+    replica_owners, container_ids = {}, {}
+    if args.diagnostic:
+        require(args.replicasets, 'diagnostic ReplicaSet ownership evidence required')
+        rs_payload = load(args.replicasets)
+        replicasets = [rs_payload] if rs_payload.get('kind') == 'ReplicaSet' else rs_payload['items']
+        for rs in replicasets:
+            meta = rs['metadata']
+            require(rs['kind'] == 'ReplicaSet' and meta['namespace'] == namespace,
+                    'foreign ReplicaSet')
+            owners = [o for o in meta['ownerReferences'] if o.get('controller') is True]
+            require(len(owners) == 1 and owners[0]['kind'] == 'Deployment'
+                    and owners[0]['uid'] == deploy['metadata']['uid']
+                    and owners[0]['name'] == deploy['metadata']['name'], 'ReplicaSet owner mismatch')
+            require(meta['uid'] not in replica_owners, 'duplicate ReplicaSet UID')
+            replica_owners[meta['uid']] = meta['name']
     receipts = load(args.runtime) if args.runtime else []
     require(isinstance(receipts, list), "runtime receipts must be an array")
     runtime = {}
@@ -160,6 +196,8 @@ def analyse():
         if coverage is not None:
             require(coverage['replicaset_owners'][owners[0]['uid']] == deploy['metadata']['uid'],
                     'ReplicaSet belongs to a different deployment')
+        if args.diagnostic:
+            require(replica_owners.get(owners[0]['uid']) == owners[0]['name'], 'pod owner mismatch')
         require(meta['uid'] not in pod_uids, 'duplicate pod UID')
         pod_uids.add(meta['uid'])
         created = stamp(meta['creationTimestamp'])
@@ -171,7 +209,7 @@ def analyse():
         state = named(pod['status']['containerStatuses'], container)
         limit = memory(live['resources']['limits']['memory'])
         require(limit > 0 and limit == memory(template['resources']['limits']['memory']), "incoherent memory limits")
-        if created < rollout:
+        if rollout is not None and created < rollout:
             absent.append(f"{meta['name']}: pod predates tuning rollout")
         for field in ('image', 'command', 'args', 'env', 'envFrom'):
             if live.get(field) != template.get(field):
@@ -187,7 +225,19 @@ def analyse():
                 finished = stamp(term['finishedAt'])
                 require(created <= finished <= now, "termination timestamp outside pod lifetime")
                 require(isinstance(term['reason'], str) and term['reason'], "missing termination reason")
-                if term['reason'] == 'OOMKilled' and finished >= rollout:
+                if args.diagnostic:
+                    cid = term['containerID']
+                    require(isinstance(cid, str) and re.fullmatch(r'[a-z0-9-]+://[A-Za-z0-9_.-]+', cid),
+                            'invalid terminated container ID')
+                    if 'startedAt' in term:
+                        require(created <= stamp(term['startedAt']) <= finished, 'invalid termination start')
+                    inside = first_observed <= finished <= last_observed
+                    report['events'].append({'namespace': namespace, 'pod': meta['name'],
+                        'pod_uid': meta['uid'], 'container': container, 'container_id': cid,
+                        'source': field, 'reason': term['reason'], 'finished_at': term['finishedAt'],
+                        'interval': 'observed_in_diagnostic_interval' if inside else 'outside_observation_interval'})
+                if term['reason'] == 'OOMKilled' and (first_observed <= finished <= last_observed
+                        if args.diagnostic else finished >= rollout):
                     ooms.append(f"{meta['name']} finished_at={term['finishedAt']}")
         restarts = state['restartCount']
         require(type(restarts) is int and restarts >= 0, "invalid restart count")
@@ -204,6 +254,21 @@ def analyse():
             if previous:
                 require(stamp(previous['finishedAt']) <= started,
                         "previous termination follows current start")
+        if args.diagnostic:
+            cid = state['containerID']
+            require(isinstance(cid, str) and re.fullmatch(r'[a-z0-9-]+://[A-Za-z0-9_.-]+', cid),
+                    'invalid current container ID')
+            current_term = state.get('state', {}).get('terminated')
+            require(not current_term or current_term['containerID'] == cid, 'current container ID mismatch')
+            require(not previous or previous['containerID'] != cid, 'previous container ID equals current container ID')
+            if previous and current_term:
+                boundary = current_term.get('startedAt', current_term['finishedAt'])
+                require(stamp(previous['finishedAt']) <= stamp(boundary),
+                        'previous termination follows current termination/start')
+            container_ids[key] = (meta['uid'], cid, previous['containerID'] if previous else None, limit, created)
+            report['pods'].append({'namespace': namespace, 'pod': meta['name'], 'pod_uid': meta['uid'],
+                                  'container': container, 'container_id': cid, 'restart_count': restarts})
+            continue
         receipt = runtime.pop((meta['uid'], container), None)
         if receipt is not None:
             require(receipt['container_id'] == state['containerID'] and started is not None
@@ -225,6 +290,62 @@ def analyse():
                     absent.append(f"{meta['name']}: config {name} mismatch")
         details.append((key, limit, created))
     require(not runtime, "foreign runtime receipt")
+    if args.diagnostic:
+        # Preserve every series. A cgroup identity proves association, not historical coverage.
+        vectors = {}
+        for source in ('rss', 'limits'):
+            payload = load(getattr(args, source))
+            require(payload['status'] == 'success' and not payload.get('warnings'), 'unsuccessful/partial metric query')
+            data = payload['data']
+            require(data['resultType'] == 'vector' and isinstance(data['result'], list), 'invalid metric vector')
+            rows = {}
+            for row in data['result']:
+                labels = row['metric']
+                key = tuple(labels[k] for k in ('namespace', 'pod', 'container'))
+                require(key in identities, 'foreign metric identity')
+                cgroup = labels.get('id', '')
+                require(isinstance(cgroup, str), 'invalid cgroup ID')
+                identity = key + (cgroup,)
+                require(identity not in rows, 'duplicate metric cgroup identity')
+                require(len(row['value']) == 2, 'invalid vector sample')
+                at, value = map(number, row['value'])
+                require(0 <= now - at <= 300 and at >= container_ids[key][4], 'stale/future metric sample')
+                rows[identity] = (at, value, labels)
+            vectors[source] = rows
+        for identity, (at, value, labels) in vectors['rss'].items():
+            key, cgroup = identity[:3], identity[3]
+            pod_uid, current, previous, limit, _ = container_ids[key]
+            associated = None
+            for cid in (current, previous):
+                if cid is None:
+                    continue
+                runtime_name, token = cid.split('://', 1)
+                # Match complete pod/container path components, never a suffix substring.
+                systemd = (f'/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod'
+                           f'{pod_uid.replace("-", "_")}.slice/cri-{runtime_name}-{token}.scope')
+                cgroupfs = f'/kubepods/burstable/pod{pod_uid}/{token}'
+                if cgroup in (systemd, cgroupfs) and labels.get('name', token) == token:
+                    associated = cid
+            unavailable = 'unproved ID association'
+            observed_limit = vectors['limits'].get(identity)
+            if associated:
+                unavailable = 'historical limit unavailable' if associated != current else 'current limit unavailable'
+                if observed_limit:
+                    if observed_limit[1] != limit:
+                        unavailable = 'limit mismatch'
+                    elif observed_limit[0] != at or observed_limit[2].get('name') != labels.get('name'):
+                        unavailable = 'limit identity/time mismatch'
+                    else:
+                        unavailable = 'historical sampling coverage unknown'
+            report['rss'].append({'namespace': key[0], 'pod': key[1], 'container': key[2],
+                'cgroup_id': cgroup, 'container_id': associated, 'rss_bytes': str(value),
+                'limit_bytes': str(observed_limit[1]) if observed_limit else None,
+                'headroom': 'unavailable', 'reason': unavailable})
+        report['limits'] = [{'namespace': k[0], 'pod': k[1], 'container': k[2],
+                             'cgroup_id': k[3], 'limit_bytes': str(v[1])}
+                            for k, v in vectors['limits'].items()]
+        report['gaps'] = sorted(set(gaps))
+        return (6 if ooms else 2), ('DIAGNOSTIC_OOM_OBSERVED' if ooms else 'DIAGNOSTIC_INCOMPLETE'), json.dumps(report, sort_keys=True)
     if coverage is not None:
         inventory = coverage['pod_uids_since_rollout']
         require(isinstance(inventory, list) and len(inventory) == len(set(inventory)),

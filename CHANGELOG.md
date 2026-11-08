@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Extend the offline gostream OOM CLI with explicit non-accepting pre-rollout
+  diagnostics: validated incident identities/times and per-cgroup historical RSS
+  remain visible without inventing rollout or coverage proof. Default acceptance
+  stays strict. See the [diagnostic guide](docs/tasks/gostream-oom-acceptance.md#pre-rollout-diagnostics).
 - Add a fail-closed offline gostream OOM/tuning acceptance analyser over retained
   pod, deployment and memory metrics, with explicit runtime/history coverage
   receipts. No deployment or memory-limit changes. See the
