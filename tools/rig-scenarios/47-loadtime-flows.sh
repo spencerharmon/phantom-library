@@ -546,22 +546,26 @@ WORK_DIR="$(mktemp -d)"
 discovery_id() {
     python3 -c '
 import json, re, sys
-expected, name = sys.argv[1:]
+expected, name, limit = sys.argv[1:]
 try:
     data = json.load(sys.stdin)
     items = data if expected == "User" else data["Items"]
-    if not isinstance(items, list) or not items:
+    if not isinstance(items, list) or (not items and not limit):
         raise ValueError()
-    item = next(i for i in items if i.get("Name") == name) if name else items[0]
-    if expected not in ("User", "Channel") and item.get("Type") != expected:
-        raise ValueError()
-    item_id = item["Id"]
-    if not isinstance(item_id, str) or not re.fullmatch(r"[A-Za-z0-9-]+", item_id):
-        raise ValueError()
-    print(item_id)
+    selected = items[:int(limit)] if limit else [next(i for i in items if i.get("Name") == name) if name else items[0]]
+    ids = []
+    for item in selected:
+        if expected not in ("User", "Channel") and item.get("Type") != expected:
+            raise ValueError()
+        item_id = item["Id"]
+        if not isinstance(item_id, str) or not re.fullmatch(r"[A-Za-z0-9-]+", item_id):
+            raise ValueError()
+        ids.append(item_id)
+    if ids:
+        print("\n".join(ids))
 except (ValueError, KeyError, TypeError, AttributeError, StopIteration):
     sys.exit(1)
-' "$1" "${2:-}"
+' "$1" "${2:-}" "${3:-}"
 }
 
 USER_ID="$(api "$API/Users" | discovery_id User)" || fail "could not resolve a Jellyfin user id"
@@ -603,13 +607,46 @@ time_flow() {
 MOVIE_ID="$(api "$API/Channels/$CH_MOVIES/Items?Limit=1&Fields=ProviderIds&userId=$USER_ID" | discovery_id Movie)" || fail "invalid Movie discovery"
 log "target type=Movie id=$MOVIE_ID"
 evidence target Movie "$MOVIE_ID"
-SERIES_ID="$(api "$API/Channels/$CH_SHOWS/Items?Limit=1&userId=$USER_ID" | discovery_id Series)" || fail "invalid Series discovery"
-log "target type=Series id=$SERIES_ID"
-evidence target Series "$SERIES_ID"
-SEASON_ID="$(api "$API/Channels/$CH_SHOWS/Items?Limit=1&userId=$USER_ID&FolderId=$SERIES_ID" | discovery_id Season)" || fail "invalid Season discovery"
-log "target type=Season id=$SEASON_ID"
-evidence target Season "$SEASON_ID"
-EPISODE_ID="$(api "$API/Channels/$CH_SHOWS/Items?Limit=1&userId=$USER_ID&FolderId=$SEASON_ID" | discovery_id Episode)" || fail "invalid Episode discovery"
+# Bounded, user-scoped traversal: at most 5 series x 5 seasons x 20 episodes.
+# States is the existing badge contract, not a playback probe. Phantom means
+# not known dead/stale, not guaranteed playable; actual playback stays measured.
+SERIES_IDS="$(api "$API/Channels/$CH_SHOWS/Items?Limit=5&userId=$USER_ID" | discovery_id Series '' 5)" || fail "invalid Series discovery"
+EPISODE_ID=""
+while IFS= read -r SERIES_ID; do
+    [ -n "$SERIES_ID" ] || continue
+    log "target type=Series id=$SERIES_ID"
+    evidence target Series "$SERIES_ID"
+    SEASON_IDS="$(api "$API/Channels/$CH_SHOWS/Items?Limit=5&userId=$USER_ID&FolderId=$SERIES_ID" | discovery_id Season '' 5)" || fail "invalid Season discovery"
+    while IFS= read -r SEASON_ID; do
+        [ -n "$SEASON_ID" ] || continue
+        log "target type=Season id=$SEASON_ID"
+        evidence target Season "$SEASON_ID"
+        EPISODE_IDS="$(api "$API/Channels/$CH_SHOWS/Items?Limit=20&userId=$USER_ID&FolderId=$SEASON_ID" | discovery_id Episode '' 20)" || fail "invalid Episode discovery"
+        [ -n "$EPISODE_IDS" ] || continue
+        payload="$(printf '%s' "$EPISODE_IDS" | python3 -c 'import json,sys; print(json.dumps({"ids": sys.stdin.read().splitlines()}))')"
+        states="$(json_post -d "$payload" "$API/Plugins/PhantomLibrary/States")" || fail "episode availability HTTP failure"
+        EPISODE_ID="$(printf '%s' "$states" | python3 -c '
+import json, sys
+try:
+    states = json.load(sys.stdin)
+    if not isinstance(states, dict):
+        raise ValueError()
+    for item in sys.argv[1].splitlines():
+        state = states.get(item)
+        if state in ("Phantom", "Materialised"):
+            print(item)
+            break
+        print("# episode discovery skipped id=" + item + " (not an eligible availability state)", file=sys.stderr)
+except (ValueError, TypeError):
+    sys.exit(1)
+' "$EPISODE_IDS")" || fail "invalid episode availability response"
+        [ -z "$EPISODE_ID" ] || break 2
+    done <<<"$SEASON_IDS"
+done <<<"$SERIES_IDS"
+if [ -z "$EPISODE_ID" ]; then
+    evidence discovery-failure no-playable-episode 1
+    fail "no-playable-episode within discovery bound (5 series x 5 seasons x 20 episodes)"
+fi
 log "target type=Episode id=$EPISODE_ID"
 evidence target Episode "$EPISODE_ID"
 evidence stage discovery 0 "$DISCOVERY_START"

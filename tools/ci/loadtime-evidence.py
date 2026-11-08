@@ -72,10 +72,11 @@ def main():
         elif action == "discovery-failure":
             reason, code = args
             if reason not in ("kube-lookup-timeout", "kube-lookup-error",
-                              "host-not-found", "evidence-write-failed"):
+                              "host-not-found", "evidence-write-failed", "no-playable-episode"):
                 raise ValueError("invalid discovery failure reason")
             # Enumerated reason + exit code only; never kubectl stderr or URLs.
-            data["discovery_failure"] = dict(reason=reason, kubectl_exit_code=int(code))
+            code_key = "exit_code" if reason == "no-playable-episode" else "kubectl_exit_code"
+            data["discovery_failure"] = dict(reason=reason, **{code_key: int(code)})
         elif action == "stage":
             stage, code, started, *duration = args
             if stage not in ("discovery", "measure", "push", "guard"):

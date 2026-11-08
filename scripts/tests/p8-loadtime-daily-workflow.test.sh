@@ -892,7 +892,7 @@ elif p.path == '/Channels':
     body = {'Items': [{'Name': 'Phantom Movies', 'Id': 'movies'},
                       {'Name': 'Phantom Shows', 'Id': 'shows'}]}
 elif p.path.startswith('/Channels/'):
-    if q.get('Limit') == ['1']:
+    if q.get('Limit') in (['1'], ['5'], ['20']):
         stage = 'Movie' if '/movies/' in p.path else {
             ids['Series']: 'Season', ids['Season']: 'Episode'
         }.get(q.get('FolderId', [''])[0], 'Series')
@@ -903,6 +903,8 @@ elif p.path.startswith('/Channels/'):
         if mode == 'requests' and channel == 'movies' and 'SortOrder' not in q:
             code, http = 22, '500'
 elif p.path == '/Plugins/PhantomLibrary/States':
+    body = {i: 'StaleReprobePending' if mode == 'dead-episodes' else 'Phantom'
+            for i in json.loads(data)['ids']}
     if mode == 'requests' and 'shows-card' in data:
         code, http = 28, '000'
 elif p.path.startswith(('/Items/', '/Videos/')):
@@ -1026,7 +1028,7 @@ def run(name, fault='', directory=None, **overrides):
     assert type(manifest['exit_code']) is int and manifest['exit_code'] == result.returncode
     assert manifest['status'] == ('complete' if result.returncode == 0 else 'failed'), manifest
     assert manifest['color'] == ('unknown' if fault in ('color', 'hang', 'nohost') else 'green'), manifest
-    if fault not in ('color', 'hang', 'nohost'):
+    if fault not in ('color', 'hang', 'nohost', 'dead-episodes', 'Series:empty', 'Season:empty', 'Episode:empty'):
         assert 'discovery_failure' not in manifest, manifest
     assert isinstance(manifest['targets'], dict) and isinstance(manifest['failures'], list)
     for failure in manifest['failures']:
@@ -1146,6 +1148,15 @@ for kind in ids:
                        or r['query'].get('Limit') == ['200'] or r['path'].endswith('/phantom-loadtime')
                        for r in requests), (kind, fault, requests)
 print('EVIDENCE PASS: 28 typed discovery failures retain exactly the validated prefix and never time/push a batch')
+
+result, manifest, _, requests, _ = run('dead-episodes', 'dead-episodes')
+assert result.returncode != 0, result
+assert manifest['discovery_failure'] == {'reason': 'no-playable-episode', 'exit_code': 1}, manifest
+assert manifest['stages']['discovery']['exit_code'] != 0, manifest
+assert 'push' not in manifest['stages'] and 'guard' not in manifest['stages'], manifest
+assert not any(r['path'].startswith(('/Items/', '/Videos/')) or r['query'].get('Limit') == ['200']
+               or r['path'].endswith('/phantom-loadtime') for r in requests), requests
+print('EVIDENCE PASS: no playable episode retains reason and failed stages; no timing or successful batch push')
 
 result, manifest, _, requests, _ = run('color-failure', 'color')
 assert result.returncode != 0 and manifest['targets'] == {} and not requests, manifest

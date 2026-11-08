@@ -279,6 +279,7 @@ with open(os.environ['CURL_LOG'], 'a') as log:
     log.write(json.dumps([method, parsed.path, query, post_body]) + '\n')
 ids = dict(user='1' * 32, movie='2' * 32, series='3' * 32,
            season='4' * 32, episode='5' * 32)
+mode = os.environ.get('CURL_EPISODES', '')
 stage = None
 if parsed.path == '/Users':
     stage = 'user'
@@ -288,13 +289,28 @@ elif parsed.path == '/Channels':
     body = {'Items': [{'Name': 'Phantom Movies', 'Id': 'movies'},
                       {'Name': 'Phantom Shows', 'Id': 'shows'}]}
 elif parsed.path.startswith('/Channels/'):
-    if query.get('Limit') == ['1']:
+    if query.get('Limit') != ['200']:
         if '/movies/' in parsed.path:
             stage = 'movie'
         else:
             folder = query.get('FolderId', [''])[0]
-            stage = {ids['series']: 'season', ids['season']: 'episode'}.get(folder, 'series')
+            stage = {ids['series']: 'season', ids['season']: 'episode',
+                     '7' * 32: 'season', '8' * 32: 'episode'}.get(folder, 'series')
         body = {'Items': [{'Id': ids[stage], 'Type': stage.title()}]}
+        if stage == 'episode' and mode == 'dead-first':
+            body['Items'].append({'Id': '6' * 32, 'Type': 'Episode'})
+            body['Items'] = body['Items'][:int(query['Limit'][0])]
+        if mode in ('next-season', 'next-series'):
+            if stage == ('season' if mode == 'next-season' else 'series'):
+                body['Items'].append({'Id': ('8' if stage == 'season' else '7') * 32,
+                                      'Type': stage.title()})
+            if stage == 'season' and folder == '7' * 32:
+                body['Items'] = [{'Id': '8' * 32, 'Type': 'Season'}]
+            if stage == 'episode' and folder == '8' * 32:
+                body['Items'] = [{'Id': '6' * 32, 'Type': 'Episode'}]
+        if mode == 'bound' and stage in ('series', 'season', 'episode'):
+            # Deliberately ignore Limit: the client must enforce its own bound.
+            body['Items'] *= 21
     else:
         # Root list/sort pages: a user-scoped catalogue of 401+ items per root
         # (forces >1 page of 200 AND >1 badge batch of 400); an unscoped
@@ -311,6 +327,17 @@ elif parsed.path.startswith('/Channels/'):
         start = int(query.get('StartIndex', ['0'])[0])
         limit = int(query.get('Limit', ['0'])[0])
         body = {'Items': items[start:start + limit], 'TotalRecordCount': len(items)}
+elif parsed.path == '/Plugins/PhantomLibrary/States':
+    body = {i: 'Phantom' for i in post_body['ids']}
+    if mode in ('dead-first', 'next-season', 'next-series', 'bound') and ids['episode'] in body:
+        body[ids['episode']] = 'StaleReprobePending'
+    if mode in ('Unavailable', 'Materialising', 'StaleReprobePending', 'unknown', 'Materialised'):
+        body = {i: mode for i in post_body['ids']}
+    if mode == 'missing-state':
+        body = {}
+    if mode == 'invalid-states':
+        body = []
+    stage = 'states'
 elif parsed.path.startswith(('/Items/', '/Videos/', '/Plugins/')):
     body = {}
 else:
@@ -388,11 +415,59 @@ def run(name, fault=''):
     assert env['PHANTOM_LOADTIME_TOKEN'] not in result.stderr, 'credential logged'
     return result, requests, out
 
+env['CURL_EPISODES'] = 'dead-first'
+result, requests, out = run('dead-first')
+del env['CURL_EPISODES']
+assert result.returncode == 0, result.stderr
+assert run.evidence['targets']['Episode'] == '6' * 32, ('dead episode chosen', run.evidence)
+assert not any(ids['episode'] in r[1] or str(uuid.UUID(ids['episode'])) in r[1]
+               for r in requests), 'dead episode was timed'
+assert any(r[1] == f'/Videos/{uuid.UUID("6" * 32)}/stream.mkv' for r in requests)
+print('LIVE: first episode dead, second Phantom selected and played; dead target never timed: PASS')
+
+for mode in ('next-season', 'next-series', 'Materialised'):
+    env['CURL_EPISODES'] = mode
+    result, requests, out = run(mode)
+    assert result.returncode == 0, (mode, result.stderr)
+    assert run.evidence['targets']['Episode'] == (ids['episode'] if mode == 'Materialised' else '6' * 32)
+    if mode != 'Materialised':
+        assert run.evidence['targets']['Season'] == '8' * 32
+    if mode == 'next-series':
+        assert run.evidence['targets']['Series'] == '7' * 32
+    assert all(r[2].get('userId') == [ids['user']] for r in requests
+               if r[1].startswith('/Channels/'))
+del env['CURL_EPISODES']
+print('LIVE: traversal continues to next season/series; Materialised is eligible: PASS')
+
+for mode in ('Unavailable', 'Materialising', 'StaleReprobePending', 'unknown', 'missing-state', 'bound'):
+    env['CURL_EPISODES'] = mode
+    result, requests, out = run(mode)
+    assert result.returncode != 0 and not result.stdout and not out.exists(), (mode, result)
+    assert 'no-playable-episode' in result.stderr
+    assert run.evidence['discovery_failure'] == {'reason': 'no-playable-episode', 'exit_code': 1}
+    assert run.evidence['stages']['discovery']['exit_code'] != 0
+    assert not any(r[1].startswith(('/Items/', '/Videos/')) or r[2].get('Limit') == ['200']
+                   for r in requests), (mode, requests)
+    if mode == 'bound':
+        assert len(run.badges) == 25 and all(len(b) == 20 for b in run.badges)
+        assert len([r for r in requests if r[2].get('Limit') == ['5']]) == 6
+del env['CURL_EPISODES']
+print('LIVE: unavailable/missing/unknown/in-flight states fail closed; 5x5x20 bound enforced; reason recorded, no batch: PASS')
+
+for mode, fault in (('invalid-states', ''), ('', 'states:http'), ('', 'states:malformed')):
+    env['CURL_EPISODES'] = mode
+    result, requests, out = run(mode or fault.replace(':', '-'), fault)
+    assert result.returncode != 0 and not result.stdout and not out.exists(), result
+    assert 'episode availability' in result.stderr, result.stderr
+    assert not any(r[1].startswith(('/Items/', '/Videos/')) for r in requests)
+del env['CURL_EPISODES']
+print('LIVE: failed/malformed availability response rejected before timing: PASS')
+
 result, requests, out = run('success')
 assert result.returncode == 0, result.stderr
 assert run.evidence['targets'] == {k.title(): v for k, v in ids.items() if k != 'user'}
 assert run.evidence['failures'] == []
-discovery = [r for r in requests if r[2].get('Limit') == ['1']]
+discovery = [r for r in requests if r[2].get('Limit') in (['1'], ['5'], ['20'])]
 assert [(r[1], r[2].get('FolderId')) for r in discovery] == [
     ('/Channels/movies/Items', None), ('/Channels/shows/Items', None),
     ('/Channels/shows/Items', [ids['series']]),
@@ -429,7 +504,7 @@ for root, n in (('movies', 405), ('shows', 413)):
             order.reverse()
         expected_badges += [order[i:i + 400] for i in range(0, n, 400)]
 assert [[r[1], r[2]] for r in pages] == expected_pages, pages
-assert run.badges == expected_badges, [len(b) for b in run.badges]
+assert run.badges == [[ids['episode']]] + expected_badges, [len(b) for b in run.badges]
 assert not any(i.startswith('latest-') for b in run.badges for i in b), 'unscoped latest leaked'
 assert 'items=405' in result.stderr and 'items=413' in result.stderr, result.stderr
 flows = ('list_load', 'sort_change', 'info_open', 'get_sources', 'materialise', 'play_materialised')

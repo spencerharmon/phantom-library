@@ -24,7 +24,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_POST(self):
-        self.rfile.read(int(self.headers.get('Content-Length', 0)))
+        self.post_body = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))))
         self.do_GET()
 
     def do_GET(self):
@@ -32,9 +32,10 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(url.query)
         page = q.get('Limit') == ['200']
         badge = url.path == '/Plugins/PhantomLibrary/States'
+        discovery_badge = badge and self.post_body == {'ids': [ids['episode']]}
         mode = self.server.mode
         if ((mode in ('page', 'sample-page', 'partial') and page)
-                or (mode in ('badge', 'sample-badge') and badge)
+                or (mode in ('badge', 'sample-badge') and badge and not discovery_badge)
                 or (mode == 'post' and self.command == 'POST' and not badge)):
             if mode == 'partial':
                 self.send_response(200)
@@ -49,11 +50,13 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == '/Channels':
             body = {'Items': [{'Name': 'Phantom Movies', 'Id': 'movies'},
                               {'Name': 'Phantom Shows', 'Id': 'shows'}]}
-        elif q.get('Limit') == ['1']:
+        elif q.get('Limit') in (['1'], ['5'], ['20']):
             kind = ('movie' if '/movies/' in url.path else
                     {ids['series']: 'season', ids['season']: 'episode'}.get(
                         q.get('FolderId', [''])[0], 'series'))
             body = {'Items': [{'Id': ids[kind], 'Type': kind.title()}]}
+        elif discovery_badge:
+            body = {ids['episode']: 'Phantom'}
         elif page:
             # Individually fast requests, but a catalogue that never ends.
             body = {'Items': [{'Id': 'item'}],
