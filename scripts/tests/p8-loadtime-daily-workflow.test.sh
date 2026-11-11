@@ -850,7 +850,7 @@ done
 head_ "retained evidence: real LIVE engine through the daily wrapper"
 unset TMPDIR
 if python3 - "$REPO_ROOT" "$TEST_TMP/retained" <<'PY'
-import json, math, os, pathlib, re, shutil, subprocess, sys, time
+import json, math, os, pathlib, re, shutil, statistics, subprocess, sys, time
 
 source, tmp = map(pathlib.Path, sys.argv[1:])
 tmp.mkdir()
@@ -863,7 +863,8 @@ thresholds = state / 'thresholds.json'
 evidence = state / 'loadtime-evidence'
 ids = dict(Movie='2' * 32, Series='3' * 32, Season='4' * 32, Episode='5' * 32)
 flows = ('list_load', 'sort_change', 'info_open', 'get_sources', 'materialise', 'play_materialised')
-secrets = ('token-DO-NOT-RETAIN', 'signed-DO-NOT-RETAIN', 'body-DO-NOT-RETAIN')
+secrets = ('token-DO-NOT-RETAIN', 'signed-DO-NOT-RETAIN', 'body-DO-NOT-RETAIN',
+           'stderr-DO-NOT-RETAIN', 'https://media.example.net/stream', 'https://dev.example.com')
 
 (bin_dir / 'curl').write_text(r'''#!/usr/bin/env python3
 import json, os, pathlib, sys
@@ -887,8 +888,10 @@ if '/metrics/job/' in p.path:
     if mode == 'push' and p.path.endswith('/phantom-loadtime'):
         code, http = 22, '503'
 elif p.path == '/Users':
+    stage = 'User'
     body = [{'Id': '1'*32}]
 elif p.path == '/Channels':
+    stage = 'Channels'
     body = {'Items': [{'Name': 'Phantom Movies', 'Id': 'movies'},
                       {'Name': 'Phantom Shows', 'Id': 'shows'}]}
 elif p.path.startswith('/Channels/'):
@@ -897,14 +900,20 @@ elif p.path.startswith('/Channels/'):
             ids['Series']: 'Season', ids['Season']: 'Episode'
         }.get(q.get('FolderId', [''])[0], 'Series')
         body = {'Items': [{'Id': ids[stage], 'Type': stage}]}
+        if stage == 'Episode' and mode.startswith('select:'):
+            body['Items'] = [{'Id': i, 'Type': 'Episode'} for i in ('6'*32, ids['Episode'], '7'*32)]
     else:
         channel = p.path.split('/')[2]
         body = {'Items': [{'Id': channel + '-card'}], 'TotalRecordCount': 1}
         if mode == 'requests' and channel == 'movies' and 'SortOrder' not in q:
             code, http = 22, '500'
 elif p.path == '/Plugins/PhantomLibrary/States':
+    if ids['Episode'] in json.loads(data)['ids']:
+        stage = 'Availability'
     body = {i: 'StaleReprobePending' if mode == 'dead-episodes' else 'Phantom'
             for i in json.loads(data)['ids']}
+    if stage and mode.startswith('select:'):
+        body = {'6'*32: 'Unavailable', ids['Episode']: mode.partition(':')[2], '7'*32: 'Materialised'}
     if mode == 'requests' and 'shows-card' in data:
         code, http = 28, '000'
 elif p.path.startswith(('/Items/', '/Videos/')):
@@ -913,14 +922,61 @@ elif p.path.startswith(('/Items/', '/Videos/')):
 else:
     raise SystemExit('unexpected test URL: ' + url)
 fault_type, _, fault = mode.partition(':')
-if stage and fault_type == stage:
-    if fault == 'wrong-type': body['Items'][0]['Type'] = 'Season' if stage == 'Episode' else 'Episode'
+if stage and fault_type.lower() == stage.lower():
+    if fault == 'http': code, http = 22, '503'
+    elif fault == 'timeout': code, http = 28, '000'
+    elif fault == 'timeout-headers': code, http = 28, '200'
+    elif fault == 'wrong-shape': body = {} if stage == 'User' else []
+    elif fault == 'null-body': body = None
+    elif fault == 'scalar-body': body = 'body-DO-NOT-RETAIN'
+    elif stage == 'Availability':
+        if fault == 'empty': body = {}
+        elif fault == 'missing-state': body = {'unrelated-id': 'Phantom'}
+        elif fault.startswith('state-'):
+            body = {ids['Episode']: {'unavailable': 'Unavailable', 'stale': 'StaleReprobePending',
+                    'unknown': 'NotAState', 'null': None, 'number': 7, 'bool': True,
+                    'list': [], 'object': {}}[fault[6:]]}
+    elif fault == 'items-object': body['Items'] = {}
+    elif fault == 'items-null': body['Items'] = None
+    elif fault == 'items-string': body['Items'] = 'body-DO-NOT-RETAIN'
+    elif fault == 'missing-items': del body['Items']
+    elif fault == 'empty':
+        if stage == 'User': body = []
+        else: body['Items'] = []
+    elif fault == 'non-object-item':
+        if stage == 'User': body = [None]
+        else: body['Items'] = [None]
+    elif stage in ('User', 'Channels'):
+        item = body[0] if stage == 'User' else body['Items'][1]
+        if fault == 'missing-id': del item['Id']
+        elif fault == 'null-id': item['Id'] = None
+        elif fault == 'numeric-id': item['Id'] = 123
+        elif fault == 'bool-id': item['Id'] = True
+        elif fault == 'empty-id': item['Id'] = ''
+        elif fault == 'oversized-id': item['Id'] = 'x' * 257
+        elif fault == 'unsafe-id': item['Id'] = 'bad?signature=signed-DO-NOT-RETAIN'
+        elif fault == 'missing-channel': body['Items'].pop()
+    elif fault == 'wrong-type': body['Items'][0]['Type'] = 'Season' if stage == 'Episode' else 'Episode'
     elif fault == 'missing-type': del body['Items'][0]['Type']
+    elif fault == 'null-type': body['Items'][0]['Type'] = None
+    elif fault == 'numeric-type': body['Items'][0]['Type'] = 123
+    elif fault == 'missing-id': del body['Items'][0]['Id']
     elif fault == 'null-id': body['Items'][0]['Id'] = None
+    elif fault == 'numeric-id': body['Items'][0]['Id'] = 123
+    elif fault == 'bool-id': body['Items'][0]['Id'] = True
+    elif fault == 'empty-id': body['Items'][0]['Id'] = ''
+    elif fault == 'oversized-id': body['Items'][0]['Id'] = 'x' * 257
     elif fault == 'unsafe-id': body['Items'][0]['Id'] = 'bad?signature=signed-DO-NOT-RETAIN'
-    elif fault == 'empty': body['Items'] = []
-    elif fault == 'http': code, http = 22, '503'
-text = '{broken' if stage and fault_type == stage and fault == 'malformed' else json.dumps(body)
+    # Unknown response fields and stderr must never be copied into evidence.
+    if isinstance(body, dict) and body: body['secret'] = 'body-DO-NOT-RETAIN'
+    elif isinstance(body, list) and body and isinstance(body[0], dict):
+        body[0]['secret'] = 'body-DO-NOT-RETAIN'
+    print('stderr-DO-NOT-RETAIN https://media.example.net/stream?signature=signed-DO-NOT-RETAIN', file=sys.stderr)
+text = ('{broken body-DO-NOT-RETAIN https://media.example.net/stream'
+        if stage and fault_type.lower() == stage.lower() and fault == 'malformed' else json.dumps(body))
+if '/metrics/job/' in p.path:
+    text = ''  # Pushgateway PUT returns no discovery response body.
+entry.update(discovery_kind=stage.lower(), curl_exit_code=code, http_status=http)
 with open(os.environ['EVIDENCE_REQUESTS'], 'a') as log:
     log.write(json.dumps(entry) + '\n')
 # Observe the actual active file BEFORE any engine discovery request returns.
@@ -1028,7 +1084,7 @@ def run(name, fault='', directory=None, **overrides):
     assert type(manifest['exit_code']) is int and manifest['exit_code'] == result.returncode
     assert manifest['status'] == ('complete' if result.returncode == 0 else 'failed'), manifest
     assert manifest['color'] == ('unknown' if fault in ('color', 'hang', 'nohost') else 'green'), manifest
-    if fault not in ('color', 'hang', 'nohost', 'dead-episodes', 'Series:empty', 'Season:empty', 'Episode:empty'):
+    if ':' not in fault and fault not in ('color', 'hang', 'nohost', 'dead-episodes'):
         assert 'discovery_failure' not in manifest, manifest
     assert isinstance(manifest['targets'], dict) and isinstance(manifest['failures'], list)
     for failure in manifest['failures']:
@@ -1045,6 +1101,8 @@ def run(name, fault='', directory=None, **overrides):
         assert secret not in path.read_text(), (name, 'secret in retained manifest')
     assert (logs / 'cleanup').read_text().splitlines() in (['0'], ['1']), 'cleanup not called once'
     assert not list(scratch.glob('loadtime-daily-*')), (name, 'wrapper scratch leaked')
+    # The real guard also builds here; MSBuild/NuGet scratch is not engine state.
+    assert not list(scratch.glob('tmp.*')), (name, 'engine scratch leaked', list(scratch.iterdir()))
     requests = [json.loads(s) for s in (logs / 'requests').read_text().splitlines()] if (logs / 'requests').exists() else []
     if (logs / 'active').exists():
         active = json.loads((logs / 'active').read_text())
@@ -1130,24 +1188,102 @@ assert first_path.read_bytes() == first_bytes, 'evidence died with executing che
 sha = checkout('second executing checkout')
 assert sha != old_sha
 seed()
-result, second, second_path, requests, logs = run('second', 'Series:wrong-type')
+result, second, second_path, requests, logs = run('second', 'Series:empty')
 assert result.returncode != 0 and second['targets'] == {'Movie': ids['Movie']}, second
 assert second['attempt_id'] != first['attempt_id'] and second['failures'] == [], second
+assert second['discovery_failure'] == {'reason': 'no-playable-episode', 'exit_code': 1}, second
 assert first_path.read_bytes() == first_bytes and second_path != first_path
 assert not any(r['path'].startswith(('/Items/', '/Videos/')) for r in requests), requests
 print('EVIDENCE PASS: checkout deletion/recreation preserves prior artifact/SHA; partial discovery has no stale targets')
 
-for kind in ids:
-    for fault in ('wrong-type', 'missing-type', 'null-id', 'unsafe-id', 'empty', 'malformed', 'http'):
-        result, manifest, _, requests, _ = run(f'discovery-{kind}-{fault}', f'{kind}:{fault}')
-        assert result.returncode != 0, (kind, fault)
-        preceding = list(ids)[:list(ids).index(kind)]
-        assert manifest['targets'] == {k: ids[k] for k in preceding}, (kind, fault, manifest)
-        assert 'push' not in manifest['stages'] and 'guard' not in manifest['stages'], manifest
-        assert not any(r['path'].startswith(('/Items/', '/Videos/', '/Plugins/', '/metrics/job/phantom-loadtime/'))
-                       or r['query'].get('Limit') == ['200'] or r['path'].endswith('/phantom-loadtime')
-                       for r in requests), (kind, fault, requests)
-print('EVIDENCE PASS: 28 typed discovery failures retain exactly the validated prefix and never time/push a batch')
+for selection in ('', 'Phantom', 'Materialised'):
+    seed()
+    result, manifest, _, requests, logs = run('success-' + (selection or 'daily'),
+                                             'select:' + selection if selection else '')
+    assert result.returncode == 0 and manifest['targets'] == ids and manifest['failures'] == [], manifest
+    assert 'discovery_failure' not in manifest, manifest
+    stages(manifest, dict(discovery=0, measure=0, push=0, guard=0))
+    payload, = [r['payload'] for r in requests if r['path'].endswith('/phantom-loadtime')]
+    records = [line.split() for line in payload.splitlines() if line and not line.startswith('#')]
+    samples = dict(records)
+    assert len(samples) == len(records), 'duplicate successful flow metrics'
+    medians = re.findall(r'flow=(\w+) item_type=(\w+) median_s=([\d.]+) runs=2 errors=0 samples=\[([^]]+)\]',
+                         (logs / 'output').read_text())
+    assert len(medians) == 12, medians
+    assert {(f, it) for f, it, _, _ in medians} == {(f, it) for f in flows for it in ('movie', 'episode')}
+    expected_keys = set()
+    for flow, item_type, median, durations in medians:
+        values = [float(v) for v in durations.split()]
+        assert len(values) == 2 and all(math.isfinite(v) and v >= 0 for v in values), values
+        assert median == f'{statistics.median(values):.6f}', (median, values)
+        for metric, value in (('seconds', float(median)), ('runs_total', 2), ('errors_total', 0)):
+            key = f'phantom_loadtime_{metric}{{flow="{flow}",item_type="{item_type}",color="green"}}'
+            expected_keys.add(key)
+            assert float(samples[key]) == value, (key, samples)
+    for item_type in ('movie', 'episode'):
+        key = f'phantom_loadtime_rig_outcome_total{{flow="materialise_then_play",item_type="{item_type}",cause="success"}}'
+        expected_keys.add(key)
+        assert samples[key] == '1', samples
+    assert set(samples) == expected_keys, samples
+    if selection:
+        timed = [r for r in requests if r['path'].startswith(('/Items/', '/Videos/'))]
+        assert len(timed) == 16, timed
+        assert all(r['path'].split('/')[2].replace('-', '') in (ids['Movie'], ids['Episode']) for r in timed), timed
+print('EVIDENCE PASS: successful LIVE daily batch keeps all 12 medians/runs/errors; first eligible Phantom/Materialised episode wins')
+
+discovery_errors = []
+discovery_cases = 0
+for kind in ('user', 'channels', 'movie', 'series', 'season', 'episode', 'availability'):
+    faults = ['http', 'timeout', 'timeout-headers', 'malformed', 'wrong-shape', 'null-body', 'scalar-body', 'empty']
+    if kind != 'availability':
+        faults += ['non-object-item', 'missing-id', 'null-id', 'numeric-id', 'bool-id', 'empty-id', 'unsafe-id', 'oversized-id']
+        if kind != 'user': faults += ['items-object', 'items-null', 'items-string', 'missing-items']
+        if kind not in ('user', 'channels'): faults += ['wrong-type', 'missing-type', 'null-type', 'numeric-type']
+        if kind == 'channels': faults += ['missing-channel']
+    else:
+        faults += ['missing-state'] + ['state-' + state for state in
+            ('unavailable', 'stale', 'unknown', 'null', 'number', 'bool', 'list', 'object')]
+    for fault in faults:
+        discovery_cases += 1
+        name = f'discovery-{kind}-{fault}'
+        no_playable = (kind in ('series', 'season', 'episode') and fault == 'empty' or
+                      kind == 'availability' and (fault in ('empty', 'missing-state') or fault.startswith('state-')))
+        code, http = {'http': (22, '503'), 'timeout': (28, '000'),
+                      'timeout-headers': (28, '200')}.get(fault, (0, '200'))
+        expected_failure = ({'reason': 'no-playable-episode', 'exit_code': 1} if no_playable else
+            dict(reason=kind + ('-request-failed' if code else '-invalid-response'),
+                 curl_exit_code=code, http_status=http))
+        prefix = {'user': 0, 'channels': 0, 'movie': 0, 'series': 1,
+                  'season': 2, 'episode': 3, 'availability': 3}[kind]
+        try:
+            result, manifest, _, requests, logs = run(name, f'{kind}:{fault}')
+            assert result.returncode != 0, 'discovery failure returned success'
+            assert manifest['targets'] == dict(list(ids.items())[:prefix]), manifest
+            assert manifest['failures'] == [], manifest
+            stages(manifest, dict(discovery=1, measure=1))
+            discovery_requests = [r for r in requests if r['discovery_kind']]
+            assert [r['discovery_kind'] for r in discovery_requests] == list(
+                ('user', 'channels', 'movie', 'series', 'season', 'episode', 'availability')
+            )[:len(discovery_requests)], discovery_requests
+            assert discovery_requests[-1]['discovery_kind'] == kind, discovery_requests
+            assert (discovery_requests[-1]['curl_exit_code'], discovery_requests[-1]['http_status']) == (code, http), discovery_requests
+            assert not any(r['path'].startswith(('/Items/', '/Videos/')) or
+                           r['query'].get('Limit') == ['200'] or r['path'].endswith('/phantom-loadtime')
+                           for r in requests), requests
+            assert not re.search(r'median_s=|sample_s=|^phantom_loadtime_seconds\{',
+                                 result.stdout + result.stderr, re.M), 'timing started after failed discovery'
+            assert not (logs / 'filing').exists(), 'discovery failure filed a performance regression'
+            for secret in secrets[:5]:
+                assert secret not in result.stdout + result.stderr, 'discovery response/stderr leaked'
+            actual = manifest.get('discovery_failure')
+            assert actual == expected_failure, f'discovery_failure expected {expected_failure!r}, got {actual!r}'
+            if not no_playable:
+                assert type(actual['curl_exit_code']) is int and re.fullmatch(r'[0-9]{3}', actual['http_status']), actual
+            print(f'EVIDENCE PASS: {name}')
+        except AssertionError as exc:
+            discovery_errors.append(f'{name}: {exc}')
+            print(f'EVIDENCE FAIL: {name}: {exc}', file=sys.stderr)
+print(f'EVIDENCE discovery matrix: {discovery_cases - len(discovery_errors)} passed, {len(discovery_errors)} failed')
 
 result, manifest, _, requests, _ = run('dead-episodes', 'dead-episodes')
 assert result.returncode != 0, result
@@ -1330,6 +1466,8 @@ try:
 finally:
     interrupted.chmod(0o755)
 print('EVIDENCE PASS: mid-discovery storage loss fails visibly, retains readable prefix, never completes or ratchets')
+assert not discovery_errors, f'{len(discovery_errors)}/{discovery_cases} discovery fixtures failed (see EVIDENCE FAIL above)'
+print(f'EVIDENCE PASS: {discovery_cases} discovery fixtures retain exact sanitized reasons/status, validated prefix, no timing/push, and clean scratch')
 PY
 then
     ok "retained run evidence through real daily wrapper/engine/emitter/guard"

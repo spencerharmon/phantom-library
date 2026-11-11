@@ -541,6 +541,19 @@ cleanup() {
 trap cleanup EXIT
 WORK_DIR="$(mktemp -d)"
 
+# Keep the body only in trap-cleaned scratch; status is independent of parsing.
+# In particular curl 28 can still carry HTTP headers, so do not replace them.
+discovery_fail() {
+    evidence discovery-failure "$1" "$2" "$DISCOVERY_HTTP" || fail "cannot retain discovery failure"
+    fail "discovery reason=$1 curl_exit=$2 http_status=$DISCOVERY_HTTP"
+}
+discovery_request() {
+    local kind="$1" rc=0; shift
+    DISCOVERY_HTTP="$("$@" -o "$WORK_DIR/discovery.json" -w '%{http_code}' 2>/dev/null)" || rc=$?
+    DISCOVERY_HTTP="$(http_code_of "$DISCOVERY_HTTP")"
+    [ "$rc" = 0 ] || discovery_fail "$kind-request-failed" "$rc"
+}
+
 # Parse discovery only, never playback bodies. Reject malformed IDs rather than
 # allowing null/containers/query delimiters to become successful timing targets.
 discovery_id() {
@@ -558,7 +571,7 @@ try:
         if expected not in ("User", "Channel") and item.get("Type") != expected:
             raise ValueError()
         item_id = item["Id"]
-        if not isinstance(item_id, str) or not re.fullmatch(r"[A-Za-z0-9-]+", item_id):
+        if not isinstance(item_id, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,256}", item_id):
             raise ValueError()
         ids.append(item_id)
     if ids:
@@ -568,10 +581,11 @@ except (ValueError, KeyError, TypeError, AttributeError, StopIteration):
 ' "$1" "${2:-}" "${3:-}"
 }
 
-USER_ID="$(api "$API/Users" | discovery_id User)" || fail "could not resolve a Jellyfin user id"
-CH_JSON="$(api "$API/Channels?userId=$USER_ID")" || fail "channel discovery HTTP failure"
-CH_MOVIES="$(printf '%s' "$CH_JSON" | discovery_id Channel 'Phantom Movies')" || fail "invalid Phantom Movies channel discovery"
-CH_SHOWS="$(printf '%s' "$CH_JSON" | discovery_id Channel 'Phantom Shows')" || fail "invalid Phantom Shows channel discovery"
+discovery_request user api "$API/Users"
+USER_ID="$(discovery_id User < "$WORK_DIR/discovery.json")" || discovery_fail user-invalid-response 0
+discovery_request channels api "$API/Channels?userId=$USER_ID"
+CH_MOVIES="$(discovery_id Channel 'Phantom Movies' < "$WORK_DIR/discovery.json")" || discovery_fail channels-invalid-response 0
+CH_SHOWS="$(discovery_id Channel 'Phantom Shows' < "$WORK_DIR/discovery.json")" || discovery_fail channels-invalid-response 0
 
 # time_flow <flow> <item_type> <curl-cmd...>
 # Runs the command, times it, and emits a record; a non-zero command marks the
@@ -604,28 +618,32 @@ time_flow() {
 }
 
 # --- pick a movie + an episode to drive -------------------------------------
-MOVIE_ID="$(api "$API/Channels/$CH_MOVIES/Items?Limit=1&Fields=ProviderIds&userId=$USER_ID" | discovery_id Movie)" || fail "invalid Movie discovery"
+discovery_request movie api "$API/Channels/$CH_MOVIES/Items?Limit=1&Fields=ProviderIds&userId=$USER_ID"
+MOVIE_ID="$(discovery_id Movie < "$WORK_DIR/discovery.json")" || discovery_fail movie-invalid-response 0
 log "target type=Movie id=$MOVIE_ID"
 evidence target Movie "$MOVIE_ID"
 # Bounded, user-scoped traversal: at most 5 series x 5 seasons x 20 episodes.
 # States is the existing badge contract, not a playback probe. Phantom means
 # not known dead/stale, not guaranteed playable; actual playback stays measured.
-SERIES_IDS="$(api "$API/Channels/$CH_SHOWS/Items?Limit=5&userId=$USER_ID" | discovery_id Series '' 5)" || fail "invalid Series discovery"
+discovery_request series api "$API/Channels/$CH_SHOWS/Items?Limit=5&userId=$USER_ID"
+SERIES_IDS="$(discovery_id Series '' 5 < "$WORK_DIR/discovery.json")" || discovery_fail series-invalid-response 0
 EPISODE_ID=""
 while IFS= read -r SERIES_ID; do
     [ -n "$SERIES_ID" ] || continue
     log "target type=Series id=$SERIES_ID"
     evidence target Series "$SERIES_ID"
-    SEASON_IDS="$(api "$API/Channels/$CH_SHOWS/Items?Limit=5&userId=$USER_ID&FolderId=$SERIES_ID" | discovery_id Season '' 5)" || fail "invalid Season discovery"
+    discovery_request season api "$API/Channels/$CH_SHOWS/Items?Limit=5&userId=$USER_ID&FolderId=$SERIES_ID"
+    SEASON_IDS="$(discovery_id Season '' 5 < "$WORK_DIR/discovery.json")" || discovery_fail season-invalid-response 0
     while IFS= read -r SEASON_ID; do
         [ -n "$SEASON_ID" ] || continue
         log "target type=Season id=$SEASON_ID"
         evidence target Season "$SEASON_ID"
-        EPISODE_IDS="$(api "$API/Channels/$CH_SHOWS/Items?Limit=20&userId=$USER_ID&FolderId=$SEASON_ID" | discovery_id Episode '' 20)" || fail "invalid Episode discovery"
+        discovery_request episode api "$API/Channels/$CH_SHOWS/Items?Limit=20&userId=$USER_ID&FolderId=$SEASON_ID"
+        EPISODE_IDS="$(discovery_id Episode '' 20 < "$WORK_DIR/discovery.json")" || discovery_fail episode-invalid-response 0
         [ -n "$EPISODE_IDS" ] || continue
         payload="$(printf '%s' "$EPISODE_IDS" | python3 -c 'import json,sys; print(json.dumps({"ids": sys.stdin.read().splitlines()}))')"
-        states="$(json_post -d "$payload" "$API/Plugins/PhantomLibrary/States")" || fail "episode availability HTTP failure"
-        EPISODE_ID="$(printf '%s' "$states" | python3 -c '
+        discovery_request availability json_post -d "$payload" "$API/Plugins/PhantomLibrary/States"
+        EPISODE_ID="$(python3 -c '
 import json, sys
 try:
     states = json.load(sys.stdin)
@@ -639,7 +657,7 @@ try:
         print("# episode discovery skipped id=" + item + " (not an eligible availability state)", file=sys.stderr)
 except (ValueError, TypeError):
     sys.exit(1)
-' "$EPISODE_IDS")" || fail "invalid episode availability response"
+' "$EPISODE_IDS" < "$WORK_DIR/discovery.json")" || discovery_fail availability-invalid-response 0
         [ -z "$EPISODE_ID" ] || break 2
     done <<<"$SEASON_IDS"
 done <<<"$SERIES_IDS"

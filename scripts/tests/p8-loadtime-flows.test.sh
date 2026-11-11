@@ -458,7 +458,11 @@ for mode, fault in (('invalid-states', ''), ('', 'states:http'), ('', 'states:ma
     env['CURL_EPISODES'] = mode
     result, requests, out = run(mode or fault.replace(':', '-'), fault)
     assert result.returncode != 0 and not result.stdout and not out.exists(), result
-    assert 'episode availability' in result.stderr, result.stderr
+    reason = 'availability-request-failed' if fault == 'states:http' else 'availability-invalid-response'
+    assert reason in result.stderr, result.stderr
+    assert run.evidence['discovery_failure']['reason'] == reason, run.evidence
+    assert run.evidence['discovery_failure']['curl_exit_code'] == (22 if fault == 'states:http' else 0)
+    assert run.evidence['discovery_failure']['http_status'] == ('503' if fault == 'states:http' else '200')
     assert not any(r[1].startswith(('/Items/', '/Videos/')) for r in requests)
 del env['CURL_EPISODES']
 print('LIVE: failed/malformed availability response rejected before timing: PASS')
