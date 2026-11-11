@@ -97,7 +97,94 @@ class Parser(argparse.ArgumentParser):
         raise ValueError(message)
 
 
+def drift():
+    # Read-only drift receipt: which tuning fields the live Deployment lacks.
+    # Never sets rollout_at; unobservable never counts as match.
+    parser = Parser(description='Offline tuning drift report (--drift).')
+    parser.add_argument('--drift', action='store_true', required=True)
+    for flag in ('deployment', 'expected-tuning', 'namespace', 'name'):
+        parser.add_argument('--' + flag, required=True)
+    parser.add_argument('--expected-image', help='Expected container image reference')
+    parser.add_argument('--config', help='Retained loaded-config JSON object for the container')
+    parser.add_argument('--flux', help='Retained Flux Kustomization/HelmRelease JSON')
+    args = parser.parse_args()
+    expected = load(args.expected_tuning)
+    require(isinstance(expected, dict) and set(expected) == {'container', 'rollout_at', 'env', 'config'},
+            'invalid expected-tuning fields')
+    container = expected['container']
+    require(isinstance(container, str) and container, 'missing expected container')
+    require(isinstance(expected['env'], dict) and isinstance(expected['config'], dict), 'invalid expected maps')
+    require(expected['env'] or expected['config'] or args.expected_image, 'empty tuning expectation')
+    require(all(isinstance(v, str) for v in expected['env'].values()), 'expected env must map names to strings')
+    deploy = load(args.deployment)
+    require(isinstance(deploy, dict) and deploy.get('kind') == 'Deployment', 'expected Deployment')
+    meta = deploy['metadata']
+    require(meta['namespace'] == args.namespace and meta['name'] == args.name, 'foreign Deployment namespace/name')
+    live = named(deploy['spec']['template']['spec']['containers'], container)
+    env = {}
+    for entry in live.get('env', []):
+        require(entry['name'] not in env, 'duplicate environment key')
+        env[entry['name']] = entry
+    fields = []
+
+    def add(field, want, state, observed):
+        fields.append({'field': field, 'expected': want, 'observed': observed, 'state': state})
+
+    for name, want in sorted(expected['env'].items()):
+        entry = env.get(name)
+        if entry is None:
+            # envFrom may export it at startup; absence is only provable without envFrom.
+            if live.get('envFrom'):
+                add('env.' + name, want, 'unobservable', None)
+            else:
+                add('env.' + name, want, 'mismatch', None)
+        elif 'value' not in entry:
+            add('env.' + name, want, 'unobservable', None)
+        else:
+            add('env.' + name, want, 'match' if entry['value'] == want else 'mismatch', entry['value'])
+    loaded = None
+    if args.config:
+        loaded = load(args.config)
+        require(isinstance(loaded, dict), 'config receipt must be an object')
+    for name, want in sorted(expected['config'].items()):
+        if loaded is None:
+            add('config.' + name, want, 'unobservable', None)
+        elif name not in loaded:
+            add('config.' + name, want, 'mismatch', None)
+        else:
+            add('config.' + name, want, 'match' if json_equal(loaded[name], want) else 'mismatch', loaded[name])
+    if args.expected_image:
+        image = live.get('image')
+        require(isinstance(image, str) and image, 'missing live image')
+        add('image', args.expected_image, 'match' if image == args.expected_image else 'mismatch', image)
+    report = {'mode': 'drift', 'namespace': meta['namespace'], 'name': meta['name'],
+              'generation': meta.get('generation'), 'container': container,
+              'rollout_at': None, 'fields': fields}
+    if args.flux:
+        flux = load(args.flux)
+        require(isinstance(flux, dict) and flux.get('kind') in ('Kustomization', 'HelmRelease'),
+                'expected Flux Kustomization/HelmRelease')
+        fstatus = flux.get('status', {})
+        require(isinstance(fstatus, dict), 'invalid Flux status')
+        revision = fstatus.get('lastAppliedRevision')
+        require(revision is None or isinstance(revision, str), 'invalid Flux revision')
+        report['flux'] = {'kind': flux['kind'], 'name': flux['metadata']['name'],
+                          'last_applied_revision': revision,
+                          'state': 'observed' if revision else 'unobservable'}
+    else:
+        report['flux'] = {'state': 'unobservable'}
+    states = {f['state'] for f in fields}
+    body = json.dumps(report, sort_keys=True)
+    if 'mismatch' in states:
+        return 3, 'DRIFT_MISMATCH', body
+    if 'unobservable' in states or report['flux']['state'] != 'observed':
+        return 2, 'DRIFT_INCOMPLETE', body
+    return 0, 'DRIFT_MATCH', body
+
+
 def analyse():
+    if '--drift' in sys.argv[1:]:
+        return drift()
     parser = Parser(description='Offline OOM acceptance. See docs/tasks/gostream-oom-acceptance.md.')
     for flag in ('pods', 'deployment', 'rss', 'limits', 'expected-tuning', 'now'):
         parser.add_argument('--' + flag, required=True)
@@ -390,7 +477,7 @@ def analyse():
 
 try:
     code, verdict, detail = analyse()
-except (ValueError, KeyError, TypeError, IndexError, AttributeError, OSError, DecimalException, OverflowError) as error:
+except (json.JSONDecodeError, ValueError, KeyError, TypeError, IndexError, AttributeError, OSError, DecimalException, OverflowError) as error:
     code, verdict, detail = 2, 'INCOMPLETE', str(error)
 print(f'{verdict} {detail}')
 sys.exit(code)
