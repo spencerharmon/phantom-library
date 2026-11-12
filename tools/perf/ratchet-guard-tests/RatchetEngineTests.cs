@@ -40,6 +40,16 @@ public class RatchetEngineTests
     }
 
     [Fact]
+    public void ZeroMeasurement_NeverTightensPositiveCeilingToZero()
+    {
+        var result = RatchetEngine.Evaluate(Thresholds(("list_load", 800)), Measure(("list_load", 0)));
+        var r = Assert.Single(result.Results);
+        Assert.Equal(ScenarioOutcome.Held, r.Outcome);
+        Assert.Equal(800, result.UpdatedThresholds.Scenarios.Single().ThresholdMs);
+        Assert.False(result.ThresholdsChanged);
+    }
+
+    [Fact]
     public void MeasurementAboveCeiling_Breaches_AndDoesNotLoosen()
     {
         var t = Thresholds(("list-view", 1000));

@@ -558,8 +558,19 @@ done
 head_ "guard --exposition: supplied-input preservation and error handling"
 sb_guard() { sb_rc=0; env PATH="$sb_bin:$PATH" PHANTOM_REPO_ROOT="$sb_root" SB_CASE="$SB_CASE_G" SB_COUNT="$SB/count" \
     SB_BEEHIVE_LOG="$SB/beehive.log" bash "$sb_root/tools/perf/loadtime-guard.sh" "$@" > "$SB/out.log" 2>&1 || sb_rc=$?; }
+# sb_expo <file> "<flow> <item_type> <seconds> <runs> <errors>"... writes a
+# well-formed batch (duration + matching runs/errors counters per tuple).
+sb_expo() {
+    local out="$1" t flow it sec runs errs; shift; : > "$out"
+    for t in "$@"; do
+        read -r flow it sec runs errs <<<"$t"
+        printf 'phantom_loadtime_seconds{flow="%s",item_type="%s",color="green"} %s\n' "$flow" "$it" "$sec" >> "$out"
+        printf 'phantom_loadtime_runs_total{flow="%s",item_type="%s",color="green"} %s\n' "$flow" "$it" "$runs" >> "$out"
+        printf 'phantom_loadtime_errors_total{flow="%s",item_type="%s",color="green"} %s\n' "$flow" "$it" "$errs" >> "$out"
+    done
+}
 sb_reset; SB_CASE_G=movie:A-breach
-printf 'phantom_loadtime_seconds{flow="list_load",item_type="movie",color="green"} 2.0\nphantom_loadtime_seconds{flow="list_load",item_type="episode",color="green"} 0.95\n' > "$SB/in.expo"
+sb_expo "$SB/in.expo" "list_load movie 2.0 1 0" "list_load episode 0.95 1 0"
 in_sha="$(sha256sum "$SB/in.expo" | awk '{print $1}')"
 sb_guard --exposition "$SB/in.expo" --no-file --breach-out "$SB/breaches.json"
 sb_check "supplied breach exposition -> exit 3 without invoking the engine" test "$sb_rc" = 3 -a ! -e "$SB/count"
@@ -571,7 +582,7 @@ assert plan['breach_count'] == len(plan['entries']) == 1
 entry = plan['entries'][0]
 assert (entry['scenario'], entry['measured_ms'], entry['threshold_ms']) == ('list_load:movie:single', 2000, 1000)
 PY
-printf 'phantom_loadtime_seconds{flow="list_load",item_type="movie",color="green"} 0.5\n' > "$SB/pass.expo"
+sb_expo "$SB/pass.expo" "list_load movie 0.5 1 0"
 sb_guard --exposition "$SB/pass.expo" --no-file --breach-out "$SB/breaches.json"
 sb_check "passing guard replaces the previous breach output with an empty plan" test "$sb_rc" = 0
 sb_check "--breach-out contains no stale entries after success" python3 - "$SB/breaches.json" <<'PY'
@@ -587,6 +598,71 @@ sb_check "malformed --exposition file -> exit 2" test "$sb_rc" = 2
 echo 'phantom_other_metric 1' > "$SB/none.expo"; sb_guard --exposition "$SB/none.expo" --no-file
 sb_check "--exposition with no load-time measurements -> exit 2" test "$sb_rc" = 2
 sb_check "no engine invocation across all --exposition runs" test ! -e "$SB/count"
+
+# --- error-aware eligibility (ttfb-loadtime-error-aware-ratchet) ----------
+# Real converter + real C# ratchet with --apply against scratch state. Each
+# case starts from positive 1000ms list ceilings (sb_reset) unless noted.
+head_ "error-aware ratchet: erroring tuples never seed/tighten/reset/loosen ceilings"
+sb_thr_sha() { sha256sum "$SB_THR" | awk '{print $1}'; }
+sb_reset
+sb_expo "$SB/e.expo" "list_load movie 0.2 3 2" "list_load episode 0.95 3 0"
+sb_guard --exposition "$SB/e.expo" --thresholds "$SB_THR" --apply --no-file
+sb_check "[positive-duration errors] guard exit 0, movie 1000ms NOT tightened to 210ms" \
+    test "$sb_rc" = 0 -a "$(sb_thr movie)" = 1000 -a "$(sb_thr episode)" = 1000
+sb_check "[positive-duration errors] tuple reported INELIGIBLE with its counters" \
+    grep -q 'INELIGIBLE list_load:movie:single errors=2/3' "$SB/out.log"
+sb_reset
+sb_expo "$SB/e.expo" "list_load movie 0.000000 3 3" "list_load episode 0.95 3 0"
+sb_guard --exposition "$SB/e.expo" --thresholds "$SB_THR" --apply --no-file
+sb_check "[engine-budget skips, median 0] movie ceiling stays 1000ms (never zeroed)" \
+    test "$sb_rc" = 0 -a "$(sb_thr movie)" = 1000
+sb_reset
+sb_expo "$SB/e.expo" "list_load movie 0.000000 3 3" "list_load episode 0.5 3 0"
+sb_guard --exposition "$SB/e.expo" --thresholds "$SB_THR" --apply --no-file --breach-out "$SB/breaches.json"
+sb_check "[mixed] eligible episode ratchets 1000->525ms, ineligible movie untouched" \
+    test "$sb_rc" = 0 -a "$(sb_thr episode)" = 525 -a "$(sb_thr movie)" = 1000
+sb_reset
+sb_expo "$SB/e.expo" "list_load movie 3.0 3 1" "list_load episode 2.5 3 1"
+sb_guard --exposition "$SB/e.expo" --thresholds "$SB_THR" --apply --no-file --breach-out "$SB/breaches.json"
+sb_check "[erroring slow] erroring above-ceiling tuples neither breach nor loosen" \
+    test "$sb_rc" = 0 -a "$(sb_thr movie)" = 1000 -a "$(sb_thr episode)" = 1000
+sb_reset; before="$(sb_thr_sha)"
+sb_expo "$SB/e.expo" "list_load movie 0.000000 3 3" "list_load episode 0.1 3 1"
+echo stale > "$SB/breaches.json"
+sb_guard --exposition "$SB/e.expo" --thresholds "$SB_THR" --apply --no-file --breach-out "$SB/breaches.json"
+sb_check "[all ineligible] explicit NO ELIGIBLE TUPLES, exit 0, state byte-identical, ratchet not run" \
+    test "$sb_rc" = 0 -a "$before" = "$(sb_thr_sha)" -a "$(grep -c 'NO ELIGIBLE TUPLES' "$SB/out.log")" = 1 \
+    -a "$(grep -c 'phantom ratcheting regression guard' "$SB/out.log")" = 0
+sb_check "[all ineligible] empty breach plan replaces stale output" \
+    test "$(cat "$SB/breaches.json")" = '{"breach_count":0,"entries":[]}'
+sb_reset
+python3 - "$SB_THR" <<'PY'
+import json, sys
+t = json.load(open(sys.argv[1]))
+for s in t['scenarios']: s['threshold_ms'] = 0
+json.dump(t, open(sys.argv[1], 'w'))
+PY
+sb_expo "$SB/e.expo" "list_load movie 0.4 3 0" "list_load episode 0.2 3 1"
+sb_guard --exposition "$SB/e.expo" --thresholds "$SB_THR" --apply --no-file
+sb_check "[initial seeding] healthy zero-ceiling tuple seeds 420ms; erroring one stays unseeded (0)" \
+    test "$sb_rc" = 0 -a "$(sb_thr movie)" = 420 -a "$(sb_thr episode)" = 0
+for bad in missing-runs missing-errors errors-gt-runs zero-runs fractional-runs orphan-counter duplicate-seconds; do
+    sb_reset; before="$(sb_thr_sha)"
+    case "$bad" in
+        missing-runs) sb_expo "$SB/v.expo" "list_load movie 0.5 1 0"; sed -i '/runs_total/d' "$SB/v.expo" ;;
+        missing-errors) sb_expo "$SB/v.expo" "list_load movie 0.5 1 0"; sed -i '/errors_total/d' "$SB/v.expo" ;;
+        errors-gt-runs) sb_expo "$SB/v.expo" "list_load movie 0.5 1 2" ;;
+        zero-runs) sb_expo "$SB/v.expo" "list_load movie 0.5 0 0" ;;
+        fractional-runs) sb_expo "$SB/v.expo" "list_load movie 0.5 1.5 0" ;;
+        orphan-counter) sb_expo "$SB/v.expo" "list_load movie 0.5 1 0"
+            printf 'phantom_loadtime_errors_total{flow="info_open",item_type="movie",color="green"} 1\n' >> "$SB/v.expo" ;;
+        duplicate-seconds) sb_expo "$SB/v.expo" "list_load movie 0.5 1 0" "list_load movie 0.4 1 0" ;;
+    esac
+    sb_guard --exposition "$SB/v.expo" --thresholds "$SB_THR" --apply --no-file
+    sb_check "[fail-closed $bad] mismatched run/error data -> exit 2, state untouched" \
+        test "$sb_rc" = 2 -a "$before" = "$(sb_thr_sha)"
+done
+
 sb_reset; sb_guard --no-file
 sb_check "standalone guard (no --exposition) still measures: engine once, A-breach -> exit 3" \
     test "$sb_rc" = 3 -a "$(cat "$SB/count" 2>/dev/null)" = 1
@@ -905,6 +981,16 @@ elif p.path.startswith('/Channels/'):
     else:
         channel = p.path.split('/')[2]
         body = {'Items': [{'Id': channel + '-card'}], 'TotalRecordCount': 1}
+        # ttfb-loadtime-error-aware-ratchet: the FIRST list request of the
+        # named channel times out (curl 28) once; later requests are healthy.
+        # slowlist:<channel> makes that channel's healthy list pages slower.
+        kind_, _, arg_ = mode.partition(':')
+        trip = pathlib.Path(os.environ['EVIDENCE_REQUESTS'] + '.tripped')
+        if kind_ == 'listtimeout' and channel == arg_ and not trip.exists():
+            trip.write_text('1')
+            code, http = 28, '000'
+        if kind_ == 'slowlist' and channel == arg_:
+            import time; time.sleep(0.05)
         if mode == 'requests' and channel == 'movies' and 'SortOrder' not in q:
             code, http = 22, '500'
 elif p.path == '/Plugins/PhantomLibrary/States':
@@ -1180,6 +1266,12 @@ for index, payload in enumerate(stage_puts, 1):
     assert set(actual) == expected, ('stage metric contract changed', actual)
     assert int(actual['phantom_loadtime_daily_run_start_timestamp_seconds']) == first['run_start']
 print('EVIDENCE PASS: LIVE movie HTTP404/curl22 vs episode timeout28/000, list attribution, 1-based samples, unchanged metrics')
+# ttfb-loadtime-error-aware-ratchet: every erroring tuple above stayed
+# unseeded; only the one all-success tuple (sort_change:movie) seeded.
+seeded = {(s['flow'], s['backend']): s['threshold_ms'] for s in json.load(open(thresholds))['scenarios']}
+assert seeded[('sort_change', 'movie')] > 0, seeded
+assert all(v == 0 for k, v in seeded.items() if k != ('sort_change', 'movie')), ('erroring tuple seeded', seeded)
+print('EVIDENCE PASS: positive-duration erroring tuples never seed; healthy zero-ceiling tuple seeds')
 
 first_bytes = first_path.read_bytes()
 old_sha = sha
@@ -1230,6 +1322,60 @@ for selection in ('', 'Phantom', 'Materialised'):
         assert len(timed) == 16, timed
         assert all(r['path'].split('/')[2].replace('-', '') in (ids['Movie'], ids['Episode']) for r in timed), timed
 print('EVIDENCE PASS: successful LIVE daily batch keeps all 12 medians/runs/errors; first eligible Phantom/Materialised episode wins')
+
+# --- error-aware durable ratchet (ttfb-loadtime-error-aware-ratchet) --------
+# Complete 12-scenario registry with a POSITIVE list ceiling for the target
+# backend. Run 1 (N=3): the first real list request times out and the engine
+# itself skips the remaining two samples (median 0, runs 3, errors 3). Run 2
+# (no reseed): a healthy slower batch must breach the ORIGINAL ceiling.
+LIST_CEILING = 1.0
+for item_type, channel in (('movie', 'movies'), ('episode', 'shows')):
+    registry = json.load(open(source / 'tools/perf/loadtime-thresholds.json'))
+    assert len(registry['scenarios']) == 12
+    for s in registry['scenarios']:
+        # Huge headroom keeps other tuples' ratchets far above timing noise.
+        s['ratchet_headroom_ratio'] = 1000
+        s['threshold_ms'] = LIST_CEILING if (s['flow'], s['backend']) == ('list_load', item_type) else 1e9
+    thresholds.write_text(json.dumps(registry, indent=2) + '\n')
+    ceiling = lambda: [s['threshold_ms'] for s in json.load(open(thresholds))['scenarios']
+                       if (s['flow'], s['backend']) == ('list_load', item_type)][0]
+    result, manifest, _, requests, logs = run(f'error-aware-{item_type}-timeout', f'listtimeout:{channel}',
+                                             PHANTOM_LOADTIME_SAMPLES='3')
+    out = (logs / 'output').read_text()
+    assert result.returncode == 0, out
+    stages(manifest, dict(discovery=0, measure=0, push=0, guard=0))
+    assert re.search(rf'flow=list_load item_type={item_type} sample=2 skipped', out), out
+    assert re.search(rf'flow=list_load item_type={item_type} sample=3 skipped', out), out
+    payload, = [r['payload'] for r in requests if r['path'].endswith('/phantom-loadtime')]
+    pushed = dict(l.split() for l in payload.splitlines() if l and not l.startswith('#'))
+    lbl = f'{{flow="list_load",item_type="{item_type}",color="green"}}'
+    assert float(pushed['phantom_loadtime_seconds' + lbl]) == 0, pushed
+    assert pushed['phantom_loadtime_runs_total' + lbl] == '3' and pushed['phantom_loadtime_errors_total' + lbl] == '3', pushed
+    assert len([k for k in pushed if k.startswith('phantom_loadtime_seconds{')]) == 12, 'batch not published complete'
+    attempted = [f for f in manifest['failures'] if (f['flow'], f['item_type']) == ('list_load', item_type)]
+    assert len(attempted) == 1 and attempted[0]['sample_index'] == 1 and attempted[0]['curl_exit_code'] == 28 \
+        and attempted[0]['http_status'] == '000', manifest['failures']
+    assert f'INELIGIBLE list_load:{item_type}:single errors=3/3' in out, out
+    assert ceiling() == LIST_CEILING, ('erroring batch moved the ceiling', ceiling())
+    result, manifest, _, requests, logs = run(f'error-aware-{item_type}-slow', f'slowlist:{channel}',
+                                             PHANTOM_LOADTIME_SAMPLES='3')
+    out = (logs / 'output').read_text()
+    assert result.returncode == 0, out  # a breach is reported, not a wrapper failure
+    assert manifest['stages']['guard']['exit_code'] == 3, manifest
+    payload, = [r['payload'] for r in requests if r['path'].endswith('/phantom-loadtime')]
+    pushed = dict(l.split() for l in payload.splitlines() if l and not l.startswith('#'))
+    assert pushed['phantom_loadtime_errors_total' + lbl] == '0', pushed
+    observed = float(pushed['phantom_loadtime_seconds' + lbl])
+    assert observed * 1000 > LIST_CEILING, observed
+    final_stage = [r['payload'] for r in requests if r['path'].endswith('/phantom-loadtime-daily-run')][-1]
+    blbl = f'{{flow="list_load",item_type="{item_type}"}}'
+    metrics = dict(l.split() for l in final_stage.splitlines() if l)
+    assert metrics['phantom_loadtime_guard_breach' + blbl] == '1', metrics
+    assert float(metrics['phantom_loadtime_guard_ceiling_seconds' + blbl]) == LIST_CEILING / 1000, metrics
+    assert abs(float(metrics['phantom_loadtime_guard_observed_seconds' + blbl]) - observed) < 1e-9, \
+        ('guard did not evaluate the published batch', metrics, observed)
+    assert ceiling() == LIST_CEILING, ('breach reset or loosened the ceiling', ceiling())
+print('EVIDENCE PASS: movie+episode timeout+2 skips published with failure evidence, ceiling unchanged; healthy slower batch breaches ORIGINAL ceiling')
 
 discovery_errors = []
 discovery_cases = 0

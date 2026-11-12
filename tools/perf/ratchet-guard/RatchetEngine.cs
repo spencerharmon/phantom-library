@@ -165,7 +165,9 @@ public static class RatchetEngine
             {
                 var candidate = Round(m.ValueMs * (1.0 + headroom));
                 // Only ever tighten: the candidate must be strictly below the current ceiling.
-                if (candidate < ceiling)
+                // Never tighten a positive ceiling to a non-positive one: a zero ceiling reads
+                // as "unseeded" on the next run, which would then re-seed (i.e. loosen) it.
+                if (candidate < ceiling && candidate > 0)
                 {
                     scenario.ThresholdMs = candidate;
                     results.Add(new ScenarioResult
