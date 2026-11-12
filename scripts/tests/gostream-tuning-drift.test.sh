@@ -15,7 +15,9 @@ assert os.access(engine, os.X_OK), f'missing executable: {engine}'
 container = {'name': 'stream', 'image': 'example.com/stream:v2',
              'env': [{'name': 'GOMEMLIMIT', 'value': '1800MiB'},
                      {'name': 'MKV_PROXY_CONCURRENCY', 'value': '6'}]}
-deployment = {'kind': 'Deployment', 'metadata': {'name': 'stream', 'namespace': 'media', 'generation': 11},
+deployment = {'kind': 'Deployment', 'metadata': {'name': 'stream', 'namespace': 'media', 'generation': 11,
+              'labels': {'kustomize.toolkit.fluxcd.io/name': 'stream',
+                         'kustomize.toolkit.fluxcd.io/namespace': 'flux-system'}},
               'spec': {'template': {'spec': {'containers': [container]}}}}
 expected = {'container': 'stream', 'rollout_at': None,
             'env': {'GOMEMLIMIT': '1800MiB', 'MKV_PROXY_CONCURRENCY': '6'},
@@ -52,7 +54,7 @@ run('missing config key', 3, 'DRIFT_MISMATCH', dict(full, config={}), contains=(
 run('config unobservable', 2, 'DRIFT_INCOMPLETE', {k: v for k, v in full.items() if k != 'config'},
     contains=('"state": "unobservable"',))
 run('missing flux input unobservable', 2, 'DRIFT_INCOMPLETE', {k: v for k, v in full.items() if k != 'flux'},
-    contains=('"flux": {"state": "unobservable"}',))
+    contains=('"binding": "unobservable"', '"state": "unobservable"'))
 d = json.loads(json.dumps(deployment)); d['metadata']['namespace'] = 'other'
 run('foreign namespace', 2, 'INCOMPLETE', dict(full, deployment=d), contains=('foreign',))
 d = json.loads(json.dumps(deployment)); d['metadata']['name'] = 'other'

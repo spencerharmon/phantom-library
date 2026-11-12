@@ -5,6 +5,7 @@ exec python3 - "$@" <<'PY'
 import argparse
 from datetime import datetime
 from decimal import Decimal, DecimalException
+import hashlib
 import json
 import re
 import sys
@@ -160,6 +161,7 @@ def drift():
     report = {'mode': 'drift', 'namespace': meta['namespace'], 'name': meta['name'],
               'generation': meta.get('generation'), 'container': container,
               'rollout_at': None, 'fields': fields}
+    report['flux'] = {'state': 'unobservable', 'binding': 'unobservable', 'namespace': None}
     if args.flux:
         flux = load(args.flux)
         require(isinstance(flux, dict) and flux.get('kind') in ('Kustomization', 'HelmRelease'),
@@ -168,14 +170,55 @@ def drift():
         require(isinstance(fstatus, dict), 'invalid Flux status')
         revision = fstatus.get('lastAppliedRevision')
         require(revision is None or isinstance(revision, str), 'invalid Flux revision')
-        report['flux'] = {'kind': flux['kind'], 'name': flux['metadata']['name'],
-                          'last_applied_revision': revision,
-                          'state': 'observed' if revision else 'unobservable'}
-    else:
-        report['flux'] = {'state': 'unobservable'}
+        fmeta = flux.get('metadata')
+        fmeta = fmeta if isinstance(fmeta, dict) else {}
+        receipt = report['flux']
+        receipt.update(kind=flux['kind'], name=fmeta.get('name'), namespace=fmeta.get('namespace'),
+                       last_applied_revision=revision)
+
+        def identity(value):
+            return isinstance(value, str) and bool(value.strip())
+
+        pairs = []
+        if all(identity(fmeta.get(key)) for key in ('name', 'namespace')):
+            if flux['kind'] == 'Kustomization':
+                labels = meta.get('labels')
+                if isinstance(labels, dict):
+                    pairs = [(labels.get('kustomize.toolkit.fluxcd.io/' + key), fmeta[key])
+                             for key in ('name', 'namespace')]
+            else:
+                spec, annotations = flux.get('spec'), meta.get('annotations')
+                if (isinstance(spec, dict) and isinstance(annotations, dict)
+                        and all(key not in spec or identity(spec[key]) for key in
+                                ('releaseName', 'targetNamespace', 'storageNamespace'))):
+                    target = spec.get('targetNamespace', fmeta['namespace'])
+                    storage = spec.get('storageNamespace', fmeta['namespace'])
+                    # Flux prefixes only an explicitly configured targetNamespace.
+                    release = spec.get('releaseName')
+                    if release is None:
+                        release = (spec['targetNamespace'] + '-' if 'targetNamespace' in spec else '') + fmeta['name']
+                        if len(release) > 53:
+                            release = release[:40] + '-' + hashlib.sha256(release.encode()).hexdigest()[:12]
+                    receipt.update(release_name=release, target_namespace=target, storage_namespace=storage)
+                    # Helm ownership uses the target (release) namespace, not secret storage.
+                    pairs = [(annotations.get('meta.helm.sh/release-name'), release),
+                             (annotations.get('meta.helm.sh/release-namespace'), target)]
+                    # When retained, Flux's own origin labels must also agree.
+                    labels = meta.get('labels', {})
+                    if not isinstance(labels, dict):
+                        pairs.append((None, None))
+                    elif any('helm.toolkit.fluxcd.io/' + key in labels for key in ('name', 'namespace')):
+                        pairs.extend((labels.get('helm.toolkit.fluxcd.io/' + key), fmeta[key])
+                                     for key in ('name', 'namespace'))
+        if any(identity(owner) and owner != supplied for owner, supplied in pairs):
+            receipt['binding'] = 'mismatch'
+        elif pairs and all(identity(owner) for owner, _ in pairs):
+            receipt['binding'] = 'match'
+        if receipt['binding'] == 'match' and identity(revision):
+            receipt['state'] = 'observed'
     states = {f['state'] for f in fields}
     body = json.dumps(report, sort_keys=True)
-    if 'mismatch' in states:
+    if 'mismatch' in states or report['flux']['binding'] == 'mismatch':
         return 3, 'DRIFT_MISMATCH', body
     if 'unobservable' in states or report['flux']['state'] != 'observed':
         return 2, 'DRIFT_INCOMPLETE', body
