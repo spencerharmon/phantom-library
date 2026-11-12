@@ -31,6 +31,49 @@ or proof that Go's soft memory limit prevents all future OOMs.
 Run the offline regression with `./scripts/tests/gostream-oom-acceptance.test.sh`.
 No service installation or restart is needed to use either script.
 
+## Tuning Drift
+
+Use the existing CLI's `--drift` mode to compare a retained Deployment against
+expected tuning, optional loaded-config evidence, and an optional expected image:
+
+```bash
+./scripts/gostream-oom-acceptance.sh --drift \
+  --namespace media --name stream --deployment deployment.json \
+  --expected-tuning expected.json --config loaded-config.json \
+  --expected-image example.com/stream:v2 --flux reconciler.json
+```
+
+The JSON receipt includes Flux object `name`/`namespace`, `binding`
+(`match`, `mismatch`, `unobservable`), and revision observation `state`.
+Kustomization evidence must match both Deployment metadata labels
+`kustomize.toolkit.fluxcd.io/name` and `kustomize.toolkit.fluxcd.io/namespace`.
+HelmRelease evidence must match Deployment metadata annotations
+`meta.helm.sh/release-name` and `meta.helm.sh/release-namespace` using the effective
+Helm release name and target namespace, not the HelmRelease object identity.
+`spec.releaseName` overrides the generated `[targetNamespace-]metadata.name`
+(prefix only when targetNamespace is explicit; names over 53 characters use
+Flux's 40-character prefix plus 12-character SHA256 suffix). Target and storage
+namespaces each default independently to the HelmRelease object's namespace.
+The receipt reports both; storage is not the Helm ownership annotation namespace.
+When Deployment `helm.toolkit.fluxcd.io/name` or `/namespace` origin labels are
+retained, both must also match the supplied HelmRelease object identity.
+Missing or malformed identity/ownership evidence stays unobservable. An explicit
+ownership disagreement produces `DRIFT_MISMATCH` (exit 3); an unbound reconciler
+or missing revision cannot be `observed` or enable `DRIFT_MATCH` (exit 0).
+Otherwise unobservable evidence produces `DRIFT_INCOMPLETE` (exit 2).
+
+Binding plus a retained revision is **not** proof of a ready/current reconcile,
+loaded process configuration, or rollout. Missing config remains incomplete,
+and `rollout_at` is always null. Revision observation retains the existing
+`status.lastAppliedRevision` contract; a HelmRelease capture with only
+`lastAttemptedRevision`/history stays incomplete even with a matching binding.
+An attempted revision is not promoted into successful-application evidence.
+This is one shared-service receipt for movie and
+episode consumers, not a playback or OOM-acceptance verdict. No deployment,
+restart, or promotion is needed. Run
+`./scripts/tests/gostream-drift-flux-ownership.test.sh` for ownership regressions
+and the existing drift, acceptance, and pre-rollout suites.
+
 ## Pre-Rollout Diagnostics
 
 When tuning rollout is absent or unverified, use the same CLI with an explicit,

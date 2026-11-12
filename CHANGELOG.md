@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Bind offline gostream drift Flux evidence to Deployment ownership: foreign or
+  unbound Kustomizations/HelmReleases cannot enable `DRIFT_MATCH`. Receipts expose
+  reconciler namespace and binding, with Helm release-name/namespace defaults
+  kept distinct from object identity and storage. No deployment or restart.
 - Extend the offline gostream OOM CLI with explicit non-accepting pre-rollout
   diagnostics: validated incident identities/times and per-cgroup historical RSS
   remain visible without inventing rollout or coverage proof. Default acceptance
