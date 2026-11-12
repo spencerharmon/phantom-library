@@ -57,6 +57,12 @@
 #   --no-file       detect + report breaches but do NOT run beehive task add/block
 #                   (for local dry runs / CI where beehive is unavailable).
 #
+# Eligibility: tuples whose errors_total > 0 (timeouts, engine-budget skips,
+# any failed sample) are reported INELIGIBLE and excluded from the ratchet —
+# they never seed, tighten, reset or loosen a ceiling. A batch with no
+# eligible tuple exits 0 with an explicit NO ELIGIBLE TUPLES line and leaves
+# the thresholds untouched (the ratchet is not run).
+#
 # Exit: 0 = no breach, 3 = breach (tasks filed unless --no-file), 2 = error.
 # ---------------------------------------------------------------------------
 set -euo pipefail
@@ -133,8 +139,30 @@ fi
 
 # --- 2. convert -----------------------------------------------------------
 python3 "$CONVERTER" "$EXPO" "$MEASUREMENTS" || die "measurement conversion failed"
-python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["measurements"] else 1)' "$MEASUREMENTS" \
-  || die "exposition contained no phantom_loadtime_seconds measurements"
+# Eligibility (ttfb-loadtime-error-aware-ratchet): only tuples whose every run
+# succeeded (errors_total 0) reach the ratchet. Erroring tuples stay observable
+# (reported here, published upstream unchanged) but never mutate a ceiling.
+eligibility="$(python3 - "$MEASUREMENTS" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1]))
+for r in data.get("ineligible", []):
+    print(f"loadtime-guard: INELIGIBLE {r['flow']}:{r['backend']}:{r['quantile']} "
+          f"errors={r['errors']}/{r['runs']} median_ms={r['value_ms']} (ceiling untouched)")
+print(f"COUNTS {len(data['measurements'])} {len(data.get('ineligible', []))}")
+PY
+)" || die "cannot read converted measurements"
+printf '%s\n' "$eligibility" | grep -v '^COUNTS ' || true
+read -r _ n_eligible n_ineligible <<<"$(printf '%s\n' "$eligibility" | grep '^COUNTS ')"
+if [ "$n_eligible" = 0 ]; then
+  [ "$n_ineligible" -gt 0 ] || die "exposition contained no phantom_loadtime_seconds measurements"
+  # Every tuple errored: nothing may seed/tighten/reset/loosen. The ratchet is
+  # NOT run (no fake successful ratchet) and the threshold state is untouched.
+  if [ -n "$BREACH_OUT" ]; then
+    printf '{"breach_count":0,"entries":[]}\n' > "$BREACH_OUT" || die "cannot write breach output: $BREACH_OUT"
+  fi
+  echo "loadtime-guard: NO ELIGIBLE TUPLES — all $n_ineligible tuples recorded errors; ratchet not evaluated, thresholds untouched"
+  exit 0
+fi
 
 # --- 3. ratchet-guard (reuses the P5 tool + engine verbatim) --------------
 guard_args=(--thresholds "$THRESHOLDS" --measurements "$MEASUREMENTS" --file-plan "$PLAN" --task-prefix "$TASK_PREFIX")
