@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Daily load-time measurements reach the resolved inactive Jellyfin Service with
+  their API token instead of the interactive OIDC gate. Timings now exclude
+  TLS/ingress/OIDC overhead; interactive authentication is unchanged. Discovery
+  redirects fail with an explicit sanitized `redirect-gate` reason.
 - Bind offline gostream loaded-config drift to the current running container via
   Pod/ReplicaSet ownership evidence. `--loaded-config` receipts can prove tuning
   match/mismatch; stale, foreign, malformed, or mounted-only config stays

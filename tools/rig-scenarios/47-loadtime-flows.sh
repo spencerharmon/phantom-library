@@ -195,10 +195,15 @@ if [ "$DRYRUN" = 1 ]; then
 fi
 
 # --- prod-safety guard: refuse to measure against the production port -------
-# The rig is :18096; production owns :8096. A record captured against prod
-# would poison the ratchet with prod-shaped numbers, so refuse outright.
+# Standalone rigs still refuse :8096. Only the daily wrapper's exact resolved
+# inactive Service may use that port; this is not a general allow-prod switch.
 case "$API" in
-    *:8096|*:8096/*) fail "PHANTOM_LOADTIME_API points at :8096 (production) — refusing; the rig is :18096." ;;
+    *:8096|*:8096/*)
+        if [[ "$API" != "${PHANTOM_LOADTIME_RESOLVED_SERVICE:-}" ||
+              ! "$API" =~ ^http://phantom-library-(blue|green)\.[a-z0-9-]+\.svc:8096$ ||
+              "$API" != "http://phantom-library-$COLOR.${PHANTOM_INCLUSTER_NAMESPACE:-phantom-library}.svc:8096" ]]; then
+            fail "PHANTOM_LOADTIME_API points at :8096 (production) — refusing; use the daily wrapper for a resolved inactive Service."
+        fi ;;
 esac
 
 # --- portable high-resolution wall clock (seconds, float) -------------------
@@ -512,7 +517,7 @@ fi
 # endpoints exercised by tools/rig-scenarios/35 & 36 and the Stage-5 harness.
 # ===========================================================================
 [ -n "$COLOR" ] || COLOR="rig"
-log "live load-time measurement against $API (color=$COLOR); rig :18096, never prod"
+log "live load-time measurement against $API (color=$COLOR); standalone rig or resolved inactive Service, never prod"
 
 api()      { curl -sS --fail --max-time "$REQUEST_TIMEOUT" -H "X-Emby-Token: $TOK" "$@"; }
 json_post(){ curl -sS --fail --max-time "$REQUEST_TIMEOUT" -X POST -H "X-Emby-Token: $TOK" -H 'Content-Type: application/json' "$@"; }
@@ -552,6 +557,9 @@ discovery_request() {
     DISCOVERY_HTTP="$("$@" -o "$WORK_DIR/discovery.json" -w '%{http_code}' 2>/dev/null)" || rc=$?
     DISCOVERY_HTTP="$(http_code_of "$DISCOVERY_HTTP")"
     [ "$rc" = 0 ] || discovery_fail "$kind-request-failed" "$rc"
+    # Never follow auth redirects with the API token or retain Location/state.
+    # A 3xx is curl success but not a Jellyfin discovery response.
+    case "$DISCOVERY_HTTP" in 3??) discovery_fail "$kind-redirect-gate" 0 ;; esac
 }
 
 # Parse discovery only, never playback bodies. Reject malformed IDs rather than

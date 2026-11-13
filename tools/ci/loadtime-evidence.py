@@ -73,13 +73,13 @@ def main():
             reason, code, *status = args
             request_reasons = {f"{kind}-{failure}" for kind in
                                ("user", "channels", "movie", "series", "season", "episode", "availability")
-                               for failure in ("request-failed", "invalid-response")}
+                               for failure in ("request-failed", "invalid-response", "redirect-gate")}
             if reason in request_reasons:
                 if len(status) != 1 or not re.fullmatch(r"[0-9]{3}", status[0]) or not 0 <= int(code) <= 255:
                     raise ValueError("invalid discovery request status")
                 data["discovery_failure"] = dict(reason=reason, curl_exit_code=int(code), http_status=status[0])
             elif reason in ("kube-lookup-timeout", "kube-lookup-error",
-                            "host-not-found", "evidence-write-failed", "no-playable-episode") and not status:
+                            "host-not-found", "service-backend-invalid", "evidence-write-failed", "no-playable-episode") and not status:
                 code_key = "exit_code" if reason == "no-playable-episode" else "kubectl_exit_code"
                 data["discovery_failure"] = dict(reason=reason, **{code_key: int(code)})
             else:
