@@ -10,11 +10,12 @@
 #
 # Unlike tools/ci/live-rig-run.sh / tools/rig-scenarios' own default target
 # (a throwaway rig Jellyfin on :18096), this script measures the ACTUAL
-# **deployed** stack the user hits — the current dev/idle color's Jellyfin,
-# reached over HTTPS at the deployed dev host (e.g.
-# `dev.<tenant-domain>` — the real hostname is supplied by CI vars, never
-# baked into this tracked script; see the infra-identifier rule in this
-# repo's AGENTS.md). It reuses the exact P3 Stage-5 in-cluster rig harness's
+# **deployed** stack — the current dev/idle color's Jellyfin, reached through
+# its in-cluster Service with the Jellyfin token. The dev host is supplied by
+# CI vars and used ONLY to resolve the inactive color, never to traverse the
+# interactive OIDC gate. This deliberately excludes TLS, ingress and OIDC
+# overhead: these are backend flow timings, NOT end-to-end edge timings.
+# It reuses the P3 Stage-5 in-cluster rig harness's
 # posture for resolving which color is "dev" LIVE from the Ingress (never a
 # cached/CNAME guess) and its prod-safety refusal
 # (tools/ci/in-cluster-acceptance-run.sh) — this is NOT a standalone rig
@@ -23,8 +24,8 @@
 # Flow:
 #   1. resolve the dev color live from the Ingress (kubectl), refuse if the
 #      configured dev host equals the prod host.
-#   2. measure the six load-time flows against https://$DEV_HOST (never
-#      :8096 or :18096 — a real port-443 hit against what the user hits).
+#   2. resolve that Ingress's root backend Service/port and measure the six
+#      flows over cluster HTTP (never a standalone rig or the prod color).
 #   3. push the resulting exposition to the Pushgateway (P8/2's emitter).
 #   4. run the ratcheting regression guard against that SAME measurement
 #      (P8/5's loadtime-guard.sh --exposition <EXPO> --apply), auto-filing a follow-up
@@ -275,6 +276,9 @@ resolve_color() {
             [ "$attempt" -lt "$KUBE_ATTEMPTS" ] && sleep "$KUBE_BACKOFF"
         done
         if [ "$rc" = 0 ] && printf '%s\n' "$out" | grep -qxF -- "$host"; then
+            if [ -n "$PROD_HOST" ] && printf '%s\n' "$out" | grep -qxF -- "$PROD_HOST"; then
+                fail "dev Ingress also carries prod host — refusing to measure the production color"
+            fi
             COLOR="$color"
             return 0
         fi
@@ -316,9 +320,37 @@ if [ "$DRYRUN" != 1 ]; then
     [ -n "$ADMIN_TOKEN" ] || fail "PHANTOM_INCLUSTER_ADMIN_TOKEN is required for a live daily measurement run (see tools/ci/provision-in-cluster-rig-creds.md)"
 fi
 
-# Deployed stack, over real HTTPS on the port the user hits — never a
-# standalone rig instance's :18096, never prod's raw :8096.
-API="https://$DEV_HOST"
+# Resolve the backend from the same color's Ingress. This needs only the
+# existing Ingress-read RBAC, not Service/Secret reads or a token-header bypass.
+# Fail closed on ambiguous/non-root/named-port backends rather than guessing.
+API="http://phantom-library-$COLOR.$NAMESPACE.svc"
+if [ "$DRYRUN" != 1 ]; then
+    [[ "$DEV_HOST" =~ ^[A-Za-z0-9.-]+$ && "$NAMESPACE" =~ ^[a-z0-9-]+$ ]] \
+        || fail "invalid dev hostname or namespace"
+    backend=""; backend_rc=0
+    for (( attempt = 1; attempt <= KUBE_ATTEMPTS; attempt++ )); do
+        backend_rc=0
+        backend="$(timeout -k 5 "$((KUBE_TIMEOUT + 5))" kubectl "${KCTX[@]}" -n "$NAMESPACE" \
+            get ingress "phantom-library-$COLOR" \
+            -o "jsonpath={range .spec.rules[?(@.host==\"$DEV_HOST\")].http.paths[?(@.path==\"/\")]}{.backend.service.name}{\":\"}{.backend.service.port.number}{\"\\n\"}{end}" \
+            2>/dev/null)" || backend_rc=$?
+        [ "$backend_rc" = 0 ] && break
+        [ "$attempt" -lt "$KUBE_ATTEMPTS" ] && sleep "$KUBE_BACKOFF"
+    done
+    if [ "$backend_rc" != 0 ]; then
+        case "$backend_rc" in
+            124|137) discovery_fail kube-lookup-timeout "$backend_rc" "dev Service backend lookup timed out" ;;
+            *) discovery_fail kube-lookup-error "$backend_rc" "cannot resolve dev Service backend" ;;
+        esac
+    fi
+    [[ "$backend" =~ ^phantom-library-$COLOR:([0-9]+)$ ]] \
+        || discovery_fail service-backend-invalid 0 "dev Ingress must have one root backend for its resolved color"
+    port="${BASH_REMATCH[1]}"
+    [ "${#port}" -le 5 ] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] \
+        || discovery_fail service-backend-invalid 0 "invalid dev Service port"
+    API="$API:$port"
+fi
+note "measurement path: in-cluster Service (excludes TLS/ingress/OIDC overhead)"
 
 # =========================================================================
 # 1. measure the six flows against the DEPLOYED stack
@@ -338,6 +370,7 @@ log "[1] measuring six load-time flows against $API (color=$COLOR)"
 _stage_start="$(date +%s)"
 set +e
 PHANTOM_LOADTIME_API="$API" \
+PHANTOM_LOADTIME_RESOLVED_SERVICE="$API" \
 PHANTOM_LOADTIME_TOKEN="$ADMIN_TOKEN" \
 PHANTOM_LOADTIME_COLOR="$COLOR" \
 PHANTOM_CI_DRYRUN="$DRYRUN" \

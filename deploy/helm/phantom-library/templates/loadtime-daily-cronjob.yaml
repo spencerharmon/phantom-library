@@ -15,7 +15,7 @@ The daily TTFB-reduction loop's ONLY previous trigger was the Gitea Actions work
 phantom-library is provisioned (gitea-mirror-provision-wiring — a standing NEEDS-HUMAN). A
 buildable dependency is never a standing human gate: tools/ci/loadtime-daily-run.sh is the
 complete daily cadence engine (resolve dev color live from the Ingress -> measure the six
-load-time flows against the deployed HTTPS host -> push to Pushgateway -> ratcheting guard);
+load-time flows against its in-cluster Service -> push to Pushgateway -> ratcheting guard);
 it needs only a Kubernetes CronJob to fire it on schedule, exactly as
 jellyfin-metadata-reaper-cronjob.yaml drives the reaper in-cluster. This removes the Gitea-mirror
 dependency from the measurement loop ENTIRELY. The two triggers are COMPLEMENTARY — this CronJob

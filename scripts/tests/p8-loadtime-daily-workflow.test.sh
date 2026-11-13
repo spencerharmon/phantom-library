@@ -19,7 +19,7 @@
 #   - the shared script itself: valid bash syntax; refuses when the dev host
 #     equals the prod host (prod-safety guard); resolves color from the live
 #     Ingress rather than a hardcoded name; measures the DEPLOYED stack over
-#     HTTPS (never a standalone rig's :18096, never prod's raw :8096 baked as
+#     the resolved inactive Service (never a standalone rig or prod baked as
 #     the daily target); delegates to the P8/1 measurement engine, the P8/2
 #     Pushgateway emitter, and the P8/5 ratcheting regression guard rather
 #     than reimplementing any of them; performs mandatory build/test process
@@ -141,6 +141,18 @@ for tool in python3 dotnet helm git; do
 done
 python3 -c 'import yaml' || fatal "PyYAML is required; structural grep is not YAML validation"
 
+head_ "OIDC gate: real HTTP redirect and resolved Service measurement"
+if python3 "$HERE/loadtime-oidc-path.test.py"; then
+    ok "LIVE daily Service path bypasses interactive gate for both item types"
+else
+    bad "LIVE daily OIDC measurement path"
+fi
+if python3 "$HERE/loadtime-daily-verify.test.py"; then
+    ok "post-merge receipt rejects stale, mismatched and empty measurement evidence"
+else
+    bad "post-merge measurement receipt"
+fi
+
 head_ "YAML parse"
 if python3 - "$WORKFLOW" <<'PY'
 import sys
@@ -261,11 +273,11 @@ else
     bad "$DAILY_SCRIPT does not resolve color from the live Ingress"
 fi
 
-head_ "shared script: measures the DEPLOYED stack over HTTPS (never a baked :8096/:18096 daily target)"
-if grep -qE 'API="https://\$DEV_HOST"' "$DAILY_SCRIPT"; then
-    ok "$DAILY_SCRIPT targets https://\$DEV_HOST — the deployed stack, not a standalone rig"
+head_ "shared script: measures the resolved DEPLOYED Service, not the interactive gate"
+if grep -qF 'API="http://phantom-library-$COLOR.$NAMESPACE.svc"' "$DAILY_SCRIPT"; then
+    ok "$DAILY_SCRIPT targets the resolved color Service"
 else
-    bad "$DAILY_SCRIPT does not target the deployed dev host over HTTPS"
+    bad "$DAILY_SCRIPT does not target the resolved color Service"
 fi
 if grep -vE '^\s*#' "$DAILY_SCRIPT" | grep -qE ':18096|:8096'; then
     bad "$DAILY_SCRIPT bakes a rig/prod port reference outside comments — the daily job must never target a standalone rig instance"
@@ -459,6 +471,7 @@ cat > "$sb_bin/kubectl" <<'K'
 # ttfb-loadtime-kubectl-incluster-config: mimic kubectl v1.31 in-cluster —
 # any client-config override without a kubeconfig drops in-cluster creds.
 case " $* " in *" --request-timeout"*) case " $* " in *" --kubeconfig"*) ;; *) exit 1 ;; esac ;; esac
+case "$*" in *'.backend.service'*) echo 'phantom-library-green:8096'; exit 0 ;; esac
 case "$*" in *phantom-library-green*) echo "$SB_DEV_HOST" ;; esac
 K
 cat > "$sb_bin/curl" <<'C'
@@ -1090,6 +1103,7 @@ esac
 # ttfb-loadtime-kubectl-incluster-config: mimic kubectl v1.31 in-cluster —
 # any client-config override without a kubeconfig drops in-cluster creds.
 case " $* " in *" --request-timeout"*) case " $* " in *" --kubeconfig"*) ;; *) exit 1 ;; esac ;; esac
+case "$*" in *'.backend.service'*) printf '%s\\n' 'phantom-library-green:8096'; exit 0 ;; esac
 case "$*" in *phantom-library-green*) printf '%s\n' dev.example.com ;; esac
 ''')
 (bin_dir / 'beehive').write_text('''#!/usr/bin/env bash
