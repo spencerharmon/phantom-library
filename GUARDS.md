@@ -17,7 +17,7 @@ identifier into the environment-AGNOSTIC plugin source or Helm chart. This is th
 runner-enforced half of the `infra-identifier-isolation` gate in the beehive-layer
 `GATES.md`, and encodes the beehive-wide AGENTS.md "Code <-> infrastructure dividing
 line" rule as an enforced guard: real site identifiers (the deployment domain
-`polyfam.studio` and any host under it; RFC1918 / k3s cluster IPs — `192.168.x`,
+`spencerharmon.com` and any host under it; RFC1918 / k3s cluster IPs — `192.168.x`,
 `10.42.x`/`10.43.x`, `172.16-31.x`) live ONLY on the infrastructure side (the Flux
 HelmReleases / config / Secrets) and are supplied at runtime — never committed into
 this shared repo. AUTHORITY is the change's own committed diff: the guard inspects

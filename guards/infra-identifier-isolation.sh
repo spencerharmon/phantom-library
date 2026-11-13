@@ -18,8 +18,8 @@
 #
 # BANNED (all deployment-specific, all placeholder-safe — RFC2606 example.com/.net and
 # RFC5737 192.0.2/198.51.100/203.0.113 test ranges are deliberately NOT matched):
-#   - the deployment domain  polyfam.studio  (any host under it: apex, color, dev, ...)
-#   - RFC1918 / cluster IPs   192.168.x  10.42.x/10.43.x (k3s pod/svc CIDRs)  172.16-31.x
+#   - the deployment domain  spencerharmon.com  (any host under it: apex, color, dev, ...)
+#   - RFC1918 addresses       10.x (LAN, LB pool, k3s pod/svc CIDRs)  172.16-31.x  192.168.x
 # Generic naming that is NOT a site identifier (e.g. the chart's color-agnostic
 # `jellyfin_prod`/`phantom_prod` default DB names) is intentionally NOT banned.
 #
@@ -38,10 +38,10 @@ fail_closed() {
 # Site-specific identifiers, one ERE per line. Each IP pattern requires a trailing
 # octet digit so it matches an address, not an unrelated dotted token (a .NET TFM,
 # a package version, etc.).
-BANNED='polyfam\.studio
-192\.168\.[0-9]
-10\.4[23]\.[0-9]
-172\.(1[6-9]|2[0-9]|3[01])\.[0-9]'
+BANNED='spencerharmon\.com
+10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]
+172\.(1[6-9]|2[0-9]|3[01])\.[0-9]
+192\.168\.[0-9]'
 
 # Only a honeybee change is guarded; the sanctioned non-honeybee actor does not run
 # through this gate at all (ABI), so it is never blocked.

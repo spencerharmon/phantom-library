@@ -60,7 +60,7 @@ run_case() {
 p="$work/patch"
 
 # (1) added banned host in a protected src file, honeybee -> refuse
-ADD='var host = "jellyfin.polyfam.studio";' DEL='' mk_patch "$SRC" "$p"
+ADD='var host = "jellyfin.spencerharmon.com";' DEL='' mk_patch "$SRC" "$p"
 BEEHIVE_HONEYBEE=1 BEEHIVE_GUARD_DIFF_PATCH="$p" BEEHIVE_GUARD_MATCHED_FILES="$SRC" \
 	run_case "added domain in src (honeybee)" refuse
 
@@ -70,9 +70,19 @@ BEEHIVE_HONEYBEE=1 BEEHIVE_GUARD_DIFF_PATCH="$p" BEEHIVE_GUARD_MATCHED_FILES="$C
 	run_case "added cluster IP in chart (honeybee)" refuse
 
 # (1c) added home-LAN LB IP, honeybee -> refuse
-ADD='  loadBalancerIP: 192.168.1.99' DEL='' mk_patch "$CHART" "$p"
+ADD='  loadBalancerIP: 10.217.40.99' DEL='' mk_patch "$CHART" "$p"
 BEEHIVE_HONEYBEE=1 BEEHIVE_GUARD_DIFF_PATCH="$p" BEEHIVE_GUARD_MATCHED_FILES="$CHART" \
 	run_case "added LB IP in chart (honeybee)" refuse
+
+# (1d) added MetalLB pool address, honeybee -> refuse
+ADD='  loadBalancerIP: 10.217.42.10' DEL='' mk_patch "$CHART" "$p"
+BEEHIVE_HONEYBEE=1 BEEHIVE_GUARD_DIFF_PATCH="$p" BEEHIVE_GUARD_MATCHED_FILES="$CHART" \
+	run_case "added pool IP in chart (honeybee)" refuse
+
+# (1e) RFC5737 placeholder address, honeybee -> allow
+ADD='  loadBalancerIP: 192.0.2.10  # example' DEL='' mk_patch "$CHART" "$p"
+BEEHIVE_HONEYBEE=1 BEEHIVE_GUARD_DIFF_PATCH="$p" BEEHIVE_GUARD_MATCHED_FILES="$CHART" \
+	run_case "placeholder IP in chart (honeybee)" allow
 
 # (2) clean diff (neutral placeholder) in a protected file, honeybee -> allow
 ADD='  host: ""  # supplied at runtime; docs use example.com' DEL='' mk_patch "$CHART" "$p"
@@ -80,12 +90,12 @@ BEEHIVE_HONEYBEE=1 BEEHIVE_GUARD_DIFF_PATCH="$p" BEEHIVE_GUARD_MATCHED_FILES="$C
 	run_case "clean placeholder in chart (honeybee)" allow
 
 # (3) same violating diff WITHOUT honeybee identity (sanctioned actor / flip path) -> allow
-ADD='var host = "jellyfin.polyfam.studio";' DEL='' mk_patch "$SRC" "$p"
+ADD='var host = "jellyfin.spencerharmon.com";' DEL='' mk_patch "$SRC" "$p"
 BEEHIVE_HONEYBEE=0 BEEHIVE_GUARD_DIFF_PATCH="$p" BEEHIVE_GUARD_MATCHED_FILES="$SRC" \
 	run_case "added domain in src (non-honeybee)" allow
 
 # (4a) content-dependence: identifier only on a REMOVED line -> allow (removing a leak is good)
-ADD='var host = cfg.Host;' DEL='var host = "jellyfin.polyfam.studio";' mk_patch "$SRC" "$p"
+ADD='var host = cfg.Host;' DEL='var host = "jellyfin.spencerharmon.com";' mk_patch "$SRC" "$p"
 BEEHIVE_HONEYBEE=1 BEEHIVE_GUARD_DIFF_PATCH="$p" BEEHIVE_GUARD_MATCHED_FILES="$SRC" \
 	run_case "identifier only removed (honeybee)" allow
 
