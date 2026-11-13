@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Bind offline gostream loaded-config drift to the current running container via
+  Pod/ReplicaSet ownership evidence. `--loaded-config` receipts can prove tuning
+  match/mismatch; stale, foreign, malformed, or mounted-only config stays
+  unobservable. See the [drift guide](docs/tasks/gostream-oom-acceptance.md#tuning-drift).
+  No deployment or restart.
 - Bind offline gostream drift Flux evidence to Deployment ownership: foreign or
   unbound Kustomizations/HelmReleases cannot enable `DRIFT_MATCH`. Receipts expose
   reconciler namespace and binding, with Helm release-name/namespace defaults

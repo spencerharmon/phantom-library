@@ -39,11 +39,37 @@ expected tuning, optional loaded-config evidence, and an optional expected image
 ```bash
 ./scripts/gostream-oom-acceptance.sh --drift \
   --namespace media --name stream --deployment deployment.json \
-  --expected-tuning expected.json --config loaded-config.json \
+  --expected-tuning expected.json --loaded-config loaded-config.json \
+  --pods pods.json --replicasets replicasets.json \
   --expected-image example.com/stream:v2 --flux reconciler.json
 ```
 
-The JSON receipt includes Flux object `name`/`namespace`, `binding`
+`--loaded-config` is optional process-derived evidence, not a mounted config file:
+
+```json
+{"container_id":"containerd://current-process","values":{"master_concurrency_limit":6,"read_ahead_budget_mb":64}}
+```
+
+Capture the actual loaded values from the process and retain current raw Pod and
+ReplicaSet JSON (each accepts an object or List). The analyzer verifies the
+Deployment namespace, selector, and controller UID chain through the ReplicaSet,
+then compares the receipt ID exactly to the named running container's
+`status.containerStatuses[].containerID`. A previous termination, sidecar, or
+foreign process is not a match. This single-process receipt requires one desired
+replica and exactly one supplied current pod; it cannot certify multiple replicas.
+Capture the evidence together: this offline tool cannot detect a restart after
+the retained pod snapshot or authenticate the source of a supplied receipt.
+
+Only a bound, valid receipt makes config fields `match` or `mismatch`. Expected
+tuning values must be present in its `values` map as finite nonnegative JSON
+numbers (not strings or booleans). Missing, stale, foreign, or malformed receipt
+or ownership evidence leaves config fields `unobservable`, with null `observed`
+and a `reason`; independent env/image mismatches remain visible. Legacy `--config`
+is accepted for existing callers but never grants observation: mounted ConfigMaps
+and bare values files do not prove what the process loaded. A valid receipt's
+value mismatch uses the existing `DRIFT_MISMATCH` exit 3, not exit 1.
+
+The JSON report includes Flux object `name`/`namespace`, `binding`
 (`match`, `mismatch`, `unobservable`), and revision observation `state`.
 Kustomization evidence must match both Deployment metadata labels
 `kustomize.toolkit.fluxcd.io/name` and `kustomize.toolkit.fluxcd.io/namespace`.
@@ -72,7 +98,9 @@ This is one shared-service receipt for movie and
 episode consumers, not a playback or OOM-acceptance verdict. No deployment,
 restart, or promotion is needed. Run
 `./scripts/tests/gostream-drift-flux-ownership.test.sh` for ownership regressions
-and the existing drift, acceptance, and pre-rollout suites.
+and the existing drift, acceptance, and pre-rollout suites. Run
+`./scripts/tests/gostream-drift-loaded-config-receipt.test.sh` for process-receipt
+and malformed/stale/foreign evidence regressions.
 
 ## Pre-Rollout Diagnostics
 

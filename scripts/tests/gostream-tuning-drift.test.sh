@@ -44,14 +44,15 @@ def run(name, code, verdict, files, extra=(), contains=()):
     failures += not ok
 
 
-full = {'deployment': deployment, 'expected-tuning': expected, 'config': config, 'flux': flux}
+full = {'deployment': deployment, 'expected-tuning': dict(expected, config={}), 'flux': flux}
 run('full match', 0, 'DRIFT_MATCH', full, contains=('main@sha1:0123abcd',))
 d = json.loads(json.dumps(deployment))
 d['spec']['template']['spec']['containers'][0]['env'][0]['value'] = '2200MiB'
 run('env mismatch 2200MiB', 3, 'DRIFT_MISMATCH', dict(full, deployment=d),
     contains=('"observed": "2200MiB"', '"state": "mismatch"'))
-run('missing config key', 3, 'DRIFT_MISMATCH', dict(full, config={}), contains=('config.read_ahead_mib',))
-run('config unobservable', 2, 'DRIFT_INCOMPLETE', {k: v for k, v in full.items() if k != 'config'},
+run('mounted config unobservable', 2, 'DRIFT_INCOMPLETE', dict(full, config=config, **{'expected-tuning': expected}),
+    contains=('config.read_ahead_mib', '"state": "unobservable"'))
+run('config unobservable', 2, 'DRIFT_INCOMPLETE', dict(full, **{'expected-tuning': expected}),
     contains=('"state": "unobservable"',))
 run('missing flux input unobservable', 2, 'DRIFT_INCOMPLETE', {k: v for k, v in full.items() if k != 'flux'},
     contains=('"binding": "unobservable"', '"state": "unobservable"'))

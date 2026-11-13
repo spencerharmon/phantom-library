@@ -106,7 +106,10 @@ def drift():
     for flag in ('deployment', 'expected-tuning', 'namespace', 'name'):
         parser.add_argument('--' + flag, required=True)
     parser.add_argument('--expected-image', help='Expected container image reference')
-    parser.add_argument('--config', help='Retained loaded-config JSON object for the container')
+    parser.add_argument('--config', help='Legacy mounted config input; never proves loaded values')
+    parser.add_argument('--loaded-config', help='Process receipt JSON: container_id and values')
+    parser.add_argument('--pods', help='Retained current Pod or List for loaded-config binding')
+    parser.add_argument('--replicasets', help='Retained ReplicaSet or List proving Deployment ownership')
     parser.add_argument('--flux', help='Retained Flux Kustomization/HelmRelease JSON')
     args = parser.parse_args()
     expected = load(args.expected_tuning)
@@ -144,14 +147,65 @@ def drift():
         else:
             add('env.' + name, want, 'match' if entry['value'] == want else 'mismatch', entry['value'])
     loaded = None
-    if args.config:
-        loaded = load(args.config)
-        require(isinstance(loaded, dict), 'config receipt must be an object')
+    config_reason = 'loaded-config process receipt required; mounted config is not proof'
+    if args.loaded_config:
+        try:
+            receipt = load(args.loaded_config)
+            require(isinstance(receipt, dict), 'malformed loaded-config receipt')
+            cid, values = receipt['container_id'], receipt['values']
+            require(isinstance(cid, str) and re.fullmatch(r'[a-z0-9-]+://[A-Za-z0-9_.-]+', cid),
+                    'malformed receipt container_id')
+            require(isinstance(values, dict), 'malformed receipt values')
+            for name in expected['config']:
+                require(name in values and type(values[name]) in (int, float),
+                        'missing/malformed receipt value: ' + name)
+                number(values[name])
+            require(args.pods and args.replicasets, 'pods and replicasets required for process binding')
+            spec = deploy['spec']
+            require(type(spec.get('replicas', 1)) is int and spec.get('replicas', 1) == 1,
+                    'single process receipt requires exactly one Deployment replica')
+            selector = spec['selector']
+            require(selector.get('matchLabels') and not selector.get('matchExpressions'),
+                    'unsupported/empty Deployment selector')
+            payload = load(args.pods)
+            pods = [payload] if payload.get('kind') == 'Pod' else payload['items']
+            require(isinstance(pods, list) and len(pods) == 1, 'ambiguous/missing current pod')
+            pod = pods[0]
+            pmeta = pod['metadata']
+            require(pod['kind'] == 'Pod' and pmeta['namespace'] == meta['namespace']
+                    and not pmeta.get('deletionTimestamp'), 'foreign/deleting pod')
+            require(all(pmeta['labels'].get(k) == v for k, v in selector['matchLabels'].items()),
+                    'pod selector mismatch')
+            owners = [o for o in pmeta['ownerReferences'] if o.get('controller') is True]
+            require(len(owners) == 1 and owners[0]['kind'] == 'ReplicaSet', 'pod controller mismatch')
+            owner = owners[0]
+            require(all(isinstance(uid, str) and uid.strip() for uid in (meta['uid'], owner['uid'])),
+                    'missing/malformed ownership UID')
+            payload = load(args.replicasets)
+            replicasets = [payload] if payload.get('kind') == 'ReplicaSet' else payload['items']
+            require(isinstance(replicasets, list), 'malformed ReplicaSet list')
+            matches = [rs for rs in replicasets if rs['metadata']['uid'] == owner['uid']]
+            require(len(matches) == 1, 'missing/ambiguous owning ReplicaSet')
+            rs = matches[0]
+            rmeta = rs['metadata']
+            require(rs['kind'] == 'ReplicaSet' and rmeta['namespace'] == meta['namespace']
+                    and rmeta['name'] == owner['name'], 'foreign ReplicaSet')
+            owners = [o for o in rmeta['ownerReferences'] if o.get('controller') is True]
+            require(len(owners) == 1 and owners[0]['kind'] == 'Deployment'
+                    and owners[0]['uid'] == meta['uid'] and owners[0]['name'] == meta['name'],
+                    'ReplicaSet Deployment owner mismatch')
+            state = named(pod['status']['containerStatuses'], container)
+            require(pod['status']['phase'] == 'Running' and isinstance(state['state'].get('running'), dict),
+                    'container is not currently running')
+            require(cid == state['containerID'], 'stale/foreign loaded-config container_id')
+            loaded = values
+        except (ValueError, KeyError, TypeError, IndexError, AttributeError, OSError, DecimalException) as error:
+            # Invalid optional evidence must not hide independent env/image drift.
+            config_reason = 'unusable loaded-config evidence: ' + str(error)
     for name, want in sorted(expected['config'].items()):
         if loaded is None:
             add('config.' + name, want, 'unobservable', None)
-        elif name not in loaded:
-            add('config.' + name, want, 'mismatch', None)
+            fields[-1]['reason'] = config_reason
         else:
             add('config.' + name, want, 'match' if json_equal(loaded[name], want) else 'mismatch', loaded[name])
     if args.expected_image:

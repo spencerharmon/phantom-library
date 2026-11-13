@@ -22,11 +22,10 @@ deployment = {'kind': 'Deployment', 'metadata': {
         'name': 'stream', 'image': 'example.com/stream:v2',
         'env': [{'name': 'GOMEMLIMIT', 'value': '1800MiB'}]}]}}}}
 expected = {'container': 'stream', 'rollout_at': None,
-            'env': {'GOMEMLIMIT': '1800MiB'}, 'config': {'read_ahead_mib': 64}}
+            'env': {'GOMEMLIMIT': '1800MiB'}, 'config': {}}
 flux = {'kind': 'Kustomization', 'metadata': {'name': 'stream-owner', 'namespace': 'controllers'},
         'status': {'lastAppliedRevision': 'main@sha1:0123abcd'}}
-full = {'deployment': deployment, 'flux': flux, 'expected-tuning': expected,
-        'config': {'read_ahead_mib': 64}}
+full = {'deployment': deployment, 'flux': flux, 'expected-tuning': expected}
 cases = []
 
 
@@ -61,7 +60,7 @@ for key in ('name', 'namespace'):
     case('absent Flux ' + key, 'unobservable', f)
 f = deepcopy(full); del f['flux']['status']['lastAppliedRevision']
 case('bound but no revision', 'match', f, code=2)
-f = deepcopy(full); del f['config']
+f = deepcopy(full); f['expected-tuning']['config'] = {'read_ahead_mib': 64}
 case('bound but config unobserved', 'match', f, code=2)
 
 helm = deepcopy(full)
