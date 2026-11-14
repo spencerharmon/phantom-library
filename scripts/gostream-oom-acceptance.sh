@@ -6,6 +6,7 @@ import argparse
 from datetime import datetime
 from decimal import Decimal, DecimalException
 import hashlib
+import math
 import json
 import re
 import sys
@@ -24,9 +25,22 @@ def unique(pairs):
     return result
 
 
+class Inexact(str):
+    """Raw JSON number token a binary float cannot represent faithfully."""
+
+
+def exact_float(token):
+    # Never round evidence: a token whose float round-trip changes its value
+    # (excess precision, underflow to 0/-0, overflow) stays an opaque token.
+    value = float(token)
+    if math.isfinite(value) and Decimal(repr(value)) == Decimal(token):
+        return value
+    return Inexact(token)
+
+
 def load(path):
     with open(path) as stream:
-        return json.load(stream, object_pairs_hook=unique)
+        return json.load(stream, object_pairs_hook=unique, parse_float=exact_float)
 
 
 def json_equal(left, right):
@@ -157,7 +171,9 @@ def drift():
                     'malformed receipt container_id')
             require(isinstance(values, dict), 'malformed receipt values')
             for name in expected['config']:
-                require(name in values and type(values[name]) in (int, float),
+                require(not isinstance(values.get(name), Inexact),
+                        'receipt value precision unsupported: ' + name)
+                require(type(values[name]) in (int, float),
                         'missing/malformed receipt value: ' + name)
                 number(values[name])
             require(args.pods and args.replicasets, 'pods and replicasets required for process binding')
@@ -203,9 +219,10 @@ def drift():
             # Invalid optional evidence must not hide independent env/image drift.
             config_reason = 'unusable loaded-config evidence: ' + str(error)
     for name, want in sorted(expected['config'].items()):
-        if loaded is None:
+        if loaded is None or isinstance(want, Inexact):
             add('config.' + name, want, 'unobservable', None)
-            fields[-1]['reason'] = config_reason
+            fields[-1]['reason'] = (config_reason if loaded is None else
+                                    'expected value precision unsupported: ' + want)
         else:
             add('config.' + name, want, 'match' if json_equal(loaded[name], want) else 'mismatch', loaded[name])
     if args.expected_image:
