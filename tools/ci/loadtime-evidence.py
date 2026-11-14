@@ -69,6 +69,44 @@ def main():
                     response="transport/no-response" if status == "000" else "http", stage=stage))
             else:
                 data["failures_omitted"] = data.get("failures_omitted", 0) + 1
+        elif action == "browse-sample":
+            # ttfb-loadtime-browse-stage-durations: one record per LIVE
+            # list_load/sort_change sample. Unreached/skipped stages carry
+            # null seconds (explicit, never a successful zero); measured
+            # components + residual reconcile to total within 1e-5 s.
+            (flow, kind, scope, sample, outcome, total, cst, cs, pages,
+             bst, bs, batches, dst, ds, residual) = args
+            seconds = lambda v: None if v == "-" else round(float(v), 6)
+            if (flow not in ("list_load", "sort_change") or kind not in ("movie", "episode")
+                    or scope != {"movie": "movies_root", "episode": "shows_root"}[kind]
+                    or outcome not in ("success", "failed", "skipped")
+                    or any(st not in ("ok", "failed", "unreached", "skipped") for st in (cst, bst, dst))):
+                raise ValueError("invalid browse sample evidence")
+            stages = {}
+            for name, st, v, extra in (("channel_items", cst, cs, dict(pages=int(pages))),
+                                       ("badge_states", bst, bs, dict(batches=int(batches))),
+                                       ("dom_materialise", dst, ds, {})):
+                secs = seconds(v)
+                if (st in ("ok", "failed")) != (secs is not None) or (secs is not None and not 0 <= secs < 1e6):
+                    raise ValueError("invalid browse stage seconds")
+                stages[name] = dict(status=st, seconds=secs, **extra)
+            total_s, residual_s = seconds(total), seconds(residual)
+            if outcome == "skipped":
+                if total_s is not None or residual_s is not None or any(s["status"] != "skipped" for s in stages.values()):
+                    raise ValueError("skipped browse sample carries timing")
+            else:
+                measured = sum(s["seconds"] for s in stages.values() if s["seconds"] is not None)
+                if total_s is None or residual_s is None or residual_s < 0 or abs(total_s - measured - residual_s) > 1e-5:
+                    raise ValueError("browse sample does not reconcile")
+            stages["residual"] = dict(status="skipped" if outcome == "skipped" else ("ok" if outcome == "success" else "failed"),
+                                      seconds=residual_s)
+            record = dict(flow=flow, item_type=kind, scope=scope, sample_index=int(sample),
+                          outcome=outcome, total_seconds=total_s, stages=stages)
+            browse = data.setdefault("browse_samples", [])
+            if len(browse) < 4096:
+                browse.append(record)
+            else:
+                data["browse_samples_omitted"] = data.get("browse_samples_omitted", 0) + 1
         elif action == "discovery-failure":
             reason, code, *status = args
             request_reasons = {f"{kind}-{failure}" for kind in

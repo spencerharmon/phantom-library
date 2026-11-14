@@ -229,13 +229,27 @@ elapsed() {
 # DRYRUN — the DOM cost is what DRYRUN actually measures) so this function
 # stays identical between the two modes.
 # badge_fanout_and_materialise <item_count> <batch_runner_fn>
+# Browse stage decomposition (ttfb-loadtime-browse-stage-durations): the DOM
+# tail's own elapsed time and outcome are exported in LAST_DOM_S /
+# LAST_DOM_STATUS (unreached|ok|failed) so the LIVE sample can account for it.
+LAST_DOM_S=""
+LAST_DOM_STATUS=unreached
 badge_fanout_and_materialise() {
     local total="$1" batch_runner="$2"
-    local i=0
+    local i=0 dom_start dom_rc=0
+    LAST_DOM_S=""; LAST_DOM_STATUS=unreached
     while [ "$i" -lt "$total" ]; do
         "$batch_runner" "$i" "$BADGE_BATCH_LIMIT" || return 1
         i=$((i + BADGE_BATCH_LIMIT))
     done
+    dom_start="$(now_s)"
+    _dom_materialise "$total" || dom_rc=$?
+    LAST_DOM_S="$(elapsed "$dom_start")"
+    if [ "$dom_rc" = 0 ]; then LAST_DOM_STATUS=ok; else LAST_DOM_STATUS=failed; fi
+    return "$dom_rc"
+}
+_dom_materialise() {
+    local total="$1"
     if command -v node >/dev/null 2>&1 && [ -f "$DOM_MATERIALISE_JS" ]; then
         if [ "$DRYRUN" = 1 ]; then
             node "$DOM_MATERIALISE_JS" "$total" >/dev/null 2>&1
@@ -304,6 +318,80 @@ list_error_records() {
         [ -n "$key" ] || continue
         printf 'phantom_loadtime_list_errors_total{%s} %s\n' "$key" "${_list_err_counts[$key]}"
     done <<<"$_list_err_order"
+}
+
+# --- browse stage decomposition (ttfb-loadtime-browse-stage-durations) -----
+# Every ATTEMPTED (or skipped) LIVE list_load/sort_change sample appends one
+# row per stage: channel_items | badge_states | dom_materialise | residual |
+# total, each with status ok|failed|unreached|skipped. Only ok/failed stages
+# carry measured seconds; unreached/skipped are explicit, never zeroes. Per
+# sample, total == channel_items + badge_states + dom_materialise + residual
+# (residual = harness overhead: JSON parsing, id slicing, budget checks,
+# temp files), to 6-decimal rounding (tolerance 1e-5 s). Aggregates are SUMS
+# and COUNTS split by sample outcome (success|failed) — sums are additive per
+# population; independently aggregated medians are NOT.
+# scope labels the actual browse surface: movies_root | shows_root (the
+# Shows channel ROOT list, NOT episode navigation, despite item_type=episode).
+_browse_rows=""
+browse_row() { _browse_rows="${_browse_rows}$*
+"; }
+browse_records() {
+    [ -n "$_browse_rows" ] || return 0
+    python3 - "$COLOR" 3<<<"$_browse_rows" <<'PY'
+import os, sys
+color = sys.argv[1]
+sums, counts, order = {}, {}, []
+for line in os.fdopen(3):
+    if not line.strip():
+        continue
+    flow, item, scope, outcome, stage, status, secs = line.split()
+    base = f'flow="{flow}",item_type="{item}",scope="{scope}",stage="{stage}",outcome="{outcome}"'
+    ckey = (base, status)
+    if ckey not in counts:
+        counts[ckey] = 0
+        order.append(ckey)
+    counts[ckey] += 1
+    if status in ("ok", "failed"):
+        sums[base] = sums.get(base, 0.0) + float(secs)
+print("# HELP phantom_loadtime_browse_stage_seconds_sum Summed measured seconds of a LIVE list_load/sort_change stage (channel_items|badge_states|dom_materialise|residual|total) over attempted samples, split by sample outcome. Sums are additive within one outcome population; medians are not.")
+print("# TYPE phantom_loadtime_browse_stage_seconds_sum counter")
+for base in dict.fromkeys(b for b, _ in order):
+    if base in sums:
+        print(f'phantom_loadtime_browse_stage_seconds_sum{{{base},color="{color}"}} {sums[base]:.6f}')
+print("# HELP phantom_loadtime_browse_stage_samples_total LIVE list_load/sort_change samples per stage, outcome and stage status (ok|failed measured; unreached|skipped carry no seconds).")
+print("# TYPE phantom_loadtime_browse_stage_samples_total counter")
+for base, status in order:
+    print(f'phantom_loadtime_browse_stage_samples_total{{{base},status="{status}",color="{color}"}} {counts[base, status]}')
+PY
+}
+# browse_account <flow> <item_type> <scope> <sample> <outcome> <total_s>
+#   <channel_status> <channel_s> <pages> <badge_status> <badge_s> <batches>
+#   <dom_status> <dom_s>
+# Computes residual, appends stage rows, retains the per-sample evidence.
+browse_account() {
+    local acct
+    acct="$(python3 - "$@" <<'PY'
+import sys
+flow, item, scope, sample, outcome, total, cst, cs, pages, bst, bs, batches, dst, ds = sys.argv[1:]
+total = float(total)
+comp = {"channel_items": (cst, cs), "badge_states": (bst, bs), "dom_materialise": (dst, ds)}
+measured = sum(round(float(v), 6) for st, v in comp.values() if st in ("ok", "failed"))
+residual = round(total - measured, 6)
+if residual < -1e-5:
+    sys.exit("component sum exceeds sample total")
+residual = max(residual, 0.0)
+rst = "ok" if outcome == "success" else "failed"
+for stage, (st, v) in list(comp.items()) + [("residual", (rst, residual)), ("total", (rst, total))]:
+    secs = f"{float(v):.6f}" if st in ("ok", "failed") else "-"
+    print(f"{flow} {item} {scope} {outcome} {stage} {st} {secs}")
+print(f"RESIDUAL {residual:.6f}")
+PY
+)" || { log "flow=$1 item_type=$2 browse accounting failed"; return 1; }
+    local residual
+    residual="$(sed -n 's/^RESIDUAL //p' <<<"$acct")"
+    browse_row "$(grep -v '^RESIDUAL ' <<<"$acct")"
+    log "flow=$1 item_type=$2 scope=$3 sample=$4 outcome=$5 total_s=$6 channel_items=$7:${8:--} pages=$9 badge_states=${10}:${11:--} batches=${12} dom_materialise=${13}:${14:--} residual_s=$residual"
+    evidence browse-sample "$1" "$2" "$3" "$4" "$5" "$6" "$7" "${8:--}" "$9" "${10}" "${11:--}" "${12}" "${13}" "${14:--}" "$residual"
 }
 
 # --- N-sample aggregation (median duration, summed errors) ------------------
@@ -412,6 +500,7 @@ EOF
         [ -n "$outcome_header" ] && printf '%s' "$outcome_header"
         [ -n "$_records" ] && printf '%s' "$_records"
         list_error_records
+        browse_records
         [ -n "$_outcome_records" ] && printf '%s' "$_outcome_records"
     }
     _emit_exposition
@@ -709,6 +798,9 @@ _full_list_sample() {
     # the FIRST failing stage + its HTTP status (000 = transport/timeout).
     local fail_stage="" fail_code="" fail_rc=0
     local all_ids_file
+    # Per-stage accounting (ttfb-loadtime-browse-stage-durations): durations
+    # are space-separated per-request elapsed lists, summed once at the end.
+    local ch_status=ok ch_durs="" pages=0 bd_status=unreached bd_durs="" batches=0 t0
     all_ids_file="$(mktemp "$WORK_DIR/ids.XXXXXX")"
     start="$(now_s)"
     local deadline request_budget
@@ -720,13 +812,17 @@ if sys.argv[2]:
 print(d)' "$LIST_TIMEOUT" "$ENGINE_DEADLINE")"
     while :; do
         if ! list_request_budget; then
-            errors=1; fail_stage=page_fetch; fail_code=000; fail_rc=28; break
+            errors=1; fail_stage=page_fetch; fail_code=000; fail_rc=28; ch_status=failed; break
         fi
         local page_json page_file
         page_file="$(mktemp "$WORK_DIR/page.XXXXXX")"
         local code
-        if code="$(api --max-time "$request_budget" "$API/Channels/$ch/Items?Limit=$page&StartIndex=$start_index&userId=$USER_ID${sort_qs}" -o "$page_file" -w '%{http_code}' 2>/dev/null)"; then :; else
+        t0="$(now_s)"; pages=$((pages + 1))
+        if code="$(api --max-time "$request_budget" "$API/Channels/$ch/Items?Limit=$page&StartIndex=$start_index&userId=$USER_ID${sort_qs}" -o "$page_file" -w '%{http_code}' 2>/dev/null)"; then
+            ch_durs="$ch_durs $(elapsed "$t0")"
+        else
             fail_rc=$?
+            ch_durs="$ch_durs $(elapsed "$t0")"; ch_status=failed
             errors=1; fail_stage=page_fetch; fail_code="$(http_code_of "$code")"
             [ "$fail_rc" != 28 ] || fail_code=000
             rm -f "$page_file"; break
@@ -739,7 +835,7 @@ print(d)' "$LIST_TIMEOUT" "$ENGINE_DEADLINE")"
         total=$((total + got))
         start_index=$((start_index + page))
         if ! list_request_budget; then
-            errors=1; fail_stage=page_fetch; fail_code=000; fail_rc=28; break
+            errors=1; fail_stage=page_fetch; fail_code=000; fail_rc=28; ch_status=failed; break
         fi
         if [ "$got" -eq 0 ] || [ "$start_index" -ge "$total_records" ]; then break; fi
     done
@@ -753,10 +849,14 @@ print(json.dumps(ids[$off:$off+$lim]))
 " 2>/dev/null || echo '[]')"
         local bcode
         if ! list_request_budget; then
-            errors=1; fail_stage=badge_states; fail_code=000; fail_rc=28; return 1
+            errors=1; fail_stage=badge_states; fail_code=000; fail_rc=28; bd_status=failed; return 1
         fi
-        if bcode="$(json_post --max-time "$request_budget" -d "{\"ids\": $chunk_ids}" -o /dev/null -w '%{http_code}' "$API/Plugins/PhantomLibrary/States" 2>/dev/null)"; then :; else
+        t0="$(now_s)"; batches=$((batches + 1))
+        if bcode="$(json_post --max-time "$request_budget" -d "{\"ids\": $chunk_ids}" -o /dev/null -w '%{http_code}' "$API/Plugins/PhantomLibrary/States" 2>/dev/null)"; then
+            bd_durs="$bd_durs $(elapsed "$t0")"
+        else
             local rc=$?
+            bd_durs="$bd_durs $(elapsed "$t0")"; bd_status=failed
             if [ "$errors" -eq 0 ]; then
                 fail_rc="$rc"
                 fail_stage=badge_states; fail_code="$(http_code_of "$bcode")"
@@ -766,7 +866,10 @@ print(json.dumps(ids[$off:$off+$lim]))
             return 1
         fi
     }
+    LAST_DOM_S=""; LAST_DOM_STATUS=unreached
     if [ "$errors" = 0 ]; then
+        # Zero items => no badge request is made: explicit skip, not a zero.
+        if [ "$total" -gt 0 ]; then bd_status=ok; else bd_status=skipped; fi
         if badge_fanout_and_materialise "$total" live_batch_runner; then
             if ! list_request_budget; then
                 errors=1; fail_stage=badge_states; fail_code=000; fail_rc=28
@@ -784,6 +887,11 @@ print(json.dumps(ids[$off:$off+$lim]))
     dur="$(elapsed "$start")"
     sample_add "$dur" "$errors"
     log "flow=$flow item_type=$item_type sample_s=$dur errors=$errors items=$total"
+    browse_account "$flow" "$item_type" "$(browse_scope "$item_type")" "$((s + 1))" \
+        "$([ "$errors" = 0 ] && echo success || echo failed)" "$dur" \
+        "$ch_status" "$(sum_durs $ch_durs)" "$pages" \
+        "$bd_status" "$( [ "$bd_status" = ok ] || [ "$bd_status" = failed ] && sum_durs $bd_durs)" "$batches" \
+        "$LAST_DOM_STATUS" "$LAST_DOM_S"
     if [ "$errors" -eq 1 ]; then
         list_error_add "$flow" "$item_type" "$fail_stage" "$fail_code"
         [ "$fail_rc" != 28 ] || LAST_LIST_TIMEOUT=1
@@ -796,11 +904,21 @@ print(json.dumps(ids[$off:$off+$lim]))
 # so they are recorded as erroring not-run samples (fail fast) rather than
 # re-attempted: 3 samples x 4 list flows x LIST_TIMEOUT would otherwise exceed
 # the engine's wall budget and lose the whole batch.
+sum_durs() { python3 -c 'import sys; print(f"{sum(float(x) for x in sys.argv[1:]):.6f}")' "$@"; }
+browse_scope() { if [ "$1" = movie ]; then echo movies_root; else echo shows_root; fi; }
+browse_skip() {
+    local stage
+    for stage in channel_items badge_states dom_materialise residual total; do
+        browse_row "$1 $2 $(browse_scope "$2") failed $stage skipped -"
+    done
+    evidence browse-sample "$1" "$2" "$(browse_scope "$2")" "$3" skipped - skipped - 0 skipped - 0 skipped - -
+}
 time_full_list_flow() {
     local s timed_out=0
     sample_reset
     for ((s = 0; s < SAMPLES; s++)); do
         if [ "$timed_out" = 1 ] || engine_expired; then
+            browse_skip "$1" "$2" "$((s + 1))"
             sample_add 0 1
             log "flow=$1 item_type=$2 sample=$((s + 1)) skipped (prior sample timed out or engine budget spent)"
             continue

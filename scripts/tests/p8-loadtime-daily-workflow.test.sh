@@ -1244,11 +1244,35 @@ canonical = lambda items: sorted(json.dumps(i, sort_keys=True) for i in items)
 assert canonical(first['failures']) == canonical(expected_failures), first['failures']
 payload, = [r['payload'] for r in requests if r['path'].endswith('/phantom-loadtime')]
 samples = {}
+browse_first = {}
 for line in payload.splitlines():
     if line and not line.startswith('#'):
         key, value = line.split()
-        assert key not in samples, ('duplicate metric', key)
-        samples[key] = float(value)
+        # ttfb-loadtime-browse-stage-durations: the additive browse-stage
+        # families are asserted separately; every pre-existing family is
+        # still held to the exact unchanged key set below.
+        target = browse_first if key.startswith('phantom_loadtime_browse_stage_') else samples
+        assert key not in target, ('duplicate metric', key)
+        target[key] = float(value)
+# Failed-population decomposition: the movie list_load page_fetch failure
+# leaves badge/DOM explicitly unreached (never a successful zero), the
+# Shows-root badge timeout leaves DOM unreached and the fast-failed second
+# sample is counted as skipped, all under scope="shows_root".
+for flow, item_type, scope, stage, status, count in (
+        ('list_load', 'movie', 'movies_root', 'channel_items', 'failed', 2),
+        ('list_load', 'movie', 'movies_root', 'badge_states', 'unreached', 2),
+        ('list_load', 'movie', 'movies_root', 'dom_materialise', 'unreached', 2),
+        ('list_load', 'episode', 'shows_root', 'badge_states', 'failed', 1),
+        ('list_load', 'episode', 'shows_root', 'dom_materialise', 'unreached', 1),
+        ('list_load', 'episode', 'shows_root', 'total', 'skipped', 1),
+        ('sort_change', 'movie', 'movies_root', 'dom_materialise', 'ok', 2)):
+    outcome = 'success' if (flow, item_type) == ('sort_change', 'movie') else 'failed'
+    key = (f'phantom_loadtime_browse_stage_samples_total{{flow="{flow}",item_type="{item_type}",scope="{scope}",'
+           f'stage="{stage}",outcome="{outcome}",status="{status}",color="green"}}')
+    assert browse_first.get(key) == count, (key, browse_first)
+assert not any('stage="badge_states",outcome="failed"' in k and 'movies_root' in k and 'seconds_sum' in k
+               and 'list_load' in k for k in browse_first), 'unreached stage reported seconds'
+assert len(first['browse_samples']) == 8, first['browse_samples']
 expected_keys = set()
 for item_type in ('movie', 'episode'):
     for flow in flows:
@@ -1310,7 +1334,8 @@ for selection in ('', 'Phantom', 'Materialised'):
     assert 'discovery_failure' not in manifest, manifest
     stages(manifest, dict(discovery=0, measure=0, push=0, guard=0))
     payload, = [r['payload'] for r in requests if r['path'].endswith('/phantom-loadtime')]
-    records = [line.split() for line in payload.splitlines() if line and not line.startswith('#')]
+    records = [line.split() for line in payload.splitlines()
+               if line and not line.startswith(('#', 'phantom_loadtime_browse_stage_'))]
     samples = dict(records)
     assert len(samples) == len(records), 'duplicate successful flow metrics'
     medians = re.findall(r'flow=(\w+) item_type=(\w+) median_s=([\d.]+) runs=2 errors=0 samples=\[([^]]+)\]',
@@ -1626,6 +1651,220 @@ try:
 finally:
     interrupted.chmod(0o755)
 print('EVIDENCE PASS: mid-discovery storage loss fails visibly, retains readable prefix, never completes or ratchets')
+# --- ttfb-loadtime-browse-stage-durations ------------------------------------
+# The REAL daily wrapper -> REAL LIVE engine -> REAL publisher, but every HTTP
+# request goes through the genuine curl binary to a delayed local HTTP fixture
+# (a shim only rewrites the in-cluster Service / Pushgateway hosts to
+# 127.0.0.1). Each phase gets its own isolated delay so the measured component
+# accounting is checked against wall-clock cost the fixture really imposed.
+import http.server, threading
+from urllib.parse import parse_qs, urlsplit
+browse_dir = tmp / 'browse'
+browse_dir.mkdir()
+browse_bin = browse_dir / 'bin'
+browse_bin.mkdir()
+real_curl = shutil.which('curl', path=os.pathsep.join(
+    d for d in os.environ['PATH'].split(os.pathsep) if pathlib.Path(d) != bin_dir))
+real_node = shutil.which('node')
+assert real_curl and real_node, 'browse stage fixture needs real curl and node'
+ITEMS = 450  # 3 channel pages of 200 and 2 badge batches of 400
+PAGE_DELAY, BADGE_DELAY, DOM_DELAY, REQUEST_TIMEOUT = 0.4, 0.5, 0.8, 1.5
+# (channel, sorted) -> per-sample fixture behaviour, sample numbers are 1-based.
+plan_ = {
+    ('movies', False): {1: dict(page=PAGE_DELAY), 2: dict(badge=BADGE_DELAY), 3: dict()},  # 3 => DOM delay
+    ('movies', True): {1: dict(page=0.1, badge=0.2), 2: dict(page_error_at=400), 3: dict()},
+    ('shows', False): {1: dict(badge_timeout=True)},
+    ('shows', True): {1: dict(page=0.2), 2: dict(page=0.2), 3: dict(page=0.2)},
+}
+# DOM-materialise invocations in engine order: movie list_load 1..3, movie
+# sort_change 1 and 3 (2 fails a late page), Shows-root sort_change 1..3.
+dom_delays = [0, 0, DOM_DELAY, 0.3, 0, 0, 0, 0]
+state_ = dict(ctx=None, sample={}, puts=[])
+lock_ = threading.Lock()
+class Fixture(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def reply(self, body, code=200):
+        data = json.dumps(body).encode() if not isinstance(body, bytes) else body
+        try:
+            self.send_response(code)
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+    def do_PUT(self):
+        body = self.rfile.read(int(self.headers.get('Content-Length', 0))).decode()
+        with lock_:
+            state_['puts'].append((self.path, body))
+        self.reply(b'')
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))) or b'{}')
+        p = urlsplit(self.path)
+        if p.path == '/Plugins/PhantomLibrary/States':
+            got = body.get('ids', [])
+            if got and all(i.startswith(('movies-', 'shows-')) for i in got):
+                spec = state_['ctx']
+                if spec.get('badge_timeout'):
+                    time.sleep(REQUEST_TIMEOUT + 1.5)
+                time.sleep(spec.get('badge', 0))
+                return self.reply({i: 'Phantom' for i in got})
+            return self.reply({i: 'Phantom' for i in got})
+        self.reply({'MediaSources': []})
+    def do_GET(self):
+        p = urlsplit(self.path)
+        q = parse_qs(p.query)
+        if p.path == '/Users':
+            return self.reply([{'Id': '1' * 32}])
+        if p.path == '/Channels':
+            return self.reply({'Items': [{'Name': 'Phantom Movies', 'Id': 'movies'},
+                                         {'Name': 'Phantom Shows', 'Id': 'shows'}]})
+        if p.path.startswith('/Channels/'):
+            channel = p.path.split('/')[2]
+            limit = q.get('Limit', [''])[0]
+            if limit in ('1', '5', '20'):
+                kind = 'Movie' if channel == 'movies' else {
+                    ids['Series']: 'Season', ids['Season']: 'Episode'}.get(q.get('FolderId', [''])[0], 'Series')
+                return self.reply({'Items': [{'Id': ids[kind], 'Type': kind}]})
+            assert limit == '200' and q.get('userId') == ['1' * 32], self.path
+            start = int(q['StartIndex'][0])
+            key = (channel, 'SortBy' in q)
+            with lock_:
+                if start == 0:
+                    state_['sample'][key] = state_['sample'].get(key, 0) + 1
+                    state_['ctx'] = plan_[key][state_['sample'][key]]
+                spec = state_['ctx']
+            time.sleep(spec.get('page', 0))
+            if spec.get('page_error_at') == start:
+                return self.reply({'error': 'late page'}, 500)
+            return self.reply({'Items': [{'Id': f'{channel}-{i:04d}'} for i in range(start, min(start + 200, ITEMS))],
+                               'TotalRecordCount': ITEMS})
+        self.reply(b'\0' * 64)
+server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Fixture)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+(browse_bin / 'curl').write_text(f'''#!/usr/bin/env bash
+args=()
+for a in "$@"; do
+    if [[ "$a" =~ ^http://phantom-library-green\\.[a-z0-9-]+\\.svc:8096(.*)$ ]] ||
+       [[ "$a" =~ ^http://pushgateway\\.example\\.com:9091(.*)$ ]]; then
+        a="http://127.0.0.1:{server.server_address[1]}${{BASH_REMATCH[1]}}"
+    fi
+    args+=("$a")
+done
+exec {real_curl} "${{args[@]}}"
+''')
+(browse_bin / 'node').write_text(f'''#!/usr/bin/env python3
+import os, pathlib, sys, time
+counter = pathlib.Path({str(browse_dir / 'dom-count')!r})
+n = int(counter.read_text()) if counter.exists() else 0
+counter.write_text(str(n + 1))
+delays = {dom_delays!r}
+time.sleep(delays[n] if n < len(delays) else 0)
+os.execv({real_node!r}, [{real_node!r}] + sys.argv[1:])
+''')
+for path in browse_bin.iterdir():
+    path.chmod(0o755)
+root = tmp / 'browse-checkout'
+sha = checkout('browse stage fixture')
+seed()
+try:
+    result, manifest, _, _, logs = run('browse-stages', directory=browse_dir / 'evidence',
+        PATH=str(browse_bin) + os.pathsep + base_env['PATH'],
+        PHANTOM_REPO_ROOT=str(root),
+        PHANTOM_LOADTIME_EVIDENCE_DIR=str(browse_dir / 'evidence'),
+        PHANTOM_LOADTIME_SAMPLES='3', PHANTOM_LOADTIME_REQUEST_TIMEOUT_SECONDS=str(REQUEST_TIMEOUT))
+finally:
+    server.shutdown()
+assert result.returncode == 0, (result.stdout, result.stderr)
+assert int((browse_dir / 'dom-count').read_text()) == len(dom_delays)
+browse = {(b['flow'], b['item_type'], b['sample_index']): b for b in manifest['browse_samples']}
+assert len(browse) == len(manifest['browse_samples']) == 12, manifest['browse_samples']
+components = ('channel_items', 'badge_states', 'dom_materialise')
+for (flow, item_type, sample), b in browse.items():
+    assert b['scope'] == {'movie': 'movies_root', 'episode': 'shows_root'}[item_type], b
+    if b['outcome'] == 'skipped':
+        assert b['total_seconds'] is None and all(s['status'] == 'skipped' and s['seconds'] is None
+                                                  for s in b['stages'].values()), b
+        continue
+    for s in b['stages'].values():
+        assert (s['seconds'] is None) == (s['status'] in ('unreached', 'skipped')), b
+    measured = sum(b['stages'][c]['seconds'] or 0 for c in components)
+    # Invariant: each attempted sample total reconciles to its component sum.
+    assert abs(b['total_seconds'] - measured - b['stages']['residual']['seconds']) <= 1e-5, b
+    assert 0 <= b['stages']['residual']['seconds'] < 1.5, b
+    if b['outcome'] == 'success':
+        assert b['stages']['channel_items']['pages'] == 3 and b['stages']['badge_states']['batches'] == 2, b
+        assert all(b['stages'][c]['status'] == 'ok' for c in components), b
+sec = lambda key, stage: browse[key]['stages'][stage]['seconds']
+base = ('sort_change', 'movie', 3)  # undelayed healthy baseline
+# Isolated phase delays land in exactly their phase.
+for key, stage, added in ((('list_load', 'movie', 1), 'channel_items', 3 * PAGE_DELAY),
+                          (('list_load', 'movie', 2), 'badge_states', 2 * BADGE_DELAY),
+                          (('list_load', 'movie', 3), 'dom_materialise', DOM_DELAY)):
+    assert sec(key, stage) - sec(base, stage) >= added - 0.05, (key, stage, browse[key], browse[base])
+    for other in components:
+        if other != stage:
+            assert sec(key, other) - sec(base, other) < added / 2, (key, other, browse[key], browse[base])
+# Mixed costs in one sample.
+mixed = ('sort_change', 'movie', 1)
+for stage, added in (('channel_items', 0.3), ('badge_states', 0.4), ('dom_materialise', 0.3)):
+    assert sec(mixed, stage) - sec(base, stage) >= added - 0.05, (stage, browse[mixed])
+# Late-page error: two pages succeeded, the third failed; nothing downstream ran.
+late = browse['sort_change', 'movie', 2]
+assert late['outcome'] == 'failed' and late['stages']['channel_items'] == dict(
+    status='failed', seconds=late['stages']['channel_items']['seconds'], pages=3), late
+assert late['stages']['badge_states'] == dict(status='unreached', seconds=None, batches=0), late
+assert late['stages']['dom_materialise'] == dict(status='unreached', seconds=None), late
+# Badge timeout on the Shows-root list: badge failed at the request budget,
+# DOM unreached, remaining samples explicitly skipped (fail-fast preserved).
+to = browse['list_load', 'episode', 1]
+assert to['outcome'] == 'failed' and to['stages']['channel_items']['status'] == 'ok', to
+assert to['stages']['badge_states']['status'] == 'failed' and to['stages']['badge_states']['batches'] == 1, to
+assert REQUEST_TIMEOUT - 0.05 <= to['stages']['badge_states']['seconds'] < REQUEST_TIMEOUT + 1.0, to
+assert to['stages']['dom_materialise'] == dict(status='unreached', seconds=None), to
+assert [browse['list_load', 'episode', s]['outcome'] for s in (2, 3)] == ['skipped', 'skipped']
+assert all(browse['sort_change', 'episode', s]['outcome'] == 'success' for s in (1, 2, 3))
+failures = {(f['flow'], f['item_type'], f['sample_index'], f['stage'], f['http_status']) for f in manifest['failures']}
+assert failures == {('sort_change', 'movie', 2, 'page_fetch', '500'),
+                    ('list_load', 'episode', 1, 'badge_states', '000')}, manifest['failures']
+# The publisher's captured PUT: existing flow totals unchanged in shape, plus
+# bounded-label component sums/counts per success/failed population that match
+# the retained per-sample evidence exactly.
+payload, = [b for p_, b in state_['puts'] if p_.endswith('/phantom-loadtime')]
+records = dict(line.split() for line in payload.splitlines() if line and not line.startswith('#'))
+for flow in flows:
+    for item_type in ('movie', 'episode'):
+        assert records[f'phantom_loadtime_runs_total{{flow="{flow}",item_type="{item_type}",color="green"}}'] == '3'
+        errors = {('list_load', 'episode'): 3, ('sort_change', 'movie'): 1}.get((flow, item_type), 0)
+        assert records[f'phantom_loadtime_errors_total{{flow="{flow}",item_type="{item_type}",color="green"}}'] == str(errors)
+expected_sums, expected_counts = {}, {}
+for (flow, item_type, _), b in browse.items():
+    outcome = 'success' if b['outcome'] == 'success' else 'failed'
+    for stage, s in list(b['stages'].items()) + [('total', dict(status=b['stages']['residual']['status'], seconds=b['total_seconds']))]:
+        labels = f'flow="{flow}",item_type="{item_type}",scope="{b["scope"]}",stage="{stage}",outcome="{outcome}"'
+        ck = f'phantom_loadtime_browse_stage_samples_total{{{labels},status="{s["status"]}",color="green"}}'
+        expected_counts[ck] = expected_counts.get(ck, 0) + 1
+        if s['seconds'] is not None:
+            sk = f'phantom_loadtime_browse_stage_seconds_sum{{{labels},color="green"}}'
+            expected_sums[sk] = expected_sums.get(sk, 0.0) + s['seconds']
+browse_records = {k: v for k, v in records.items() if k.startswith('phantom_loadtime_browse_stage_')}
+assert set(browse_records) == set(expected_sums) | set(expected_counts), set(browse_records) ^ (set(expected_sums) | set(expected_counts))
+for k, v in expected_counts.items():
+    assert int(browse_records[k]) == v, (k, browse_records[k], v)
+for k, v in expected_sums.items():
+    assert abs(float(browse_records[k]) - v) <= 1e-5 * 4, (k, browse_records[k], v)
+# Population sums ARE additive: stage sums reconcile to the total sum.
+for flow in ('list_load', 'sort_change'):
+    for item_type, scope in (('movie', 'movies_root'), ('episode', 'shows_root')):
+        for outcome in ('success', 'failed'):
+            labels = f'flow="{flow}",item_type="{item_type}",scope="{scope}",stage="%s",outcome="{outcome}",color="green"'
+            total = browse_records.get('phantom_loadtime_browse_stage_seconds_sum{' + labels % 'total' + '}')
+            if total is None:
+                continue
+            parts = sum(float(browse_records.get('phantom_loadtime_browse_stage_seconds_sum{' + labels % st + '}', 0))
+                        for st in components + ('residual',))
+            assert abs(float(total) - parts) <= 1e-5 * 12, (flow, item_type, outcome, total, parts)
+assert not any('episode_nav' in k or 'scope="episode' in k for k in browse_records), 'Shows-root mislabelled'
+print('EVIDENCE PASS: LIVE browse stages over real HTTP: isolated page/badge/DOM delays, mixed costs, late-page error, badge timeout+skips reconcile per sample and in the published PUT')
 assert not discovery_errors, f'{len(discovery_errors)}/{discovery_cases} discovery fixtures failed (see EVIDENCE FAIL above)'
 print(f'EVIDENCE PASS: {discovery_cases} discovery fixtures retain exact sanitized reasons/status, validated prefix, no timing/push, and clean scratch')
 PY
