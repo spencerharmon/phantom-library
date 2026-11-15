@@ -1,0 +1,66 @@
+name: P0 availability claims acceptance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  availability-claims:
+    runs-on: [k8s]
+    timeout-minutes: 60
+    container:
+      image: mcr.microsoft.com/dotnet/sdk:9.0.305-noble
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: phantom
+          POSTGRES_PASSWORD: disposable-p0-only
+          POSTGRES_DB: phantom_p0
+        options: >-
+          --health-cmd "pg_isready -U phantom -d phantom_p0"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      PHANTOM_TEST_POSTGRES_DSN: Host=postgres;Username=phantom;Password=disposable-p0-only;Database=phantom_p0
+      MSBUILDDISABLENODEREUSE: '1'
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      # The legacy rig requires user systemd + a sandbox seed. Container runners
+      # without those must provide an executable isolated runner via the mounted
+      # path variable below. Missing runner/seed FAILS, never skips movie/TV parity.
+      PHANTOM_P0_RIG_RUNNER: ${{ vars.PHANTOM_P0_RIG_RUNNER }}
+      PHANTOM_REGISTRY: ${{ vars.PHANTOM_REGISTRY }}
+      PHANTOM_RIG_TAG: ${{ vars.PHANTOM_RIG_TAG }}
+    steps:
+      - name: Install build and evidence tools
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends nodejs git ca-certificates python3 podman sqlite3 curl ffmpeg procps util-linux
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Apply the tracked Jellyfin patch stack
+        run: |
+          set -euo pipefail
+          for patch in scripts/jellyfin-patches/*.patch; do
+            if git -C jellyfin apply --check "$PWD/$patch"; then
+              git -C jellyfin apply "$PWD/$patch"
+            else
+              git -C jellyfin apply --reverse --check "$PWD/$patch"
+            fi
+          done
+      - name: Required database and movie/episode acceptance
+        run: bash scripts/tests/p0-availability-claims.test.sh
+      - name: Upload all evidence, including failed plans
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: p0-availability-claims-${{ github.run_id }}
+          path: artifacts/p0-availability/
+          if-no-files-found: error
+          retention-days: 30

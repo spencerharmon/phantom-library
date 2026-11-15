@@ -37,6 +37,8 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
     private CancellationTokenSource? _stopping;
     private Task? _currentTick;
     private int _running;
+    private string _nextAvailabilityType = "episode";
+    private const int ProbeConcurrency = 2;
 
     // availability-stale-candidate-reprobe-001: claim priority a
     // stale-available-no-candidate row is promoted to for eager re-probe.
@@ -201,34 +203,55 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
                 _logger.LogWarning(ex, "Stale-available eager re-probe promotion failed");
             }
 
-            for (var i = 0; i < batch; i++)
+            var leaseDuration = TimeSpan.FromMinutes(Math.Max(1, cfg.AvailabilityLeaseMinutes));
+            var policyHash = ComputePolicyHash(cfg);
+            for (var used = 0; used < batch;)
             {
-                using var cts = CancellationTokenSource.CreateLinkedTokenSource(serviceStopping);
-                cts.CancelAfter(TimeSpan.FromMinutes(Math.Max(1, cfg.AvailabilityLeaseMinutes)));
-
-                // TV parity: series expansion creates episode availability work,
-                // and episode probes must not sit behind a movie backlog. Each
-                // slot gives TV expansion a chance, then probes availability
-                // with alternating episode/movie preference and fallback.
-                var expanded = i % 2 == 0 && await ExpandOneSeriesAsync(cfg, cts.Token).ConfigureAwait(false);
-                var preferredType = i % 2 == 0 ? "episode" : "movie";
-                var probed = await ProbeOneAvailabilityAsync(cfg, preferredType, cts.Token).ConfigureAwait(false);
-                if (!probed)
+                serviceStopping.ThrowIfCancellationRequested();
+                if (yieldWindow > 0
+                    && await _db.GetUserActivityAtAsync(serviceStopping).ConfigureAwait(false) is { } activity
+                    && DateTimeOffset.UtcNow - activity < TimeSpan.FromSeconds(yieldWindow))
                 {
-                    probed = await ProbeOneAvailabilityAsync(cfg, preferredType == "episode" ? "movie" : "episode", cts.Token).ConfigureAwait(false);
-                }
-                if (!probed)
-                {
-                    probed = await ProbeOneAvailabilityAsync(cfg, preferredType: null, cts.Token).ConfigureAwait(false);
-                }
-                if (!expanded && !probed && i % 2 != 0)
-                {
-                    expanded = await ExpandOneSeriesAsync(cfg, cts.Token).ConfigureAwait(false);
+                    var backoff = TimeSpan.FromSeconds(Math.Max(1, cfg.AvailabilityProbeMaxIntervalSeconds));
+                    _timer?.Change(backoff, backoff);
+                    return;
                 }
 
-                var didWork = expanded || probed;
-                anyWork |= didWork;
-                if (!didWork)
+                bool expanded;
+                using (var expansion = CancellationTokenSource.CreateLinkedTokenSource(serviceStopping))
+                {
+                    expansion.CancelAfter(leaseDuration);
+                    expanded = await ExpandOneSeriesAsync(cfg, expansion.Token).ConfigureAwait(false);
+                }
+
+                // Claim only work that can start together. No FIFO survives this
+                // opportunity: a promotion is visible to the next DB claim.
+                var leases = await _db.ClaimDueAvailabilityBatchAsync(
+                    _owner, leaseDuration, DateTimeOffset.UtcNow, policyHash,
+                    Math.Min(ProbeConcurrency, batch - used), serviceStopping, _nextAvailabilityType).ConfigureAwait(false);
+                if (leases.Count == 0)
+                {
+                    leases = await _db.ClaimDueAvailabilityBatchAsync(
+                        _owner, leaseDuration, DateTimeOffset.UtcNow, policyHash,
+                        Math.Min(ProbeConcurrency, batch - used), serviceStopping).ConfigureAwait(false);
+                }
+
+                var probes = new Task<bool>[leases.Count];
+                for (var i = 0; i < leases.Count; i++)
+                {
+                    probes[i] = ProbeClaimedAvailabilityAsync(cfg, leases[i], policyHash, serviceStopping);
+                }
+
+                await Task.WhenAll(probes).ConfigureAwait(false);
+                if (leases.Count > 0)
+                {
+                    // Persist across ticks, including a configured budget of one.
+                    _nextAvailabilityType = leases[leases.Count - 1].Type == "episode" ? "movie" : "episode";
+                }
+
+                anyWork |= expanded || leases.Count > 0;
+                used += Math.Max(1, leases.Count);
+                if (!expanded && leases.Count == 0)
                 {
                     break;
                 }
@@ -250,25 +273,60 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
         }
     }
 
-    private Task<bool> ProbeOneAvailabilityAsync(PluginConfiguration cfg, CancellationToken ct)
-        => ProbeOneAvailabilityAsync(cfg, preferredType: null, ct);
-
-    private async Task<bool> ProbeOneAvailabilityAsync(PluginConfiguration cfg, string? preferredType, CancellationToken ct)
+    private async Task<bool> ProbeOneAvailabilityAsync(PluginConfiguration cfg, CancellationToken ct)
     {
-        var now = DateTimeOffset.UtcNow;
         var policyHash = ComputePolicyHash(cfg);
-        var lease = await _db.ClaimDueAvailabilityAsync(
+        var leases = await _db.ClaimDueAvailabilityBatchAsync(
             _owner,
             TimeSpan.FromMinutes(Math.Max(1, cfg.AvailabilityLeaseMinutes)),
-            now,
+            DateTimeOffset.UtcNow,
             policyHash,
-            ct,
-            preferredType).ConfigureAwait(false);
-        if (lease is null)
-        {
-            return false;
-        }
+            1,
+            ct).ConfigureAwait(false);
+        return leases.Count > 0 && await ProbeClaimedAvailabilityAsync(cfg, leases[0], policyHash, ct).ConfigureAwait(false);
+    }
 
+    private async Task<bool> ProbeClaimedAvailabilityAsync(
+        PluginConfiguration cfg, AvailabilityItemRow lease, string policyHash, CancellationToken ct)
+    {
+        var started = false;
+        try
+        {
+            // Let all members of the small batch start, even with synchronous
+            // SQLite reads or a synchronously completing probe implementation.
+            await Task.Yield();
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            var now = DateTimeOffset.UtcNow;
+            var duration = TimeSpan.FromMinutes(Math.Max(1, cfg.AvailabilityLeaseMinutes));
+            // DB lease timestamps are whole seconds. Anchor before the DB round
+            // trip and cancel before expiry, never leaseDuration * batchSize.
+            deadline.CancelAfter(DateTimeOffset.FromUnixTimeSeconds(now.Add(duration).ToUnixTimeSeconds())
+                - now - TimeSpan.FromSeconds(1));
+            if (!await _db.RenewAvailabilityLeaseAsync(lease, duration, now, deadline.Token).ConfigureAwait(false))
+            {
+                return false;
+            }
+
+            deadline.Token.ThrowIfCancellationRequested();
+            started = true;
+            return await ProbeAvailabilityCoreAsync(cfg, lease, policyHash, now, deadline.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            _logger.LogDebug("Availability lease expired or lost for {Type}/{Tmdb}", lease.Type, lease.TmdbId);
+            return started;
+        }
+        finally
+        {
+            // Completion/reschedule already clears ownership; this fenced release
+            // is then a no-op. Cancellation must also release not-yet-started work.
+            await _db.ReleaseAvailabilityLeaseAsync(lease, CancellationToken.None, unconsumed: !started).ConfigureAwait(false);
+        }
+    }
+
+    private async Task<bool> ProbeAvailabilityCoreAsync(
+        PluginConfiguration cfg, AvailabilityItemRow lease, string policyHash, DateTimeOffset now, CancellationToken ct)
+    {
         using var timer = PhantomMetrics.TimeAvailabilityProbe();
         try
         {
@@ -288,6 +346,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
 
             var imdbType = lease.Type == "movie" ? "movie" : "series";
             var imdb = await _externalIds.GetImdbIdAsync(lease.TmdbId, imdbType, ct).ConfigureAwait(false);
+            await EnsureAvailabilityOwnershipAsync(lease, cfg, ct).ConfigureAwait(false);
 
             // Pre-classify before spending a probe cycle: neither
             // "no capable indexer" nor "not yet released/aired" is a
@@ -363,6 +422,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
                 return true;
             }
 
+            await EnsureAvailabilityOwnershipAsync(lease, cfg, ct).ConfigureAwait(false);
             var probe = await _probe(
                 lease.TmdbId,
                 imdb,
@@ -373,6 +433,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
                 meta.Year,
                 ct).ConfigureAwait(false);
 
+            await EnsureAvailabilityOwnershipAsync(lease, cfg, ct).ConfigureAwait(false);
             switch (probe.Outcome)
             {
                 case MagnetProbeOutcome.Available:
@@ -387,7 +448,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
                         var backoffDays = Math.Min(
                             Math.Max(1, cfg.AvailabilityUnavailableTtlDays) * (1L << Math.Min(negativeStreak - 1, 20)),
                             Math.Max(1, cfg.AvailabilityUnavailableMaxTtlDays));
-                        await _db.CompleteAvailabilityProbeAsync(
+                        var completed = await _db.CompleteAvailabilityProbeAsync(
                             lease,
                             "unavailable",
                             now,
@@ -398,7 +459,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
                             errorMessage: null,
                             ct,
                             negativeStreak: negativeStreak).ConfigureAwait(false);
-                        if (lease.Status == "available")
+                        if (completed && lease.Status == "available")
                         {
                             BumpFor(lease.Type);
                         }
@@ -465,16 +526,29 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
         }
         catch (Exception ex)
         {
+            await EnsureAvailabilityOwnershipAsync(lease, cfg, ct).ConfigureAwait(false);
             await _db.RescheduleAvailabilityTransientAsync(
                 lease,
                 ComputeTransientRetryAt(cfg, lease, DateTimeOffset.UtcNow),
                 "probe_exception",
                 ex.Message,
-                CancellationToken.None).ConfigureAwait(false);
+                ct).ConfigureAwait(false);
             PhantomMetrics.AvailabilityProbe(lease.Type, "transient");
             _logger.LogWarning(ex, "Availability probe exception for {Type}/{Tmdb}", lease.Type, lease.TmdbId);
             return true;
         }
+    }
+
+    private async Task EnsureAvailabilityOwnershipAsync(AvailabilityItemRow lease, PluginConfiguration cfg, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        if (!await _db.RenewAvailabilityLeaseAsync(lease,
+            TimeSpan.FromMinutes(Math.Max(1, cfg.AvailabilityLeaseMinutes)), DateTimeOffset.UtcNow, ct).ConfigureAwait(false))
+        {
+            throw new OperationCanceledException("Availability lease is no longer owned", ct);
+        }
+
+        ct.ThrowIfCancellationRequested();
     }
 
     /// <summary>
@@ -503,6 +577,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
         MagnetProbeResult reconciled;
         try
         {
+            await EnsureAvailabilityOwnershipAsync(lease, cfg, ct).ConfigureAwait(false);
             reconciled = await _reconcileProbe(
                 lease.TmdbId,
                 imdb,
@@ -527,6 +602,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
             return false;
         }
 
+        await EnsureAvailabilityOwnershipAsync(lease, cfg, ct).ConfigureAwait(false);
         if (reconciled.Outcome != MagnetProbeOutcome.Available)
         {
             return false;
@@ -556,6 +632,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
         MagnetProbeResult probe,
         CancellationToken ct)
     {
+        await EnsureAvailabilityOwnershipAsync(lease, cfg, ct).ConfigureAwait(false);
         await _db.UpsertSourceCandidatesAsync(
             lease.TmdbId,
             lease.Type,
@@ -582,13 +659,16 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
             lease.Type == "episode" ? lease.Season : null,
             lease.Type == "episode" ? lease.Episode : null,
             cfg.SourcePickerPreset);
+        await EnsureAvailabilityOwnershipAsync(lease, cfg, ct).ConfigureAwait(false);
         await _db.PutCachedMagnetAsync(magnetKey, entry, ct).ConfigureAwait(false);
+        await EnsureAvailabilityOwnershipAsync(lease, cfg, ct).ConfigureAwait(false);
         await _db.DeleteUnavailableAsync(
             new UnavailableKey(lease.TmdbId, imdb, lease.Type,
                 lease.Type == "episode" ? lease.Season : null,
                 lease.Type == "episode" ? lease.Episode : null),
             ct).ConfigureAwait(false);
-        await _db.CompleteAvailabilityProbeAsync(
+        await EnsureAvailabilityOwnershipAsync(lease, cfg, ct).ConfigureAwait(false);
+        var completed = await _db.CompleteAvailabilityProbeAsync(
             lease,
             "available",
             now,
@@ -599,7 +679,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
             null,
             ct,
             negativeStreak: 0).ConfigureAwait(false);
-        if (lease.Status != "available")
+        if (completed && lease.Status != "available")
         {
             BumpFor(lease.Type);
         }
@@ -686,6 +766,8 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
         }
         catch (OperationCanceledException)
         {
+            await _db.FailSeriesExpansionAsync(lease, DateTimeOffset.UtcNow,
+                "cancelled", null, CancellationToken.None).ConfigureAwait(false);
             throw;
         }
         catch (Exception ex)

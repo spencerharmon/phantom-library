@@ -412,6 +412,7 @@ public sealed class PhantomDb : IDisposable
 
     private readonly IPhantomDbProvider _provider;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly SemaphoreSlim _schemaLock = new(1, 1);
     private int _schemaEnsured;
     private int _connectionsOpenedForTests;
 
@@ -467,9 +468,13 @@ public sealed class PhantomDb : IDisposable
     /// <summary>Gets which engine this instance is backed by.</summary>
     public PhantomDbBackend Backend => _provider.Backend;
 
+    /// <summary>Whether availability claims use the indexed PostgreSQL batch scheduler.</summary>
+    public bool UsesPostgresAvailabilityBatch => _provider.Backend == PhantomDbBackend.Postgres;
+
     public void Dispose()
     {
         _writeLock.Dispose();
+        _schemaLock.Dispose();
         _provider.ClearPool();
     }
 
@@ -478,15 +483,26 @@ public sealed class PhantomDb : IDisposable
         var conn = _provider.CreateConnection();
         await conn.OpenAsync(ct).ConfigureAwait(false);
         Interlocked.Increment(ref _connectionsOpenedForTests);
-        if (Interlocked.CompareExchange(ref _schemaEnsured, 1, 0) == 0)
+        if (Volatile.Read(ref _schemaEnsured) == 0)
         {
             try
             {
-                await EnsureSchemaAsync(conn, ct).ConfigureAwait(false);
+                await _schemaLock.WaitAsync(ct).ConfigureAwait(false);
+                try
+                {
+                    if (_schemaEnsured == 0)
+                    {
+                        await EnsureSchemaAsync(conn, ct).ConfigureAwait(false);
+                        Volatile.Write(ref _schemaEnsured, 1);
+                    }
+                }
+                finally
+                {
+                    _schemaLock.Release();
+                }
             }
             catch
             {
-                Interlocked.Exchange(ref _schemaEnsured, 0);
                 await conn.DisposeAsync().ConfigureAwait(false);
                 throw;
             }
@@ -511,6 +527,10 @@ public sealed class PhantomDb : IDisposable
             try
             {
                 await EnsureSchemaOnceAsync(conn, ct).ConfigureAwait(false);
+                if (conn is NpgsqlConnection postgres)
+                {
+                    await AvailabilitySchedulerSchema.EnsureAsync(postgres, ct).ConfigureAwait(false);
+                }
                 return;
             }
             catch (Npgsql.PostgresException ex) when (ex.SqlState == "23505" && attempt < maxAttempts)
@@ -2541,6 +2561,12 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
 
     public async Task<AvailabilityItemRow?> ClaimDueAvailabilityAsync(string owner, TimeSpan leaseDuration, DateTimeOffset now, string policyHash, CancellationToken ct, string? preferredType = null)
     {
+        if (UsesPostgresAvailabilityBatch)
+        {
+            var rows = await ClaimDueAvailabilityBatchAsync(owner, leaseDuration, now, policyHash, 1, ct, preferredType).ConfigureAwait(false);
+            return rows.Count == 0 ? null : rows[0];
+        }
+
         ArgumentException.ThrowIfNullOrWhiteSpace(owner);
         ArgumentException.ThrowIfNullOrWhiteSpace(policyHash);
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
@@ -2549,6 +2575,24 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
             await using var conn = await OpenAsync(ct).ConfigureAwait(false);
             await using var tx = await conn.BeginTransactionAsync(ct).ConfigureAwait(false);
             var sqliteTx = tx;
+            if (preferredType is not null)
+            {
+                await using var priority = conn.CreateCommand();
+                priority.Transaction = sqliteTx;
+                priority.CommandText = @"SELECT type FROM availability_items
+                    WHERE (next_check_at <= @now OR probe_policy_hash IS NULL OR probe_policy_hash <> @policy)
+                      AND (lease_until IS NULL OR lease_until < @now)
+                    ORDER BY priority DESC, CASE WHEN type=@preferred THEN 0 ELSE 1 END
+                    LIMIT 1;";
+                priority.AddWithValue("@now", now.ToUnixTimeSeconds());
+                priority.AddWithValue("@policy", policyHash);
+                priority.AddWithValue("@preferred", preferredType);
+                if (await priority.ExecuteScalarAsync(ct).ConfigureAwait(false) is string urgentType)
+                {
+                    preferredType = urgentType;
+                }
+            }
+
             var preferredEpisode = string.Equals(preferredType, "episode", StringComparison.Ordinal);
 
             AvailabilityItemRow? row;
@@ -2608,6 +2652,139 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         }
     }
 
+    /// <summary>
+    /// Claims at most 32 items. PostgreSQL leases the batch atomically without the
+    /// process write lock; SQLite retains its existing single-claim implementation.
+    /// Episode batches take at most one episode per series at the highest ready
+    /// priority, advancing the shared series cursor. A batch may be partially full.
+    /// </summary>
+    public async Task<IReadOnlyList<AvailabilityItemRow>> ClaimDueAvailabilityBatchAsync(
+        string owner, TimeSpan leaseDuration, DateTimeOffset now, string policyHash,
+        int batchSize, CancellationToken ct, string? preferredType = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(owner);
+        ArgumentException.ThrowIfNullOrWhiteSpace(policyHash);
+        ArgumentOutOfRangeException.ThrowIfLessThan(batchSize, 1);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(batchSize, PostgresAvailabilityScheduler.MaxBatchSize);
+        ArgumentOutOfRangeException.ThrowIfLessThan(leaseDuration, TimeSpan.FromSeconds(1));
+        if (UsesPostgresAvailabilityBatch)
+        {
+            await using var conn = (NpgsqlConnection)await OpenAsync(ct).ConfigureAwait(false);
+            return await PostgresAvailabilityScheduler.ClaimAsync(conn, owner, leaseDuration, now, policyHash, batchSize, ct, preferredType).ConfigureAwait(false);
+        }
+
+        var rows = new List<AvailabilityItemRow>(batchSize);
+        try
+        {
+            for (var i = 0; i < batchSize; i++)
+            {
+                var row = await ClaimDueAvailabilityAsync(owner, leaseDuration, now, policyHash, ct, preferredType).ConfigureAwait(false);
+                if (row is null)
+                {
+                    break;
+                }
+
+                rows.Add(row);
+            }
+
+            ct.ThrowIfCancellationRequested();
+            return rows;
+        }
+        catch
+        {
+            foreach (var row in rows)
+            {
+                await ReleaseAvailabilityLeaseAsync(row, CancellationToken.None, unconsumed: true).ConfigureAwait(false);
+            }
+
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Renews an owned, unexpired lease to at least now + leaseDuration. Call before
+    /// probing a buffered item; false means discard it without probe/cache effects.
+    /// Generation and owner fence both renewal and release. Only SQLite takes the process write lock.
+    /// </summary>
+    public async Task<bool> RenewAvailabilityLeaseAsync(
+        AvailabilityItemRow lease, TimeSpan leaseDuration, DateTimeOffset now, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(lease);
+        ArgumentOutOfRangeException.ThrowIfLessThan(leaseDuration, TimeSpan.FromSeconds(1));
+        if (!UsesPostgresAvailabilityBatch)
+        {
+            await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        }
+
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"UPDATE availability_items SET
+                lease_until=CASE WHEN lease_until>@until THEN lease_until ELSE @until END
+            WHERE tmdb_id=@tmdb AND type=@type AND season=@season AND episode=@episode
+              AND lease_owner=@owner AND probe_generation=@generation AND lease_until>@now;";
+            cmd.AddWithValue("@until", now.Add(leaseDuration).ToUnixTimeSeconds());
+            cmd.AddWithValue("@now", now.ToUnixTimeSeconds());
+            cmd.AddWithValue("@tmdb", lease.TmdbId);
+            cmd.AddWithValue("@type", lease.Type);
+            cmd.AddWithValue("@season", lease.Season);
+            cmd.AddWithValue("@episode", lease.Episode);
+            cmd.AddWithValue("@owner", lease.LeaseOwner ?? string.Empty);
+            cmd.AddWithValue("@generation", lease.ProbeGeneration);
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) == 1;
+        }
+        finally
+        {
+            if (!UsesPostgresAvailabilityBatch)
+            {
+                _writeLock.Release();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Clears only this generation's owned lease and makes it due, even if expired. Set unconsumed
+    /// only when no probe started: it refunds the claim's attempt (floor zero).
+    /// Active/cancelled probes retain their attempt. Repeated/stale releases return
+    /// false and cannot refund twice. Use a cleanup token rather than a cancelled tick token.
+    /// </summary>
+    public async Task<bool> ReleaseAvailabilityLeaseAsync(
+        AvailabilityItemRow lease, CancellationToken ct, bool unconsumed = false)
+    {
+        ArgumentNullException.ThrowIfNull(lease);
+        if (!UsesPostgresAvailabilityBatch)
+        {
+            await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        }
+
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"UPDATE availability_items SET lease_owner=NULL,lease_until=NULL,
+                attempt_count=CASE WHEN @refund AND attempt_count>0 THEN attempt_count-1 ELSE attempt_count END,
+                next_check_at=0
+            WHERE tmdb_id=@tmdb AND type=@type AND season=@season AND episode=@episode
+              AND lease_owner=@owner AND probe_generation=@generation;";
+            cmd.AddWithValue("@refund", unconsumed);
+            cmd.AddWithValue("@tmdb", lease.TmdbId);
+            cmd.AddWithValue("@type", lease.Type);
+            cmd.AddWithValue("@season", lease.Season);
+            cmd.AddWithValue("@episode", lease.Episode);
+            cmd.AddWithValue("@owner", lease.LeaseOwner ?? string.Empty);
+            cmd.AddWithValue("@generation", lease.ProbeGeneration);
+            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) == 1;
+        }
+        finally
+        {
+            if (!UsesPostgresAvailabilityBatch)
+            {
+                _writeLock.Release();
+            }
+        }
+    }
+
     private static async Task<AvailabilityItemRow?> TryReadDueAvailabilityAsync(
         DbConnection conn,
         DbTransaction tx,
@@ -2651,6 +2828,10 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                    candidate_indexer,candidate_source,probe_generation,lease_owner,attempt_count,negative_streak
             FROM availability_items
             WHERE type='episode'
+              AND priority=(SELECT MAX(priority) FROM availability_items
+                  WHERE type='episode'
+                    AND (next_check_at <= @now OR probe_policy_hash IS NULL OR probe_policy_hash <> @policy)
+                    AND (lease_until IS NULL OR lease_until < @now))
               AND (@cursor IS NULL OR tmdb_id > @cursor)
               AND (next_check_at <= @now OR probe_policy_hash IS NULL OR probe_policy_hash <> @policy)
               AND (lease_until IS NULL OR lease_until < @now)
@@ -4259,7 +4440,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
             r.GetDouble(offset + 13));
     }
 
-    private static AvailabilityItemRow ReadAvailability(DbDataReader r, int offset = 0)
+    internal static AvailabilityItemRow ReadAvailability(DbDataReader r, int offset = 0)
         => new(
             r.GetInt32(offset),
             r.GetString(offset + 1),
