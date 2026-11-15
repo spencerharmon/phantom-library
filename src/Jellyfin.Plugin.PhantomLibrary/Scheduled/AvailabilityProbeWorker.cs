@@ -149,6 +149,15 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
         try
         {
             var cfg = _configProvider();
+            try
+            {
+                await _db.RefreshAvailabilityBacklogAsync(ComputePolicyHash(cfg), DateTimeOffset.UtcNow, serviceStopping).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogWarning(ex, "Availability backlog observation failed; previous sample remains stale");
+            }
+
             if (!cfg.AvailabilityProbeEnabled)
             {
                 return;
