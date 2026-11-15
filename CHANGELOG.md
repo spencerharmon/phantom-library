@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Committed availability claims/completions by movie/episode and priority/background,
+  plus five-minute cached eligible/dormant/leased/scheduled backlog on the existing
+  OTel 1.10 pipeline. Read-only P0 acceptance probe retains PostgreSQL and Mimir
+  evidence, rejects incomplete 24-hour windows, and verifies post-sizing Flux receipts.
+  See `docs/tasks/p0-probe-load-observability.md`. No schema or deployment change.
+
 ### Fixed
 - Preserve independent loaded-config fields in offline gostream drift reports:
   after process binding, a missing or invalid sibling no longer hides a valid

@@ -99,6 +99,45 @@ internal static class PhantomFlowMetrics
 
     private static readonly Meter Meter = new(MeterName, "1.0.0");
 
+    private static readonly Counter<long> AvailabilityClaims = Meter.CreateCounter<long>("phantom_availability_claims_total");
+    private static readonly Counter<long> AvailabilityCompletions = Meter.CreateCounter<long>("phantom_availability_completions_total");
+    private static Measurement<long>[] _availabilityBacklog = Array.Empty<Measurement<long>>();
+    private static long _availabilityObservedAt;
+    internal static ObservableGauge<long> AvailabilityBacklog { get; } = Meter.CreateObservableGauge(
+        "phantom_availability_backlog", () => Volatile.Read(ref _availabilityBacklog));
+    internal static ObservableGauge<long> AvailabilityObservedAt { get; } = Meter.CreateObservableGauge(
+        "phantom_availability_backlog_observed_at", () => Interlocked.Read(ref _availabilityObservedAt));
+
+    internal static void RecordAvailability(bool completion, string mediaType, string lane)
+    {
+        if (mediaType is not ("movie" or "episode") || lane is not ("priority" or "background"))
+        {
+            throw new ArgumentException("Invalid availability metric labels");
+        }
+
+        (completion ? AvailabilityCompletions : AvailabilityClaims).Add(1,
+            new KeyValuePair<string, object?>("media_type", mediaType),
+            new KeyValuePair<string, object?>("lane", lane));
+    }
+
+    internal static void PublishAvailabilityBacklog(Measurement<long>[] measurements, long observedAt)
+    {
+        // Export quiet lanes too: missing series must not be mistaken for zero work.
+        foreach (var type in new[] { "movie", "episode" })
+        {
+            foreach (var lane in new[] { "priority", "background" })
+            {
+                var typeTag = new KeyValuePair<string, object?>("media_type", type);
+                var laneTag = new KeyValuePair<string, object?>("lane", lane);
+                AvailabilityClaims.Add(0, typeTag, laneTag);
+                AvailabilityCompletions.Add(0, typeTag, laneTag);
+            }
+        }
+
+        Volatile.Write(ref _availabilityBacklog, measurements);
+        Interlocked.Exchange(ref _availabilityObservedAt, observedAt);
+    }
+
     private static readonly Counter<long> PlaybackOutcomes = Meter.CreateCounter<long>(
         "phantom_playback_outcome_total",
         unit: "{attempt}",
