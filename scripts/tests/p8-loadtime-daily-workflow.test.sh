@@ -1679,7 +1679,7 @@ plan_ = {
 # DOM-materialise invocations in engine order: movie list_load 1..3, movie
 # sort_change 1 and 3 (2 fails a late page), Shows-root sort_change 1..3.
 dom_delays = [0, 0, DOM_DELAY, 0.3, 0, 0, 0, 0]
-state_ = dict(ctx=None, sample={}, puts=[])
+state_ = dict(ctx=None, ctx_key=None, sample={}, puts=[], badges=[])
 lock_ = threading.Lock()
 class Fixture(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -1703,6 +1703,8 @@ class Fixture(http.server.BaseHTTPRequestHandler):
         if p.path == '/Plugins/PhantomLibrary/States':
             got = body.get('ids', [])
             if got and all(i.startswith(('movies-', 'shows-')) for i in got):
+                with lock_:
+                    state_['badges'].append((state_['ctx_key'], list(got)))
                 spec = state_['ctx']
                 if spec.get('badge_timeout'):
                     time.sleep(REQUEST_TIMEOUT + 1.5)
@@ -1732,6 +1734,7 @@ class Fixture(http.server.BaseHTTPRequestHandler):
                 if start == 0:
                     state_['sample'][key] = state_['sample'].get(key, 0) + 1
                     state_['ctx'] = plan_[key][state_['sample'][key]]
+                    state_['ctx_key'] = key + (state_['sample'][key],)
                 spec = state_['ctx']
             time.sleep(spec.get('page', 0))
             if spec.get('page_error_at') == start:
@@ -1757,6 +1760,8 @@ import os, pathlib, sys, time
 counter = pathlib.Path({str(browse_dir / 'dom-count')!r})
 n = int(counter.read_text()) if counter.exists() else 0
 counter.write_text(str(n + 1))
+with open({str(browse_dir / 'dom-args')!r}, 'a') as fh:
+    fh.write(' '.join(sys.argv[2:]) + '\\n')
 delays = {dom_delays!r}
 time.sleep(delays[n] if n < len(delays) else 0)
 os.execv({real_node!r}, [{real_node!r}] + sys.argv[1:])
@@ -1766,9 +1771,10 @@ os.execv({real_node!r}, [{real_node!r}] + sys.argv[1:])
 # test proves O(1) parses per fetched page (it was 3/page before).
 (browse_bin / 'python3').write_text(f'''#!{sys.executable}
 import os, sys
-if any(os.path.basename(a).startswith('page.') for a in sys.argv[1:]):
+pages = [a for a in sys.argv[1:] if os.path.basename(a).startswith('page.')]
+if pages:
     with open({str(browse_dir / 'page-parses')!r}, 'a') as fh:
-        fh.write('1\\n')
+        fh.write(' '.join(pages) + '\\n')
 os.execv({sys.executable!r}, [{sys.executable!r}] + sys.argv[1:])
 ''')
 for path in browse_bin.iterdir():
@@ -1796,8 +1802,33 @@ parsed_pages = {it: sum(b['stages']['channel_items']['pages']
                         if b['outcome'] != 'skipped' and b['item_type'] == it)
                 for it in ('movie', 'episode')}
 assert parsed_pages['movie'] > 0 and parsed_pages['episode'] > 0, parsed_pages
-parse_calls = len((browse_dir / 'page-parses').read_text().splitlines())
-assert parse_calls == sum(parsed_pages.values()), (parse_calls, parsed_pages)
+# Each launch names exactly one page file and each successfully fetched page
+# file is parsed exactly once (per-page, so a double parse of one page cannot
+# mask a missing parse of another).
+launches = (browse_dir / 'page-parses').read_text().splitlines()
+assert all(len(l.split()) == 1 for l in launches), launches
+assert len(set(launches)) == len(launches), launches
+assert len(launches) == sum(parsed_pages.values()), (len(launches), parsed_pages)
+# Exact counts/ids parity for movie AND Shows root, list and sort: every
+# successful sample sends the 450 ids in order as 400+50 badge payloads and
+# materialises exactly 450 DOM items.
+expected_ids = {ch: [f'{ch}-{i:04d}' for i in range(ITEMS)] for ch in ('movies', 'shows')}
+badge_by = {}
+for k, got_ids in state_['badges']:
+    badge_by.setdefault(k, []).append(got_ids)
+chan = {'movie': 'movies', 'episode': 'shows'}
+success = 0
+for (flow, item_type, sample), b in browse.items():
+    k = (chan[item_type], flow == 'sort_change', sample)
+    if b['outcome'] == 'success':
+        success += 1
+        ids_ = expected_ids[chan[item_type]]
+        assert badge_by.get(k) == [ids_[:400], ids_[400:]], (k, [len(x) for x in badge_by.get(k, [])])
+assert ('movies', True, 2) not in badge_by, badge_by.keys()  # late-page error: no badge
+assert badge_by[('shows', False, 1)] == [expected_ids['shows'][:400]]  # badge timeout batch
+assert success == 8, success
+dom_args = (browse_dir / 'dom-args').read_text().splitlines()
+assert dom_args == [str(ITEMS)] * len(dom_delays), dom_args
 components = ('channel_items', 'badge_states', 'dom_materialise')
 for (flow, item_type, sample), b in browse.items():
     assert b['scope'] == {'movie': 'movies_root', 'episode': 'shows_root'}[item_type], b
