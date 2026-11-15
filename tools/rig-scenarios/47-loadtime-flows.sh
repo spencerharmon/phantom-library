@@ -828,9 +828,29 @@ print(d)' "$LIST_TIMEOUT" "$ENGINE_DEADLINE")"
             rm -f "$page_file"; break
         fi
         local got total_records
-        got="$(python3 -c "import json; d=json.load(open('$page_file')); print(len(d.get('Items',[])))" 2>/dev/null || echo 0)"
-        total_records="$(python3 -c "import json; d=json.load(open('$page_file')); print(d.get('TotalRecordCount',0))" 2>/dev/null || echo 0)"
-        python3 -c "import json; d=json.load(open('$page_file')); print('\n'.join(i['Id'] for i in d.get('Items',[])))" 2>/dev/null >> "$all_ids_file" || true
+        # Parse each page ONCE (ttfb-loadtime-page-parse-residual): count,
+        # TotalRecordCount and ids come from a single interpreter, not three.
+        # Failure semantics match the old per-field calls: unparseable => 0/0
+        # and no ids; a bad id list skips the ids but keeps the counts.
+        local parsed
+        parsed="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print("0 0"); sys.exit(0)
+def field(f):
+    try: return str(f())
+    except Exception: return "0"
+print(field(lambda: len(d.get("Items", []))), field(lambda: d.get("TotalRecordCount", 0)))
+try:
+    ids = "\n".join(i["Id"] for i in d.get("Items", []))
+except Exception:
+    sys.exit(0)
+with open(sys.argv[2], "a") as fh:
+    fh.write(ids + "\n")
+' "$page_file" "$all_ids_file" 2>/dev/null || echo "0 0")"
+        read -r got total_records <<<"$parsed"
         rm -f "$page_file"
         total=$((total + got))
         start_index=$((start_index + page))

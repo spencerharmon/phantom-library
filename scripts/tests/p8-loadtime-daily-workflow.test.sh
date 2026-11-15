@@ -1761,6 +1761,16 @@ delays = {dom_delays!r}
 time.sleep(delays[n] if n < len(delays) else 0)
 os.execv({real_node!r}, [{real_node!r}] + sys.argv[1:])
 ''')
+# Parse-count probe (ttfb-loadtime-page-parse-residual): a python3 shim that
+# records every interpreter launch handed a downloaded page file, so the
+# test proves O(1) parses per fetched page (it was 3/page before).
+(browse_bin / 'python3').write_text(f'''#!{sys.executable}
+import os, sys
+if any(os.path.basename(a).startswith('page.') for a in sys.argv[1:]):
+    with open({str(browse_dir / 'page-parses')!r}, 'a') as fh:
+        fh.write('1\\n')
+os.execv({sys.executable!r}, [{sys.executable!r}] + sys.argv[1:])
+''')
 for path in browse_bin.iterdir():
     path.chmod(0o755)
 root = tmp / 'browse-checkout'
@@ -1778,6 +1788,16 @@ assert result.returncode == 0, (result.stdout, result.stderr)
 assert int((browse_dir / 'dom-count').read_text()) == len(dom_delays)
 browse = {(b['flow'], b['item_type'], b['sample_index']): b for b in manifest['browse_samples']}
 assert len(browse) == len(manifest['browse_samples']) == 12, manifest['browse_samples']
+# One parse per successfully fetched page, movie AND Shows root: a sample
+# whose page fetch failed parsed one page fewer than it requested.
+parsed_pages = {it: sum(b['stages']['channel_items']['pages']
+                        - (b['stages']['channel_items']['status'] == 'failed')
+                        for b in manifest['browse_samples']
+                        if b['outcome'] != 'skipped' and b['item_type'] == it)
+                for it in ('movie', 'episode')}
+assert parsed_pages['movie'] > 0 and parsed_pages['episode'] > 0, parsed_pages
+parse_calls = len((browse_dir / 'page-parses').read_text().splitlines())
+assert parse_calls == sum(parsed_pages.values()), (parse_calls, parsed_pages)
 components = ('channel_items', 'badge_states', 'dom_materialise')
 for (flow, item_type, sample), b in browse.items():
     assert b['scope'] == {'movie': 'movies_root', 'episode': 'shows_root'}[item_type], b
