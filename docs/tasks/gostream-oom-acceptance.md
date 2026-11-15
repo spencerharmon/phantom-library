@@ -60,11 +60,16 @@ replica and exactly one supplied current pod; it cannot certify multiple replica
 Capture the evidence together: this offline tool cannot detect a restart after
 the retained pod snapshot or authenticate the source of a supplied receipt.
 
-Only a bound, valid receipt makes config fields `match` or `mismatch`. Expected
-tuning values must be present in its `values` map as finite nonnegative JSON
-numbers (not strings or booleans). Missing, stale, foreign, or malformed receipt
-or ownership evidence leaves config fields `unobservable`, with null `observed`
-and a `reason`; independent env/image mismatches remain visible. Legacy `--config`
+Only a process-bound receipt makes config fields `match` or `mismatch`. Each
+requested tuning value is validated independently in its `values` map as a finite
+nonnegative JSON number (not a string or boolean). Missing, malformed, or
+unsupported-precision values make only that field `unobservable`, with null
+`observed` and a field-local `reason`; valid siblings retain their observations
+and match/mismatch states. A valid mismatch still exits 3; a valid match with an
+invalid sibling stays incomplete (exit 2). Malformed JSON, duplicate keys, an
+invalid values object, or missing/stale/foreign/ambiguous process ownership
+evidence invalidates all config fields. Independent env/image mismatches remain
+visible. Legacy `--config`
 is accepted for existing callers but never grants observation: mounted ConfigMaps
 and bare values files do not prove what the process loaded. A valid receipt's
 value mismatch uses the existing `DRIFT_MISMATCH` exit 3, not exit 1.
@@ -100,7 +105,9 @@ restart, or promotion is needed. Run
 `./scripts/tests/gostream-drift-flux-ownership.test.sh` for ownership regressions
 and the existing drift, acceptance, and pre-rollout suites. Run
 `./scripts/tests/gostream-drift-loaded-config-receipt.test.sh` for process-receipt
-and malformed/stale/foreign evidence regressions.
+and malformed/stale/foreign evidence regressions. Run
+`./scripts/tests/gostream-drift-field-isolation.test.sh` for independent field
+evidence in both directions, including raw lossy numbers and binding controls.
 
 ## Pre-Rollout Diagnostics
 

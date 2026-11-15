@@ -66,9 +66,11 @@ for receipt in (None, [], {}, 'bad json', {'container_id': 'containerd://current
     case('malformed receipt ' + repr(receipt), f)
 for value in (None, True, '6', [], {}, -1, float('nan'), float('inf')):
     f = deepcopy(full); f['loaded-config']['values']['master_concurrency_limit'] = value
-    case('malformed tuning value ' + repr(value), f)
+    case('malformed tuning value ' + repr(value), f,
+         {'master_concurrency_limit': 'unobservable', 'read_ahead_budget_mb': 'match'})
 f = deepcopy(full); del f['loaded-config']['values']['read_ahead_budget_mb']
-case('partial receipt', f)
+case('partial receipt', f,
+     {'master_concurrency_limit': 'match', 'read_ahead_budget_mb': 'unobservable'})
 for flag in ('loaded-config', 'pods', 'replicasets'):
     f = deepcopy(full); del f[flag]
     case('missing ' + flag, f)
@@ -130,10 +132,11 @@ for name, files, state, code in cases:
         assert len(fields) == 2
         assert all(field['state'] == (state[field['field'][7:]] if isinstance(state, dict) else state)
                    for field in fields), fields
-        if state == 'unobservable':
-            assert all(field['observed'] is None and field.get('reason') for field in fields), fields
-        else:
-            assert {field['field'][7:]: field['observed'] for field in fields} == files['loaded-config']['values']
+        for field in fields:
+            if field['state'] == 'unobservable':
+                assert field['observed'] is None and field.get('reason'), field
+            else:
+                assert field['observed'] == files['loaded-config']['values'][field['field'][7:]], field
         assert not out.stderr, out.stderr
         print('ok   ' + name)
     except (AssertionError, KeyError, ValueError) as error:

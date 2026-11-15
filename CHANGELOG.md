@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Preserve independent loaded-config fields in offline gostream drift reports:
+  after process binding, a missing or invalid sibling no longer hides a valid
+  match or mismatch. Whole-receipt and ownership failures still invalidate all
+  config evidence; exact-number safeguards are unchanged. No runtime changes.
 - Daily load-time measurements reach the resolved inactive Jellyfin Service with
   their API token instead of the interactive OIDC gate. Timings now exclude
   TLS/ingress/OIDC overhead; interactive authentication is unchanged. Discovery

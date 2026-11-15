@@ -170,12 +170,6 @@ def drift():
             require(isinstance(cid, str) and re.fullmatch(r'[a-z0-9-]+://[A-Za-z0-9_.-]+', cid),
                     'malformed receipt container_id')
             require(isinstance(values, dict), 'malformed receipt values')
-            for name in expected['config']:
-                require(not isinstance(values.get(name), Inexact),
-                        'receipt value precision unsupported: ' + name)
-                require(type(values[name]) in (int, float),
-                        'missing/malformed receipt value: ' + name)
-                number(values[name])
             require(args.pods and args.replicasets, 'pods and replicasets required for process binding')
             spec = deploy['spec']
             require(type(spec.get('replicas', 1)) is int and spec.get('replicas', 1) == 1,
@@ -224,7 +218,17 @@ def drift():
             fields[-1]['reason'] = (config_reason if loaded is None else
                                     'expected value precision unsupported: ' + want)
         else:
-            add('config.' + name, want, 'match' if json_equal(loaded[name], want) else 'mismatch', loaded[name])
+            # Binding is receipt-wide; a bad value only invalidates its own field.
+            try:
+                value = loaded.get(name)
+                require(not isinstance(value, Inexact), 'receipt value precision unsupported')
+                require(type(value) in (int, float), 'missing/malformed receipt value')
+                number(value)
+            except (ValueError, DecimalException) as error:
+                add('config.' + name, want, 'unobservable', None)
+                fields[-1]['reason'] = 'unusable loaded-config value: ' + str(error) + ': ' + name
+            else:
+                add('config.' + name, want, 'match' if json_equal(value, want) else 'mismatch', value)
     if args.expected_image:
         image = live.get('image')
         require(isinstance(image, str) and image, 'missing live image')
