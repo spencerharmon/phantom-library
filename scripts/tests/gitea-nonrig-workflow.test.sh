@@ -100,6 +100,18 @@ for path in workflows:
     with path.open() as f:
         workflow = yaml.safe_load(f)
     jobs = workflow['jobs']
+    if path.name == 'nonrig-gate.yaml':
+        job = jobs['nonrig-build-test']
+        pg = job['services']['postgres']
+        assert pg['image'] == 'postgres:16-alpine'
+        assert 'pg_isready' in pg['options'] and '--health-retries 30' in pg['options']
+        dsn = dict(part.split('=', 1) for part in job['env']['PHANTOM_TEST_POSTGRES_DSN'].split(';'))
+        assert dsn['Host'] == 'postgres' and dsn['Port'] == '5432'
+        assert dsn['Username'] == pg['env']['POSTGRES_USER']
+        assert dsn['Password'] == pg['env']['POSTGRES_PASSWORD']
+        assert dsn['Database'] == pg['env']['POSTGRES_DB']
+        assert any(step.get('run') == './tools/ci/nonrig-build-test.sh'
+                   and not step.get('if') and not step.get('continue-on-error') for step in job['steps'])
     assert isinstance(jobs, dict) and jobs, f'{path.name}: no jobs found'
     for name, job in jobs.items():
         job_count += 1

@@ -2,15 +2,13 @@
 # tools/ci/nonrig-build-test.sh
 #
 # Non-rig CI gate for the Phantom Library Jellyfin plugin. Runs identically in
-# Zuul (playbooks/phantom-library-nonrig-build-test.yaml) and locally.
+# Gitea Actions and locally.
 #
 #   1. Restore the pinned, PATCHED Jellyfin source tree the plugin compiles
 #      against. The plugin/test csprojs ProjectReference ../../jellyfin/* (the
 #      additive IChannelItemRefresh{,Manager} patches), so a bare
-#      `dotnet build` fails without it. We clone jellyfin at the pinned tag
-#      (single source of truth: scripts/jellyfin-patches/REBASE.md) into
-#      jellyfin/ and apply scripts/jellyfin-patches/*.patch, mirroring
-#      install.sh's --build patch step.
+#      `dotnet build` fails without it. The recorded gitlink and configured
+#      fork are authoritative, not an upstream tag. Apply any remaining patches.
 #   2. `dotnet build -c Release`  then  `dotnet test`  — with MSBuild node
 #      reuse and shared compilation DISABLED (no reusable build servers).
 #   3. An EXIT trap shuts the dotnet build servers down and VERIFIES no stray
@@ -24,9 +22,9 @@
 #                                 the cleanup trap.
 #   PHANTOM_JELLYFIN_DIR=<path>  where to place the jellyfin/ clone (default
 #                                 <repo>/jellyfin)
-#   PHANTOM_JELLYFIN_REPO=<url>  clone URL (default upstream jellyfin/jellyfin)
-#   PHANTOM_JELLYFIN_TAG=<tag>   pinned tag (default: parsed from REBASE.md,
-#                                 fallback v10.11.9)
+#   PHANTOM_JELLYFIN_REPO=<url>  override submodule.jellyfin.url / .gitmodules
+#   PHANTOM_TEST_POSTGRES_DSN   disposable PostgreSQL DSN (Gitea service); when
+#                                 unset, with-postgres.sh provisions via Podman
 #   PHANTOM_CI_RELAX_SDK=1       rewrite the THROWAWAY jellyfin/global.json
 #                                 rollForward to latestMajor so a >=9 SDK is
 #                                 accepted when a 9.x SDK is absent (default 1;
@@ -44,7 +42,6 @@ cd "$REPO_ROOT"
 DRYRUN="${PHANTOM_CI_DRYRUN:-0}"
 PATCHES_DIR="$REPO_ROOT/scripts/jellyfin-patches"
 JELLYFIN_DIR="${PHANTOM_JELLYFIN_DIR:-$REPO_ROOT/jellyfin}"
-JELLYFIN_REPO="${PHANTOM_JELLYFIN_REPO:-https://github.com/jellyfin/jellyfin.git}"
 RELAX_SDK="${PHANTOM_CI_RELAX_SDK:-1}"
 
 # --- Mandatory MSBuild process-cleanup contract -----------------------------
@@ -70,47 +67,28 @@ trap cleanup EXIT
 log()  { printf '\n=== %s\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
 
-# Pinned Jellyfin tag — REBASE.md is the source of truth.
-derive_tag() {
-    local t=""
-    if [ -f "$PATCHES_DIR/REBASE.md" ]; then
-        t="$(sed -n 's/.*tag `\(v10\.11\.[0-9][0-9]*\)`.*/\1/p' \
-             "$PATCHES_DIR/REBASE.md" | head -1)"
-    fi
-    printf '%s' "${PHANTOM_JELLYFIN_TAG:-${t:-v10.11.9}}"
-}
-JELLYFIN_TAG="$(derive_tag)"
-
 log "phantom-library non-rig gate"
 note "repo:            $REPO_ROOT"
 note "jellyfin clone:  $JELLYFIN_DIR"
-note "jellyfin repo:   $JELLYFIN_REPO"
-note "jellyfin tag:    $JELLYFIN_TAG"
 note "dotnet flags:    ${DOTNET_FLAGS[*]}"
 note "MSBUILDDISABLENODEREUSE=$MSBUILDDISABLENODEREUSE"
 note "dry run:         $DRYRUN"
 
 # --- 1. Restore the patched Jellyfin source tree ----------------------------
 restore_jellyfin() {
-    log "restoring patched Jellyfin source tree ($JELLYFIN_TAG)"
+    log "restoring patched Jellyfin source tree (recorded gitlink)"
     if [ "$DRYRUN" = 1 ]; then
-        note "DRYRUN: git clone --depth 1 --branch $JELLYFIN_TAG $JELLYFIN_REPO $JELLYFIN_DIR"
+        note "DRYRUN: bash scripts/tests/p0-prepare-jellyfin.sh"
         note "DRYRUN: git -C $JELLYFIN_DIR apply <scripts/jellyfin-patches/*.patch>"
         return 0
     fi
 
-    if [ ! -d "$JELLYFIN_DIR/.git" ]; then
-        git clone --depth 1 --branch "$JELLYFIN_TAG" "$JELLYFIN_REPO" "$JELLYFIN_DIR"
-    else
-        note "existing jellyfin/ checkout — resetting to $JELLYFIN_TAG"
-        git -C "$JELLYFIN_DIR" fetch --depth 1 origin "refs/tags/$JELLYFIN_TAG:refs/tags/$JELLYFIN_TAG" 2>/dev/null || true
-        git -C "$JELLYFIN_DIR" reset --hard "$JELLYFIN_TAG"
-        git -C "$JELLYFIN_DIR" clean -fd
-    fi
+    bash "$REPO_ROOT/scripts/tests/p0-prepare-jellyfin.sh"
 
     # Apply the additive patches in lexicographic order (mirrors install.sh).
     local patch name
     for patch in "$PATCHES_DIR"/*.patch; do
+        [[ -f "$patch" ]] || continue
         name="$(basename "$patch")"
         if git -C "$JELLYFIN_DIR" apply --check "$patch" 2>/dev/null; then
             git -C "$JELLYFIN_DIR" apply "$patch"
@@ -153,15 +131,16 @@ build_and_test() {
     if [ "$DRYRUN" = 1 ]; then
         note "DRYRUN: dotnet build ${DOTNET_FLAGS[*]}"
     else
+        dotnet restore "$JELLYFIN_DIR/src/Jellyfin.CodeAnalysis/Jellyfin.CodeAnalysis.csproj" -p:UseSharedCompilation=false
         dotnet build "${DOTNET_FLAGS[@]}"
     fi
 
     log "dotnet test"
     if [ "$DRYRUN" = 1 ]; then
-        note "DRYRUN: dotnet test ${DOTNET_FLAGS[*]} --no-build"
+        note "DRYRUN: bash tools/ci/with-postgres.sh dotnet test ${DOTNET_FLAGS[*]} --no-build"
     else
         # Reuse the build output; keep the same no-reusable-server flags.
-        dotnet test "${DOTNET_FLAGS[@]}" --no-build
+        bash "$REPO_ROOT/tools/ci/with-postgres.sh" dotnet test "${DOTNET_FLAGS[@]}" --no-build
     fi
 }
 

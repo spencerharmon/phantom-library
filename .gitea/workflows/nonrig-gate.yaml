@@ -51,6 +51,18 @@ jobs:
     # cannot silently drift onto an untested SDK patch line.
     container:
       image: mcr.microsoft.com/dotnet/sdk:9.0.305-noble
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: regression
+          POSTGRES_DB: regression
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres -d regression"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      PHANTOM_TEST_POSTGRES_DSN: Host=postgres;Port=5432;Username=postgres;Password=regression;Database=regression
     steps:
       - name: install nodejs + git + sqlite3 + Python/PyYAML (checkout, CI script and workflow checks)
         run: |
@@ -68,5 +80,8 @@ jobs:
       - name: validate workflow runner labels and non-rig wiring
         run: bash scripts/tests/gitea-nonrig-workflow.test.sh
 
-      - name: non-rig build + test (shared script; Zuul + Gitea identical)
+      - name: verify exact-gitlink bootstrap regressions
+        run: bash scripts/tests/p0-prepare-jellyfin.test.sh
+
+      - name: non-rig build + test (shared script; real PostgreSQL)
         run: ./tools/ci/nonrig-build-test.sh

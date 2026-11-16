@@ -116,6 +116,59 @@ public sealed class P0ObservabilityTests
             Assert.Contains(records, r => r.Name == "phantom_availability_claims_total" && (string?)r.Tags["media_type"] == "movie");
             Assert.Contains(records, r => r.Name == "phantom_availability_claims_total" && (string?)r.Tags["media_type"] == "episode");
             Assert.Equal(2, records.Where(r => r.Name == "phantom_availability_completions_total").Sum(r => r.Value));
+
+            // Hold a real claimed lease through multiple observation intervals,
+            // advancing only the observation clock rather than sleeping 11 minutes.
+            foreach (var type in new[] { "movie", "episode" })
+            {
+                sql.CommandText = $"UPDATE {schema}.availability_items SET next_check_at=0, lease_until=NULL, probe_policy_hash=@policy";
+                await sql.ExecuteNonQueryAsync();
+                await db.UpsertTmdbMetadataAsync(new TmdbMetadataRow(1, type == "movie" ? "movie" : "series",
+                    "Slow probe", 2020, null, null, null, null, null, null, null, now), default);
+                // The injected availability probe holds the real database lease.
+                var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var release = new TaskCompletionSource<MagnetProbeResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+                var clock = new ObservationClock { Now = now.AddSeconds(type == "movie" ? 1000 : 3000) };
+                cfg.AvailabilityMaxBatchSize = 1;
+                cfg.AvailabilityLeaseMinutes = 120;
+                sql.CommandText = $"UPDATE {schema}.availability_items SET next_check_at=@future WHERE type<>@type OR tmdb_id<>1";
+                sql.Parameters.Clear();
+                sql.Parameters.AddWithValue("future", now.AddDays(1).ToUnixTimeSeconds());
+                sql.Parameters.AddWithValue("type", type);
+                await sql.ExecuteNonQueryAsync();
+                using var slowWorker = new AvailabilityProbeWorker(db, selector,
+                    new TmdbExternalIdResolver(db, tmdb, NullLogger<TmdbExternalIdResolver>.Instance), tmdb,
+                    new ChannelStateProvider(db), NullLogger<AvailabilityProbeWorker>.Instance, () => cfg,
+                    probe: (_, _, _, _, _, _, _, _) =>
+                    {
+                        entered.TrySetResult();
+                        return release.Task;
+                    }, timeProvider: clock);
+                var running = (Task)tick.Invoke(slowWorker, new object[] { CancellationToken.None })!;
+                try
+                {
+                    await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+                    for (var interval = 0; interval < 3; interval++)
+                    {
+                        clock.Now = clock.Now.AddSeconds(301);
+                        records.Clear();
+                        await ((Task)tick.Invoke(slowWorker, new object[] { CancellationToken.None })!).WaitAsync(TimeSpan.FromSeconds(10));
+                        Assert.False(running.IsCompleted);
+                        listener.RecordObservableInstruments();
+                        Assert.Equal(clock.Now.ToUnixTimeSeconds(), records.Single(r => r.Name == "phantom_availability_backlog_observed_at").Value);
+                        Assert.Equal(1, records.Single(r => r.Name == "phantom_availability_backlog"
+                            && (string?)r.Tags["media_type"] == type && (string?)r.Tags["state"] == "leased").Value);
+                        Assert.DoesNotContain(records, r => r.Name == "phantom_availability_claims_total" && r.Value > 0);
+                    }
+                }
+                finally
+                {
+                    release.TrySetResult(new MagnetProbeResult(MagnetProbeOutcome.IndeterminateTransient, Array.Empty<MagnetCandidate>(), null, null));
+                    await running.WaitAsync(TimeSpan.FromSeconds(10));
+                }
+                sql.Parameters.Clear();
+                sql.Parameters.AddWithValue("policy", policy);
+            }
         }
         finally
         {
@@ -123,5 +176,11 @@ public sealed class P0ObservabilityTests
             sql.CommandText = $"DROP SCHEMA {schema} CASCADE";
             await sql.ExecuteNonQueryAsync();
         }
+    }
+
+    private sealed class ObservationClock : TimeProvider
+    {
+        public DateTimeOffset Now { get; set; }
+        public override DateTimeOffset GetUtcNow() => Now;
     }
 }

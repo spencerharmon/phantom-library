@@ -27,10 +27,12 @@ leased (`lease_until >= now`), eligible (due time OR missing/changed policy), do
 On this revision a policy mismatch can make a future dormant row eligible; the
 metric intentionally exposes that existing scheduler behavior rather than hiding it.
 
-The serialized worker tick requests refresh even when disabled or yielding to users.
+Every worker timer callback requests refresh before the batch-running guard, even
+when disabled, yielding to users, or waiting on a slow movie/episode probe.
 Each database object attempts at most one aggregate scan per 300 seconds; failures
 also consume that cadence, use a 10-second SQL timeout, and preserve the old timestamp.
-Scrapes read only an immutable memory snapshot. A stopped/hung worker becomes stale.
+Scrapes read only an immutable memory snapshot. A stopped observation loop becomes stale;
+a healthy long-running probe does not prevent observation callbacks.
 Counts are shared-database observations: dashboards must use max, not sum, across
 replicas. The collector should retain pod identity separately from instrument labels.
 Every successful refresh also emits zero increments to initialize quiet counter lanes.
@@ -46,11 +48,21 @@ plus observation age. Do not collapse missing series into zero with `or vector(0
 
 ## Regression
 
+The bootstrap resolves `PHANTOM_JELLYFIN_REPO`, then the configured submodule URL,
+then `.gitmodules`, and fetches/verifies the exact recorded gitlink. It repairs a
+clean wrong-tip checkout and refuses to overwrite dirty wrong-tip work. Both the
+dedicated harness and nonrig CI use this helper. Nonrig Gitea provisions a healthy
+PostgreSQL 16 service and passes its DSN to the entire unfiltered test suite;
+local nonrig runs without a DSN use the same Podman fixture as this harness.
+The harness also tests bootstrap on isolated repositories and validates workflow
+service/DSN wiring. Slow-worker coverage holds real PostgreSQL leases for both
+media types while advancing the observation clock across three 301-second intervals.
+
 ```sh
 beehive submodule worktree exec phantom-library bee-p0-probe-load-observability -- ./scripts/tests/p0-database-load-observability.test.sh
 ```
 
-Requires .NET 9, Python 3, Git and Podman (or a disposable PostgreSQL DSN in
+Requires .NET 9, Python 3 with PyYAML, Git and Podman (or a disposable PostgreSQL DSN in
 `PHANTOM_TEST_POSTGRES_DSN`). The script provisions isolated PostgreSQL, compiles
 against the pinned Jellyfin gitlink, and runs a real worker/DB regression with a
 MeterListener. Missing DSN is never silently skipped. It covers movie/episode,
