@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- PostgreSQL: real >= 2 GiB movie/episode sizes no longer fail with `22003
+  integer out of range` (source candidates, selected file, availability
+  candidate, magnet cache). Schema v23 is an additive expand: nullable BIGINT
+  `*_bytes` companions are added next to the existing INTEGER size columns
+  (never retyped/dropped), new builds dual-write and read through a
+  legacy-writer-tolerant resolver, and a v22 Postgres DB self-applies the
+  expand on start (no data update). SQLite DBs below v23 still require
+  `scripts/phantom-wipe.sh --commit` per the pre-v1.0 policy. Proof:
+  `scripts/tests/postgres-media-size-int64.test.sh`.
 - Preserve independent loaded-config fields in offline gostream drift reports:
   after process binding, a missing or invalid sibling no longer hides a valid
   match or mismatch. Whole-receipt and ownership failures still invalidate all

@@ -562,7 +562,10 @@ UPDATE phantom_schema_meta SET version = 20;";
         await using var readVersion = verify.CreateCommand();
         readVersion.CommandText = "SELECT version FROM phantom_schema_meta LIMIT 1;";
         var version = Convert.ToInt32(await readVersion.ExecuteScalarAsync(), CultureInfo.InvariantCulture);
-        Assert.Equal(22, version);
+        // The whole registered expand chain (v20->...->current) self-applies,
+        // so the stamp lands on CurrentSchemaVersion (v23 since
+        // postgres-media-size-int64-expand), not a hardcoded intermediate.
+        Assert.Equal(PhantomDb.CurrentSchemaVersion, version);
     }
 
     /// <summary>

@@ -73,8 +73,11 @@ grepf() { grep -Fq -- "$2" "$1"; }  # fixed-string grep, quiet
 head_ "A. Structural: fix wiring present in tracked source"
 # ---------------------------------------------------------------------------
 
-grepf "$PHANTOMDB" "CurrentSchemaVersion = 22" \
-  && ok "schema bumped to v22" || bad "schema NOT bumped to v22"
+# >= 22: later additive bumps (v23 postgres-media-size-int64-expand) keep the
+# dead_swarm_confirmations table; the invariant is "at least v22", not "== 22".
+schema_ver="$(grep -oE 'CurrentSchemaVersion = [0-9]+' "$PHANTOMDB" | grep -oE '[0-9]+' | head -1)"
+[[ -n "$schema_ver" && "$schema_ver" -ge 22 ]] \
+  && ok "schema at >= v22 (v$schema_ver)" || bad "schema NOT at >= v22 (got '${schema_ver}')"
 
 grepf "$PHANTOMDB" "CREATE TABLE IF NOT EXISTS dead_swarm_confirmations" \
   && ok "dead_swarm_confirmations table in fresh schema" \
