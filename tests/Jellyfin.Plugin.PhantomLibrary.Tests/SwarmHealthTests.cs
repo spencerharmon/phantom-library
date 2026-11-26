@@ -193,6 +193,27 @@ public sealed class SwarmHealthTests : IDisposable
     }
 
     [Fact]
+    public async Task Worker_Sync_OneItemFailingToSave_DoesNotAbortThePass()
+    {
+        using var db = await NewDbAsync();
+        var bad = new Movie { Id = Guid.NewGuid(), ExternalId = "movie_31" };
+        var good = new Movie { Id = Guid.NewGuid(), ExternalId = "movie_32" };
+        var lib = new Mock<ILibraryManager>(MockBehavior.Loose);
+        lib.Setup(l => l.GetItemList(It.Is<InternalItemsQuery>(q => q.ChannelIds.Contains(ChannelIds.Movies))))
+            .Returns(new List<BaseItem> { bad, good });
+        lib.Setup(l => l.GetItemList(It.Is<InternalItemsQuery>(q => q.ChannelIds.Contains(ChannelIds.Shows))))
+            .Returns(new List<BaseItem>());
+        lib.Setup(l => l.UpdateItemAsync(bad, It.IsAny<BaseItem>(), It.IsAny<ItemUpdateType>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("FK violation"));
+        lib.Setup(l => l.UpdateItemAsync(good, It.IsAny<BaseItem>(), It.IsAny<ItemUpdateType>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        var worker = NewWorker(db, new FakeClient(new Dictionary<string, int>()), lib.Object);
+
+        Assert.Equal(1, await worker.SyncBaseItemsAsync(Config(), default));
+        Assert.Equal(SwarmHealthScore.UnmeasuredScore, good.CriticRating);
+    }
+
+    [Fact]
     public async Task Rows_AppendHealthiestSwarmsShelf_OnlyWhenEnabledAndLive()
     {
         using var db = await NewDbAsync();

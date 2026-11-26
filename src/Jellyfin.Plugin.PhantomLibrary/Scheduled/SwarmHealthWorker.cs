@@ -190,6 +190,7 @@ public sealed class SwarmHealthWorker : IHostedService, IDisposable
     {
         var fresh = DateTimeOffset.UtcNow.AddDays(-cfg.SwarmHealthRankWindowDays);
         var written = 0;
+        var failed = 0;
         foreach (var (channelId, kind, dbType, metricType) in new[]
                  {
                      (ChannelIds.Movies, BaseItemKind.Movie, "movie", "movie"),
@@ -226,16 +227,26 @@ public sealed class SwarmHealthWorker : IHostedService, IDisposable
                     continue;
                 }
 
-                item.CriticRating = target;
-                await _libraryManager.UpdateItemAsync(item, item.GetParent(), ItemUpdateType.MetadataEdit, ct).ConfigureAwait(false);
-                written++;
+                // One item failing to save (e.g. core deleting it concurrently: FK violation on
+                // BaseItemImageInfos) must not abort the pass for the rest of the catalogue.
+                try
+                {
+                    item.CriticRating = target;
+                    await _libraryManager.UpdateItemAsync(item, item.GetParent(), ItemUpdateType.MetadataEdit, ct).ConfigureAwait(false);
+                    written++;
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    failed++;
+                    _logger.LogDebug(ex, "Swarm-health could not write Peers onto {Item}", item.Id);
+                }
             }
         }
 
         SwarmHealthMetrics.RecordBaseItemsUpdated(written);
-        if (written > 0)
+        if (written > 0 || failed > 0)
         {
-            _logger.LogInformation("Swarm-health wrote Peers onto {Written} phantom BaseItems", written);
+            _logger.LogInformation("Swarm-health wrote Peers onto {Written} phantom BaseItems ({Failed} failed)", written, failed);
         }
 
         return written;
