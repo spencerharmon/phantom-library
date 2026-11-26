@@ -8,14 +8,17 @@ and answers:
 
   POST /measure   {"info_hashes": ["<40-hex>", ...]}
       -> {"results": [{"info_hash", "dht_peers", "measured_at"}...], "dht_nodes": N}
-      Runs one DHT get_peers traversal per infohash (concurrently, bounded by
-      MEASURE_TIMEOUT_S) and reports the number of DISTINCT peers announced for it.
-      An infohash whose traversal did not complete in time is omitted (unmeasured),
-      never reported as 0. Recent answers are cached for CACHE_TTL_S.
+      Runs one DHT get_peers traversal per infohash (concurrently) and reports the
+      number of DISTINCT peers announced for it, unioned over every reply the
+      traversal produces. Collection ends SETTLE_S after the last new reply once every
+      infohash has answered, or at MEASURE_TIMEOUT_S. libtorrent only replies when a
+      traversal finds peers, so an infohash with no reply after the full window on a
+      healthy routing table (>= MIN_DHT_NODES) is reported as 0 (dead swarm).
+      Recent answers are cached for CACHE_TTL_S.
   GET  /healthz   200 once the routing table has >= MIN_DHT_NODES nodes, else 503.
   GET  /metrics   Prometheus text: dht nodes, measurements, batch durations, peer counts.
 
-Configuration (env): LISTEN_PORT (8095), DHT_PORT (0 = ephemeral), MEASURE_TIMEOUT_S (30), MAX_BATCH (256), CACHE_TTL_S (3600), MIN_DHT_NODES (20),
+Configuration (env): LISTEN_PORT (8095), DHT_PORT (0 = ephemeral), MEASURE_TIMEOUT_S (30), SETTLE_S (5), MAX_BATCH (256), CACHE_TTL_S (3600), MIN_DHT_NODES (20),
 DHT_BOOTSTRAP (comma list host:port).
 `--selftest` checks request validation and exposition without network.
 """
@@ -102,7 +105,7 @@ class Metrics:
                 "# HELP swarm_health_measurements_total Infohashes measured by result.",
                 "# TYPE swarm_health_measurements_total counter",
                 f'swarm_health_measurements_total{{result="measured"}} {self.measured}',
-                f'swarm_health_measurements_total{{result="unanswered"}} {self.unanswered}',
+                f'swarm_health_measurements_total{{result="dead"}} {self.unanswered}',
                 f'swarm_health_measurements_total{{result="cached"}} {self.cache_hits}',
                 "# HELP swarm_health_batch_seconds Wall time of /measure batches.",
                 "# TYPE swarm_health_batch_seconds summary",
@@ -120,8 +123,9 @@ class Metrics:
 
 
 class Dht:
-    def __init__(self, lt, port, bootstrap, timeout_s, cache_ttl_s, metrics):
+    def __init__(self, lt, port, bootstrap, timeout_s, cache_ttl_s, metrics, settle_s=5):
         self.lt = lt
+        self.settle_s = settle_s
         self.timeout_s = timeout_s
         self.cache_ttl_s = cache_ttl_s
         self.metrics = metrics
@@ -159,22 +163,34 @@ class Dht:
                 start = time.time()
                 for h in todo:
                     self.session.dht_get_peers(self.lt.sha1_hash(bytes.fromhex(h)))
-                pending = set(todo)
-                while pending and time.time() - start < self.timeout_s:
+                wanted = set(todo)
+                seen = {h: set() for h in todo}
+                last_new = start
+                while time.time() - start < self.timeout_s:
+                    answered = all(seen[h] for h in todo)
+                    if answered and time.time() - last_new >= self.settle_s:
+                        break
                     self.session.wait_for_alert(500)
                     for a in self.session.pop_alerts():
                         if isinstance(a, self.lt.dht_get_peers_reply_alert):
                             h = str(a.info_hash).lower()
-                            if h in pending:
-                                pending.discard(h)
-                                peers = len({str(p) for p in a.peers()})
-                                results[h] = (peers, time.time())
-                                self.cache[h] = results[h]
-                                with self.metrics.lock:
-                                    self.metrics.measured += 1
-                                    self.metrics.observe_peers(peers)
+                            if h in wanted:
+                                before = len(seen[h])
+                                seen[h].update(str(p) for p in a.peers())
+                                if len(seen[h]) > before:
+                                    last_new = time.time()
+                finished = time.time()
+                silent = 0
+                for h in todo:
+                    peers = len(seen[h])
+                    silent += peers == 0
+                    results[h] = (peers, finished)
+                    self.cache[h] = results[h]
                 with self.metrics.lock:
-                    self.metrics.unanswered += len(pending)
+                    for h in todo:
+                        self.metrics.observe_peers(len(seen[h]))
+                    self.metrics.measured += len(todo) - silent
+                    self.metrics.unanswered += silent
                     self.metrics.batches += 1
                     self.metrics.batch_seconds_sum += time.time() - start
         if len(self.cache) > 200000:
@@ -265,7 +281,8 @@ def main():
     dht = Dht(lt, env_int("DHT_PORT", 0),
               os.environ.get("DHT_BOOTSTRAP", "router.bittorrent.com:6881,dht.transmissionbt.com:6881,"
                                               "dht.libtorrent.org:25401,router.utorrent.com:6881"),
-              env_int("MEASURE_TIMEOUT_S", 30), env_int("CACHE_TTL_S", 3600), metrics)
+              env_int("MEASURE_TIMEOUT_S", 30), env_int("CACHE_TTL_S", 3600), metrics,
+              settle_s=env_int("SETTLE_S", 5))
 
     port = env_int("LISTEN_PORT", 8095)
     handler = make_handler(dht, metrics, env_int("MAX_BATCH", 256), env_int("MIN_DHT_NODES", 20))
