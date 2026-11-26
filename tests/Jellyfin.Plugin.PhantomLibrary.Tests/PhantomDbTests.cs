@@ -47,6 +47,49 @@ public class PhantomDbTests : IDisposable
     // Schema / HARD-REFUSE
     // ----------------------------------------------------------------
 
+    /// <summary>
+    /// postgres-media-size-int64-expand: the dual-write + witness-resolve read
+    /// path is shared SQL, so the >= 5 GiB round trip must also hold on the
+    /// SQLite backend (the Postgres proof is
+    /// scripts/tests/postgres-media-size-int64.test.sh).
+    /// </summary>
+    [Fact]
+    public async Task MediaSize_FiveGiB_RoundTrips_SourceCandidate_MagnetCache_Availability()
+    {
+        const long fiveGiB = 5L * 1024 * 1024 * 1024;
+        using var db = await NewDbAsync();
+        var hash = new string('a', 40);
+        await db.UpsertSourceCandidatesAsync(
+            42, "episode", 1, 2, "1080p",
+            new[] { new Jellyfin.Plugin.PhantomLibrary.Sources.MagnetCandidate("magnet:?xt=urn:btih:" + hash, hash, fiveGiB, 1, "prowlarr") },
+            "availability", TimeSpan.FromHours(1), CancellationToken.None);
+        Assert.Equal(fiveGiB, (await db.ListSourceCandidatesAsync(42, "episode", 1, 2, "1080p", false, CancellationToken.None)).Single().Size);
+
+        var entry = new MagnetCacheEntry
+        {
+            Magnet = "magnet:?xt=urn:btih:" + hash, InfoHash = hash, Size = fiveGiB, Seeders = 1, Indexer = "p",
+            CachedAt = DateTimeOffset.UtcNow, Ttl = TimeSpan.FromHours(1), Source = "eager",
+        };
+        var key = new MagnetCacheKey(42, null, "movie", null, null, "1080p");
+        await db.PutCachedMagnetAsync(key, entry, CancellationToken.None);
+        Assert.Equal(fiveGiB, (await db.GetCachedMagnetAsync(key, CancellationToken.None))!.Size);
+
+        await db.MarkAvailabilityAvailableAsync(42, "movie", -1, -1, entry, CancellationToken.None);
+        Assert.Equal(fiveGiB, (await db.GetAvailabilityItemAsync(42, "movie", -1, -1, CancellationToken.None))!.CandidateSize);
+    }
+
+    [Theory]
+    [InlineData(0L, 0L)]
+    [InlineData(700L * 1024 * 1024, 700L * 1024 * 1024)]
+    [InlineData(2147483647L, 2147483647L)]
+    [InlineData(2147483648L, -1L)]
+    [InlineData(5L * 1024 * 1024 * 1024, -1L)]
+    public void LegacySizeValue_FitsInt32OrSentinel(long size, long expectedLegacy)
+    {
+        Assert.Equal(expectedLegacy, PhantomDb.LegacySizeValue(size));
+        Assert.Null(PhantomDb.LegacySizeValue(null));
+    }
+
     [Fact]
     public async Task FreshDb_CreatesCurrentSchema_WithAllExpectedTables()
     {
