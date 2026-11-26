@@ -236,61 +236,73 @@ def drift():
     report = {'mode': 'drift', 'namespace': meta['namespace'], 'name': meta['name'],
               'generation': meta.get('generation'), 'container': container,
               'rollout_at': None, 'fields': fields}
-    report['flux'] = {'state': 'unobservable', 'binding': 'unobservable', 'namespace': None}
+    report['flux'] = {'state': 'unobservable', 'binding': 'unobservable', 'namespace': None,
+                      'reason': 'Flux evidence required'}
     if args.flux:
-        flux = load(args.flux)
-        require(isinstance(flux, dict) and flux.get('kind') in ('Kustomization', 'HelmRelease'),
-                'expected Flux Kustomization/HelmRelease')
-        fstatus = flux.get('status', {})
-        require(isinstance(fstatus, dict), 'invalid Flux status')
-        revision = fstatus.get('lastAppliedRevision')
-        require(revision is None or isinstance(revision, str), 'invalid Flux revision')
-        fmeta = flux.get('metadata')
-        fmeta = fmeta if isinstance(fmeta, dict) else {}
-        receipt = report['flux']
-        receipt.update(kind=flux['kind'], name=fmeta.get('name'), namespace=fmeta.get('namespace'),
-                       last_applied_revision=revision)
+        try:
+            flux = load(args.flux)
+            require(isinstance(flux, dict) and flux.get('kind') in ('Kustomization', 'HelmRelease'),
+                    'expected Flux Kustomization/HelmRelease')
+            fstatus = flux.get('status', {})
+            require(isinstance(fstatus, dict), 'invalid Flux status')
+            revision = fstatus.get('lastAppliedRevision')
+            require(revision is None or isinstance(revision, str), 'invalid Flux revision')
+            fmeta = flux.get('metadata')
+            fmeta = fmeta if isinstance(fmeta, dict) else {}
+            # Publish only after validation; an error must not leave partial proof.
+            receipt = {'state': 'unobservable', 'binding': 'unobservable',
+                       'kind': flux['kind'], 'name': fmeta.get('name'),
+                       'namespace': fmeta.get('namespace'), 'last_applied_revision': revision}
 
-        def identity(value):
-            return isinstance(value, str) and bool(value.strip())
+            def identity(value):
+                return isinstance(value, str) and bool(value.strip())
 
-        pairs = []
-        if all(identity(fmeta.get(key)) for key in ('name', 'namespace')):
-            if flux['kind'] == 'Kustomization':
-                labels = meta.get('labels')
-                if isinstance(labels, dict):
-                    pairs = [(labels.get('kustomize.toolkit.fluxcd.io/' + key), fmeta[key])
-                             for key in ('name', 'namespace')]
+            pairs = []
+            if all(identity(fmeta.get(key)) for key in ('name', 'namespace')):
+                if flux['kind'] == 'Kustomization':
+                    labels = meta.get('labels')
+                    if isinstance(labels, dict):
+                        pairs = [(labels.get('kustomize.toolkit.fluxcd.io/' + key), fmeta[key])
+                                 for key in ('name', 'namespace')]
+                else:
+                    spec, annotations = flux.get('spec'), meta.get('annotations')
+                    if (isinstance(spec, dict) and isinstance(annotations, dict)
+                            and all(key not in spec or identity(spec[key]) for key in
+                                    ('releaseName', 'targetNamespace', 'storageNamespace'))):
+                        target = spec.get('targetNamespace', fmeta['namespace'])
+                        storage = spec.get('storageNamespace', fmeta['namespace'])
+                        # Flux prefixes only an explicitly configured targetNamespace.
+                        release = spec.get('releaseName')
+                        if release is None:
+                            release = (spec['targetNamespace'] + '-' if 'targetNamespace' in spec else '') + fmeta['name']
+                            if len(release) > 53:
+                                release = release[:40] + '-' + hashlib.sha256(release.encode()).hexdigest()[:12]
+                        receipt.update(release_name=release, target_namespace=target, storage_namespace=storage)
+                        # Helm ownership uses the target (release) namespace, not secret storage.
+                        pairs = [(annotations.get('meta.helm.sh/release-name'), release),
+                                 (annotations.get('meta.helm.sh/release-namespace'), target)]
+                        # When retained, Flux's own origin labels must also agree.
+                        labels = meta.get('labels', {})
+                        if not isinstance(labels, dict):
+                            pairs.append((None, None))
+                        elif any('helm.toolkit.fluxcd.io/' + key in labels for key in ('name', 'namespace')):
+                            pairs.extend((labels.get('helm.toolkit.fluxcd.io/' + key), fmeta[key])
+                                         for key in ('name', 'namespace'))
+            if any(identity(owner) and owner != supplied for owner, supplied in pairs):
+                receipt['binding'] = 'mismatch'
+            elif pairs and all(identity(owner) for owner, _ in pairs):
+                receipt['binding'] = 'match'
+            if receipt['binding'] == 'match' and identity(revision):
+                receipt['state'] = 'observed'
             else:
-                spec, annotations = flux.get('spec'), meta.get('annotations')
-                if (isinstance(spec, dict) and isinstance(annotations, dict)
-                        and all(key not in spec or identity(spec[key]) for key in
-                                ('releaseName', 'targetNamespace', 'storageNamespace'))):
-                    target = spec.get('targetNamespace', fmeta['namespace'])
-                    storage = spec.get('storageNamespace', fmeta['namespace'])
-                    # Flux prefixes only an explicitly configured targetNamespace.
-                    release = spec.get('releaseName')
-                    if release is None:
-                        release = (spec['targetNamespace'] + '-' if 'targetNamespace' in spec else '') + fmeta['name']
-                        if len(release) > 53:
-                            release = release[:40] + '-' + hashlib.sha256(release.encode()).hexdigest()[:12]
-                    receipt.update(release_name=release, target_namespace=target, storage_namespace=storage)
-                    # Helm ownership uses the target (release) namespace, not secret storage.
-                    pairs = [(annotations.get('meta.helm.sh/release-name'), release),
-                             (annotations.get('meta.helm.sh/release-namespace'), target)]
-                    # When retained, Flux's own origin labels must also agree.
-                    labels = meta.get('labels', {})
-                    if not isinstance(labels, dict):
-                        pairs.append((None, None))
-                    elif any('helm.toolkit.fluxcd.io/' + key in labels for key in ('name', 'namespace')):
-                        pairs.extend((labels.get('helm.toolkit.fluxcd.io/' + key), fmeta[key])
-                                     for key in ('name', 'namespace'))
-        if any(identity(owner) and owner != supplied for owner, supplied in pairs):
-            receipt['binding'] = 'mismatch'
-        elif pairs and all(identity(owner) for owner, _ in pairs):
-            receipt['binding'] = 'match'
-        if receipt['binding'] == 'match' and identity(revision):
-            receipt['state'] = 'observed'
+                receipt['reason'] = ('missing/blank Flux applied revision' if receipt['binding'] == 'match'
+                                     else 'Flux ownership ' + receipt['binding'])
+        except (ValueError, KeyError, TypeError, IndexError, AttributeError, OSError,
+                DecimalException, OverflowError, RecursionError) as error:
+            # Optional Flux failures withhold acceptance, never independent drift.
+            report['flux']['reason'] = ('unusable Flux evidence: ' + str(error))[:240]
+        else:
+            report['flux'] = receipt
     states = {f['state'] for f in fields}
     body = json.dumps(report, sort_keys=True)
     if 'mismatch' in states or report['flux']['binding'] == 'mismatch':
