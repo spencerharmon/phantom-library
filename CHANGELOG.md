@@ -13,6 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   URL clears the service setting. One XML-aware merge replaces the Prowlarr-only
   text substitutions, preserving unrelated fields/secrets and rejecting malformed
   input without replacing config. See `docs/swarm-health-chart-config.md`.
+- In-player stream stats overlay (ROI P14). While a Phantom movie or episode is
+  playing, the web/mobile player shows a small collapsible panel with the
+  current source (release, size, indexer) and live peers/seeders, download
+  rate, buffered-ahead and gostream stream state, polled every 2–5 s only while
+  the player is open (stops on close, backgrounding or collapse). New
+  `GET /Plugins/PhantomLibrary/PlayerStats/Current` and
+  `/PlayerStats/{itemId}` proxy gostream's `/api/library/stats` server-side (the
+  gostream token never reaches the browser); the overlay
+  (`/Plugins/PhantomLibrary/playerstats.js`) is bootstrapped by `badges.js`, so
+  existing installs pick it up with no new `index.html` tag (`install.sh` also
+  adds one). Requires a gostream build with the stats endpoint; older gostream
+  shows "gostream unavailable". No schema change.
 - Rank by REAL DHT swarm health (ROI Priority 0.5). A standalone swarm-health
   service (`tools/swarm-health/swarm_health_service.py`, libtorrent DHT node)
   measures the distinct DHT peers behind each available item's candidate

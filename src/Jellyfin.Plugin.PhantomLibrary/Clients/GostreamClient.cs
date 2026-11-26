@@ -312,6 +312,59 @@ public sealed class GostreamClient : IGostreamClient
         throw new GostreamBadRequestException($"gostream unprestage {status}: {err}");
     }
 
+    public async Task<GostreamTorrentStats?> GetTorrentStatsAsync(string infoHash, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(infoHash))
+        {
+            throw new ArgumentException("infoHash required", nameof(infoHash));
+        }
+
+        var url = BuildUrl("/api/library/stats?hash=" + Uri.EscapeDataString(infoHash));
+        using var message = new HttpRequestMessage(HttpMethod.Get, url);
+        AddLibraryAuthHeader(message);
+        using var response = await _http.SendAsync(message, ct).ConfigureAwait(false);
+        var status = (int)response.StatusCode;
+        if (status == 200)
+        {
+            var body = await response.Content.ReadFromJsonAsync<StatsResponseDto>(JsonOpts, ct).ConfigureAwait(false)
+                ?? throw new GostreamServerException(status, "gostream /api/library/stats returned empty body");
+            if (string.IsNullOrWhiteSpace(body.Hash))
+            {
+                throw new GostreamServerException(status, "gostream /api/library/stats returned incomplete response (missing hash)");
+            }
+
+            return new GostreamTorrentStats
+            {
+                Hash = body.Hash!,
+                Peers = body.Peers,
+                Seeders = body.Seeders,
+                DownloadRateBytesPerSec = body.DownloadRateBytesPerSec,
+                BytesCompleted = body.BytesCompleted,
+                Size = body.Size,
+                ReadOffset = body.ReadOffset,
+                BufferedAheadBytes = body.BufferedAheadBytes,
+                BufferedAheadSeconds = body.BufferedAheadSeconds,
+                StreamState = body.StreamState,
+                LastReadAt = body.LastReadAt,
+                TorrentSampledAt = body.TorrentSampledAt,
+                StreamSampledAt = body.StreamSampledAt,
+            };
+        }
+
+        if (status == 404)
+        {
+            return null;
+        }
+
+        var err = await SafeReadErrorAsync(response, ct).ConfigureAwait(false);
+        if (status >= 500)
+        {
+            throw new GostreamServerException(status, $"gostream stats {status}: {err}");
+        }
+
+        throw new GostreamBadRequestException($"gostream stats {status}: {err}");
+    }
+
     public Task<bool> IsVaultModePresentAsync(CancellationToken ct)
     {
         // Probe /api/library/prestage/status?stub_path=__probe__ once per
@@ -528,6 +581,23 @@ public sealed class GostreamClient : IGostreamClient
         [JsonPropertyName("selected_audio_language")] public string? SelectedAudioLanguage { get; init; }
         [JsonPropertyName("validation_session_id")] public string? ValidationSessionId { get; init; }
         [JsonPropertyName("validation_lease_expires_at")] public DateTimeOffset? ValidationLeaseExpiresAt { get; init; }
+    }
+
+    private sealed class StatsResponseDto
+    {
+        [JsonPropertyName("hash")] public string? Hash { get; init; }
+        [JsonPropertyName("peers")] public int? Peers { get; init; }
+        [JsonPropertyName("seeders")] public int? Seeders { get; init; }
+        [JsonPropertyName("download_rate_bytes_per_sec")] public double? DownloadRateBytesPerSec { get; init; }
+        [JsonPropertyName("bytes_completed")] public long? BytesCompleted { get; init; }
+        [JsonPropertyName("size")] public long? Size { get; init; }
+        [JsonPropertyName("read_offset")] public long? ReadOffset { get; init; }
+        [JsonPropertyName("buffered_ahead_bytes")] public long? BufferedAheadBytes { get; init; }
+        [JsonPropertyName("buffered_ahead_seconds")] public double? BufferedAheadSeconds { get; init; }
+        [JsonPropertyName("stream_state")] public string? StreamState { get; init; }
+        [JsonPropertyName("last_read_at")] public DateTimeOffset? LastReadAt { get; init; }
+        [JsonPropertyName("torrent_sampled_at")] public DateTimeOffset? TorrentSampledAt { get; init; }
+        [JsonPropertyName("stream_sampled_at")] public DateTimeOffset? StreamSampledAt { get; init; }
     }
 
     private sealed class SelectedFileDto

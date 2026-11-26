@@ -687,3 +687,26 @@
         start();
     }
 })();
+
+/* p14-player-stats-overlay: bootstrap the in-player stream stats overlay.
+ * Every deployed jellyfin-web index.html already carries the badges.js tag
+ * (the fork image + install.sh inject it), so loading playerstats.js from here
+ * ships the overlay without requiring a new <script> tag. If a dedicated
+ * playerstats.js tag is also present, the overlay's own load guard
+ * (window.__phantomPlayerStatsLoaded) makes the second load a no-op. */
+(function () {
+    'use strict';
+    if (window.__phantomPlayerStatsLoaded || document.getElementById('phantom-player-stats-script')) return;
+    var src = '/Plugins/PhantomLibrary/playerstats.js';
+    try {
+        var cur = document.currentScript && document.currentScript.src;
+        if (cur && /\/Plugins\/PhantomLibrary\/badges\.js(\?|$)/.test(cur)) {
+            src = cur.replace(/badges\.js(\?.*)?$/, 'playerstats.js');
+        }
+    } catch (e) { /* keep root-relative default */ }
+    var s = document.createElement('script');
+    s.id = 'phantom-player-stats-script';
+    s.src = src;
+    s.defer = true;
+    (document.head || document.body || document.documentElement).appendChild(s);
+})();
