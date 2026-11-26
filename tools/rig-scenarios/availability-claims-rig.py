@@ -25,27 +25,40 @@ os.environ.pop("PHANTOM_PARITY_PLUGIN", None)
 os.environ.pop("PHANTOM_PARITY_SERVER", None)
 env.update(MSBUILDDISABLENODEREUSE="1", DOTNET_CLI_TELEMETRY_OPTOUT="1", PHANTOM_TEST_RESULTS=str(root))
 (root / "hardware.json").write_text(json.dumps({"platform": platform.platform(), "cpu_count": os.cpu_count(),
+    "cpu_affinity": sorted(os.sched_getaffinity(0)),
+    "host_physical_memory_bytes": os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"),
+    "postgres_container_shared_memory_bytes": 256 * 1024 * 1024,
     "cache": "normal planner; no drop_caches, forced scan setting, prewarm or fastest-of retries"}, indent=2))
 pg = parity.Postgres(root, env.copy())
 def terminate(signum, frame):
     raise KeyboardInterrupt(f"terminated by signal {signum}")
 signal.signal(signal.SIGTERM, terminate)
 try:
-    server, plugin = parity.build(root, env)
+    server, built_plugin = parity.build(root, env)
+    # dotnet test may rebuild project references without publish dependencies.
+    # Preserve the complete candidate bundle before it can mutate that output.
+    plugin = root / "candidate"
+    shutil.copytree(built_plugin, plugin)
+    (root / "candidate-identity.json").write_text(json.dumps({p.name: parity.sha(p) for p in plugin.glob("*.dll")}, indent=2))
     shutil.copytree(REPO / "tests", root / "build/tests", ignore=shutil.ignore_patterns("bin", "obj"))
     pg.open()
     env["PHANTOM_TEST_POSTGRES_DSN"] = (f"Host={pg.env['PGHOST']};Port={pg.env['PGPORT']};"
         f"Username={pg.env['PGUSER']};Password={pg.env['PGPASSWORD']};Database={pg.database}")
     with (root / "dotnet-test.log").open("w") as log:
         parity.run(["dotnet", "test", root / "build/tests/Jellyfin.Plugin.PhantomLibrary.Tests/Jellyfin.Plugin.PhantomLibrary.Tests.csproj",
-            "-c", "Release", "-m:2", "-p:UseSharedCompilation=false", "-nodeReuse:false",
+            "-c", "Release", "-m:2", "-p:UseSharedCompilation=false", "-p:CopyLocalLockFileAssemblies=true", "-nodeReuse:false",
             "--filter", "FullyQualifiedName~AvailabilityClaimsPostgresTests|FullyQualifiedName~AvailabilityProbeWorkerTests",
             "--logger", "trx;LogFileName=claims.trx", "--logger", "console;verbosity=normal", "--results-directory", root],
             env=env, stdout=log, stderr=subprocess.STDOUT)
     ns = {"t": "http://microsoft.com/schemas/VisualStudio/TeamTest/2010"}
     results = ET.parse(root / "claims.trx").findall(".//t:UnitTestResult", ns)
-    assert any("AvailabilityClaimsPostgresTests" in r.attrib["testName"] for r in results)
+    expected = {"AvailabilityClaimsPostgresTests": 2, "AvailabilityProbeWorkerTests": 22}
+    for cls, count in expected.items():
+        selected = [r for r in results if cls + "." in r.attrib["testName"]]
+        assert len(selected) == count, (cls, count, len(selected))
+    assert len(results) == sum(expected.values()), len(results)
     assert all(r.attrib["outcome"] == "Passed" for r in results), [(r.attrib["testName"], r.attrib["outcome"]) for r in results]
+    assert parity.sha(built_plugin / (parity.PLUGIN + ".dll")) == parity.sha(plugin / (parity.PLUGIN + ".dll")), "tests rebuilt a different candidate"
     print(f"PASS PostgreSQL claim/worker and legacy worker regressions: {len(results)} passed; 0 skipped", flush=True)
     for node in ET.parse(root / "claims.trx").findall(".//t:StdOut", ns):
         print(node.text or "", flush=True)

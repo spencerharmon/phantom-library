@@ -176,7 +176,7 @@ CASE WHEN n%5=0 THEN {Now.AddMinutes(10).ToUnixTimeSeconds()} ELSE NULL END FROM
             Assert.Equal(3L, await Sql("SELECT claim_bucket FROM availability_items WHERE tmdb_id=5"));
             Assert.Equal(Now.AddDays(2).ToUnixTimeSeconds(), await Sql("SELECT claim_due FROM availability_items WHERE tmdb_id=5"));
             Assert.Equal(0, await restarted.RescheduleAvailabilityPolicyAsync("C", Now.AddDays(1), default));
-            Assert.Equal(Now.AddDays(2).ToUnixTimeSeconds(), await Sql("SELECT next_check_at FROM availability_items WHERE tmdb_id=5"));
+            Assert.Equal(Now.AddDays(2).ToUnixTimeSeconds(), await Sql("SELECT next_check_at::bigint FROM availability_items WHERE tmdb_id=5"));
             output.WriteLine("SMALL CLONE predicted=600 actual=256+256+88; churn A/B/C completes; restart resumes; stable policy idle; 480 disjoint claims, 120 old leases protected; old writer projections; future schema 999 retained");
         }
         finally
