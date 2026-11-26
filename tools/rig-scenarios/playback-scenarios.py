@@ -190,13 +190,40 @@ def match_tmdb(rows, tmdb):
     return next(x for x in rows if x.get("ProviderIds", {}).get("Tmdb") == str(tmdb))
 
 
+def wait_metadata(item, *, after="1970-01-01", path=None):
+    """Wait for the real queued metadata save, not a dynamic MediaSource.
+
+    ChannelManager queues probes on first browse and on post-flight refresh.
+    A new MediaSource can already be real while the earlier phantom probe still
+    owns an old BaseItem. Do not overlap those fixture phases: its late save can
+    otherwise put phantom Tags back (ordinary browse doesn't overwrite Tags).
+    DateLastRefreshed is persisted by MetadataService after providers finish.
+    """
+    observations = []
+    try:
+        for _ in range(60):
+            row = jellyfin_sql("SELECT DateLastRefreshed,Path,Tags FROM BaseItems WHERE Id=upper(?)", (guid(item),))
+            assert row is not None, f"BaseItem disappeared during metadata refresh: {item['Id']}"
+            observations.append(row)
+            if row[0] and row[0] > after and (path is None or (row[1] == path and "phantom" not in (row[2] or "").split("|"))):
+                print("METADATA_SAVED", item["Id"], row, flush=True)
+                return row[0]
+            time.sleep(1)
+        raise AssertionError(f"queued metadata save did not converge: after={after} path={path} rows={observations}")
+    finally:
+        phase = "materialised" if path else "initial"
+        (OUT / f"metadata-{item['Id']}-{phase}.json").write_text(json.dumps(observations, indent=2))
+
+
 def materialise(item, kind, channel, folder=None):
     assert "phantom" in item.get("Tags", []), item
     source(item, opening=True, kind=kind)
     playback(item, kind, opening=True)
-    playback(item, kind, auto=True)
+    before = wait_metadata(item)
+    opened = playback(item, kind, auto=True)
     where = "tmdb_id=99000001 AND type='movie' AND season=-1 AND episode=-1" if kind == "movie" else "tmdb_id=99100001 AND type='episode' AND season=1 AND episode=1"
     assert DB.query("SELECT COUNT(*) FROM materialised_state WHERE " + where) == "1"
+    wait_metadata(item, after=before, path=opened["Path"])
     for _ in range(20):
         refreshed = next(x for x in browse(channel, folder) if x["Id"] == item["Id"])
         if "phantom" not in refreshed.get("Tags", []) and (refreshed.get("MediaSources") or [{}])[0].get("Path"):

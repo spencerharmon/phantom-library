@@ -8,7 +8,7 @@ import sys
 import tempfile
 import subprocess
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools/rig-scenarios"))
 from playback_db import PhantomDatabase
@@ -91,6 +91,70 @@ class AdapterTests(unittest.TestCase):
         self.assertFalse((root / "build").exists())
         self.assertTrue((root / "build.log").exists())
         self.assertEqual("[]", (root / "results.json").read_text().strip())
+
+    def load_scenarios(self):
+        os.environ.update(JF_RIG_ROOT=self.tmp.name, PHANTOM_RIG_OUTPUT=self.tmp.name,
+            PHANTOM_RIG_API="http://example.invalid", PHANTOM_RIG_TOKEN="synthetic", PHANTOM_RIG_JDB=self.tmp.name + "/jellyfin.db")
+        spec = importlib.util.spec_from_file_location("scenarios", rig.TOOLS / "playback-scenarios.py")
+        scenarios = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scenarios)
+        return scenarios
+
+    def test_metadata_barrier_waits_for_initial_probe_and_final_persisted_tags(self):
+        scenarios = self.load_scenarios()
+        item = {"Id": "00000000000000000000000000000001"}
+        initial, final = "2026-01-01 01:00:01", "2026-01-01 01:00:02"
+        with patch.object(scenarios, "jellyfin_sql", side_effect=[
+            ("0001-01-01 00:00:00", None, "phantom"), (initial, None, "phantom")]) as query, patch.object(scenarios.time, "sleep"):
+            self.assertEqual(initial, scenarios.wait_metadata(item))
+            self.assertEqual(2, query.call_count)
+        with patch.object(scenarios, "jellyfin_sql", side_effect=[
+            (initial, "/real.mkv", ""), (final, "/wrong.mkv", ""),
+            (final, "/real.mkv", "phantom"), (final, "/real.mkv", "")]) as query, patch.object(scenarios.time, "sleep"):
+            self.assertEqual(final, scenarios.wait_metadata(item, after=initial, path="/real.mkv"))
+            self.assertEqual(4, query.call_count, "a real path alone is not a completed refresh")
+
+    def test_metadata_barrier_never_accepts_stuck_phantom_tags_or_missing_item(self):
+        scenarios = self.load_scenarios()
+        item = {"Id": "00000000000000000000000000000001"}
+        with patch.object(scenarios, "jellyfin_sql", return_value=("2026-01-01", "/real.mkv", "phantom")), patch.object(scenarios.time, "sleep"):
+            with self.assertRaisesRegex(AssertionError, "did not converge"):
+                scenarios.wait_metadata(item, path="/real.mkv")
+        with patch.object(scenarios, "jellyfin_sql", return_value=None):
+            with self.assertRaisesRegex(AssertionError, "disappeared"):
+                scenarios.wait_metadata(item)
+
+    def test_worker_config_rejects_boot_defaults_even_with_disabled_api_readback(self):
+        config = dict(ChannelWarmupEnabled=False, EvictionEnabled=False, SeriesAutopilotEnabled=False)
+        good = "Channel BaseItem warmup worker started startupDelay=30s interval=30min enabled=False"
+        self.assertEqual(config, rig.assert_worker_configuration(good, config)["loaded_flags"])
+        for bad in ("", good.replace("False", "True"), good + "\n" + good.replace("False", "True")):
+            with self.subTest(log=bad), self.assertRaises(AssertionError):
+                rig.assert_worker_configuration(bad, config)
+        for key in config:
+            with self.subTest(flag=key), self.assertRaises(AssertionError):
+                rig.assert_worker_configuration(good, {**config, key: True})
+
+    def test_configured_restart_stops_only_owned_server_before_start_and_readback(self):
+        root = Path(self.tmp.name)
+        (root / "logs").mkdir()
+        (root / "logs/jellyfin-console.log").write_text("Channel BaseItem warmup worker started enabled=False\n")
+        config = dict(ChannelWarmupEnabled=False, EvictionEnabled=False, SeriesAutopilotEnabled=False)
+        other, bootstrap, restarted = Mock(), Mock(), Mock()
+        restarted.poll.return_value = None
+        processes = [other, bootstrap]
+        events = []
+        with patch.object(rig, "stop", side_effect=lambda p: events.append(("stop", p))), \
+             patch.object(rig, "start", side_effect=lambda *a: events.append(("start", a[0])) or restarted), \
+             patch.object(rig, "request", side_effect=lambda *a, **k: events.append(("read", k)) or config) as api:
+            rig.restart_configured_server(["server"], processes, root,
+                {"PHANTOM_RIG_API": "http://example.invalid", "PHANTOM_RIG_TOKEN": "synthetic"}, config)
+        self.assertEqual(["stop", "start", "read"], [x[0] for x in events])
+        self.assertTrue(api.call_args.args[1].endswith("/Configuration"), "public setup host is not readiness")
+        self.assertIs(bootstrap, events[0][1])
+        self.assertEqual([other, bootstrap, restarted], processes)
+        self.assertEqual(2, len(api.call_args.args), "post-restart API must be read-only")
+        self.assertTrue((root / "worker-configuration.json").exists())
 
     def test_container_removal_attempted_even_if_log_capture_fails(self):
         pg = rig.Postgres(Path(self.tmp.name), {})

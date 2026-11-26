@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 from pathlib import Path
 import shutil
 import signal
@@ -66,12 +67,12 @@ def request(base, path, body=None, token=""):
         return json.loads(raw) if raw else None
 
 
-def wait_http(process, base, path):
+def wait_http(process, base, path, token=""):
     for _ in range(180):
         if process.poll() is not None:
             raise RuntimeError(f"owned process exited ({process.returncode}); see logs")
         try:
-            return request(base, path)
+            return request(base, path, token=token)
         except (OSError, urllib.error.URLError):
             time.sleep(1)
     raise TimeoutError(f"service never ready: {base}{path}")
@@ -205,6 +206,40 @@ class Postgres:
             self.sql(f"DROP DATABASE {self.database} WITH (FORCE);")
 
 
+def assert_worker_configuration(log, observed):
+    """Fail closed on startup defaults, not just the later API configuration.
+
+    Only warmup logs its startup setting on the tracked plugin. Eviction and
+    autopilot read the same Plugin.Configuration dynamically and have no startup
+    log; require their post-restart readback too (without a second API write).
+    """
+    flags = ("ChannelWarmupEnabled", "EvictionEnabled", "SeriesAutopilotEnabled")
+    for key in flags:
+        assert observed[key] is False, (key, observed[key])
+    lines = [line for line in log.splitlines() if "Channel BaseItem warmup worker started" in line]
+    assert len(lines) == 1 and re.search(r"\benabled=False\b", lines[0]), f"warmup boot configuration not disabled: {lines}"
+    return {"warmup_startup_log": lines[0], "loaded_flags": {key: observed[key] for key in flags}}
+
+
+def restart_configured_server(command, processes, root, env, config):
+    # Bootstrap may deserialize defaults before the plugin/API is fully ready.
+    # Persist via Jellyfin's serializer, then restart OUR server so no worker can
+    # retain the bootstrap configuration. The boot log is separate evidence.
+    stop(processes[-1])
+    log = root / "logs/jellyfin-console.log"
+    processes.append(start(command, log, env))
+    # /System/Info/Public is also served by the temporary setup host, BEFORE
+    # plugin workers start. An authenticated plugin response is the real gate.
+    observed = wait_http(processes[-1], env["PHANTOM_RIG_API"],
+                         f"/Plugins/{PLUGIN_ID}/Configuration", token=env["PHANTOM_RIG_TOKEN"])
+    for key, expected in config.items():
+        assert observed[key] == expected, (key, observed[key], expected)
+    receipt = assert_worker_configuration(log.read_text(), observed)
+    (root / "worker-configuration.json").write_text(json.dumps(receipt, indent=2))
+    (root / "loaded-fixture-config.json").write_text(json.dumps({key: observed[key] for key in config}, indent=2))
+    print("WORKER_CONFIG", receipt, flush=True)
+
+
 def scenario(kind, root, server, candidate, backend, base_env):
     root.mkdir()
     env = base_env.copy()
@@ -262,8 +297,9 @@ def scenario(kind, root, server, candidate, backend, base_env):
             time.sleep(1)
         else:
             raise TimeoutError("gostream did not generate its real media fixtures")
-        processes.append(start(["dotnet", server / "jellyfin.dll", "--datadir", root / "data", "--configdir", root / "config",
-            "--cachedir", root / "cache", "--logdir", root / "logs", "--nowebclient", "--ffmpeg", env["PHANTOM_RIG_FFMPEG"]], root / "logs/jellyfin-console.log", env))
+        server_command = ["dotnet", server / "jellyfin.dll", "--datadir", root / "data", "--configdir", root / "config",
+            "--cachedir", root / "cache", "--logdir", root / "logs", "--nowebclient", "--ffmpeg", env["PHANTOM_RIG_FFMPEG"]]
+        processes.append(start(server_command, root / "logs/jellyfin-bootstrap.log", env))
         wait_http(processes[-1], env["PHANTOM_RIG_API"], "/Startup/Configuration")
         info = request(env["PHANTOM_RIG_API"], "/System/Info/Public")
         (root / "initial-system-info.json").write_text(json.dumps(info, indent=2))
@@ -296,7 +332,7 @@ def scenario(kind, root, server, candidate, backend, base_env):
         observed = request(env["PHANTOM_RIG_API"], config_path, token=auth["AccessToken"])
         for key in values:
             assert observed[key] == config[key], (key, observed[key], config[key])
-        (root / "loaded-fixture-config.json").write_text(json.dumps({key: observed[key] for key in values}, indent=2))
+        restart_configured_server(server_command, processes, root, env, {key: config[key] for key in values})
         receipt = {"server": info["Version"], "plugin": loaded, "candidate_sha256": sha(candidate / (PLUGIN + ".dll")),
                    "deployed_sha256": sha(plugin_dir / (PLUGIN + ".dll")),
                    "server_assemblies": {p.name: sha(p) for p in server.glob("*.dll")}, "backend": backend}

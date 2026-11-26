@@ -79,11 +79,35 @@ rather than leaving a second weaker implementation. Preserved assertions:
 | second episode play | final File source, GUID ID, probed streams, nonempty real stream again |
 
 Fixture configuration disables scheduled channel warmup, eviction and autopilot:
-this test drives browse/materialisation explicitly. On the current plugin, the
+this test drives browse/materialisation explicitly. After applying and reading
+back configuration through Jellyfin's serializer/API, the runner stops and
+restarts **only its owned Jellyfin process**. Playback cannot start until the
+restarted authenticated plugin endpoint responds, all fixture values match, and
+the new server log contains exactly one warmup startup with `enabled=False`.
+`/System/Info/Public` is not a readiness gate: Jellyfin's temporary setup host
+serves it while plugin endpoints still return 503. Bootstrap and playback-boot
+logs are retained separately. Eviction/autopilot on the current plugin have no
+startup configuration log and read `Plugin.Configuration` dynamically; their
+post-restart **read-only** API values must both be false. No log is fabricated. On the current plugin, the
 30-second background warmup can race native episode materialisation and remove
 the active BaseItem; that separate background-warmup behavior is **not** claimed
 covered here. Availability and materialisation workers remain enabled and real.
 No HTTP/stream/persistence assertion is skipped or retried away on a 404.
+
+Metadata is a separate asynchronous boundary from media-source discovery.
+Patched `ChannelManager` queues metadata on first browse and post-flight refresh;
+`MetadataService` persists `DateLastRefreshed` after those providers finish.
+Dynamic media sources can return the real path before that save. Ordinary browse
+updates paths but does **not** overwrite existing tags (only first creation and
+`ForceUpdate` do), so polling browse/DataVersion is not a metadata-save barrier.
+The rig now waits for the initial phantom probe to save before native-open, then
+for a newer saved timestamp, the exact opened path and cleared persisted phantom
+tags before browsing again. This separates the initial stale-BaseItem writer from
+the post-flight writer instead of racing them. It retains the original refreshed
+browse tag assertion and records every SQL observation. Missing items and stuck
+tags fail closed; it never clears tags, edits Jellyfin rows, or bumps DataVersion
+to make playback pass. This is serial playback parity, not a concurrency fix for
+a consumer opening while its first metadata refresh is still outstanding.
 
 Fixtures additionally populate `source_candidates` for the seeded available
 movie/episode: current browse pruning intentionally hides previously-assessed
@@ -97,6 +121,7 @@ not the Jellyfin/plugin playback, probe, claim/worker or persistence path.
 Every run owns `artifacts/playback-parity-<random>/`, fresh synthetic startup-wizard
 user `a`, distinct ports, process groups, and PostgreSQL databases. It applies
 and reads back the fixture config through the live plugin API after startup,
+then restarts its owned server and verifies the boot configuration as above,
 so bootstrap's XML rewrites cannot silently replace mock endpoints with defaults. No copied user
 seed, global `/tmp` filenames, user-systemd units, broad `pkill`, production DB,
 image deployment or blue/green flip. SIGINT/SIGTERM and failure paths unwind owned
