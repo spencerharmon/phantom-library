@@ -71,6 +71,7 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         // p13-parallel-indexer-search: the discovered Prowlarr indexer list is a
         // process-wide TTL cache (ProwlarrClient itself is a transient typed client).
         serviceCollection.AddSingleton<ProwlarrIndexerDirectory>();
+        serviceCollection.AddSingleton<IndexerHealthGate>();
         serviceCollection.AddHttpClient<ProwlarrClient>(c =>
         {
             c.Timeout = TimeSpan.FromSeconds(30);

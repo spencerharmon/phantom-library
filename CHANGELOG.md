@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Per-indexer shared PostgreSQL admission (plugin 0.5.7.47, schema v25): both
+  colours honour 429/Retry-After, Prowlarr disabled-until, and capped exponential
+  failure backoff. Interactive searches reserve the next slot ahead of queued
+  background work; recovery admits one probe at a time. Includes Torrentio,
+  Prowlarr subqueries/download redirects, and movie/episode parity. The v24→v25
+  expand adds only `indexer_health`; old PostgreSQL readers/writers keep working.
+  Pre-v25 SQLite installations still require the pre-v1.0 wipe/rebuild procedure.
+  See [health/backoff contract](docs/tasks/p13-indexer-health-backoff.md).
 - Helm chart 2.13.0: opt-in `swarmHealth.enabled` / `serviceUrl` durably manage
   `SwarmHealthServiceUrl` before every plugin boot, on retained and fresh PVCs.
   Disabled management leaves operator settings alone; an explicitly managed empty

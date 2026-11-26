@@ -94,7 +94,7 @@ public sealed class MagnetCacheBuilder
         : this(
             db,
             BuildTmdbMetaResolver(db, externalIds),
-            selector.SelectRankedAsync,
+            selector.SelectRankedBackgroundAsync,
             logger,
             () => Plugin.Instance?.Configuration ?? new PluginConfiguration(),
             selector.ProbeAsync)

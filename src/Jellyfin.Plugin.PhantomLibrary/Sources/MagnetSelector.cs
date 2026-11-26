@@ -199,22 +199,31 @@ public sealed class MagnetSelector : IDisposable
     /// individual indexers are logged and skipped; the remaining indexers'
     /// results are still scored.
     /// </summary>
-    public async Task<IReadOnlyList<MagnetCandidate>> SelectRankedAsync(
-        int tmdbId,
-        string? imdbId,
-        string type,
-        int? season,
-        int? episode,
-        string? title,
-        int? year,
-        CancellationToken ct)
+    public Task<IReadOnlyList<MagnetCandidate>> SelectRankedAsync(
+        int tmdbId, string? imdbId, string type, int? season, int? episode, string? title, int? year, CancellationToken ct)
+        => SelectRankedCoreAsync(tmdbId, imdbId, type, season, episode, title, year, IndexerPriority.Interactive, ct);
+
+    public Task<IReadOnlyList<MagnetCandidate>> SelectRankedBackgroundAsync(
+        int tmdbId, string? imdbId, string type, int? season, int? episode, string? title, int? year, CancellationToken ct)
+        => SelectRankedCoreAsync(tmdbId, imdbId, type, season, episode, title, year, IndexerPriority.Background, ct);
+
+    private async Task<IReadOnlyList<MagnetCandidate>> SelectRankedCoreAsync(
+        int tmdbId, string? imdbId, string type, int? season, int? episode, string? title, int? year,
+        IndexerPriority priority, CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(type);
 
-        var probe = await ProbeAsync(tmdbId, imdbId, type, season, episode, title, year, ct).ConfigureAwait(false);
+        var probe = await ProbeCoreAsync(tmdbId, imdbId, type, season, episode, title, year, false, priority, ct).ConfigureAwait(false);
         if (probe.Outcome == MagnetProbeOutcome.DegenerateQuerySkipped)
         {
             throw new DegenerateQuerySkippedException(probe.ErrorMessage ?? DegenerateQuerySkippedKind);
+        }
+
+        if (priority == IndexerPriority.Background && probe.Outcome == MagnetProbeOutcome.IndeterminateTransient)
+        {
+            // A skipped/backed-off build must not complete its cache job as an
+            // authoritative empty. Preserve the builder's failed/retry path.
+            throw new IndexerTransientException(probe.ErrorMessage ?? "Background indexer search indeterminate");
         }
 
         return probe.Outcome == MagnetProbeOutcome.Available ? probe.Candidates : Array.Empty<MagnetCandidate>();
@@ -267,7 +276,7 @@ public sealed class MagnetSelector : IDisposable
         string? title,
         int? year,
         CancellationToken ct)
-        => ProbeCoreAsync(tmdbId, imdbId, type, season, episode, title, year, availabilityOracleOnly: false, ct);
+        => ProbeCoreAsync(tmdbId, imdbId, type, season, episode, title, year, false, IndexerPriority.Interactive, ct);
 
     /// <summary>
     /// Availability-oracle probe (ROI Priority 6, revised architecture item 1 —
@@ -290,7 +299,7 @@ public sealed class MagnetSelector : IDisposable
         string? title,
         int? year,
         CancellationToken ct)
-        => ProbeCoreAsync(tmdbId, imdbId, type, season, episode, title, year, availabilityOracleOnly: true, ct);
+        => ProbeCoreAsync(tmdbId, imdbId, type, season, episode, title, year, true, IndexerPriority.Background, ct);
 
     private List<IIndexerClient> EnabledIndexers(bool availabilityOracleOnly)
     {
@@ -307,6 +316,7 @@ public sealed class MagnetSelector : IDisposable
         string? title,
         int? year,
         bool availabilityOracleOnly,
+        IndexerPriority priority,
         CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(type);
@@ -348,6 +358,7 @@ public sealed class MagnetSelector : IDisposable
 
         var query = new IndexerQuery
         {
+            Priority = priority,
             Type = type,
             Tmdb = tmdbId,
             Imdb = type == "movie" ? imdbId : null,
@@ -374,6 +385,7 @@ public sealed class MagnetSelector : IDisposable
         ct.ThrowIfCancellationRequested();
         var cfg = _configProvider();
         var requestCts = CancellationTokenSource.CreateLinkedTokenSource(_lifetime);
+        query = query with { SearchCancellation = requestCts.Token };
         var run = new ProbeRun(query, tmdbId, type, season, episode, TimeSpan.FromSeconds(cfg.IndexerProbeTimeoutSeconds), requestCts.Token);
 
         // While the caller is waiting, its cancellation cancels every request
@@ -718,8 +730,17 @@ public sealed class MagnetSelector : IDisposable
             catch (Exception ex)
             {
                 req.Failure = $"{label}:transient";
-                status = IndexerSearchMetrics.StatusError;
-                _logger.LogWarning(ex, "Indexer {Indexer} failed for {Type}/{Tmdb}", label, run.Type, run.TmdbId);
+                status = ex is IndexerTransientException transient
+                    ? transient.HealthStatus ?? (transient.HttpStatus == 429 ? "429" : IndexerSearchMetrics.StatusError)
+                    : IndexerSearchMetrics.StatusError;
+                if (status.StartsWith("skipped_", StringComparison.Ordinal))
+                {
+                    _logger.LogDebug("Indexer {Indexer} {Status}", label, status);
+                }
+                else
+                {
+                    _logger.LogWarning(ex, "Indexer {Indexer} failed for {Type}/{Tmdb}", label, run.Type, run.TmdbId);
+                }
             }
 
             IndexerSearchMetrics.RecordRequest(

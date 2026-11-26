@@ -73,6 +73,9 @@ public sealed record DiscoveredIndexer(int Id, string Name, string Protocol);
 
 public sealed record IndexerQuery
 {
+    public IndexerPriority Priority { get; init; } = IndexerPriority.Interactive;
+    // Distinguishes the collector's request timeout from caller/shutdown cancellation.
+    internal CancellationToken? SearchCancellation { get; init; }
     public required string Type { get; init; } // "movie" | "episode"
     public string? Imdb { get; init; }
     public int? Tmdb { get; init; }
@@ -107,6 +110,9 @@ public sealed class IndexerAuthException : Exception
 /// <summary>Transient or indeterminate indexer failure; callers must not treat it as a definitive empty result.</summary>
 public sealed class IndexerTransientException : Exception
 {
+    public int? HttpStatus { get; init; }
+    public TimeSpan RetryAfter { get; init; }
+    public string? HealthStatus { get; init; }
     public IndexerTransientException() { }
     public IndexerTransientException(string message) : base(message) { }
     public IndexerTransientException(string message, Exception inner) : base(message, inner) { }

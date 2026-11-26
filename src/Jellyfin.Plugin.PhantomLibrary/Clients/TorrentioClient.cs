@@ -31,18 +31,20 @@ public sealed class TorrentioClient : IIndexerClient
     private readonly HttpClient _http;
     private readonly ILogger<TorrentioClient> _logger;
     private readonly Func<string> _baseUrlProvider;
+    private readonly IndexerHealthGate? _health;
 
-    public TorrentioClient(HttpClient http, ILogger<TorrentioClient> logger)
-        : this(http, logger, () => Plugin.Instance?.Configuration.TorrentioBaseUrl ?? string.Empty)
+    public TorrentioClient(HttpClient http, ILogger<TorrentioClient> logger, IndexerHealthGate health)
+        : this(http, logger, () => Plugin.Instance?.Configuration.TorrentioBaseUrl ?? string.Empty, health)
     {
     }
 
     // Test-only ctor (internal so ActivatorUtilities does not consider it).
-    internal TorrentioClient(HttpClient http, ILogger<TorrentioClient> logger, Func<string> baseUrlProvider)
+    internal TorrentioClient(HttpClient http, ILogger<TorrentioClient> logger, Func<string> baseUrlProvider, IndexerHealthGate? health = null)
     {
         _http = http;
         _logger = logger;
         _baseUrlProvider = baseUrlProvider;
+        _health = health;
     }
 
     public string Name => "Torrentio";
@@ -90,6 +92,14 @@ public sealed class TorrentioClient : IIndexerClient
             return Array.Empty<IndexerCandidate>();
         }
 
+        return _health is null
+            ? await SearchUrlAsync(url, ct).ConfigureAwait(false)
+            : await _health.ExecuteAsync(IndexerHealthGate.Key(Name, baseUrl), Name, Name, query.Priority,
+                token => SearchUrlAsync(url, token), ct, query.SearchCancellation).ConfigureAwait(false);
+    }
+
+    private async Task<IReadOnlyList<IndexerCandidate>> SearchUrlAsync(string url, CancellationToken ct)
+    {
         HttpResponseMessage resp;
         try
         {
@@ -111,7 +121,11 @@ public sealed class TorrentioClient : IIndexerClient
             if (!resp.IsSuccessStatusCode)
             {
                 _logger.LogWarning("Torrentio returned {Status}; treating indexer result as transient", (int)resp.StatusCode);
-                throw new IndexerTransientException($"Torrentio returned HTTP {(int)resp.StatusCode}");
+                throw new IndexerTransientException($"Torrentio returned HTTP {(int)resp.StatusCode}")
+                {
+                    HttpStatus = (int)resp.StatusCode,
+                    RetryAfter = IndexerHealthGate.RetryAfter(resp),
+                };
             }
 
             TorrentioResponseDto? dto;

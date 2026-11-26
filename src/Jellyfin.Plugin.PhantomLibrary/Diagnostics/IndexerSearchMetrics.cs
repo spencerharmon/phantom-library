@@ -79,6 +79,32 @@ internal static class IndexerSearchMetrics
         unit: "{candidate}",
         description: "Searches whose budget expired with indexers still pending; value = candidates held at expiry.");
 
+    internal const string HealthName = "phantom_indexer_health_total";
+    private static readonly Counter<long> Health = Meter.CreateCounter<long>(HealthName);
+    private static readonly Histogram<double> HealthLatency = Meter.CreateHistogram<double>("phantom_indexer_upstream_duration_ms", "ms");
+    private static readonly Histogram<double> RetryDelay = Meter.CreateHistogram<double>("phantom_indexer_retry_after_ms", "ms");
+
+    internal static void RecordHealth(string client, string indexer, string status, string priority, double latencyMs, double retryMs)
+    {
+        var tags = new[]
+        {
+            new KeyValuePair<string, object?>("client", client),
+            new KeyValuePair<string, object?>("indexer", indexer),
+            new KeyValuePair<string, object?>("status", status),
+            new KeyValuePair<string, object?>("priority", priority),
+        };
+        Health.Add(1, tags);
+        if (!status.StartsWith("skipped_", System.StringComparison.Ordinal))
+        {
+            HealthLatency.Record(latencyMs, tags);
+        }
+
+        if (retryMs > 0)
+        {
+            RetryDelay.Record(retryMs, tags);
+        }
+    }
+
     /// <summary>
     /// Record one finished indexer request. <paramref name="client"/> is the
     /// top-level client (Torrentio / Prowlarr); <paramref name="indexer"/> is the

@@ -1,0 +1,40 @@
+name: Shared indexer health and backoff
+on:
+  push:
+    branches: [main, bee-p13-indexer-health-backoff]
+  pull_request:
+  workflow_dispatch:
+jobs:
+  indexer-health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      image: mcr.microsoft.com/dotnet/sdk:9.0.305-noble
+    services:
+      postgres:
+        image: docker.io/library/postgres@sha256:9d9e487c1bd6413c52ccb3c02f46c8e37fa1e1d1a32a84519eb4e68d0ad1da30
+        env:
+          POSTGRES_USER: phantom
+          POSTGRES_PASSWORD: fixture-only
+          POSTGRES_DB: health_test
+        options: --health-cmd "pg_isready -U phantom -d health_test" --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      PHANTOM_TEST_POSTGRES_DSN: Host=postgres;Username=phantom;Password=fixture-only;Database=health_test
+      PHANTOM_TEST_RESULTS: ${{ gitea.workspace }}/test-results/indexer-health
+      MSBUILDDISABLENODEREUSE: '1'
+    steps:
+      - name: Checkout and fixture tooling
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends nodejs git python3 curl ca-certificates
+      - uses: actions/checkout@v4
+      - name: Real plugin, old/new overlap, PostgreSQL and HTTP regressions
+        run: ./scripts/tests/p13-indexer-health-backoff.test.sh
+      - name: Retain test receipts
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: indexer-health
+          path: |
+            test-results/indexer-health/*.log
+            test-results/indexer-health/*.trx
