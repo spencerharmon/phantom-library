@@ -355,19 +355,22 @@ def main():
     def interrupted(signum, frame):
         raise KeyboardInterrupt(f"signal {signum}")
     signal.signal(signal.SIGTERM, interrupted)
-    env["PHANTOM_RIG_FFMPEG"] = ffmpeg(root)
-    server, candidate = build(root, env)
     results = []
     try:
+        env["PHANTOM_RIG_FFMPEG"] = ffmpeg(root)
+        server, candidate = build(root, env)
         for kind in (("movie", "episode") if args.scenario == "both" else (args.scenario,)):
-            results.append(scenario(kind, root / kind, server, candidate, args.backend, env))
-        (root / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+            results.append({"scenario": kind, "backend": args.backend, "result": "failed"})
+            results[-1] = scenario(kind, root / kind, server, candidate, args.backend, env)
         print(f"PLAYBACK_PARITY_OK backend={args.backend} " + " ".join(r["scenario"] + "=passed" for r in results), flush=True)
     finally:
-        if (root / "build").exists() and os.environ.get("PHANTOM_PARITY_KEEP_BUILD") != "1":
-            shutil.rmtree(root / "build")
-        if (root / "jellyfin-source.tar.gz").exists():
-            (root / "jellyfin-source.tar.gz").unlink()
+        (root / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+        for directory in ("build", "ffmpeg"):
+            if (root / directory).exists() and os.environ.get("PHANTOM_PARITY_KEEP_BUILD") != "1":
+                shutil.rmtree(root / directory)
+        for archive in ("jellyfin-source.tar.gz", "ffmpeg.tar.xz"):
+            if (root / archive).exists():
+                (root / archive).unlink()
 
 
 if __name__ == "__main__":

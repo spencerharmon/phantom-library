@@ -79,6 +79,19 @@ class AdapterTests(unittest.TestCase):
         self.assertIsNotNone(owned.poll())
         self.assertIsNone(other.poll(), "cleanup signalled an unrelated process")
 
+    def test_failed_build_removes_owned_tree_and_keeps_failure_evidence(self):
+        def failed_build(root, env):
+            (root / "build").mkdir()
+            (root / "build.log").write_text("real build would report its failure here")
+            raise RuntimeError("test build failure")
+        with patch.object(rig, "REPO", Path(self.tmp.name)), patch.object(rig, "ffmpeg", return_value="unused"), patch.object(rig, "build", side_effect=failed_build), patch.object(sys, "argv", ["rig"]):
+            with self.assertRaisesRegex(RuntimeError, "test build failure"):
+                rig.main()
+        root = next((Path(self.tmp.name) / "artifacts").iterdir())
+        self.assertFalse((root / "build").exists())
+        self.assertTrue((root / "build.log").exists())
+        self.assertEqual("[]", (root / "results.json").read_text().strip())
+
     def test_container_removal_attempted_even_if_log_capture_fails(self):
         pg = rig.Postgres(Path(self.tmp.name), {})
         pg.container = "owned-container-id"
