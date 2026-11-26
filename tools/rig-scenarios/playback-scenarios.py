@@ -39,8 +39,10 @@ def api(path, body=None, *, post=False, user=False):
         raw = response.read()
     SEQUENCE += 1
     # Keep every response, including retries, rather than overwrite failure evidence.
-    (OUT / f"{SEQUENCE:03d}-{path.split('?')[0].strip('/').replace('/', '-')}.json").write_bytes(raw)
-    return json.loads(raw) if raw else None
+    result = json.loads(raw) if raw else None
+    recorded = {**result, "AccessToken": "<synthetic-token-redacted>"} if isinstance(result, dict) and "AccessToken" in result else result
+    (OUT / f"{SEQUENCE:03d}-{path.split('?')[0].strip('/').replace('/', '-')}.json").write_text(json.dumps(recorded))
+    return result
 
 
 def items(path):
@@ -131,10 +133,13 @@ def resume(item, src, position):
 
 def discovery(kind):
     task = next(t for t in api("/ScheduledTasks") if t["Key"] == "PhantomLibrary.DiscoveryRefresh")
+    previous = task.get("LastExecutionResult")
     api("/ScheduledTasks/Running/" + task["Id"], post=True)
     for _ in range(120):
-        state = next(t["State"] for t in api("/ScheduledTasks") if t["Id"] == task["Id"])
-        if state == "Idle":
+        current = next(t for t in api("/ScheduledTasks") if t["Id"] == task["Id"])
+        result = current.get("LastExecutionResult")
+        if current["State"] == "Idle" and result and result != previous:
+            assert result["Status"] == "Completed", result
             break
         time.sleep(1)
     else:

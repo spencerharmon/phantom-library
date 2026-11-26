@@ -57,9 +57,9 @@ def start(cmd, log, env):
                                 env=env, start_new_session=True)
 
 
-def request(base, path, body=None):
+def request(base, path, body=None, token=""):
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(base + path, data=data, headers={"Content-Type": "application/json",
+    req = urllib.request.Request(base + path, data=data, headers={"Content-Type": "application/json", "X-Emby-Token": token,
         "X-Emby-Authorization": 'MediaBrowser Client="phantom-rig", Device="phantom-rig", DeviceId="synthetic-seed", Version="1"'})
     with urllib.request.urlopen(req, timeout=5) as response:
         raw = response.read()
@@ -79,20 +79,24 @@ def wait_http(process, base, path):
 
 def ffmpeg(root):
     supplied = os.environ.get("PHANTOM_PARITY_FFMPEG")
+    receipt = {}
     if supplied:
-        return str(Path(supplied).resolve())
-    arch = {"x86_64": "linux64", "aarch64": "linuxarm64"}[platform.machine()]
-    archive = root / "ffmpeg.tar.xz"
-    url = f"https://github.com/jellyfin/jellyfin-ffmpeg/releases/download/v7.1.3-1/jellyfin-ffmpeg_7.1.3-1_portable_{arch}-gpl.tar.xz"
-    urllib.request.urlretrieve(url, archive)
-    dest = root / "ffmpeg"
-    dest.mkdir()
-    with tarfile.open(archive) as tar:
-        tar.extractall(dest, filter="data")
-    binary = next(dest.rglob("ffmpeg"))
-    (root / "ffmpeg-identity.json").write_text(json.dumps({"url": url, "archive_sha256": sha(archive),
-        "binary_sha256": sha(binary), "version": run([binary, "-version"], capture_output=True, text=True).stdout}, indent=2))
-    archive.unlink()
+        binary = Path(supplied).resolve()
+    else:
+        arch = {"x86_64": "linux64", "aarch64": "linuxarm64"}[platform.machine()]
+        archive = root / "ffmpeg.tar.xz"
+        url = f"https://github.com/jellyfin/jellyfin-ffmpeg/releases/download/v7.1.3-1/jellyfin-ffmpeg_7.1.3-1_portable_{arch}-gpl.tar.xz"
+        urllib.request.urlretrieve(url, archive)
+        dest = root / "ffmpeg"
+        dest.mkdir()
+        with tarfile.open(archive) as tar:
+            tar.extractall(dest, filter="data")
+        binary = next(dest.rglob("ffmpeg"))
+        receipt.update(url=url, archive_sha256=sha(archive))
+        archive.unlink()
+    receipt.update(binary_sha256=sha(binary), ffprobe_sha256=sha(binary.with_name("ffprobe")),
+                   version=run([binary, "-version"], capture_output=True, text=True).stdout)
+    (root / "ffmpeg-identity.json").write_text(json.dumps(receipt, indent=2))
     return str(binary)
 
 
@@ -268,6 +272,23 @@ def scenario(kind, root, server, candidate, backend, base_env):
             plugins = json.load(response)
         loaded = next(p for p in plugins if p["Id"].replace("-", "").lower() == PLUGIN_ID.replace("-", ""))
         assert loaded["Status"] == "Active", loaded
+        # Bootstrap/plugin discovery can replace a preseeded XML configuration.
+        # Apply through the live API, retaining defaults/types, then read back the
+        # exact loaded configuration rather than assuming deployed == loaded.
+        config_path = f"/Plugins/{PLUGIN_ID}/Configuration"
+        config = request(env["PHANTOM_RIG_API"], config_path, token=auth["AccessToken"])
+        for key, value in values.items():
+            if isinstance(config.get(key), bool):
+                config[key] = value == "true"
+            elif isinstance(config.get(key), int):
+                config[key] = int(value)
+            else:
+                config[key] = value
+        request(env["PHANTOM_RIG_API"], config_path, config, auth["AccessToken"])
+        observed = request(env["PHANTOM_RIG_API"], config_path, token=auth["AccessToken"])
+        for key in values:
+            assert observed[key] == config[key], (key, observed[key], config[key])
+        (root / "loaded-fixture-config.json").write_text(json.dumps({key: observed[key] for key in values}, indent=2))
         receipt = {"server": info["Version"], "plugin": loaded, "candidate_sha256": sha(candidate / (PLUGIN + ".dll")),
                    "deployed_sha256": sha(plugin_dir / (PLUGIN + ".dll")),
                    "server_assemblies": {p.name: sha(p) for p in server.glob("*.dll")}, "backend": backend}
@@ -313,9 +334,9 @@ def scenario(kind, root, server, candidate, backend, base_env):
                 for name in ("data", "config", "cache", "tmp", "phantom", "gostream"):
                     if (root / name).exists():
                         shutil.rmtree(root / name)
-                (root / "cleanup.json").write_text(json.dumps({"owned_pids": [p.pid for p in processes],
-                    "exit_codes": [p.returncode for p in processes], "database": pg.database,
-                    "container_removed": pg.container is not None, "data_removed": not (root / "data").exists()}, indent=2))
+        (root / "cleanup.json").write_text(json.dumps({"owned_pids": [p.pid for p in processes],
+            "exit_codes": [p.returncode for p in processes], "database": pg.database,
+            "container_removed": pg.container is not None, "data_removed": not (root / "data").exists()}, indent=2))
 
 
 def main():
