@@ -31,7 +31,7 @@ internal static class ConcurrentIndexExpand
         'expression', pg_catalog.pg_get_expr(i.indexprs, i.indrelid, false),
         'predicate', pg_catalog.pg_get_expr(i.indpred, i.indrelid, false))::text";
 
-    internal static async Task<bool> ApplyAsync(NpgsqlConnection caller, string name, IReadOnlyList<string> statements, CancellationToken ct)
+    internal static async Task<bool> ApplyAsync(NpgsqlConnection caller, string name, IReadOnlyList<string> statements, IReadOnlyList<AdditiveRowProjection> projections, CancellationToken ct)
     {
         var schema = (string?)await ScalarAsync(caller, "SELECT pg_catalog.current_schema()", ct).ConfigureAwait(false)
             ?? throw new InvalidOperationException("Expand requires an existing current schema");
@@ -81,13 +81,28 @@ CREATE TABLE IF NOT EXISTS phantom_expand_index_builds (
             }
         }
 
+        await ScalarAsync(connection, RowProjectionExpand.MetadataSql, ct).ConfigureAwait(false);
         var receipt = await ScalarAsync(connection, "SELECT applied_at FROM phantom_expand_migrations WHERE name=@name", ct, ("name", name)).ConfigureAwait(false);
         var already = receipt is not null;
         // A receipt is an observation, not a substitute for catalogue validation.
         // Remove it before any work that can fail; only verified completion restores it.
         await ScalarAsync(connection, "DELETE FROM phantom_expand_migrations WHERE name=@name", ct, ("name", name)).ConfigureAwait(false);
 
+        await RowProjectionExpand.RequireBatchAsync(connection, name, projections, ct).ConfigureAwait(false);
         var prepared = new List<Prepared>();
+        var projectionsInstalled = false;
+        async Task InstallProjectionsAsync()
+        {
+            if (!projectionsInstalled)
+            {
+                foreach (var projection in projections)
+                {
+                    await RowProjectionExpand.InstallOrVerifyAsync(connection, schema, name, projection, ct).ConfigureAwait(false);
+                }
+
+                projectionsInstalled = true;
+            }
+        }
         var changed = !already;
         await using (var tx = await connection.BeginTransactionAsync(ct).ConfigureAwait(false))
         {
@@ -110,6 +125,7 @@ CREATE TABLE IF NOT EXISTS phantom_expand_index_builds (
                     continue;
                 }
 
+                await InstallProjectionsAsync().ConfigureAwait(false);
                 var table = ExpandIndex.Quote(schema) + "." + ExpandIndex.Quote(index.Table);
                 var tableOid = (long?)await ScalarAsync(connection,
                     "SELECT c.oid::bigint FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=@schema AND c.relname=@table AND c.relkind='r'",
@@ -135,6 +151,7 @@ CREATE TABLE IF NOT EXISTS phantom_expand_index_builds (
                 }
             }
 
+            await InstallProjectionsAsync().ConfigureAwait(false);
             // For mixed batches this commits ONLY the additive prefix + reservations,
             // never a completion receipt. A retry replays the idempotent prefix.
             if (indexes.All(i => !i.Concurrent))
@@ -152,6 +169,15 @@ CREATE TABLE IF NOT EXISTS phantom_expand_index_builds (
                 changed |= await BuildAsync(connection, schema, item.Index, item.Expected, ct).ConfigureAwait(false);
             }
 
+            // The concurrent builds must stay outside a transaction. Final projection
+            // verification takes relation locks in this short transaction and retains
+            // them through the receipt commit, closing the topology-check/receipt gap.
+            await using var verification = await connection.BeginTransactionAsync(ct).ConfigureAwait(false);
+            foreach (var projection in projections)
+            {
+                await RowProjectionExpand.VerifyAsync(connection, schema, projection, ct).ConfigureAwait(false);
+            }
+
             // Verify EVERY index again, including the transactional prefix, before
             // recording success. Reservations and receipts never bypass this check.
             foreach (var item in prepared)
@@ -165,6 +191,7 @@ CREATE TABLE IF NOT EXISTS phantom_expand_index_builds (
             }
 
             await RecordAsync(connection, name, receipt, ct).ConfigureAwait(false);
+            await verification.CommitAsync(ct).ConfigureAwait(false);
         }
 
         return changed;
@@ -285,7 +312,7 @@ CREATE TABLE IF NOT EXISTS phantom_expand_index_builds (
         ScalarAsync(connection, "INSERT INTO phantom_expand_migrations (name,applied_at) VALUES (@name,@at)", ct,
             ("name", name), ("at", receipt ?? DateTimeOffset.UtcNow.ToUnixTimeSeconds()));
 
-    private static async Task<object?> ScalarAsync(NpgsqlConnection connection, string sql, CancellationToken ct, params (string Name, object Value)[] parameters)
+    internal static async Task<object?> ScalarAsync(NpgsqlConnection connection, string sql, CancellationToken ct, params (string Name, object Value)[] parameters)
     {
         await using var command = connection.CreateCommand();
         command.CommandText = sql;
