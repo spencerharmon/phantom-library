@@ -1,0 +1,6 @@
+{
+  "name": "phantom-player-stats-browser-tests",
+  "private": true,
+  "type": "module",
+  "dependencies": { "playwright": "1.56.1" }
+}

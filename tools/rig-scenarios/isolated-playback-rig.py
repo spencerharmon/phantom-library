@@ -62,7 +62,7 @@ def request(base, path, body=None, token=""):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(base + path, data=data, headers={"Content-Type": "application/json", "X-Emby-Token": token,
         "X-Emby-Authorization": 'MediaBrowser Client="phantom-rig", Device="phantom-rig", DeviceId="synthetic-seed", Version="1"'})
-    with urllib.request.urlopen(req, timeout=5) as response:
+    with urllib.request.urlopen(req, timeout=30) as response:
         raw = response.read()
         return json.loads(raw) if raw else None
 
@@ -240,6 +240,28 @@ def restart_configured_server(command, processes, root, env, config):
     print("WORKER_CONFIG", receipt, flush=True)
 
 
+WEB_URL = "https://repo.jellyfin.org/files/server/portable/stable/v10.11.11/any/jellyfin_10.11.11.tar.xz"
+WEB_SHA256 = "633edb3c01cf4face38f257a03d4d20fe9294ec10a1d239ef06f364be2d249bc"
+
+
+def pinned_web(root, env):
+    """Pinned official jellyfin-web; inject only the plugin badges bootstrap tag."""
+    archive = Path(os.environ.get("PHANTOM_RIG_WEB_ARCHIVE", root / "web.tar.xz"))
+    if not archive.exists():
+        urllib.request.urlretrieve(WEB_URL, archive)
+    digest = sha(archive)
+    assert digest == WEB_SHA256, f"jellyfin-web archive sha256 {digest} != pinned {WEB_SHA256}"
+    with tarfile.open(archive) as tar:
+        tar.extractall(root / "web-dist", members=[m for m in tar.getmembers() if m.name.startswith("jellyfin/jellyfin-web/")], filter="data")
+    web = root / "web-dist/jellyfin/jellyfin-web"
+    index = web / "index.html"
+    html = index.read_text()
+    assert html.count("</body>") == 1
+    index.write_text(html.replace("</body>", '<script src="/Plugins/PhantomLibrary/badges.js" defer></script></body>'))
+    env["PHANTOM_RIG_WEBDIR"] = str(web)
+    (root / "web-identity.json").write_text(json.dumps({"url": WEB_URL, "sha256": digest, "index_sha256": sha(index)}, indent=2))
+
+
 def scenario(kind, root, server, candidate, backend, base_env):
     root.mkdir()
     env = base_env.copy()
@@ -298,7 +320,8 @@ def scenario(kind, root, server, candidate, backend, base_env):
         else:
             raise TimeoutError("gostream did not generate its real media fixtures")
         server_command = ["dotnet", server / "jellyfin.dll", "--datadir", root / "data", "--configdir", root / "config",
-            "--cachedir", root / "cache", "--logdir", root / "logs", "--nowebclient", "--ffmpeg", env["PHANTOM_RIG_FFMPEG"]]
+            "--cachedir", root / "cache", "--logdir", root / "logs", "--ffmpeg", env["PHANTOM_RIG_FFMPEG"]]
+        server_command += ["--webdir", env["PHANTOM_RIG_WEBDIR"]] if env.get("PHANTOM_RIG_WEBDIR") else ["--nowebclient"]
         processes.append(start(server_command, root / "logs/jellyfin-bootstrap.log", env))
         wait_http(processes[-1], env["PHANTOM_RIG_API"], "/Startup/Configuration")
         info = request(env["PHANTOM_RIG_API"], "/System/Info/Public")
@@ -389,6 +412,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=("postgres", "sqlite"), default="postgres")
     parser.add_argument("--scenario", choices=("movie", "episode", "both"), default="both")
+    parser.add_argument("--episode-web-queue", action="store_true",
+                        help="episode: regular-user native queue + real jellyfin-web/Chromium Play (desktop+mobile)")
     args = parser.parse_args()
     artifacts = REPO / "artifacts"
     artifacts.mkdir(exist_ok=True)
@@ -402,6 +427,9 @@ def main():
     results = []
     try:
         env["PHANTOM_RIG_FFMPEG"] = ffmpeg(root)
+        if args.episode_web_queue:
+            env.update(PHANTOM_WEB_QUEUE="1", PHANTOM_RIG_MEDIA_SECONDS="30")
+            pinned_web(root, env)
         server, candidate = build(root, env)
         for kind in (("movie", "episode") if args.scenario == "both" else (args.scenario,)):
             results.append({"scenario": kind, "backend": args.backend, "result": "failed"})
@@ -409,10 +437,10 @@ def main():
         print(f"PLAYBACK_PARITY_OK backend={args.backend} " + " ".join(r["scenario"] + "=passed" for r in results), flush=True)
     finally:
         (root / "results.json").write_text(json.dumps(results, indent=2) + "\n")
-        for directory in ("build", "ffmpeg"):
+        for directory in ("build", "ffmpeg", "web-dist"):
             if (root / directory).exists() and os.environ.get("PHANTOM_PARITY_KEEP_BUILD") != "1":
                 shutil.rmtree(root / directory)
-        for archive in ("jellyfin-source.tar.gz", "ffmpeg.tar.xz"):
+        for archive in ("jellyfin-source.tar.gz", "ffmpeg.tar.xz", "web.tar.xz"):
             if (root / archive).exists():
                 (root / archive).unlink()
 

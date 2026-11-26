@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 import time
 import urllib.request
@@ -287,6 +288,151 @@ def movie():
     print("CHANNEL_E2E_PLAYBACK_OK", flush=True)
 
 
+def tv_rows(label):
+    """Persisted native TV hierarchy (evidence; the queue reads these columns)."""
+    with sqlite3.connect(JDB, timeout=30) as db:
+        db.row_factory = sqlite3.Row
+        rows = [dict(r) for r in db.execute(
+            "SELECT Id,Type,Name,ParentId,SeriesId,SeasonId,PresentationUniqueKey,SeriesPresentationUniqueKey,"
+            "IsVirtualItem,IndexNumber,ParentIndexNumber,Path,ExternalId,ChannelId "
+            "FROM BaseItems WHERE Type IN ('MediaBrowser.Controller.Entities.TV.Series',"
+            "'MediaBrowser.Controller.Entities.TV.Season','MediaBrowser.Controller.Entities.TV.Episode') "
+            "ORDER BY Type,SortName")]
+    (OUT / f"tv-rows-{label}.json").write_text(json.dumps(rows, indent=2, default=str))
+    return rows
+
+
+def assert_hierarchy(label, series, season, episodes):
+    rows = {uuid.UUID(r["Id"]): r for r in tv_rows(label)}
+    sid, zid = uuid.UUID(series["Id"]), uuid.UUID(season["Id"])
+    assert sid in rows and zid in rows, (label, "series/season BaseItem deleted", series["Id"], season["Id"])
+    key = rows[sid]["PresentationUniqueKey"]
+    assert key and rows[zid]["SeriesPresentationUniqueKey"] == key, (label, rows[zid], key)
+    for ep in episodes:
+        row = rows.get(uuid.UUID(ep["Id"]))
+        assert row is not None, (label, "episode deleted", ep["Id"])
+        assert uuid.UUID(row["ParentId"]) == zid and uuid.UUID(row["SeasonId"]) == zid, (label, "episode detached from season", row)
+        assert uuid.UUID(row["SeriesId"]) == sid and row["SeriesPresentationUniqueKey"] == key, (label, "episode lost series", row)
+    print("HIERARCHY", label, "series=" + series["Id"], "season=" + season["Id"], "episodes=" + ",".join(e["Id"] for e in episodes), flush=True)
+
+
+def viewer_api(path, body=None, token=None):
+    request = urllib.request.Request(API + path, data=json.dumps(body).encode() if body is not None else None,
+        headers={"X-Emby-Token": token, "Content-Type": "application/json",
+                 "X-Emby-Authorization": f'MediaBrowser Client="phantom-rig", Device="viewer", DeviceId="web-queue-viewer", Version="1", Token="{token}"'},
+        method="POST" if body is not None else "GET")
+    with urllib.request.urlopen(request, timeout=120) as response:
+        raw = response.read()
+    global SEQUENCE
+    SEQUENCE += 1
+    result = json.loads(raw) if raw else None
+    (OUT / f"{SEQUENCE:03d}-viewer-{path.split('?')[0].strip('/').replace('/', '-')}.json").write_text(json.dumps(result))
+    return result
+
+
+def regular_user():
+    """A normal non-admin Jellyfin user, created through the admin API."""
+    created = api("/Users/New", {"Name": "viewer", "Password": "viewer"})
+    user = api(f"/Users/{created['Id']}")
+    assert user["Policy"]["IsAdministrator"] is False, user["Policy"]
+    assert user["Policy"]["EnableAllChannels"] is True and user["Policy"]["EnableMediaPlayback"] is True, user["Policy"]
+    auth = api("/Users/AuthenticateByName", {"Username": "viewer", "Pw": "viewer"})
+    print("REGULAR_USER", created["Id"], "admin=False", flush=True)
+    return created["Id"], auth["AccessToken"]
+
+
+def queue(series, season, start, viewer, token, expected):
+    """Exactly what jellyfin-web's episode Play action and season browse request."""
+    base = f"/Shows/{series['Id']}/Episodes?IsVirtualUnaired=false&IsMissing=false&UserId={viewer}&Fields=Chapters,Trickplay"
+    unscoped = viewer_api(base + f"&limit=100&startItemId={start['Id']}", token=token)
+    scoped = viewer_api(base + f"&SeasonId={season['Id']}&startItemId={start['Id']}", token=token)
+    for label, result in (("unscoped", unscoped), ("season", scoped)):
+        ids = [x["Id"] for x in result["Items"]]
+        assert ids == expected, (label, ids, expected)
+        assert result["TotalRecordCount"] == len(expected), (label, result["TotalRecordCount"])
+        for i, item in enumerate(result["Items"]):
+            assert item["SeriesId"] == series["Id"] and item["SeasonId"] == season["Id"], (label, item)
+            assert (item["ParentIndexNumber"], item["IndexNumber"]) == (1, i + 1 + (8 - len(expected))), (label, item)
+        print("QUEUE", label, "start=" + start["Id"], "count=%d" % len(ids), flush=True)
+    # Missing/unavailable policy: channel episodes are Remote, never Missing,
+    # so IsMissing=true is empty and the non-missing listing is the full season.
+    missing = viewer_api(f"/Shows/{series['Id']}/Episodes?IsMissing=true&UserId={viewer}", token=token)
+    assert missing["Items"] == [] and missing["TotalRecordCount"] == 0, missing
+
+
+def home_latest(channel, viewer, token, series):
+    """The Home 'Latest in Phantom Shows' request: core refreshes the channel's latest view."""
+    latest = viewer_api(f"/Users/{viewer}/Items/Latest?ParentId={channel}&Limit=16&Fields=PrimaryImageAspectRatio", token=token)
+    ids = [x["Id"] for x in latest]
+    assert series["Id"] in ids, ("latest row lost the materialised series", ids)
+    print("HOME_LATEST", ids, flush=True)
+
+
+def wait_series_key(item, label):
+    """The post-flight metadata save re-derives Series/Season ids from the parent."""
+    for _ in range(30):
+        row = jellyfin_sql("SELECT SeriesPresentationUniqueKey,ParentId FROM BaseItems WHERE Id=upper(?)", (guid(item),))
+        if row and row[0]:
+            return
+        time.sleep(1)
+    raise AssertionError((label, "episode lost SeriesPresentationUniqueKey", row))
+
+
+def seed_episode(number, digit):
+    now = int(time.time())
+    magnet = "magnet:?xt=urn:btih:" + digit * 40 + f"&dn=Phantom+Rig+Delta+S01E{number:02d}"
+    common = dict(tmdb_id=99100001, type="episode", season=1, episode=number)
+    DB.upsert("magnet_cache", ("tmdb_id", "imdb_id", "type", "season", "episode", "preset"),
+              dict(common, imdb_id="tt99100001", preset="gostream-default", magnet=magnet, info_hash=digit * 40,
+                   size=10485760, seeders=100, indexer="rig-cache", cached_at=now, ttl_seconds=86400, source="rig"))
+    DB.upsert("availability_items", ("tmdb_id", "type", "season", "episode"),
+              dict(common, status="available", checked_at=now, next_check_at=now + 604800, candidate_magnet=magnet,
+                   candidate_info_hash=digit * 40, candidate_size=10485760, candidate_seeders=100,
+                   candidate_indexer="rig-cache", candidate_source="rig"))
+    DB.upsert("source_candidates", ("tmdb_id", "type", "season", "episode", "preset", "magnet"),
+              dict(common, preset="gostream-default", magnet=magnet, info_hash=digit * 40, indexer="rig-cache",
+                   title="Parity fixture", seeders=100, size=10485760, rank=1, source="rig", fetched_at=now,
+                   expires_at=now + 604800, validation_status="unknown", validation_policy_version="unknown"))
+
+
+def web_queue(channel, series, season, eps):
+    """p14-native-episode-web-queue: native all-series queue + real web Play."""
+    viewer, token = regular_user()
+    ep1, ep2 = eps[0], eps[1]
+    all_ids = [e["Id"] for e in eps]
+    assert_hierarchy("after-materialise", series, season, eps)
+    queue(series, season, ep1, viewer, token, all_ids)
+    # 1. Home Latest refresh (unpatched core re-parented the episode to the
+    #    channel root and pruned the Series/Season it does not list).
+    home_latest(channel, viewer, token, series)
+    time.sleep(10)  # let any queued metadata save land before reading the hierarchy
+    assert_hierarchy("after-home-latest", series, season, eps)
+    queue(series, season, ep1, viewer, token, all_ids)
+    # 2. A second native-open WITHOUT re-browsing: the per-item post-flight
+    #    refresh (IChannelItemRefreshManager) must not detach the episode either.
+    seed_episode(2, "3")
+    opened = viewer_api(f"/Items/{guid(ep2)}/PlaybackInfo?UserId={viewer}&AutoOpenLiveStream=true",
+                        {"UserId": viewer, "AutoOpenLiveStream": True}, token=token)
+    src = opened["MediaSources"][0]
+    assert not opened.get("ErrorCode") and not src.get("RequiresOpening") and src["Path"].endswith("_S01E02.mkv"), opened
+    assert DB.query("SELECT COUNT(*) FROM materialised_state WHERE tmdb_id=99100001 AND type='episode' AND season=1 AND episode=2") == "1"
+    wait_metadata(ep2, path=src["Path"])
+    wait_series_key(ep2, "after-second-native-open")
+    assert_hierarchy("after-second-native-open", series, season, eps)
+    queue(series, season, ep2, viewer, token, all_ids[1:])
+    home_latest(channel, viewer, token, series)
+    time.sleep(10)
+    assert_hierarchy("after-second-home-latest", series, season, eps)
+    queue(series, season, ep1, viewer, token, all_ids)
+    # 3. Real jellyfin-web in Chromium: login, Home, details, ordinary Play.
+    spec = {"api": API, "user": "viewer", "password": "viewer", "item": ep1["Id"], "series": series["Id"],
+            "out": str(OUT), "expectedQueue": all_ids}
+    (OUT / "web-queue-spec.json").write_text(json.dumps(spec, indent=2))
+    subprocess.run(["node", str(Path(__file__).parent / "browser/episode-web-queue.mjs"), str(OUT / "web-queue-spec.json")], check=True)
+    assert_hierarchy("after-browser", series, season, eps)
+    print("NATIVE_EPISODE_WEB_QUEUE_OK", flush=True)
+
+
 def episode():
     discovery("episode")
     seed("episode")
@@ -306,6 +452,10 @@ def episode():
     assert badges.get(ep["Id"]) == "Phantom", badges
     print("BADGE_SCOPE", badges, flush=True)
     materialise(ep, "episode", channel, season["Id"])
+    if os.environ.get("PHANTOM_WEB_QUEUE") == "1":
+        eps = sorted(browse(channel, season["Id"]), key=lambda x: x["IndexNumber"])
+        assert [x["IndexNumber"] for x in eps] == list(range(1, 9)) and eps[0]["Id"] == ep["Id"], eps
+        web_queue(channel, series, season, eps)
     print("CHANNEL_EPISODE_E2E_PLAYBACK_OK", flush=True)
 
 

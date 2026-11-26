@@ -73,15 +73,17 @@ To rebase:
    dotnet build -c Release Jellyfin.Server/Jellyfin.Server.csproj
    ```
 
-   All `ChannelManagerRefreshTests.*` cases must pass, and the server
-   build must compile the patched item-action API.
+   All `ChannelManagerRefreshTests.*` and `ChannelManagerHierarchyTests.*`
+   cases must pass, and the server build must compile the patched item-action
+   API. `scripts/tests/native-episode-web-queue.test.sh` re-checks clean
+   application of the whole stack to the pristine tag and the live effect.
 
 5. **Re-export the patches.** Determine how many commits the rebased
-   series produced (currently 5 unless you intentionally restructured):
+   series produced (currently 7 unless you intentionally restructured):
 
    ```bash
    cd jellyfin
-   git format-patch -5 -o ../scripts/jellyfin-patches/
+   git format-patch -7 -o ../scripts/jellyfin-patches/
    ```
 
    The output filenames stay numbered `0001-`/`0002-`/`0003-` —

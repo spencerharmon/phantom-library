@@ -40,7 +40,7 @@ def ensure_fixture(path: Path) -> None:
         "-hide_banner", "-loglevel", "error", "-y",
         "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24",
         "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000",
-        "-t", "2",
+        "-t", os.environ.get("PHANTOM_RIG_MEDIA_SECONDS", "2"),
         "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-shortest", str(path),
     ]

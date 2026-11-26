@@ -1,0 +1,292 @@
+From 139ea645dd48712255b331e808d16d0967cfc205 Mon Sep 17 00:00:00 2001
+From: honeybee <honeybee@beehive>
+Date: Thu, 26 Nov 2026 07:53:43 -0600
+Subject: [PATCH] Keep channel hierarchy during latest and per-item refresh
+
+A channel latest view (Home "Latest in <channel>") and the per-item
+IChannelItemRefreshManager refresh reach existing items through the channel
+root. Treating that root as the item's parent moved a materialised channel
+episode out of its Season, cleared SeriesId/SeasonId/SeriesPresentationUniqueKey
+on the next metadata save, and the latest prune then deleted the Series and
+Season it no longer listed. Series.GetEpisodes (the all-series web Play queue)
+then returned no items or 404.
+
+Non-authoritative refreshes now keep an existing item's live parent in the same
+channel, and the latest prune keeps the parent chain of every item it keeps.
+---
+ .../Channels/ChannelManager.cs                |  91 ++++++++++++++--
+ .../Channels/ChannelManagerHierarchyTests.cs  | 103 ++++++++++++++++++
+ 2 files changed, 184 insertions(+), 10 deletions(-)
+ create mode 100644 tests/Jellyfin.LiveTv.Tests/Channels/ChannelManagerHierarchyTests.cs
+
+diff --git a/src/Jellyfin.LiveTv/Channels/ChannelManager.cs b/src/Jellyfin.LiveTv/Channels/ChannelManager.cs
+index af6042b..d50e0e0 100644
+--- a/src/Jellyfin.LiveTv/Channels/ChannelManager.cs
++++ b/src/Jellyfin.LiveTv/Channels/ChannelManager.cs
+@@ -668,7 +668,9 @@ namespace Jellyfin.LiveTv.Channels
+                 ChannelIds = new Guid[] { internalChannel.Id }
+             };
+ 
+-            var result = await GetChannelItemsInternal(query, new Progress<double>(), cancellationToken).ConfigureAwait(false);
++            // A latest view is a partial, flattened projection of the channel. It
++            // may refresh items, but it is not authoritative for their hierarchy.
++            var result = await GetChannelItemsInternal(query, latestRefresh: true, cancellationToken).ConfigureAwait(false);
+ 
+             foreach (var item in result.Items)
+             {
+@@ -681,14 +683,17 @@ namespace Jellyfin.LiveTv.Channels
+                             EnableTotalRecordCount = false,
+                             ChannelIds = new Guid[] { internalChannel.Id }
+                         },
+-                        new Progress<double>(),
++                        latestRefresh: true,
+                         cancellationToken).ConfigureAwait(false);
+                 }
+             }
+         }
+ 
+         /// <inheritdoc />
+-        public async Task<QueryResult<BaseItem>> GetChannelItemsInternal(InternalItemsQuery query, IProgress<double> progress, CancellationToken cancellationToken)
++        public Task<QueryResult<BaseItem>> GetChannelItemsInternal(InternalItemsQuery query, IProgress<double> progress, CancellationToken cancellationToken)
++            => GetChannelItemsInternal(query, latestRefresh: false, cancellationToken);
++
++        private async Task<QueryResult<BaseItem>> GetChannelItemsInternal(InternalItemsQuery query, bool latestRefresh, CancellationToken cancellationToken)
+         {
+             // Get the internal channel entity
+             var channel = GetChannel(query.ChannelIds[0]);
+@@ -725,18 +730,30 @@ namespace Jellyfin.LiveTv.Channels
+                 var items = itemsResult.Items;
+                 var itemsLen = items.Count;
+                 var internalItems = new Guid[itemsLen];
++                var liveIds = new HashSet<Guid>();
+                 for (int i = 0; i < itemsLen; i++)
+                 {
+-                    internalItems[i] = (await GetChannelItemEntityAsync(
++                    var entity = await GetChannelItemEntityAsync(
+                         items[i],
+                         channelProvider,
+                         channel.Id,
+                         parentItem,
+-                        cancellationToken).ConfigureAwait(false)).Id;
++                        authoritativeParent: !latestRefresh,
++                        forceUpdateParam: false,
++                        forceProbe: false,
++                        cancellationToken).ConfigureAwait(false);
++                    internalItems[i] = entity.Id;
++                    liveIds.Add(entity.Id);
++                    if (latestRefresh)
++                    {
++                        // An item kept under its real parent keeps that parent's
++                        // ancestry alive; a latest view never lists those folders.
++                        liveIds.UnionWith(GetParentChainIds(entity));
++                    }
+                 }
+ 
+                 var existingIds = _libraryManager.GetItemIds(query);
+-                var deadIds = existingIds.Except(internalItems)
++                var deadIds = existingIds.Where(id => !liveIds.Contains(id))
+                     .ToArray();
+ 
+                 foreach (var deadId in deadIds)
+@@ -957,10 +974,7 @@ namespace Jellyfin.LiveTv.Channels
+             return item;
+         }
+ 
+-        private Task<BaseItem> GetChannelItemEntityAsync(ChannelItemInfo info, IChannel channelProvider, Guid internalChannelId, BaseItem parentFolder, CancellationToken cancellationToken)
+-            => GetChannelItemEntityAsync(info, channelProvider, internalChannelId, parentFolder, forceUpdateParam: false, forceProbe: false, cancellationToken);
+-
+-        private async Task<BaseItem> GetChannelItemEntityAsync(ChannelItemInfo info, IChannel channelProvider, Guid internalChannelId, BaseItem parentFolder, bool forceUpdateParam, bool forceProbe, CancellationToken cancellationToken)
++        private async Task<BaseItem> GetChannelItemEntityAsync(ChannelItemInfo info, IChannel channelProvider, Guid internalChannelId, BaseItem parentFolder, bool authoritativeParent, bool forceUpdateParam, bool forceProbe, CancellationToken cancellationToken)
+         {
+             var parentFolderId = parentFolder.Id;
+ 
+@@ -1089,6 +1103,15 @@ namespace Jellyfin.LiveTv.Channels
+ 
+             item.ChannelId = internalChannelId;
+ 
++            if (!isNew && !authoritativeParent && IsValidChannelParent(item.ParentId, internalChannelId))
++            {
++                // Latest views and per-item refreshes reach an existing item
++                // through the channel root. Moving it there detaches an episode
++                // from its Season/Series (SeriesId, SeasonId and
++                // SeriesPresentationUniqueKey are re-derived from the parent).
++                parentFolderId = item.ParentId;
++            }
++
+             if (!item.ParentId.Equals(parentFolderId))
+             {
+                 forceUpdate = true;
+@@ -1267,6 +1290,7 @@ namespace Jellyfin.LiveTv.Channels
+                     provider,
+                     channelId,
+                     channelEntity,
++                    authoritativeParent: false,
+                     forceUpdateParam: options.ForceUpdate,
+                     forceProbe: options.ForceProbe,
+                     cancellationToken).ConfigureAwait(false);
+@@ -1281,6 +1305,53 @@ namespace Jellyfin.LiveTv.Channels
+             }
+         }
+ 
++        /// <summary>
++        /// Determines whether an existing item's parent is still a live folder of
++        /// <paramref name="internalChannelId"/> and can therefore be preserved by a
++        /// non-authoritative (latest or per-item) channel refresh.
++        /// </summary>
++        /// <param name="parentId">The item's persisted parent id.</param>
++        /// <param name="internalChannelId">The internal channel id.</param>
++        /// <returns><c>true</c> if the parent can be kept.</returns>
++        internal bool IsValidChannelParent(Guid parentId, Guid internalChannelId)
++        {
++            if (parentId.IsEmpty())
++            {
++                return false;
++            }
++
++            if (parentId.Equals(internalChannelId))
++            {
++                return true;
++            }
++
++            return _libraryManager.GetItemById(parentId) is Folder parent
++                && internalChannelId.Equals(parent.ChannelId);
++        }
++
++        /// <summary>
++        /// Gets the ids of an item's parent chain (nearest first), bounded and
++        /// cycle-safe.
++        /// </summary>
++        /// <param name="item">The item.</param>
++        /// <returns>The parent ids.</returns>
++        internal IEnumerable<Guid> GetParentChainIds(BaseItem item)
++        {
++            var seen = new HashSet<Guid> { item.Id };
++            var parentId = item.ParentId;
++            for (var depth = 0; depth < 32 && !parentId.IsEmpty() && seen.Add(parentId); depth++)
++            {
++                yield return parentId;
++                var parent = _libraryManager.GetItemById(parentId);
++                if (parent is null)
++                {
++                    yield break;
++                }
++
++                parentId = parent.ParentId;
++            }
++        }
++
+         internal IChannel GetChannelProvider(Channel channel)
+         {
+             ArgumentNullException.ThrowIfNull(channel);
+diff --git a/tests/Jellyfin.LiveTv.Tests/Channels/ChannelManagerHierarchyTests.cs b/tests/Jellyfin.LiveTv.Tests/Channels/ChannelManagerHierarchyTests.cs
+new file mode 100644
+index 0000000..7811e87
+--- /dev/null
++++ b/tests/Jellyfin.LiveTv.Tests/Channels/ChannelManagerHierarchyTests.cs
+@@ -0,0 +1,103 @@
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using Jellyfin.LiveTv.Channels;
++using MediaBrowser.Controller.Channels;
++using MediaBrowser.Controller.Configuration;
++using MediaBrowser.Controller.Dto;
++using MediaBrowser.Controller.Entities;
++using MediaBrowser.Controller.Entities.TV;
++using MediaBrowser.Controller.Library;
++using MediaBrowser.Controller.Providers;
++using MediaBrowser.Model.IO;
++using Microsoft.Extensions.Caching.Memory;
++using Microsoft.Extensions.Logging.Abstractions;
++using Moq;
++using Xunit;
++
++namespace Jellyfin.LiveTv.Tests.Channels;
++
++/// <summary>
++/// Non-authoritative channel refreshes (the Home "latest" refresh and the
++/// per-item <see cref="IChannelItemRefreshManager"/> refresh) reach existing
++/// items through the channel root. They must keep an item's valid
++/// Season/Series parent and must not prune the ancestors of items they keep.
++/// The live end-to-end proof is the plugin's
++/// scripts/tests/native-episode-web-queue.test.sh rig.
++/// </summary>
++public class ChannelManagerHierarchyTests
++{
++    private static readonly Guid ChannelId = Guid.Parse("40ab6e9a-f516-a84f-46dc-ea7140855d88");
++    private static readonly Guid OtherChannelId = Guid.Parse("11111111-2222-3333-4444-555555555555");
++
++    private static (ChannelManager Mgr, Series Series, Season Season, Episode Episode, Mock<ILibraryManager> Lib) Build()
++    {
++        var lib = new Mock<ILibraryManager>(MockBehavior.Loose);
++        var channel = new Channel { Id = ChannelId, Name = "Shows" };
++        var series = new Series { Id = Guid.NewGuid(), ParentId = ChannelId, ChannelId = ChannelId };
++        var season = new Season { Id = Guid.NewGuid(), ParentId = series.Id, ChannelId = ChannelId };
++        var episode = new Episode { Id = Guid.NewGuid(), ParentId = season.Id, ChannelId = ChannelId };
++        foreach (BaseItem item in new BaseItem[] { channel, series, season, episode })
++        {
++            lib.Setup(m => m.GetItemById(item.Id)).Returns(item);
++        }
++
++        var mgr = new ChannelManager(
++            userManager: Mock.Of<IUserManager>(),
++            dtoService: Mock.Of<IDtoService>(),
++            libraryManager: lib.Object,
++            logger: NullLogger<ChannelManager>.Instance,
++            config: Mock.Of<IServerConfigurationManager>(),
++            fileSystem: Mock.Of<IFileSystem>(),
++            userDataManager: Mock.Of<IUserDataManager>(),
++            providerManager: Mock.Of<IProviderManager>(),
++            memoryCache: Mock.Of<IMemoryCache>(),
++            channels: Array.Empty<IChannel>());
++        return (mgr, series, season, episode, lib);
++    }
++
++    [Fact]
++    public void IsValidChannelParent_SeasonOfSameChannel_IsKept()
++    {
++        var (mgr, _, season, _, _) = Build();
++        Assert.True(mgr.IsValidChannelParent(season.Id, ChannelId));
++    }
++
++    [Fact]
++    public void IsValidChannelParent_ChannelRoot_IsKept()
++    {
++        var (mgr, _, _, _, _) = Build();
++        Assert.True(mgr.IsValidChannelParent(ChannelId, ChannelId));
++    }
++
++    [Fact]
++    public void IsValidChannelParent_EmptyDeletedOrForeignParent_IsRepaired()
++    {
++        var (mgr, _, season, _, lib) = Build();
++        Assert.False(mgr.IsValidChannelParent(Guid.Empty, ChannelId));
++        Assert.False(mgr.IsValidChannelParent(Guid.NewGuid(), ChannelId));
++        Assert.False(mgr.IsValidChannelParent(season.Id, OtherChannelId));
++
++        var nonFolder = new Episode { Id = Guid.NewGuid(), ChannelId = ChannelId };
++        lib.Setup(m => m.GetItemById(nonFolder.Id)).Returns(nonFolder);
++        Assert.False(mgr.IsValidChannelParent(nonFolder.Id, ChannelId));
++    }
++
++    [Fact]
++    public void GetParentChainIds_EpisodeProtectsSeasonSeriesAndChannel()
++    {
++        var (mgr, series, season, episode, _) = Build();
++        Assert.Equal(new[] { season.Id, series.Id, ChannelId }, mgr.GetParentChainIds(episode).ToArray());
++    }
++
++    [Fact]
++    public void GetParentChainIds_IsCycleSafeAndStopsAtMissingParent()
++    {
++        var (mgr, series, season, _, lib) = Build();
++        series.ParentId = season.Id;
++        Assert.Equal(new[] { series.Id, season.Id }, mgr.GetParentChainIds(new Episode { Id = Guid.NewGuid(), ParentId = series.Id }).ToArray());
++
++        var missing = Guid.NewGuid();
++        Assert.Equal(new[] { missing }, mgr.GetParentChainIds(new Episode { Id = Guid.NewGuid(), ParentId = missing }).ToArray());
++    }
++}
+-- 
+2.56.1
+
