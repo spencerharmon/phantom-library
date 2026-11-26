@@ -1153,7 +1153,7 @@ base_env.update(PATH=str(bin_dir) + os.pathsep + os.environ['PATH'],
                 PHANTOM_LOADTIME_KUBE_BACKOFF_SECONDS='0',
                 MSBUILDDISABLENODEREUSE='1', DOTNET_CLI_USE_MSBUILD_SERVER='0')
 
-def run(name, fault='', directory=None, **overrides):
+def run(name, fault='', directory=None, audit=None, wall=120, **overrides):
     directory = evidence if directory is None else directory
     logs = tmp / name
     logs.mkdir()
@@ -1165,8 +1165,16 @@ def run(name, fault='', directory=None, **overrides):
                EVIDENCE_KUBE=str(logs / 'kube'), EVIDENCE_FILING=str(logs / 'filing'),
                EVIDENCE_CLEANUP=str(logs / 'cleanup'), TMPDIR=str(scratch), **overrides)
     started = int(time.time())
-    result = subprocess.run(['bash', str(root / 'tools/ci/loadtime-daily-run.sh')],
-                            env=env, text=True, capture_output=True, timeout=120)
+    # audit: an observer of the engine's scratch (started before the engine
+    # creates its WORK_DIR, stopped after the wrapper exits).
+    if audit is not None:
+        audit.start(scratch)
+    try:
+        result = subprocess.run(['bash', str(root / 'tools/ci/loadtime-daily-run.sh')],
+                                env=env, text=True, capture_output=True, timeout=wall)
+    finally:
+        if audit is not None:
+            audit.stop()
     (logs / 'output').write_text(result.stdout + result.stderr)
     fresh = set(directory.glob('run-*.json')) - before
     if overrides.get('PHANTOM_CI_DRYRUN') == '1':
@@ -1667,10 +1675,11 @@ real_curl = shutil.which('curl', path=os.pathsep.join(
     d for d in os.environ['PATH'].split(os.pathsep) if pathlib.Path(d) != bin_dir))
 real_node = shutil.which('node')
 assert real_curl and real_node, 'browse stage fixture needs real curl and node'
-ITEMS = 450  # 3 channel pages of 200 and 2 badge batches of 400
 PAGE_DELAY, BADGE_DELAY, DOM_DELAY, REQUEST_TIMEOUT = 0.4, 0.5, 0.8, 1.5
 # (channel, sorted) -> per-sample fixture behaviour, sample numbers are 1-based.
-plan_ = {
+# Run A (stage timing): every sample serves 450 ids = 3 pages of 200 and 2
+# badge batches of 400 (+ partial 50).
+plan_a = {
     ('movies', False): {1: dict(page=PAGE_DELAY), 2: dict(badge=BADGE_DELAY), 3: dict()},  # 3 => DOM delay
     ('movies', True): {1: dict(page=0.1, badge=0.2), 2: dict(page_error_at=400), 3: dict()},
     ('shows', False): {1: dict(badge_timeout=True)},
@@ -1678,9 +1687,23 @@ plan_ = {
 }
 # DOM-materialise invocations in engine order: movie list_load 1..3, movie
 # sort_change 1 and 3 (2 fails a late page), Shows-root sort_change 1..3.
-dom_delays = [0, 0, DOM_DELAY, 0.3, 0, 0, 0, 0]
-state_ = dict(ctx=None, ctx_key=None, sample={}, puts=[], badges=[])
+dom_delays_a = [0, 0, DOM_DELAY, 0.3, 0, 0, 0, 0]
+state_ = dict(ctx=None, ctx_key=None, plan=None, sample={}, puts=[], badges=[], order=[])
 lock_ = threading.Lock()
+hang_ = threading.Event()
+
+def spec_ids(channel, sorted_, sample, spec):
+    """The exact ordered ids the fixture serves for one browse sample.
+    Untagged specs keep the 450-id run-A population; tagged specs carry a
+    per-sample distinct population and the sort flow is DESCENDING, so a
+    payload that reused another sample's/flow's ids or reordered them fails."""
+    n = spec.get('items', 450)
+    tag = spec.get('tag')
+    if tag is None:
+        return [f'{channel}-{i:04d}' for i in range(n)]
+    order = range(n - 1, -1, -1) if sorted_ else range(n)
+    return [f'{channel}-{tag}-{"d" if sorted_ else "a"}{sample}-{i:05d}' for i in order]
+
 class Fixture(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def reply(self, body, code=200):
@@ -1704,11 +1727,20 @@ class Fixture(http.server.BaseHTTPRequestHandler):
             got = body.get('ids', [])
             if got and all(i.startswith(('movies-', 'shows-')) for i in got):
                 with lock_:
-                    state_['badges'].append((state_['ctx_key'], list(got)))
-                spec = state_['ctx']
+                    key = state_['ctx_key']
+                    state_['badges'].append((key, list(got)))
+                    state_['order'].append((key, 'badge', len(got)))
+                    nth = sum(1 for k, _ in state_['badges'] if k == key)
+                    spec = state_['ctx']
                 if spec.get('badge_timeout'):
                     time.sleep(REQUEST_TIMEOUT + 1.5)
+                if spec.get('badge_hang_at') == nth:
+                    # Outlives the sample's remaining LIST deadline: the engine
+                    # must abandon it at that deadline (curl 28), not later.
+                    hang_.wait(spec['hang_seconds'])
                 time.sleep(spec.get('badge', 0))
+                if spec.get('badge_error_at') == nth:
+                    return self.reply({'error': 'late badge'}, 500)
                 return self.reply({i: 'Phantom' for i in got})
             return self.reply({i: 'Phantom' for i in got})
         self.reply({'MediaSources': []})
@@ -1733,14 +1765,18 @@ class Fixture(http.server.BaseHTTPRequestHandler):
             with lock_:
                 if start == 0:
                     state_['sample'][key] = state_['sample'].get(key, 0) + 1
-                    state_['ctx'] = plan_[key][state_['sample'][key]]
+                    state_['ctx'] = state_['plan'][key][state_['sample'][key]]
                     state_['ctx_key'] = key + (state_['sample'][key],)
                 spec = state_['ctx']
+                state_['order'].append((state_['ctx_key'], 'page', start))
+                served = spec_ids(*state_['ctx_key'], spec)
             time.sleep(spec.get('page', 0))
             if spec.get('page_error_at') == start:
                 return self.reply({'error': 'late page'}, 500)
-            return self.reply({'Items': [{'Id': f'{channel}-{i:04d}'} for i in range(start, min(start + 200, ITEMS))],
-                               'TotalRecordCount': ITEMS})
+            items = [{'Id': i} for i in served[start:start + 200]]
+            if spec.get('missing_id_at') == start and items:
+                del items[len(items) // 2]['Id']  # counted, but no extractable id
+            return self.reply({'Items': items, 'TotalRecordCount': len(served)})
         self.reply(b'\0' * 64)
 server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Fixture)
 threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -1756,13 +1792,13 @@ done
 exec {real_curl} "${{args[@]}}"
 ''')
 (browse_bin / 'node').write_text(f'''#!/usr/bin/env python3
-import os, pathlib, sys, time
+import json, os, pathlib, sys, time
 counter = pathlib.Path({str(browse_dir / 'dom-count')!r})
 n = int(counter.read_text()) if counter.exists() else 0
 counter.write_text(str(n + 1))
 with open({str(browse_dir / 'dom-args')!r}, 'a') as fh:
     fh.write(' '.join(sys.argv[2:]) + '\\n')
-delays = {dom_delays!r}
+delays = json.loads(pathlib.Path({str(browse_dir / 'dom-delays')!r}).read_text())
 time.sleep(delays[n] if n < len(delays) else 0)
 os.execv({real_node!r}, [{real_node!r}] + sys.argv[1:])
 ''')
@@ -1779,143 +1815,348 @@ os.execv({sys.executable!r}, [{sys.executable!r}] + sys.argv[1:])
 ''')
 for path in browse_bin.iterdir():
     path.chmod(0o755)
-root = tmp / 'browse-checkout'
-sha = checkout('browse stage fixture')
-seed()
-try:
-    result, manifest, _, _, logs = run('browse-stages', directory=browse_dir / 'evidence',
+
+# --- ID-file traversal audit (ttfb-loadtime-badge-payload-preparation) -------
+# A kernel inotify observer on the engine's scratch WORK_DIR records every
+# open/close of each per-sample ids.* file (and payloads.* scratch), from ANY
+# process -- python3, bash read/mapfile, cat... -- so the test counts the
+# actual complete reads (open + close-without-write) of each sample's id file,
+# per pathname, not interpreter launches or a global total.
+import ctypes, ctypes.util, select, struct
+IN_CREATE, IN_OPEN, IN_CLOSE_WRITE, IN_CLOSE_NOWRITE, IN_DELETE = 0x100, 0x20, 0x8, 0x10, 0x200
+IN_Q_OVERFLOW, IN_ISDIR = 0x4000, 0x40000000
+libc_ = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+class IdsAudit:
+    def start(self, scratch):
+        self.fd = libc_.inotify_init1(os.O_NONBLOCK)
+        assert self.fd >= 0, ctypes.get_errno()
+        self.dirs, self.live, self.records, self.overflow, self.late = {}, {}, [], False, []
+        self._watch(scratch, IN_CREATE)
+        self.done = threading.Event()
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+    def _watch(self, path, mask):
+        wd = libc_.inotify_add_watch(self.fd, str(path).encode(), mask)
+        if wd >= 0:
+            self.dirs[wd] = pathlib.Path(path)
+            # Anything already present was created before the observer saw it.
+            self.late += [p.name for p in pathlib.Path(path).glob('ids.*')]
+    def _drain(self):
+        while True:
+            try:
+                buf = os.read(self.fd, 65536)
+            except BlockingIOError:
+                return
+            off = 0
+            while off < len(buf):
+                wd, mask, _, ln = struct.unpack_from('iIII', buf, off)
+                name = buf[off + 16:off + 16 + ln].split(b'\0', 1)[0].decode()
+                off += 16 + ln
+                if mask & IN_Q_OVERFLOW:
+                    self.overflow = True
+                    continue
+                parent = self.dirs.get(wd)
+                if parent is None:
+                    continue
+                if mask & IN_ISDIR and mask & IN_CREATE and name.startswith('tmp.'):
+                    self._watch(parent / name, IN_CREATE | IN_OPEN | IN_CLOSE_WRITE | IN_CLOSE_NOWRITE | IN_DELETE)
+                    continue
+                if not name.startswith(('ids.', 'payloads.')):
+                    continue
+                path = str(parent / name)
+                if mask & IN_CREATE:
+                    rec = dict(path=path, events=[])
+                    self.records.append(rec)
+                    self.live[path] = rec
+                rec = self.live.get(path)
+                if rec is None:
+                    self.late.append(name)
+                    continue
+                for bit, label in ((IN_OPEN, 'open'), (IN_CLOSE_WRITE, 'write'),
+                                   (IN_CLOSE_NOWRITE, 'read'), (IN_DELETE, 'delete')):
+                    if mask & bit:
+                        rec['events'].append(label)
+                if mask & IN_DELETE:
+                    del self.live[path]
+    def _loop(self):
+        while not self.done.is_set():
+            select.select([self.fd], [], [], 0.05)
+            self._drain()
+    def stop(self):
+        self.done.set()
+        self.thread.join()
+        self._drain()
+        os.close(self.fd)
+
+def browse_expectations(plan, samples):
+    """Engine-order expected per-sample behaviour derived from the fixture plan."""
+    exp = []
+    for item_type, channel in (('movie', 'movies'), ('episode', 'shows')):
+        for flow, sorted_ in (('list_load', False), ('sort_change', True)):
+            timed_out = False
+            for sample in range(1, samples + 1):
+                key = (flow, item_type, sample)
+                if timed_out:
+                    exp.append(dict(key=key, outcome='skipped'))
+                    continue
+                spec = plan[channel, sorted_][sample]
+                served = spec_ids(channel, sorted_, sample, spec)
+                starts = []
+                for start in range(0, max(len(served), 1), 200):
+                    starts.append(start)
+                    if start == spec.get('page_error_at'):
+                        break
+                page_fail = spec.get('page_error_at') in starts
+                parsed = starts[:-1] if page_fail else starts
+                # Every parsed page appends its ids EXCEPT one whose id list
+                # cannot be extracted (an item without Id).
+                appends = len(parsed) - (spec.get('missing_id_at') in parsed)
+                e = dict(key=key, ctx=(channel, sorted_, sample), served=served, pages=starts,
+                         appends=appends, chunks=[], dom=None, failure=None, timed_out=False)
+                if page_fail:
+                    e.update(outcome='failed', channel='failed', badge='unreached', reads=0,
+                             failure=('page_fetch', '500', 22))
+                elif 'missing_id_at' in spec:
+                    # ONE preparation traversal finds fewer ids than items:
+                    # visible failure, no badge request, no DOM.
+                    e.update(outcome='failed', channel='ok', badge='failed', reads=1,
+                             failure=('badge_states', '000', 1))
+                elif not served:
+                    e.update(outcome='success', channel='ok', badge='skipped', reads=0, dom=0)
+                else:
+                    chunks = [served[o:o + 400] for o in range(0, len(served), 400)]
+                    stop = spec.get('badge_error_at') or spec.get('badge_hang_at') or (
+                        1 if spec.get('badge_timeout') else None)
+                    e.update(channel='ok', reads=1, chunks=chunks[:stop] if stop else chunks)
+                    if stop is None:
+                        e.update(outcome='success', badge='ok', dom=len(served))
+                    elif spec.get('badge_error_at'):
+                        e.update(outcome='failed', badge='failed', failure=('badge_states', '500', 22))
+                    else:
+                        e.update(outcome='failed', badge='failed', failure=('badge_states', '000', 28),
+                                 timed_out=True)
+                        timed_out = True
+                exp.append(e)
+    return exp
+
+def check_browse(label, plan, samples, manifest, audit, dom_args, expected_flow_errors):
+    """Shared retained/published browse invariants for one LIVE run."""
+    exp = browse_expectations(plan, samples)
+    attempted = [e for e in exp if e['outcome'] != 'skipped']
+    browse = {(b['flow'], b['item_type'], b['sample_index']): b for b in manifest['browse_samples']}
+    assert len(browse) == len(manifest['browse_samples']) == len(exp), (label, manifest['browse_samples'])
+    # Exact ordered payloads: each attempted sample sends ITS ids in server
+    # order, partitioned 400/400/.../partial, and nothing else.
+    badge_by = {}
+    for k, got_ids in state_['badges']:
+        badge_by.setdefault(k, []).append(got_ids)
+    assert set(badge_by) == {e['ctx'] for e in attempted if e['chunks']}, (label, sorted(badge_by))
+    for e in attempted:
+        assert badge_by.get(e['ctx'], []) == e['chunks'], (label, e['key'], [len(x) for x in badge_by.get(e['ctx'], [])])
+    # Exact request ordering per sample: its pages in order, then its badge
+    # batches serially; nothing after a failed page/batch within the sample.
+    order = [o for o in state_['order'] if o[0] is not None]
+    blocks = []
+    for ctx, kind, n in order:
+        if not blocks or blocks[-1][0] != ctx:
+            blocks.append((ctx, []))
+        blocks[-1][1].append((kind, n))
+    assert [b[0] for b in blocks] == [e['ctx'] for e in attempted], (label, [b[0] for b in blocks])
+    for (ctx, seq), e in zip(blocks, attempted):
+        assert seq == [('page', s) for s in e['pages']] + [('badge', len(c)) for c in e['chunks']], (label, e['key'], seq)
+    # DOM totals: one materialisation per sample that reached it, with exactly
+    # its item count (0 for an empty list); none after any failure.
+    assert dom_args == [str(e['dom']) for e in attempted if e['dom'] is not None], (label, dom_args)
+    # One parser per successfully fetched page (ttfb-loadtime-page-parse-residual).
+    launches = (browse_dir / 'page-parses').read_text().splitlines()
+    assert all(len(l.split()) == 1 for l in launches), launches
+    assert len(set(launches)) == len(launches), launches
+    assert len(launches) == sum(len(e['pages']) - (e['channel'] == 'failed') for e in attempted), (label, len(launches))
+    # ID preparation: per sample pathname, exactly ONE complete traversal of
+    # the id file for a nonempty sample that reached the badge stage -- never
+    # one per badge batch -- and none for empty lists or late-page failures.
+    assert not audit.overflow and not audit.late, (label, 'audit missed events', audit.late)
+    id_recs = [r for r in audit.records if pathlib.Path(r['path']).name.startswith('ids.')]
+    assert len(id_recs) == len(attempted), (label, len(id_recs), len(attempted))
+    for rec, e in zip(id_recs, attempted):
+        want = ['open', 'write'] * (1 + e['appends']) + ['open', 'read'] * e['reads'] + ['delete']
+        assert rec['events'] == want, (label, e['key'], 'id-file traversal', rec['events'].count('read'),
+                                       'reads, expected', e['reads'], rec['events'])
+    # Bounded scratch: the one prepared-payload file per traversal is deleted.
+    pay_recs = [r for r in audit.records if pathlib.Path(r['path']).name.startswith('payloads.')]
+    assert len(pay_recs) == sum(e['reads'] for e in attempted), (label, pay_recs)
+    assert all(r['events'][-1] == 'delete' and r['events'].count('delete') == 1 for r in pay_recs), pay_recs
+    # Retained per-sample evidence: stage statuses, page/batch counts and the
+    # additive per-sample reconciliation.
+    components = ('channel_items', 'badge_states', 'dom_materialise')
+    for e in exp:
+        b = browse[e['key']]
+        assert b['scope'] == {'movie': 'movies_root', 'episode': 'shows_root'}[e['key'][1]], b
+        if e['outcome'] == 'skipped':
+            assert b['outcome'] == 'skipped' and b['total_seconds'] is None and all(
+                s['status'] == 'skipped' and s['seconds'] is None for s in b['stages'].values()), (label, b)
+            continue
+        assert b['outcome'] == e['outcome'], (label, e['key'], b)
+        st = b['stages']
+        assert st['channel_items']['status'] == e['channel'] and st['channel_items']['pages'] == len(e['pages']), (label, b)
+        assert st['badge_states']['status'] == e['badge'] and st['badge_states']['batches'] == len(e['chunks']), (label, b)
+        assert st['dom_materialise']['status'] == ('ok' if e['dom'] is not None else 'unreached'), (label, b)
+        for s in st.values():
+            assert (s['seconds'] is None) == (s['status'] in ('unreached', 'skipped')), (label, b)
+        if e['failure'] and e['failure'][2] == 1:
+            assert st['badge_states']['seconds'] == 0, (label, 'preparation is not a badge request', b)
+        measured = sum(st[c]['seconds'] or 0 for c in components)
+        assert st['residual']['seconds'] >= 0, b
+        assert abs(b['total_seconds'] - measured - st['residual']['seconds']) <= 1e-5, (label, b)
+    failures = sorted((f['flow'], f['item_type'], f['sample_index'], f['stage'], f['http_status'], f['curl_exit_code'])
+                      for f in manifest['failures'] if f['flow'] in ('list_load', 'sort_change'))
+    assert failures == sorted(e['key'] + e['failure'] for e in attempted if e['failure']), (label, manifest['failures'])
+    assert not [f for f in manifest['failures'] if f['flow'] not in ('list_load', 'sort_change')], manifest['failures']
+    # Publication: the complete 12-tuple batch with exact runs/errors, list
+    # error attribution, and browse-stage families matching retained evidence.
+    payload, = [b for p_, b in state_['puts'] if p_.endswith('/phantom-loadtime')]
+    pub = dict(line.split() for line in payload.splitlines() if line and not line.startswith('#'))
+    for flow in flows:
+        for item_type in ('movie', 'episode'):
+            lbl = f'{{flow="{flow}",item_type="{item_type}",color="green"}}'
+            assert pub[f'phantom_loadtime_runs_total{lbl}'] == str(samples), (label, flow, item_type)
+            assert pub[f'phantom_loadtime_errors_total{lbl}'] == str(expected_flow_errors.get((flow, item_type), 0)), \
+                (label, flow, item_type, pub[f'phantom_loadtime_errors_total{lbl}'])
+            assert math.isfinite(float(pub[f'phantom_loadtime_seconds{lbl}'])), (label, flow, item_type)
+    assert len([k for k in pub if k.startswith('phantom_loadtime_seconds{')]) == 12, (label, 'batch not complete')
+    list_errs = {}
+    for e in attempted:
+        if e['failure']:
+            k = (e['key'][0], e['key'][1], e['failure'][0], e['failure'][1])
+            list_errs[k] = list_errs.get(k, 0) + 1
+    pub_errs = {k: v for k, v in pub.items() if k.startswith('phantom_loadtime_list_errors_total{')}
+    assert pub_errs == {f'phantom_loadtime_list_errors_total{{flow="{f}",item_type="{it}",stage="{s}",http_code="{h}"}}': str(v)
+                        for (f, it, s, h), v in list_errs.items()}, (label, pub_errs, list_errs)
+    expected_sums, expected_counts = {}, {}
+    for (flow, item_type, _), b in browse.items():
+        outcome = 'success' if b['outcome'] == 'success' else 'failed'
+        for stage, s in list(b['stages'].items()) + [('total', dict(status=b['stages']['residual']['status'], seconds=b['total_seconds']))]:
+            labels = f'flow="{flow}",item_type="{item_type}",scope="{b["scope"]}",stage="{stage}",outcome="{outcome}"'
+            ck = f'phantom_loadtime_browse_stage_samples_total{{{labels},status="{s["status"]}",color="green"}}'
+            expected_counts[ck] = expected_counts.get(ck, 0) + 1
+            if s['seconds'] is not None:
+                sk = f'phantom_loadtime_browse_stage_seconds_sum{{{labels},color="green"}}'
+                expected_sums[sk] = expected_sums.get(sk, 0.0) + s['seconds']
+    browse_records = {k: v for k, v in pub.items() if k.startswith('phantom_loadtime_browse_stage_')}
+    assert set(browse_records) == set(expected_sums) | set(expected_counts), (label, set(browse_records) ^ (set(expected_sums) | set(expected_counts)))
+    for k, v in expected_counts.items():
+        assert int(browse_records[k]) == v, (label, k, browse_records[k], v)
+    for k, v in expected_sums.items():
+        assert abs(float(browse_records[k]) - v) <= 1e-5 * 4, (label, k, browse_records[k], v)
+    # Population sums ARE additive: stage sums reconcile to the total sum.
+    for flow in ('list_load', 'sort_change'):
+        for item_type, scope in (('movie', 'movies_root'), ('episode', 'shows_root')):
+            for outcome in ('success', 'failed'):
+                labels = f'flow="{flow}",item_type="{item_type}",scope="{scope}",stage="%s",outcome="{outcome}",color="green"'
+                total = browse_records.get('phantom_loadtime_browse_stage_seconds_sum{' + labels % 'total' + '}')
+                if total is None:
+                    continue
+                parts = sum(float(browse_records.get('phantom_loadtime_browse_stage_seconds_sum{' + labels % st + '}', 0))
+                            for st in components + ('residual',))
+                assert abs(float(total) - parts) <= 1e-5 * 12, (label, flow, item_type, outcome, total, parts)
+    assert not any('episode_nav' in k or 'scope="episode' in k for k in browse_records), 'Shows-root mislabelled'
+    return browse, exp
+
+def browse_run(name, plan, dom_delays, samples, **overrides):
+    with lock_:
+        state_.update(ctx=None, ctx_key=None, plan=plan, sample={}, puts=[], badges=[], order=[])
+    for f in ('dom-count', 'dom-args', 'page-parses'):
+        (browse_dir / f).unlink(missing_ok=True)
+    (browse_dir / 'dom-delays').write_text(json.dumps(dom_delays))
+    seed()
+    audit = IdsAudit()
+    result, manifest, _, _, logs = run(name, directory=browse_dir / 'evidence', audit=audit,
         PATH=str(browse_bin) + os.pathsep + base_env['PATH'],
         PHANTOM_REPO_ROOT=str(root),
         PHANTOM_LOADTIME_EVIDENCE_DIR=str(browse_dir / 'evidence'),
-        PHANTOM_LOADTIME_SAMPLES='3', PHANTOM_LOADTIME_REQUEST_TIMEOUT_SECONDS=str(REQUEST_TIMEOUT))
+        PHANTOM_LOADTIME_SAMPLES=str(samples), **overrides)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    stages(manifest, dict(discovery=0, measure=0, push=0, guard=manifest['stages']['guard']['exit_code']))
+    assert manifest['stages']['guard']['exit_code'] in (0, 3), manifest  # 3 = reported breach, not a failure
+    dom_args = (browse_dir / 'dom-args').read_text().splitlines()
+    assert int((browse_dir / 'dom-count').read_text()) == len(dom_args)
+    return manifest, audit, dom_args, logs
+
+root = tmp / 'browse-checkout'
+sha = checkout('browse stage fixture')
+try:
+    # --- run A: isolated/mixed stage timing over 450-id samples -------------
+    manifest, audit, dom_args, _ = browse_run('browse-stages', plan_a, dom_delays_a, 3,
+        PHANTOM_LOADTIME_REQUEST_TIMEOUT_SECONDS=str(REQUEST_TIMEOUT))
+    assert len(dom_args) == len(dom_delays_a), dom_args
+    browse, _ = check_browse('A', plan_a, 3, manifest, audit, dom_args,
+                             {('list_load', 'episode'): 3, ('sort_change', 'movie'): 1})
+    components = ('channel_items', 'badge_states', 'dom_materialise')
+    for b in browse.values():
+        if b['outcome'] != 'skipped':
+            assert 0 <= b['stages']['residual']['seconds'] < 1.5, b
+        if b['outcome'] == 'success':
+            assert b['stages']['channel_items']['pages'] == 3 and b['stages']['badge_states']['batches'] == 2, b
+    sec = lambda key, stage: browse[key]['stages'][stage]['seconds']
+    base = ('sort_change', 'movie', 3)  # undelayed healthy baseline
+    # Isolated phase delays land in exactly their phase.
+    for key, stage, added in ((('list_load', 'movie', 1), 'channel_items', 3 * PAGE_DELAY),
+                              (('list_load', 'movie', 2), 'badge_states', 2 * BADGE_DELAY),
+                              (('list_load', 'movie', 3), 'dom_materialise', DOM_DELAY)):
+        assert sec(key, stage) - sec(base, stage) >= added - 0.05, (key, stage, browse[key], browse[base])
+        for other in components:
+            if other != stage:
+                assert sec(key, other) - sec(base, other) < added / 2, (key, other, browse[key], browse[base])
+    # Mixed costs in one sample.
+    mixed = ('sort_change', 'movie', 1)
+    for stage, added in (('channel_items', 0.3), ('badge_states', 0.4), ('dom_materialise', 0.3)):
+        assert sec(mixed, stage) - sec(base, stage) >= added - 0.05, (stage, browse[mixed])
+    # Badge timeout on the Shows-root list: badge failed at the request budget,
+    # DOM unreached, remaining samples explicitly skipped (fail-fast preserved).
+    to = browse['list_load', 'episode', 1]
+    assert REQUEST_TIMEOUT - 0.05 <= to['stages']['badge_states']['seconds'] < REQUEST_TIMEOUT + 1.0, to
+    print('EVIDENCE PASS: LIVE browse stages over real HTTP: isolated page/badge/DOM delays, mixed costs, late-page error, badge timeout+skips reconcile per sample and in the published PUT')
+
+    # --- run B: badge payload preparation (ttfb-loadtime-badge-payload-preparation)
+    # Both roots, list AND sort, distinct per-sample populations: empty, small
+    # single-page, exact-400, multi-page/multi-batch with partial final batch,
+    # late-page failure, unextractable-id preparation failure, late badge
+    # failure, and LIST-deadline exhaustion mid fan-out (+ fail-fast skip).
+    LIST_DEADLINE = 15.0
+    plan_b = {
+        ('movies', False): {1: dict(tag='b', items=0), 2: dict(tag='b', items=3),
+                            3: dict(tag='b', items=1203), 4: dict(tag='b', items=650, missing_id_at=400)},
+        ('movies', True): {1: dict(tag='b', items=400), 2: dict(tag='b', items=1601),
+                           3: dict(tag='b', items=650, page_error_at=600), 4: dict(tag='b', items=801, badge_error_at=2)},
+        ('shows', False): {1: dict(tag='b', items=2), 2: dict(tag='b', items=999),
+                           3: dict(tag='b', items=650, page_error_at=400), 4: dict(tag='b', items=0)},
+        ('shows', True): {1: dict(tag='b', items=1201), 2: dict(tag='b', items=17),
+                          3: dict(tag='b', items=900, badge_hang_at=2, hang_seconds=LIST_DEADLINE + 25),
+                          4: dict(tag='b', items=5)},
+    }
+    manifest, audit, dom_args, logs = browse_run('browse-payloads', plan_b, [], 4,
+        PHANTOM_LOADTIME_REQUEST_TIMEOUT_SECONDS='30',
+        PHANTOM_LOADTIME_LIST_TIMEOUT_SECONDS=str(LIST_DEADLINE), wall=900)
+    browse, exp = check_browse('B', plan_b, 4, manifest, audit, dom_args,
+        {('list_load', 'movie'): 1, ('sort_change', 'movie'): 2, ('list_load', 'episode'): 1,
+         ('sort_change', 'episode'): 2})
+    out = (logs / 'output').read_text()
+    assert 'flow=list_load item_type=movie badge payload preparation failed rc=1' in out, out
+    assert '# badge payload preparation: 450 ids for 650 items' in out, out
+    # Deadline exhaustion: the hung 2nd batch is abandoned at the sample's
+    # LIST deadline (well inside the 30s request timeout); no 3rd batch, no
+    # DOM, and the flow's last sample is skipped.
+    dl = browse['sort_change', 'episode', 3]
+    assert LIST_DEADLINE - 0.5 <= dl['total_seconds'] < LIST_DEADLINE + 5, dl
+    assert dl['stages']['badge_states']['batches'] == 2 and dl['stages']['dom_materialise']['status'] == 'unreached', dl
+    assert browse['sort_change', 'episode', 4]['outcome'] == 'skipped', browse['sort_change', 'episode', 4]
+    covered = {(e['key'][0], e['key'][1]) for e in exp if e['outcome'] == 'success' and len(e['chunks']) >= 3
+               and len(e['chunks'][-1]) < 400}
+    assert covered == {(f, it) for f in ('list_load', 'sort_change') for it in ('movie', 'episode')}, covered
+    print('EVIDENCE PASS: badge payloads prepared by ONE id-file traversal per sample (not per batch): exact ordered 400-partitions and DOM totals for both roots, list+sort, small/empty/multi-batch; late page/badge, prep error and deadline send nothing further; 12-tuple and stage reconciliation')
 finally:
+    hang_.set()
     server.shutdown()
-assert result.returncode == 0, (result.stdout, result.stderr)
-assert int((browse_dir / 'dom-count').read_text()) == len(dom_delays)
-browse = {(b['flow'], b['item_type'], b['sample_index']): b for b in manifest['browse_samples']}
-assert len(browse) == len(manifest['browse_samples']) == 12, manifest['browse_samples']
-# One parse per successfully fetched page, movie AND Shows root: a sample
-# whose page fetch failed parsed one page fewer than it requested.
-parsed_pages = {it: sum(b['stages']['channel_items']['pages']
-                        - (b['stages']['channel_items']['status'] == 'failed')
-                        for b in manifest['browse_samples']
-                        if b['outcome'] != 'skipped' and b['item_type'] == it)
-                for it in ('movie', 'episode')}
-assert parsed_pages['movie'] > 0 and parsed_pages['episode'] > 0, parsed_pages
-# Each launch names exactly one page file and each successfully fetched page
-# file is parsed exactly once (per-page, so a double parse of one page cannot
-# mask a missing parse of another).
-launches = (browse_dir / 'page-parses').read_text().splitlines()
-assert all(len(l.split()) == 1 for l in launches), launches
-assert len(set(launches)) == len(launches), launches
-assert len(launches) == sum(parsed_pages.values()), (len(launches), parsed_pages)
-# Exact counts/ids parity for movie AND Shows root, list and sort: every
-# successful sample sends the 450 ids in order as 400+50 badge payloads and
-# materialises exactly 450 DOM items.
-expected_ids = {ch: [f'{ch}-{i:04d}' for i in range(ITEMS)] for ch in ('movies', 'shows')}
-badge_by = {}
-for k, got_ids in state_['badges']:
-    badge_by.setdefault(k, []).append(got_ids)
-chan = {'movie': 'movies', 'episode': 'shows'}
-success = 0
-for (flow, item_type, sample), b in browse.items():
-    k = (chan[item_type], flow == 'sort_change', sample)
-    if b['outcome'] == 'success':
-        success += 1
-        ids_ = expected_ids[chan[item_type]]
-        assert badge_by.get(k) == [ids_[:400], ids_[400:]], (k, [len(x) for x in badge_by.get(k, [])])
-assert ('movies', True, 2) not in badge_by, badge_by.keys()  # late-page error: no badge
-assert badge_by[('shows', False, 1)] == [expected_ids['shows'][:400]]  # badge timeout batch
-assert success == 8, success
-dom_args = (browse_dir / 'dom-args').read_text().splitlines()
-assert dom_args == [str(ITEMS)] * len(dom_delays), dom_args
-components = ('channel_items', 'badge_states', 'dom_materialise')
-for (flow, item_type, sample), b in browse.items():
-    assert b['scope'] == {'movie': 'movies_root', 'episode': 'shows_root'}[item_type], b
-    if b['outcome'] == 'skipped':
-        assert b['total_seconds'] is None and all(s['status'] == 'skipped' and s['seconds'] is None
-                                                  for s in b['stages'].values()), b
-        continue
-    for s in b['stages'].values():
-        assert (s['seconds'] is None) == (s['status'] in ('unreached', 'skipped')), b
-    measured = sum(b['stages'][c]['seconds'] or 0 for c in components)
-    # Invariant: each attempted sample total reconciles to its component sum.
-    assert abs(b['total_seconds'] - measured - b['stages']['residual']['seconds']) <= 1e-5, b
-    assert 0 <= b['stages']['residual']['seconds'] < 1.5, b
-    if b['outcome'] == 'success':
-        assert b['stages']['channel_items']['pages'] == 3 and b['stages']['badge_states']['batches'] == 2, b
-        assert all(b['stages'][c]['status'] == 'ok' for c in components), b
-sec = lambda key, stage: browse[key]['stages'][stage]['seconds']
-base = ('sort_change', 'movie', 3)  # undelayed healthy baseline
-# Isolated phase delays land in exactly their phase.
-for key, stage, added in ((('list_load', 'movie', 1), 'channel_items', 3 * PAGE_DELAY),
-                          (('list_load', 'movie', 2), 'badge_states', 2 * BADGE_DELAY),
-                          (('list_load', 'movie', 3), 'dom_materialise', DOM_DELAY)):
-    assert sec(key, stage) - sec(base, stage) >= added - 0.05, (key, stage, browse[key], browse[base])
-    for other in components:
-        if other != stage:
-            assert sec(key, other) - sec(base, other) < added / 2, (key, other, browse[key], browse[base])
-# Mixed costs in one sample.
-mixed = ('sort_change', 'movie', 1)
-for stage, added in (('channel_items', 0.3), ('badge_states', 0.4), ('dom_materialise', 0.3)):
-    assert sec(mixed, stage) - sec(base, stage) >= added - 0.05, (stage, browse[mixed])
-# Late-page error: two pages succeeded, the third failed; nothing downstream ran.
-late = browse['sort_change', 'movie', 2]
-assert late['outcome'] == 'failed' and late['stages']['channel_items'] == dict(
-    status='failed', seconds=late['stages']['channel_items']['seconds'], pages=3), late
-assert late['stages']['badge_states'] == dict(status='unreached', seconds=None, batches=0), late
-assert late['stages']['dom_materialise'] == dict(status='unreached', seconds=None), late
-# Badge timeout on the Shows-root list: badge failed at the request budget,
-# DOM unreached, remaining samples explicitly skipped (fail-fast preserved).
-to = browse['list_load', 'episode', 1]
-assert to['outcome'] == 'failed' and to['stages']['channel_items']['status'] == 'ok', to
-assert to['stages']['badge_states']['status'] == 'failed' and to['stages']['badge_states']['batches'] == 1, to
-assert REQUEST_TIMEOUT - 0.05 <= to['stages']['badge_states']['seconds'] < REQUEST_TIMEOUT + 1.0, to
-assert to['stages']['dom_materialise'] == dict(status='unreached', seconds=None), to
-assert [browse['list_load', 'episode', s]['outcome'] for s in (2, 3)] == ['skipped', 'skipped']
-assert all(browse['sort_change', 'episode', s]['outcome'] == 'success' for s in (1, 2, 3))
-failures = {(f['flow'], f['item_type'], f['sample_index'], f['stage'], f['http_status']) for f in manifest['failures']}
-assert failures == {('sort_change', 'movie', 2, 'page_fetch', '500'),
-                    ('list_load', 'episode', 1, 'badge_states', '000')}, manifest['failures']
-# The publisher's captured PUT: existing flow totals unchanged in shape, plus
-# bounded-label component sums/counts per success/failed population that match
-# the retained per-sample evidence exactly.
-payload, = [b for p_, b in state_['puts'] if p_.endswith('/phantom-loadtime')]
-records = dict(line.split() for line in payload.splitlines() if line and not line.startswith('#'))
-for flow in flows:
-    for item_type in ('movie', 'episode'):
-        assert records[f'phantom_loadtime_runs_total{{flow="{flow}",item_type="{item_type}",color="green"}}'] == '3'
-        errors = {('list_load', 'episode'): 3, ('sort_change', 'movie'): 1}.get((flow, item_type), 0)
-        assert records[f'phantom_loadtime_errors_total{{flow="{flow}",item_type="{item_type}",color="green"}}'] == str(errors)
-expected_sums, expected_counts = {}, {}
-for (flow, item_type, _), b in browse.items():
-    outcome = 'success' if b['outcome'] == 'success' else 'failed'
-    for stage, s in list(b['stages'].items()) + [('total', dict(status=b['stages']['residual']['status'], seconds=b['total_seconds']))]:
-        labels = f'flow="{flow}",item_type="{item_type}",scope="{b["scope"]}",stage="{stage}",outcome="{outcome}"'
-        ck = f'phantom_loadtime_browse_stage_samples_total{{{labels},status="{s["status"]}",color="green"}}'
-        expected_counts[ck] = expected_counts.get(ck, 0) + 1
-        if s['seconds'] is not None:
-            sk = f'phantom_loadtime_browse_stage_seconds_sum{{{labels},color="green"}}'
-            expected_sums[sk] = expected_sums.get(sk, 0.0) + s['seconds']
-browse_records = {k: v for k, v in records.items() if k.startswith('phantom_loadtime_browse_stage_')}
-assert set(browse_records) == set(expected_sums) | set(expected_counts), set(browse_records) ^ (set(expected_sums) | set(expected_counts))
-for k, v in expected_counts.items():
-    assert int(browse_records[k]) == v, (k, browse_records[k], v)
-for k, v in expected_sums.items():
-    assert abs(float(browse_records[k]) - v) <= 1e-5 * 4, (k, browse_records[k], v)
-# Population sums ARE additive: stage sums reconcile to the total sum.
-for flow in ('list_load', 'sort_change'):
-    for item_type, scope in (('movie', 'movies_root'), ('episode', 'shows_root')):
-        for outcome in ('success', 'failed'):
-            labels = f'flow="{flow}",item_type="{item_type}",scope="{scope}",stage="%s",outcome="{outcome}",color="green"'
-            total = browse_records.get('phantom_loadtime_browse_stage_seconds_sum{' + labels % 'total' + '}')
-            if total is None:
-                continue
-            parts = sum(float(browse_records.get('phantom_loadtime_browse_stage_seconds_sum{' + labels % st + '}', 0))
-                        for st in components + ('residual',))
-            assert abs(float(total) - parts) <= 1e-5 * 12, (flow, item_type, outcome, total, parts)
-assert not any('episode_nav' in k or 'scope="episode' in k for k in browse_records), 'Shows-root mislabelled'
-print('EVIDENCE PASS: LIVE browse stages over real HTTP: isolated page/badge/DOM delays, mixed costs, late-page error, badge timeout+skips reconcile per sample and in the published PUT')
 assert not discovery_errors, f'{len(discovery_errors)}/{discovery_cases} discovery fixtures failed (see EVIDENCE FAIL above)'
 print(f'EVIDENCE PASS: {discovery_cases} discovery fixtures retain exact sanitized reasons/status, validated prefix, no timing/push, and clean scratch')
 PY

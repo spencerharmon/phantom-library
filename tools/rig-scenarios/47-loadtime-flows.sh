@@ -791,6 +791,37 @@ print(min(remaining, float(sys.argv[2])))
 PY
 )"
 }
+# prepare_badge_payloads <ids_file> <expected_count>
+# ONE linear traversal of the sample's accumulated ids file: partitions the
+# ordered ids into BADGE_BATCH_LIMIT-sized {"ids": [...]} request bodies
+# (partial final batch included) and loads them, in order, into the caller's
+# badge_payloads array (bash dynamic scope, like list_request_budget). The id
+# count must equal the paginated item count: a page whose ids could not be
+# extracted fails preparation visibly instead of shipping short/empty batches.
+prepare_badge_payloads() {
+    local ids_file="$1" expected="$2" out rc=0
+    out="$(mktemp "$WORK_DIR/payloads.XXXXXX")"
+    python3 - "$ids_file" "$expected" "$BADGE_BATCH_LIMIT" "$out" <<'PY' || rc=$?
+import json, sys
+ids_path, expected, limit, out_path = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+with open(ids_path) as fh:
+    ids = [line.strip() for line in fh if line.strip()]
+if len(ids) != expected:
+    sys.exit(f"# badge payload preparation: {len(ids)} ids for {expected} items")
+with open(out_path, "w") as fh:
+    for off in range(0, len(ids), limit):
+        fh.write(json.dumps({"ids": ids[off:off + limit]}) + "\n")
+PY
+    if [ "$rc" = 0 ]; then
+        mapfile -t badge_payloads < "$out" || rc=$?
+    fi
+    rm -f "$out"
+    if [ "$rc" = 0 ] && [ "${#badge_payloads[@]}" -ne $(((expected + BADGE_BATCH_LIMIT - 1) / BADGE_BATCH_LIMIT)) ]; then
+        rc=1
+    fi
+    [ "$rc" = 0 ] || badge_payloads=()
+    return "$rc"
+}
 _full_list_sample() {
     local flow="$1" item_type="$2" ch="$3" sort_qs="$4"
     local start errors=0 dur total=0 start_index=0 page=200
@@ -859,20 +890,29 @@ with open(sys.argv[2], "a") as fh:
         fi
         if [ "$got" -eq 0 ] || [ "$start_index" -ge "$total_records" ]; then break; fi
     done
+    # Badge payload preparation (ttfb-loadtime-badge-payload-preparation): the
+    # accumulated ids file is traversed ONCE per successful nonempty sample and
+    # partitioned into the ordered BADGE_BATCH_LIMIT-sized request bodies
+    # (partial final batch included), which the runner then sends serially.
+    # Previously every batch relaunched python3 and re-read the WHOLE file to
+    # slice one chunk (O(N*batches)). Preparation sits between budget checks,
+    # so its wall time is charged to this sample's list/engine deadline.
+    local -a badge_payloads=()
     live_batch_runner() {
         local off="$1" lim="$2"
-        local chunk_ids
-        chunk_ids="$(python3 -c "
-import json,sys
-ids=[l.strip() for l in open('$all_ids_file') if l.strip()]
-print(json.dumps(ids[$off:$off+$lim]))
-" 2>/dev/null || echo '[]')"
+        local idx=$((off / lim))
+        # The fan-out walks exactly the prepared partition; anything else is an
+        # engine defect, never an invented (empty) payload.
+        if [ $((idx * lim)) -ne "$off" ] || [ "$idx" -ge "${#badge_payloads[@]}" ]; then
+            log "flow=$flow item_type=$item_type badge batch offset=$off has no prepared payload"
+            return 1
+        fi
         local bcode
         if ! list_request_budget; then
             errors=1; fail_stage=badge_states; fail_code=000; fail_rc=28; bd_status=failed; return 1
         fi
         t0="$(now_s)"; batches=$((batches + 1))
-        if bcode="$(json_post --max-time "$request_budget" -d "{\"ids\": $chunk_ids}" -o /dev/null -w '%{http_code}' "$API/Plugins/PhantomLibrary/States" 2>/dev/null)"; then
+        if bcode="$(json_post --max-time "$request_budget" -d "${badge_payloads[$idx]}" -o /dev/null -w '%{http_code}' "$API/Plugins/PhantomLibrary/States" 2>/dev/null)"; then
             bd_durs="$bd_durs $(elapsed "$t0")"
         else
             local rc=$?
@@ -887,6 +927,17 @@ print(json.dumps(ids[$off:$off+$lim]))
         fi
     }
     LAST_DOM_S=""; LAST_DOM_STATUS=unreached
+    if [ "$errors" = 0 ] && [ "$total" -gt 0 ]; then
+        local prep_rc=0
+        prepare_badge_payloads "$all_ids_file" "$total" || prep_rc=$?
+        if [ "$prep_rc" != 0 ]; then
+            # Visible preparation failure: the badge stage failed before any
+            # request (batches=0, zero request time); nothing is sent and the
+            # DOM tail stays unreached. Not a timeout, so no fail-fast skip.
+            errors=1; fail_stage=badge_states; fail_code=000; fail_rc="$prep_rc"; bd_status=failed
+            log "flow=$flow item_type=$item_type badge payload preparation failed rc=$prep_rc"
+        fi
+    fi
     if [ "$errors" = 0 ]; then
         # Zero items => no badge request is made: explicit skip, not a zero.
         if [ "$total" -gt 0 ]; then bd_status=ok; else bd_status=skipped; fi
@@ -904,6 +955,7 @@ print(json.dumps(ids[$off:$off+$lim]))
         fi
     fi
     rm -f "$all_ids_file"
+    badge_payloads=()
     dur="$(elapsed "$start")"
     sample_add "$dur" "$errors"
     log "flow=$flow item_type=$item_type sample_s=$dur errors=$errors items=$total"
