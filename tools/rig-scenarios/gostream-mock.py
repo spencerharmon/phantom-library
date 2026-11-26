@@ -36,7 +36,7 @@ def ensure_fixture(path: Path) -> None:
     if path.exists() and path.stat().st_size > 0:
         return
     cmd = [
-        "/usr/lib/jellyfin-ffmpeg/ffmpeg",
+        os.environ.get("PHANTOM_RIG_FFMPEG", "/usr/lib/jellyfin-ffmpeg/ffmpeg"),
         "-hide_banner", "-loglevel", "error", "-y",
         "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24",
         "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000",
