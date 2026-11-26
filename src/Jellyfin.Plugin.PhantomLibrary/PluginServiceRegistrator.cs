@@ -88,6 +88,8 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         // signature, MagnetSelector + TmdbExternalIdResolver,
         // IChannelItemRefreshManager hand-off, in-flight sweeper).
         serviceCollection.AddSingleton<QualityScorer>();
+        // Degenerate-query guard title repair (p13-degenerate-query-guard).
+        serviceCollection.AddSingleton<IQueryTitleRepairSource, TmdbQueryTitleRepairSource>();
         serviceCollection.AddSingleton<MagnetSelector>();
         serviceCollection.AddSingleton<TmdbExternalIdResolver>();
         serviceCollection.AddSingleton<MagnetCacheBuilder>();

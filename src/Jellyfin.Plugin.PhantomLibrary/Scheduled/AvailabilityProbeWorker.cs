@@ -274,13 +274,17 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
         {
             var metaType = lease.Type == "movie" ? "movie" : "series";
             var meta = await _db.GetTmdbMetadataAsync(lease.TmdbId, metaType, ct).ConfigureAwait(false);
-            if (meta is null || string.IsNullOrWhiteSpace(meta.Title) || !meta.Year.HasValue)
+            // An empty/degenerate title is NOT treated as missing metadata:
+            // the selector's degenerate-query guard repairs it from TMDB, falls
+            // back to an IMDB-only query, or skips it with the counted
+            // degenerate_query_skipped outcome (p13-degenerate-query-guard).
+            if (meta is null || !meta.Year.HasValue)
             {
                 await _db.RescheduleAvailabilityTransientAsync(
                     lease,
                     ComputeTransientRetryAt(cfg, lease, now),
                     "missing_metadata",
-                    $"Missing title/year for {metaType}/{lease.TmdbId}",
+                    $"Missing metadata/year for {metaType}/{lease.TmdbId}",
                     ct).ConfigureAwait(false);
                 PhantomMetrics.AvailabilityProbe(lease.Type, "transient");
                 return true;
@@ -451,6 +455,27 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
                         PhantomMetrics.AvailabilityProbe(lease.Type, "no_capable_indexer");
                         _logger.LogInformation(
                             "Availability no-capable-indexer {Type}/{Tmdb} s{Season}e{Episode}; long backoff {Hours}h",
+                            lease.Type, lease.TmdbId, lease.Season, lease.Episode, cfg.AvailabilityNoIndexerRetryHours);
+                        return true;
+                    }
+
+                case MagnetProbeOutcome.DegenerateQuerySkipped:
+                    {
+                        // Degenerate, unrepairable title and no indexer can
+                        // serve it IMDB-only: no indexer request was made. A
+                        // fresh TMDB record could repair it later, so use the
+                        // long no-indexer backoff (not the 30-min transient
+                        // cadence) and keep the status unchanged.
+                        var backoff = now.AddHours(Math.Max(1, cfg.AvailabilityNoIndexerRetryHours));
+                        await _db.RescheduleAvailabilityTransientAsync(
+                            lease,
+                            backoff,
+                            MagnetSelector.DegenerateQuerySkippedKind,
+                            probe.ErrorMessage,
+                            ct).ConfigureAwait(false);
+                        PhantomMetrics.AvailabilityProbe(lease.Type, MagnetSelector.DegenerateQuerySkippedKind);
+                        _logger.LogInformation(
+                            "Availability degenerate-query skipped {Type}/{Tmdb} s{Season}e{Episode}; long backoff {Hours}h",
                             lease.Type, lease.TmdbId, lease.Season, lease.Episode, cfg.AvailabilityNoIndexerRetryHours);
                         return true;
                     }

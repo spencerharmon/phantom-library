@@ -35,6 +35,17 @@ public interface ITmdbClient
     /// <summary>Returns the IMDB id for a series via /tv/{id}/external_ids, or null if absent.</summary>
     Task<string?> GetImdbIdForSeriesAsync(int tmdbId, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// Alternative + translated titles for a movie (one call:
+    /// <c>/movie/{id}?append_to_response=alternative_titles,translations</c>),
+    /// English/US variants first. Used only to repair a degenerate indexer
+    /// title term (p13-degenerate-query-guard). Empty when TMDB has none / 404.
+    /// </summary>
+    Task<IReadOnlyList<string>> GetMovieTitleVariantsAsync(int tmdbId, CancellationToken cancellationToken);
+
+    /// <summary>Series analogue of <see cref="GetMovieTitleVariantsAsync"/> (<c>/tv/{id}</c>).</summary>
+    Task<IReadOnlyList<string>> GetSeriesTitleVariantsAsync(int tmdbId, CancellationToken cancellationToken);
+
     /// <summary>Trending movies. <paramref name="window"/> is "day" or "week".</summary>
     Task<IReadOnlyList<TmdbSearchHit>> GetTrendingMoviesAsync(string window, string? languageCode, CancellationToken cancellationToken);
 

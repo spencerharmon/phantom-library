@@ -44,6 +44,11 @@ internal static class PhantomMetrics
         "Elapsed seconds for one availability probe.",
         new HistogramConfiguration { Buckets = Histogram.ExponentialBuckets(0.25, 2, 12) });
 
+    private static readonly Counter DegenerateQueriesTotal = Metrics.CreateCounter(
+        "phantom_degenerate_queries_total",
+        "Indexer lookups whose title term was degenerate (empty / whitespace / punctuation-only), by resolution: repaired_original_title | repaired_alternate_title | imdb_only | degenerate_query_skipped.",
+        new CounterConfiguration { LabelNames = new[] { "type", "outcome" } });
+
     public static IDisposable TimeDiscoveryRun()
     {
         DiscoveryRunsTotal.Inc();
@@ -69,6 +74,13 @@ internal static class PhantomMetrics
 
     public static void AvailabilityProbe(string type, string outcome)
         => AvailabilityProbesTotal.WithLabels(type, outcome).Inc();
+
+    public static void DegenerateQuery(string type, string outcome)
+        => DegenerateQueriesTotal.WithLabels(type, outcome).Inc();
+
+    /// <summary>Current value of the degenerate-query counter (tests/diagnostics).</summary>
+    public static double DegenerateQueryCount(string type, string outcome)
+        => DegenerateQueriesTotal.WithLabels(type, outcome).Value;
 
     public static void SeriesExpansion(string outcome)
         => SeriesExpansionsTotal.WithLabels(outcome).Inc();
