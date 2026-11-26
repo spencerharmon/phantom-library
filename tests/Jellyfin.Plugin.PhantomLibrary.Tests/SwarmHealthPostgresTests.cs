@@ -93,6 +93,33 @@ public sealed class SwarmHealthPostgresTests : IAsyncLifetime
         Assert.Equal(PhantomDb.CurrentSchemaVersion, await ScalarIntAsync(_connectionString!, "SELECT version FROM phantom_schema_meta;"));
     }
 
+    [Fact]
+    public async Task PeersForTmdbIds_PerBatchIndexedLookup_MatchesFullAggregate_OnPostgres()
+    {
+        if (!Enabled)
+        {
+            return;
+        }
+
+        using var db = PhantomDb.CreatePostgres(_connectionString!);
+        var now = DateTimeOffset.UtcNow;
+        var rows = Enumerable.Range(1, 700)
+            .Select(i => new SwarmHealthMeasurement(i.ToString("x40", System.Globalization.CultureInfo.InvariantCulture), 5000 + (i % 350), i % 2 == 0 ? "movie" : "episode", -1, -1, i % 7, i == 699 ? now.AddDays(-30) : now))
+            .ToList();
+        await db.UpsertSwarmHealthAsync(rows, default);
+
+        foreach (var type in new[] { "movie", "episode" })
+        {
+            var full = await db.GetSwarmPeersByTmdbAsync(type, now.AddDays(-7), default);
+            // > one 500-id chunk, including ids with no measurement at all.
+            var ids = Enumerable.Range(4900, 600).ToList();
+            var batch = await db.GetSwarmPeersForTmdbIdsAsync(type, ids, now.AddDays(-7), default);
+            Assert.Equal(full.Where(kv => ids.Contains(kv.Key)).OrderBy(kv => kv.Key), batch.OrderBy(kv => kv.Key));
+        }
+
+        Assert.Empty(await db.GetSwarmPeersForTmdbIdsAsync("movie", Array.Empty<int>(), now.AddDays(-7), default));
+    }
+
     private static async Task ExecAsync(string cs, string sql, bool ignoreErrors = false)
     {
         await using var conn = new NpgsqlConnection(cs);
