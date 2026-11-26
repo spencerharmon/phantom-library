@@ -27,6 +27,28 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HEX = set("0123456789abcdef")
+MAX_BODY = 1 << 20
+
+
+def read_body(headers, rfile):
+    """Request body, honouring Content-Length or chunked transfer encoding (.NET's
+    PostAsJsonAsync streams JSON chunked, without a Content-Length)."""
+    if "chunked" in (headers.get("Transfer-Encoding") or "").lower():
+        body = b""
+        while True:
+            size = int(rfile.readline().split(b";", 1)[0].strip() or b"0", 16)
+            if size == 0:
+                while rfile.readline() not in (b"\r\n", b"\n", b""):
+                    pass
+                return body
+            body += rfile.read(size)
+            rfile.readline()
+            if len(body) > MAX_BODY:
+                raise ValueError("request body too large")
+    length = int(headers.get("Content-Length") or 0)
+    if length > MAX_BODY:
+        raise ValueError("request body too large")
+    return rfile.read(length) if length else b""
 PEER_BUCKETS = (0, 1, 2, 5, 10, 20, 50, 100, 200, 500)
 
 
@@ -186,8 +208,7 @@ def make_handler(dht, metrics, max_batch, min_nodes):
                 self._send(404, '{"error":"not found"}')
                 return
             try:
-                length = int(self.headers.get("Content-Length") or 0)
-                req = json.loads(self.rfile.read(length) or b"{}")
+                req = json.loads(read_body(self.headers, self.rfile) or b"{}")
                 hashes = normalize_hashes(req.get("info_hashes"), max_batch)
             except (ValueError, json.JSONDecodeError) as e:
                 self._send(400, json.dumps({"error": str(e)}))
@@ -226,6 +247,11 @@ def selftest():
     assert 'swarm_health_dht_peers_bucket{le="0"} 1' in body
     assert 'swarm_health_dht_peers_bucket{le="5"} 2' in body
     assert 'swarm_health_dht_peers_bucket{le="+Inf"} 3' in body and "swarm_health_dht_peers_sum 123" in body
+    import io
+    chunked = io.BytesIO(b"5\r\n{\"a\":\r\n3\r\n12}\r\n0\r\n\r\n")
+    assert read_body({"Transfer-Encoding": "chunked"}, chunked) == b'{"a":12}'
+    assert read_body({"Content-Length": "4"}, io.BytesIO(b"abcdXX")) == b"abcd"
+    assert read_body({}, io.BytesIO(b"")) == b""
     print("selftest ok")
 
 

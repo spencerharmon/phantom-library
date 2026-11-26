@@ -35,7 +35,10 @@ public class SwarmHealthClient
         }
 
         var uri = new Uri(new Uri(baseUrl.TrimEnd('/') + "/"), "measure");
-        using var resp = await _http.PostAsJsonAsync(uri, new MeasureRequest { InfoHashes = infoHashes.ToArray() }, ct).ConfigureAwait(false);
+        // Buffered (Content-Length) body: PostAsJsonAsync would stream it chunked.
+        using var content = JsonContent.Create(new MeasureRequest { InfoHashes = infoHashes.ToArray() });
+        await content.LoadIntoBufferAsync().ConfigureAwait(false);
+        using var resp = await _http.PostAsync(uri, content, ct).ConfigureAwait(false);
         resp.EnsureSuccessStatusCode();
         var body = await resp.Content.ReadFromJsonAsync<MeasureResponse>(cancellationToken: ct).ConfigureAwait(false);
         var map = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
