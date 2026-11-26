@@ -67,10 +67,16 @@ Requires .NET 9, Python 3 with PyYAML, Git and Podman (or a disposable PostgreSQ
 against the pinned Jellyfin gitlink, and runs a real worker/DB regression with a
 MeterListener. Missing DSN is never silently skipped. It covers movie/episode,
 both lanes, guarded/duplicate completions, disabled/enabled worker, transient
-outcomes, and cached backlog cadence. Then five Python tests run the actual CLI
+outcomes, and cached backlog cadence. Then nine Python tests run the actual CLI
 against controlled Kubernetes/Mimir HTTP responses and a read-only psql transport
 double. Reset, gap, stale, partial, missing lane/media, disabled worker, no demand,
 bad CPU/backlog, incomplete observation and invalid final receipts must fail.
+Boundary regressions independently cover claims/completions for both media types
+across both lanes: before-start-only and after-end-only increments must fail, while
+observed in-window increments (including an exact end scrape) count without fractions.
+Backlog regressions cover start/end excess for both media and eligible/leased states,
+including an excess smaller than interpolation would detect; exact boundary scrapes
+exclude unrelated outside excess.
 
 Container storage is isolated under ignored `.p0-test-runtime/`; the script removes
 its own container and shuts down build servers on exit. No live service is touched.
@@ -147,6 +153,19 @@ Prometheus `increase()` would otherwise compensate. Re-baseline after restarts/r
 Acceptance requires mean CPU <= min(0.092, baseline*0.2) cores, near-zero tuple-read
 growth (default exactly zero/hour), bounded eligible/leased backlog without growth,
 and eligible demand plus positive claims AND completions for both movies and episodes.
+Boundary policy: claims/completions count only the last minus first **actual scrape
+inside the closed interval** `[start,end]`, per series before lane/replica aggregation.
+An increment spanning either boundary cannot be the sole evidence of progress; it
+may have happened entirely outside the window. At least two in-window scrapes are
+required. This deliberately undercounts uncertain edge work. CPU and tuple-read
+interval deltas retain linear boundary interpolation; counter reset/gap checks
+still cover every fetched series, including its bracketing samples.
+
+The eligible/leased backlog maximum includes all in-window samples AND both interval
+boundaries. At an exact boundary scrape, use that value; otherwise use the **larger
+of the two bracketing gauge values**, not their interpolated average. This is a
+conservative bound on the sampled boundary, not a claim to detect unsampled spikes.
+The independent backlog-growth check continues to use interpolated boundary values.
 A nonzero tuple tolerance requires `seq_tolerance_evidence`, retained in the report.
 No-demand or quiet stopped workers do not prove improvement. A failed report remains
 useful evidence but must never be presented as a P0 pass.

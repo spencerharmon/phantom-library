@@ -169,6 +169,25 @@ print(urllib.request.urlopen(request).read().decode())
                     if cls.scenario == 'seq-reset' and i == len(times) // 2:
                         value = 0
                 values.append([timestamp, str(value)])
+            boundary = cls.boundary_fixture
+            if boundary and name == boundary['metric'] and dimension['media_type'] == boundary['media']:
+                # Deliberately straddle BOTH interval boundaries by 30s rather
+                # than accidentally testing exact scrapes at start/end. Derive
+                # end from the CLI query time so wall-clock ticks cannot flake it.
+                window_start, window_end = cls.window_start, now - 120
+                sample_times = (set(range(window_start - 90, now, 60))
+                                | {window_end - 30, window_end + 30, now}) - {window_start, window_end}
+                if boundary.get('exact'):
+                    sample_times |= {window_start, window_end}
+                if name.endswith(('claims_total', 'completions_total')):
+                    step = {'before-start': window_start - 1, 'after-end': window_end + 1,
+                            'inside-start': window_start + 31, 'inside-end': window_end - 30,
+                            'at-end': window_end}[boundary['edge']]
+                    values = [[t, str(10000 + int(t >= step))] for t in sorted(sample_times)]
+                elif dimension['state'] == boundary['state']:
+                    values = [[t, str(boundary['high'] if (
+                        t < window_start if boundary['edge'] == 'start' else t > window_end
+                    ) else 10)] for t in sorted(sample_times)]
             if cls.scenario == 'gap' and app:
                 del values[len(values) // 2:len(values) // 2 + 6]
             if cls.scenario == 'stale':
@@ -198,6 +217,7 @@ print(urllib.request.urlopen(request).read().decode())
     def setUp(self):
         type(self).scenario = 'good'
         type(self).sized = False
+        type(self).boundary_fixture = None
         self.now = int(time.time())
         endpoint = {'url': self.url, 'headers_env': {'Authorization': 'P0_TEST_AUTH'}}
         self.config = {'rollout_at': self.now - 90000, 'mimir': endpoint, 'kubernetes': endpoint,
@@ -266,6 +286,63 @@ print(urllib.request.urlopen(request).read().decode())
             with self.subTest(scenario=scenario):
                 type(self).scenario = scenario
                 self.cli(['--evaluate'], baseline, 'FAILED', fragment)
+
+    def test_outside_only_progress_fails_over_actual_cli(self):
+        baseline = self.baseline()
+        type(self).window_start = baseline['captured_at']
+        for instrument in ('claims', 'completions'):
+            for media in ('movie', 'episode'):
+                for edge in ('before-start', 'after-end'):
+                    with self.subTest(instrument=instrument, media=media, edge=edge):
+                        type(self).boundary_fixture = {
+                            'metric': 'phantom_availability_' + instrument + '_total',
+                            'media': media, 'edge': edge}
+                        self.cli(['--evaluate'], baseline, 'FAILED',
+                                 media + ': zero claims/completions')
+
+    def test_observed_boundary_progress_over_actual_cli(self):
+        baseline = self.baseline()
+        type(self).window_start = baseline['captured_at']
+        for instrument in ('claims', 'completions'):
+            for media in ('movie', 'episode'):
+                for edge, exact in (('inside-start', False), ('inside-end', False), ('at-end', True)):
+                    with self.subTest(instrument=instrument, media=media, edge=edge):
+                        type(self).boundary_fixture = {
+                            'metric': 'phantom_availability_' + instrument + '_total',
+                            'media': media, 'edge': edge, 'exact': exact}
+                        evidence, _ = self.cli(['--evaluate'], baseline)
+                        # One positively observed increment in EACH of two lanes;
+                        # interpolation must not invent fractional work at edges.
+                        self.assertEqual(evidence['progress'][media][instrument], 2)
+                        self.assertAlmostEqual(evidence['cpu_mean_cores'], .09)
+
+    def test_backlog_boundary_excess_fails_over_actual_cli(self):
+        # Permit growth so the END case specifically exercises backlog_max,
+        # not the existing independent backlog_growth_max rejection.
+        self.config['backlog_growth_max'] = 3000
+        baseline = self.baseline()
+        type(self).window_start = baseline['captured_at']
+        for media in ('movie', 'episode'):
+            for state in ('eligible', 'leased'):
+                for edge in ('start', 'end'):
+                    # 3000 reproduces the review's interpolated 1505 excess;
+                    # 1001 requires conservative bracketing, not interpolation.
+                    for high in (3000, 1001):
+                        with self.subTest(media=media, state=state, edge=edge, high=high):
+                            type(self).boundary_fixture = {
+                                'metric': 'phantom_availability_backlog', 'media': media,
+                                'state': state, 'edge': edge, 'high': high}
+                            self.cli(['--evaluate'], baseline, 'FAILED', media + ': backlog unbounded')
+
+    def test_backlog_exact_boundaries_exclude_outside_excess(self):
+        baseline = self.baseline()
+        type(self).window_start = baseline['captured_at']
+        for edge in ('start', 'end'):
+            with self.subTest(edge=edge):
+                type(self).boundary_fixture = {
+                    'metric': 'phantom_availability_backlog', 'media': 'movie',
+                    'state': 'eligible', 'edge': edge, 'high': 3000, 'exact': True}
+                self.cli(['--evaluate'], baseline)
 
     def test_short_history_and_policy_drift(self):
         baseline = self.baseline()

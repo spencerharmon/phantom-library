@@ -288,9 +288,28 @@ def at(points, when):
     raise ValueError('boundary not covered')
 
 
-def delta(points, start, end):
+def delta(points, start, end, *, observed_only=False):
     require(all(b[1] >= a[1] for a, b in zip(points, points[1:])), 'per-series counter reset')
+    if observed_only:
+        # Claims/completions are discrete work: a straddling increment might
+        # have occurred wholly outside the window. Count only differences
+        # between real in-window scrapes, never interpolated boundary values.
+        inside = [v for t, v in points if start <= t <= end]
+        require(len(inside) >= 2, 'insufficient in-window counter samples')
+        return inside[-1] - inside[0]
     return at(points, end) - at(points, start)
+
+
+def gauge_upper_at(points, when):
+    # With no exact boundary scrape, either bracketing value could still hold
+    # at the boundary. Use the larger value, not an interpolated average.
+    for t, v in points:
+        if t == when:
+            return v
+    for a, b in zip(points, points[1:]):
+        if a[0] < when < b[0]:
+            return max(a[1], b[1])
+    raise ValueError('boundary not covered')
 
 
 def cpu_quantity(value):
@@ -333,7 +352,8 @@ def run(args, evidence):
     metrics = probe.metrics(start, end, binding)
     totals = {}
     for key in ('cpu', 'claims', 'completions', 'seq'):
-        totals[key] = [(m, delta(p, start, end)) for m, p in metrics[key].values()]
+        totals[key] = [(m, delta(p, start, end, observed_only=key in ('claims', 'completions')))
+                       for m, p in metrics[key].values()]
     cpu = sum(v for _, v in totals['cpu']) / (end - start)
     require(cpu <= probe.thresholds['cpu_mean_cores_max'] + 1e-12, 'CPU mean exceeds threshold')
     for _, growth in totals['seq']:
@@ -349,7 +369,9 @@ def run(args, evidence):
         require(any(v > 0 for p in eligible for t, v in p if start <= t <= end), media + ': no eligible demand evidence')
         active = [p for m, p in metrics['backlog'].values() if m['media_type'] == media and m['state'] in ('eligible', 'leased')]
         for points in active:
-            require(max(v for t, v in points if start <= t <= end) <= probe.thresholds['backlog_max'], media + ': backlog unbounded')
+            maximum = max([gauge_upper_at(points, start), gauge_upper_at(points, end)]
+                          + [v for t, v in points if start <= t <= end])
+            require(maximum <= probe.thresholds['backlog_max'], media + ': backlog unbounded')
             require(at(points, end) - at(points, start) <= probe.thresholds['backlog_growth_max'], media + ': backlog growing')
         progress[media] = {key: sum(v for m, v in totals[key] if m['media_type'] == media) for key in ('claims', 'completions')}
         require(all(v > 0 for v in progress[media].values()), media + ': zero claims/completions under eligible demand (disabled/stalled)')

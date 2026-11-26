@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   See `docs/tasks/p0-probe-load-observability.md`. No schema or deployment change.
 
 ### Fixed
+- P0 acceptance requires positively observed in-window claims/completions rather
+  than interpolated progress from outside the window. Backlog limits now include
+  conservative start/end boundary values; CPU integration is unchanged. Actual CLI
+  regressions cover both media types, both work counters, and eligible/leased backlog.
 - Preserve independent loaded-config fields in offline gostream drift reports:
   after process binding, a missing or invalid sibling no longer hides a valid
   match or mismatch. Whole-receipt and ownership failures still invalidate all
