@@ -85,6 +85,7 @@
         fields: null,
         lastResponse: null,
         probed: false,
+        probeAgain: false,
         requests: 0
     };
 
@@ -419,19 +420,39 @@
         if (!v || v.__phantomPlayerStatsHooked) return;
         v.__phantomPlayerStatsHooked = true;
         var onMediaStart = function () {
-            if (!st.open) return;
-            if (st.stoppedByServer) {
-                rearm();
-                reconcile();
+            if (!st.open || pageHidden()) return;
+            // A collapsed startup probe can race Sessions/Playing (or fail).
+            // Retry ONLY on a bounded media lifecycle event, never a timer or
+            // a DOM mutation. Also discard the previous episode's response.
+            if (st.collapsed) {
+                st.lastResponse = null;
+                hideOverlay();
+                if (st.inflight) {
+                    st.probeAgain = true; // coalesce starts while the first probe is pending
+                } else {
+                    st.generation++;
+                    st.probed = false;
+                }
             }
+            if (st.stoppedByServer) rearm();
+            reconcile();
         };
         v.addEventListener('loadstart', onMediaStart);
         v.addEventListener('playing', onMediaStart);
     }
 
-    /* Collapsed + freshly opened player: ONE bounded request (never re-armed)
-     * to learn whether this is a phantom item, so the collapsed pill can be
-     * shown for re-expansion. Collapsed never polls. */
+    /* One probe per open/media-start event to resolve the expansion pill.
+     * Collapsed never runs a polling timer. */
+    function finishProbe() {
+        st.inflight = false;
+        if (!st.probeAgain) return;
+        st.probeAgain = false;
+        if (!st.open || pageHidden()) return;
+        st.probed = false;
+        st.lastResponse = null;
+        reconcile();
+    }
+
     function probeOnce() {
         var api = getApiClient();
         if (!api || typeof api.ajax !== 'function' || st.inflight) return;
@@ -439,15 +460,21 @@
         st.inflight = true;
         st.probed = true;
         st.requests++;
-        Promise.resolve(api.ajax({ type: 'GET', url: api.getUrl(ENDPOINT), dataType: 'json' })).then(function (res) {
-            st.inflight = false;
-            if (gen !== st.generation || !st.open) return;
-            res = res || {};
-            st.lastResponse = res;
-            if (res.playing && res.isPhantom) render(res);
-        }, function () {
-            st.inflight = false;
-        });
+        var request;
+        try {
+            request = api.ajax({ type: 'GET', url: api.getUrl(ENDPOINT), dataType: 'json' });
+        } catch (e) {
+            finishProbe();
+            return;
+        }
+        Promise.resolve(request).then(function (res) {
+            if (gen === st.generation && st.open && !pageHidden() && !st.probeAgain) {
+                res = res || {};
+                st.lastResponse = res;
+                if (res.playing && res.isPhantom) render(res);
+            }
+            finishProbe();
+        }, finishProbe);
     }
 
     function reconcile() {
@@ -459,13 +486,14 @@
         if (!(st.collapsed && st.open) || pageHidden()) return;
         if (st.lastResponse && st.lastResponse.playing && st.lastResponse.isPhantom) {
             showOverlay();
-        } else if (!st.lastResponse && !st.probed) {
+        } else if (!st.probed) {
             probeOnce();
         }
     }
 
     function sync() {
         var open = isPlayerOpen();
+        if (!open || pageHidden()) st.probeAgain = false;
         if (open && !st.open) {
             st.open = true;
             st.lastResponse = null;

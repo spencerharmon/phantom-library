@@ -22,13 +22,11 @@
 #   3. The rig gostream mock's new /api/library/stats endpoint (real HTTP server
 #      on an ephemeral port; loaded-on-add semantics, 404/400, stats log).
 #   4. The live-rig scenario tools/rig-scenarios/52-player-stats-overlay.sh
-#      (movie AND episode on :18096; overlay served/injected; stats payload;
-#      polling stops when playback stops) is executable, syntax/shellcheck/
-#      py_compile clean, prod-port-refusing and trap-clean. It is RUN here
-#      when PHANTOM_P14_LIVE_RIG=1 (fails hard if the rig cannot start) or
-#      automatically when the seeded rig prerequisites exist and :18096 is free.
+#      (movie AND episode on :18096; actual injected web asset in Chromium,
+#      real stream bytes, stats payload, zero polling after stop). Always RUN
+#      on a fresh synthetic rig built from this checkout. No optional skip.
 #
-# Exit 0 = all assertions passed. No optional skip of 1–3.
+# Exit 0 = all assertions including live playback passed.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 # Importing tools/rig-scenarios/gostream-mock.py must not rewrite the tracked
@@ -39,9 +37,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 TEST_PROJ="$REPO_ROOT/tests/Jellyfin.Plugin.PhantomLibrary.Tests/Jellyfin.Plugin.PhantomLibrary.Tests.csproj"
 TEST_CLASS="Jellyfin.Plugin.PhantomLibrary.Tests.PlayerStatsOverlayTests"
-EXPECTED_TESTS=31
+EXPECTED_TESTS=35
 OVERLAY_HARNESS="$REPO_ROOT/tools/rig-scenarios/phantom-player-stats-overlay-dom.mjs"
-EXPECTED_OVERLAY_CASES=16
+EXPECTED_OVERLAY_CASES=19
 GOSTREAM_MOCK="$REPO_ROOT/tools/rig-scenarios/gostream-mock.py"
 SCENARIO="$REPO_ROOT/tools/rig-scenarios/52-player-stats-overlay.sh"
 
@@ -167,53 +165,9 @@ pass "gostream mock stats endpoint"
 # ---------------------------------------------------------------------------
 note "4. live-rig scenario 52 (movie + episode on :18096)"
 [[ -x "$SCENARIO" ]] || fatal "scenario not executable: $SCENARIO"
-bash -n "$SCENARIO" || fatal "scenario has a bash syntax error"
-if command -v shellcheck >/dev/null 2>&1; then
-    shellcheck -S warning "$SCENARIO" || fatal "scenario fails shellcheck -S warning"
-    pass "shellcheck -S warning clean"
-fi
-python3 - "$SCENARIO" "$WORK" <<'PY' || fatal "embedded python in scenario does not compile"
-import re, sys, py_compile
-src = open(sys.argv[1]).read()
-bodies = re.findall(r"<<'PY'[^\n]*\n(.*?)\nPY\n", src, re.S)
-assert len(bodies) >= 3, f"expected heredoc python bodies, found {len(bodies)}"
-for i, b in enumerate(bodies):
-    p = f"{sys.argv[2]}/heredoc-{i}.py"
-    open(p, "w").write(b)
-    py_compile.compile(p, doraise=True)
-print(f"  {len(bodies)} quoted-heredoc python bodies py_compile clean")
-PY
-# Structural guarantees the scenario must keep (it is the live proof).
-for needle in \
-    'REFUSING to run against production port :8096' \
-    'trap cleanup EXIT INT TERM' \
-    'rig-up.sh --reset' \
-    'rig-down.sh' \
-    'Plugins/PhantomLibrary/playerstats.js' \
-    'PlayerStats/Current' \
-    'Sessions/Playing' \
-    'phantom-player-stats-overlay-dom.mjs --live' \
-    'play_and_assert "$ALPHA_ID" movie' \
-    'play_and_assert "$EP_ID" episode' \
-    'gostream still receiving stats requests after playback stopped'; do
-    grep -qF -- "$needle" "$SCENARIO" || fatal "scenario lost required step: $needle"
-done
-pass "scenario structure: prod refusal, trap teardown, movie+episode, served/injected script, stop-polling proof"
-
-run_live=0
-if [[ "${PHANTOM_P14_LIVE_RIG:-0}" == "1" ]]; then
-    run_live=1
-elif [[ -s /var/tmp/jf-test/data/data/jellyfin.db && -f "$REPO_ROOT/jellyfin/Jellyfin.Server/bin/Release/net9.0/jellyfin.dll" ]] \
-    && ! (exec 3<>/dev/tcp/127.0.0.1/18096) 2>/dev/null; then
-    run_live=1
-fi
-if [[ "$run_live" == "1" ]]; then
-    PHANTOM_REPO_ROOT="$REPO_ROOT" bash "$SCENARIO" | tee "$WORK/scenario-52.log"
-    grep -q '^PLAYER_STATS_OVERLAY_OK' "$WORK/scenario-52.log" || fatal "live scenario 52 did not complete"
-    pass "LIVE scenario 52 passed (movie + episode)"
-else
-    printf '  NOTE: live rig not run here (no seeded /var/tmp/jf-test clone + built patched Jellyfin, or :18096 already bound by a non-rig server).\n'
-    printf '        Run it on the rig host: PHANTOM_P14_LIVE_RIG=1 %s\n' "${BASH_SOURCE[0]}"
-fi
+# No PHANTOM_P14_LIVE_RIG switch: missing tools/build/browser/live server FAIL.
+PHANTOM_REPO_ROOT="$REPO_ROOT" bash "$SCENARIO" | tee "$WORK/scenario-52.log"
+grep -q '^PLAYER_STATS_OVERLAY_OK' "$WORK/scenario-52.log" || fatal "live scenario 52 did not complete"
+pass "LIVE scenario 52 passed (movie + episode + real browser)"
 
 printf '\nP14 PLAYER STATS OVERLAY: ALL CHECKS PASSED\n'

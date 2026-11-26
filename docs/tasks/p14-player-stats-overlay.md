@@ -1,99 +1,101 @@
-# p14-player-stats-overlay — in-player source + stream-health overlay (ROI P14)
+# P14 — player source and stream stats (rework; not yet accepted)
 
-## Contract
+## API and source ownership
 
-While a Phantom movie/episode is playing, the Jellyfin web/mobile player shows a
-small, collapsible panel with the current **source** (release, size, indexer) and
-live **stream health** (peers / seeders, download rate, buffered-ahead, gostream
-stream state), polled every 2–5 s **only while the player is open**.
+`GET /Plugins/PhantomLibrary/PlayerStats/Current` requires the caller's Jellyfin
+user/device session. `GET /PlayerStats/{itemId}?mediaSourceId=&playSessionId=`
+requires a playing user's matching item (administrators may inspect without
+playing). The server alone calls gostream `/api/library/stats?hash=...` with its
+library token, with a four-second timeout. No token, internal URL or file path
+is returned. Explicit unknown/null fields survive Jellyfin serialization.
 
-## Endpoints (`PhantomLibraryPlayerStatsController`)
+`Materialiser` snapshots the candidate that actually succeeded, including cached
+candidates, after gostream add and the file-ready check. It passes magnet/hash,
+size, seeders, indexer and release title to `InsertMaterialisedStateAsync`.
+That method writes state and the snapshot in **one database transaction**.
+The mutable availability recommendation (`magnet_cache`) is not a source of
+playing stats. Candidate titles are consulted only at materialisation; later
+candidate sweeps, availability writes and preset changes do not alter the snapshot.
 
-| Route | Auth | Purpose |
-| --- | --- | --- |
-| `GET /Plugins/PhantomLibrary/playerstats.js` | anonymous | the overlay shim (embedded `Configuration/phantomPlayerStats.js`) |
-| `GET /Plugins/PhantomLibrary/PlayerStats/Current` | any user | what the overlay polls: resolves the **caller's own** session (`Jellyfin-UserId` + `Jellyfin-DeviceId` claims) → now-playing item → stats. Nothing playing → `{status:"not_playing", playing:false}` |
-| `GET /Plugins/PhantomLibrary/PlayerStats/{itemId}?playSessionId=&mediaSourceId=` | user playing it / admin | per-item, per-playback-session form. Non-admin not playing that item (or a different `mediaSourceId`) → **403**; unknown item → 404 |
+Storage: existing `plugin_meta` key
+`materialised-source/v1/<type>/<tmdb>/<season>/<episode>`, JSON with version,
+stub/FUSE path and materialised timestamp witnesses. No schema/table/column change
+or migration. Both SQLite and PostgreSQL use the existing provider transaction and
+key upsert. Old binaries ignore the new key. Unknown versions, malformed JSON,
+unbound legacy state or mismatched witnesses return `no_source`, never a cache
+guess. A new unbound materialisation clears the snapshot; restoring an eviction's
+explicit original timestamp preserves its witnessed snapshot. Removing state
+makes the snapshot unreadable. At most one snapshot exists per item tuple.
 
-Response (`PlayerStatsResponse`, camelCase, nullable fields always present —
-`JsonIgnore(Never)` overrides the host's `WhenWritingNull`, so `null` means
-"not known", never a fabricated 0):
+Release falls back to the winning magnet's display name when no candidate title
+exists. Hashes accept hex/base32 and normalize to gostream's v1 hex contract.
+Movie and episode use the same service with their respective tuple sentinels.
+No gostream pin change: the isolated rig uses its real-HTTP fake engine; production
+must already provide the linked gostream stats endpoint.
 
+## Web and mobile lifecycle
+
+Embedded `playerstats.js` is served by the plugin, anonymously with no-cache.
+Existing `badges.js` injects it; `install.sh` also supports its own idempotent tag.
+The load guard prevents duplicate instances. Values use textContent, not HTML.
+Desktop uses a compact card, mobile a full-width strip with a 44px toggle.
+
+Visible expanded playback polls every 2–5s, at most one request in flight. Closing,
+backgrounding, collapsing, non-phantom playback or a stopped server session stops
+polling. A collapsed player performs only a bounded resolution probe, never a
+timer; loadstart/playing can recover an initial not-playing/error response.
+Concurrent start events coalesce one follow-up after an in-flight probe. Episode
+transitions discard the previous display and resolve again.
+
+## Mandatory verification
+
+```sh
+beehive submodule worktree exec phantom-library bee-p14-player-stats-overlay -- ./scripts/tests/p14-player-stats-overlay.test.sh
 ```
-status  ok | not_playing | not_phantom | materialising | not_materialised |
-        no_source | invalid_hash | torrent_not_loaded | gostream_unavailable | item_not_found
-playing, isPhantom, itemId, type(movie|episode), tmdbId, season, episode,
-playSessionId, mediaSourceId, isPaused, positionTicks, materialisedAt,
-source { release, releaseSource(candidate|magnet_dn), sizeBytes, indexer, infoHash, seedersAtSelection }
-stream { state(warmup|streaming|stalled|idle), peers, seeders, downloadRateBytesPerSec,
-         bytesCompleted, torrentSize, readOffset, bufferedAheadBytes, bufferedAheadSeconds,
-         lastReadAt, torrentSampledAt, streamSampledAt }
-pollIntervalMs (3000)
-```
 
-## Resolution (`Playback/PlayerStatsService`)
+35 .NET controller/fake-gostream/SQLite tests; 19 simulated-DOM lifecycle tests;
+real HTTP mock contract; then **mandatory** scenario 52. There is no live-skip
+switch. Missing prerequisites or failed browser playback fail the whole command.
+The old simulated-DOM `--live` path and clone/systemd scenario were removed.
 
-1. `ILibraryManager.GetItemById` → must be a Phantom channel item
-   (`ChannelIds.IsPhantom`, not tagged `external`) whose `ExternalId` parses as
-   `movie_<tmdb>` / `episode_<tmdb>_s<S>e<E>`; else `not_phantom`.
-2. `materialised_state` row (sentinels −1 for movies) → else `materialising`
-   (in-flight row) / `not_materialised`.
-3. `PhantomDb.GetMaterialisedSourceMagnetAsync`: newest `magnet_cache` row for the
-   tuple (movie 0/0), current preset first, **TTL and imdb half ignored** (an
-   expired TTL only gates the next materialise; the open file is still that
-   torrent) → else `no_source`.
-4. Release = `source_candidates.title` for the same magnet/hash
-   (`GetSourceCandidateTitleAsync`), else the magnet `dn`.
-5. Info-hash normalised to lowercase 40-hex (hex or base32; falls back to the
-   magnet `btih`) → else `invalid_hash`.
-6. `IGostreamClient.GetTorrentStatsAsync` → gostream
-   `GET /api/library/stats?hash=` (gostream:phantom-player-stats-endpoint) with
-   the **server-side** `X-Gostream-Token`, 4 s budget. 404 → `torrent_not_loaded`;
-   401/403/5xx/timeout/unreachable → `gostream_unavailable` (upstream text is
-   logged, never echoed).
+Scenario 52 reuses `isolated-playback-rig.py --backend sqlite --player-stats`:
+- Builds v10.11.9 Jellyfin with all repository patches and this checkout's plugin.
+- Creates fresh synthetic state and owns/cleans every service; no production DB,
+  global rig, systemd unit or deployment. Port 18096 collisions fail closed.
+- Uses pinned, SHA256-verified official Jellyfin web 10.11.11, injecting **only**
+  the badges tag, so the actual bootstrap must fetch this build's overlay.
+- Logs into real Chromium/Jellyfin, clicks the real Play button, verifies live
+  source/stream payloads, 2–5s cadence, desktop/mobile layout, served asset bytes
+  against source, HTTP media requests, and zero polling after browser Back causes
+  Jellyfin to report Stopped. Native REST playback also saves 4096 stream bytes.
+- Uses 90-second generated media; the general parity rig's two-second fixtures
+  were too short to test multiple stats polls.
+- Retains per-run `artifacts/playback-parity-*/` build/server/plugin/web hashes,
+  raw responses, stream bytes, screenshots and cleanup receipts. Synthetic browser
+  console tokens are redacted. Build servers/node reuse are disabled.
 
-Per poll: one cached item lookup, ≤4 single-row indexed reads, ≤1 gostream GET.
-No writes, no TMDB/indexer calls. The response never contains the gostream
-token, URL, stub or FUSE path.
+Requires .NET 9, Node/npm, Python, patch and public network downloads. Playwright
+is lockfile-pinned in `tools/rig-scenarios/browser`; it uses host Chromium if
+available or fetches its matching browser. `PHANTOM_P14_CHROMIUM` can select a
+compatible browser. Existing `PHANTOM_PARITY_{SERVER,PLUGIN,FFMPEG}` artifact
+injection supports iteration; release proof should use the default candidate build.
+`PHANTOM_P14_WEB_ARCHIVE` can reuse the **same hash-verified** archive offline.
+See `docs/tasks/postgres-playback-parity-rig.md` for the base rig contract.
 
-## Overlay (`Configuration/phantomPlayerStats.js`)
+## Current gate: native episode queue prerequisite
 
-- Loaded by `badges.js` (already injected into every jellyfin-web `index.html` by
-  the fork image / `install.sh`) and by its own `install.sh` tag
-  (`<!--phantom-library-playerstats-->`). Double load is a no-op
-  (`window.__phantomPlayerStatsLoaded`). The jellyfin fork Dockerfile needs no
-  change for the overlay to ship; adding its own tag there is optional.
-- Player open = `#/video` route or `<video class="htmlvideoplayer">` present.
-  Polls immediately, then every `pollIntervalMs` clamped to 2000–5000 ms, one
-  request in flight, stale responses discarded.
-- Stops on player close, `visibilitychange` → hidden, collapse toggle,
-  server `not_playing` (after playing was seen, or after 5 start-up answers) or
-  `not_phantom`. The `<video>` element's next `loadstart`/`playing` (autoplay of
-  the next episode) re-arms it.
-- Toggle: click the header; preference persists in `localStorage`
-  (`phantomPlayerStats.collapsed`). Collapsed never polls (one bounded probe on a
-  fresh player to know whether to show the pill).
-- Layout: desktop card top-right; mobile (≤720 px or coarse pointer) full-width
-  strip under the OSD with 44 px toggle. All dynamic text via `textContent`.
+Full default check currently **fails**, honestly. Movie browser playback passes
+with live stats and zero polls after stop. Episode REST native-open, stream bytes
+and stats pass, but the real web Play path first calls the all-series endpoint:
 
-## Rig / gostream pin
+`GET /Shows/{seriesId}/Episodes?IsVirtualUnaired=false&IsMissing=false&UserId=...&Fields=Chapters,Trickplay&limit=100&startItemId={episodeId}`
 
-The local rig talks to `tools/rig-scenarios/gostream-mock.py`, which now serves
-`/api/library/stats` (hash loaded on `/api/library/add`; 404/400 per contract;
-every request appended to `logs/gostream-mock-stats.jsonl`). The CI live rig pulls
-the gostream **registry image**. Neither uses the nested `gostream` submodule
-pin, so it was not bumped.
-
-## Tests
-
-`scripts/tests/p14-player-stats-overlay.test.sh` (task `Check:`):
-1. `dotnet test --filter PlayerStatsOverlayTests` — 31 real controller tests vs an
-   HttpListener fake gostream; exact count, zero skips.
-2. `node tools/rig-scenarios/phantom-player-stats-overlay-dom.mjs` — the real
-   shim on a virtual clock (16 lifecycle/layout/injection cases).
-3. gostream-mock stats endpoint over real HTTP.
-4. `tools/rig-scenarios/52-player-stats-overlay.sh` static gates; runs LIVE when
-   `PHANTOM_P14_LIVE_RIG=1` (or the seeded rig exists and :18096 is free):
-   movie + episode, overlay served/bootstrapped, exact proxied stats, owner 200 /
-   other-user 403, real overlay `--live` → `Sessions/Playing/Stopped` → zero
-   further gostream stats requests.
+It returns `200 {Items:[],TotalRecordCount:0}`. The season-scoped endpoint lists the
+same materialised episode (`LocationType=FileSystem`), and the same user can stream
+it. Jellyfin web shows "Unable to find a valid media source to play" before any
+PlaybackInfo/player/stats request. The likely boundary is native
+`Series.GetEpisodes` (SeriesPresentationUniqueKey + Season aggregation) versus
+`Season.GetEpisodes`; no fixture SQL or browser queue bypass was added to hide it.
+Hive prerequisite `p14-native-episode-web-queue` owns that fix and its independent
+native API/browser regression. P14 remains TODO-blocked until the prerequisite
+lands and the full mandatory check passes. This is not a production rollout.

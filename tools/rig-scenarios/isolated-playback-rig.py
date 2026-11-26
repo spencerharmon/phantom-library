@@ -298,8 +298,12 @@ def scenario(kind, root, server, candidate, backend, base_env, suite="playback",
             pg.open()
         for name in ("data/plugins/configurations/PhantomLibrary", "config", "cache", "logs", "responses", "tmp"):
             (root / name).mkdir(parents=True)
-        jf_port, tmdb_port, go_port = port(), port(), port()
+        jf_port, tmdb_port, go_port = (18096 if env.get("PHANTOM_P14") == "1" else port()), port(), port()
         assert len({jf_port, tmdb_port, go_port}) == 3
+        # Refuse a collision; never stop a caller-owned server to claim the port.
+        with socket.socket() as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind(("127.0.0.1", jf_port))
         env.update(PHANTOM_REPO_ROOT=str(REPO), JF_RIG_ROOT=str(root), TMDB_MOCK_PORT=str(tmdb_port), GOSTREAM_MOCK_PORT=str(go_port),
             GOSTREAM_MOCK_RESPONSE_MOVIES_ROOT="/mnt/gostream-mkv-virtual/movies",
             PHANTOM_RIG_API=f"http://127.0.0.1:{jf_port}", PHANTOM_RIG_OUTPUT=str(root / "responses"),
@@ -452,7 +456,10 @@ def main():
     parser.add_argument("--episode-web-queue", action="store_true",
                         help="episode: regular-user native queue + real jellyfin-web/Chromium Play (desktop+mobile)")
     parser.add_argument("--suite", choices=("playback", "stale-candidate"), default="playback")
+    parser.add_argument("--player-stats", action="store_true", help="mandatory :18096 real web/browser stats for both item types")
     args = parser.parse_args()
+    if args.player_stats and args.scenario != "both":
+        parser.error("--player-stats requires both movie and episode")
     artifacts = REPO / "artifacts"
     artifacts.mkdir(exist_ok=True)
     root = Path(tempfile.mkdtemp(prefix="playback-parity-", dir=artifacts))
@@ -467,6 +474,9 @@ def main():
         env["PHANTOM_RIG_FFMPEG"] = ffmpeg(root)
         if args.episode_web_queue:
             env.update(PHANTOM_WEB_QUEUE="1", PHANTOM_RIG_MEDIA_SECONDS="30")
+        if args.player_stats:
+            env.update(PHANTOM_P14="1", PHANTOM_RIG_MEDIA_SECONDS="90")
+        if args.episode_web_queue or args.player_stats:
             pinned_web(root, env)
         server, candidate = build(root, env)
         control = build_availability_control(root, server, candidate, env) if args.suite == "stale-candidate" else None

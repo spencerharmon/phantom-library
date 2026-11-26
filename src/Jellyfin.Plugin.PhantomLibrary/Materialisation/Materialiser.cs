@@ -63,7 +63,7 @@ public sealed class Materialiser : IMaterialiser
     private sealed record CandidateAddRequest(GostreamAddRequest Request, MagnetCandidate Magnet, bool FromCache, int Rank = 0, SourceCandidateRow? SourceRow = null);
     private sealed record CandidatePlan(IReadOnlyList<CandidateAddRequest> InitialCandidates, Task<IReadOnlyList<CandidateAddRequest>>? FreshCandidatesTask);
     private sealed record CandidateValidation(CandidateAddRequest Candidate, GostreamValidateResult Result, string SessionId);
-    private sealed record CandidateAddResult(GostreamAddResult AddResult, string FusePath);
+    private sealed record CandidateAddResult(GostreamAddResult AddResult, string FusePath, MaterialisedSource Source);
 
     private static readonly string[] RequiredAudioLanguages = { "eng", "en", "english" };
 
@@ -380,7 +380,7 @@ public sealed class Materialiser : IMaterialiser
                 tmdbId, type, sSentinel, eSentinel,
                 stubPath: addResult.AddResult.StubPath,
                 fusePath: addResult.FusePath,
-                ct).ConfigureAwait(false);
+                ct, source: addResult.Source).ConfigureAwait(false);
 
             // Post-flight refresh: channel now emits real MediaSource.
             // Invalidate dynamic media-source cache before queueing the
@@ -1572,7 +1572,18 @@ public sealed class Materialiser : IMaterialiser
                     }
                 }
 
-                return new CandidateAddResult(result, fusePath);
+                // Snapshot the actual winner, including cached candidates. Availability
+                // and preset changes can overwrite magnet_cache immediately afterwards.
+                var title = validated.Magnet.Title;
+                if (string.IsNullOrWhiteSpace(title))
+                {
+                    var (s, e) = ChannelItemId.ToSentinels(season, episode);
+                    title = await _db.GetSourceCandidateTitleAsync(tmdbId, type, s, e,
+                        validated.Magnet.Magnet, validated.Magnet.InfoHash, cfg.SourcePickerPreset, ct).ConfigureAwait(false);
+                }
+                return new CandidateAddResult(result, fusePath, new MaterialisedSource(
+                    validated.Magnet.Magnet, validated.Magnet.InfoHash, validated.Magnet.Size,
+                    validated.Magnet.Seeders, validated.Magnet.Indexer, title));
             }
             catch (OperationCanceledException)
             {
