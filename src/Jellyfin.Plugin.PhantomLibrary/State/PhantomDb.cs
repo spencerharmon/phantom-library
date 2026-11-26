@@ -3782,6 +3782,55 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         return map;
     }
 
+    /// <summary>
+    /// p05-baseitem-writeback: <see cref="GetSwarmPeersByTmdbAsync"/> restricted to the
+    /// given TMDB ids — the per-batch read of the BaseItem score sweep. Each lookup is an
+    /// equality probe on <c>idx_swarm_health_item(type, tmdb_id)</c>, so the cost is
+    /// O(batch), never a scan of every measurement on every tick.
+    /// </summary>
+    public async Task<IReadOnlyDictionary<int, int>> GetSwarmPeersForTmdbIdsAsync(
+        string type,
+        IReadOnlyCollection<int> tmdbIds,
+        DateTimeOffset freshAfter,
+        CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        ArgumentNullException.ThrowIfNull(tmdbIds);
+        var map = new Dictionary<int, int>();
+        var ids = tmdbIds.Distinct().ToList();
+        if (ids.Count == 0)
+        {
+            return map;
+        }
+
+        const int Chunk = 500;
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        for (var offset = 0; offset < ids.Count; offset += Chunk)
+        {
+            var chunk = ids.Skip(offset).Take(Chunk).ToList();
+            await using var cmd = conn.CreateCommand();
+            var names = new string[chunk.Count];
+            for (var i = 0; i < chunk.Count; i++)
+            {
+                names[i] = "@t" + i.ToString(CultureInfo.InvariantCulture);
+                cmd.AddWithValue(names[i], chunk[i]);
+            }
+
+            cmd.CommandText = $@"SELECT tmdb_id, MAX(dht_peers) FROM swarm_health
+                WHERE type = @type AND tmdb_id IN ({string.Join(',', names)}) AND checked_at >= @fresh
+                GROUP BY tmdb_id;";
+            cmd.AddWithValue("@type", type);
+            cmd.AddWithValue("@fresh", freshAfter.ToUnixTimeSeconds());
+            await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+            while (await r.ReadAsync(ct).ConfigureAwait(false))
+            {
+                map[r.GetInt32(0)] = Convert.ToInt32(r.GetValue(1), CultureInfo.InvariantCulture);
+            }
+        }
+
+        return map;
+    }
+
     public async Task<IReadOnlyList<VisibleMovieRow>> ListVisibleMovieRowsAsync(CancellationToken ct)
         => await ListVisibleMovieRowsAsync(DefaultDeadSwarmBrowsePruneThreshold, ct).ConfigureAwait(false);
 
