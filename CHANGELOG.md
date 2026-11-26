@@ -28,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SwarmHealthServiceUrl` is empty. Metrics: `phantom_swarm_health_*`.
 
 ### Fixed
+- Plugin 0.5.7.47: successful availability re-probes now invalidate the affected
+  channel when a previously assessed available movie/episode regains an empty or
+  expired candidate cache. REST browse (including series → season → episode)
+  recovers on the same running server; fresh-cache refreshes do not churn channel
+  versions. No browse SQL, scheduling priority or schema change.
 - Harden the independent swarm-health service: BEP33 bloom estimates and bounded
   peer observations, unknown/partial/timeout results instead of false dead swarms,
   bounded/coalesced priority scheduling, cancellation, HTTP limits, TTL/LRU cache,

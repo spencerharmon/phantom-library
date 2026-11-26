@@ -19,10 +19,13 @@ this owned PostgreSQL rig (`--suite stale-candidate`), not the old clone. It
 asserts movie/episode browse exclusion, exactly one real hosted-worker tick,
 external HTTP re-probe/candidate persistence and restored REST visibility.
 A test-only control assembly exposes the existing private tick and repository
-reads without changing the production plugin. See [its contract and observed
-cache-invalidation failure](../tasks/availability-stale-candidate-reprobe-verify-001.md).
-The check intentionally fails on that application defect; structural/unit tests
-or repository-only visibility cannot substitute for REST restoration.
+reads without adding production test endpoints. See [its contract and measured
+cache recovery](../tasks/availability-stale-candidate-reprobe-verify-001.md).
+Plugin 0.5.7.47 passes both stale-recovery scenarios and ordinary PostgreSQL 35/36
+playback; 0.5.7.45/46 failed real REST restoration despite repository success.
+Structural/unit tests or repository-only visibility cannot substitute for that
+live contract. `AvailabilityCacheInvalidationTests` additionally guards narrow
+movie/show version changes and unchanged fresh-cache/transient behavior.
 
 Operator does not want to be in the loop for every test cycle.
 Run live integration tests yourself against a clone of the
