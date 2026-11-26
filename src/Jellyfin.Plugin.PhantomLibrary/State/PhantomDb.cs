@@ -366,7 +366,8 @@ public sealed record HiddenItemRow(int TmdbId, string Type, DateTimeOffset Hidde
 /// EXPAND phase only: the legacy INTEGER columns are kept (never retyped or
 /// dropped here), new writers dual-write (legacy column = the size when it
 /// fits int32, else <see cref="LegacySizeOverflowSentinel"/>; companion =
-/// the exact value), and every read resolves through
+/// the exact value plus nullable candidate/file identity witnesses), and
+/// every read resolves through
 /// <see cref="ResolvedSizeSql"/>, which tolerates a still-running pre-v23
 /// writer that updates only the legacy column. No data update/backfill is
 /// performed; the v22-&gt;v23 Postgres migration self-applies via
@@ -404,17 +405,31 @@ public sealed class PhantomDb : IDisposable
     /// SQL expression resolving a media size from a legacy 32-bit column and
     /// its BIGINT <c>*_bytes</c> companion, tolerant of a still-running pre-v23
     /// (legacy) writer that only knows the legacy column. The companion is
-    /// trusted ONLY while the legacy column still "witnesses" it — it equals
-    /// the companion (a small value written by a v23 writer) or holds the
-    /// overflow sentinel (a value too large for the legacy column, written by a
-    /// v23 writer). Once a legacy writer overwrites the legacy column (a new
-    /// value or NULL), it no longer witnesses the companion, so the stale
-    /// companion is ignored and the legacy writer's value wins. A pre-expand
-    /// row (companion NULL) resolves to the legacy value unchanged, so no data
-    /// backfill is needed for correctness.
+    /// trusted when the legacy value equals it, or when BOTH the overflow
+    /// sentinel and the saved identity witness still match. Old readers CAN
+    /// feed -1 back into old writers (Materialiser recaches source candidates;
+    /// PhantomSourceManager re-marks availability from cache). Sentinel alone
+    /// cannot prove that the leftover bytes describe the current candidate.
+    /// Identity comprises magnet AND info hash; selected-file sizes additionally
+    /// witness file ID AND path, null-safely. New writers atomically save these
+    /// witnesses with bytes. A legacy identity change therefore degrades to
+    /// explicit unknown, never the preceding candidate's positive byte count.
+    /// Pre-expand rows (companion NULL) need no backfill. Arguments are trusted
+    /// SQL identifiers only; candidatePrefix includes any table alias.
     /// </summary>
-    internal static string ResolvedSizeSql(string legacyColumn, string bytesColumn)
-        => $"(CASE WHEN {bytesColumn} IS NOT NULL AND ({legacyColumn} = {bytesColumn} OR {legacyColumn} = {LegacySizeOverflowSentinel.ToString(CultureInfo.InvariantCulture)}) THEN {bytesColumn} ELSE {legacyColumn} END)";
+    internal static string ResolvedSizeSql(string legacyColumn, string bytesColumn, string candidatePrefix = "", bool selectedFile = false)
+    {
+        var identity = $"{candidatePrefix}magnet = {bytesColumn}_magnet AND {candidatePrefix}info_hash = {bytesColumn}_info_hash";
+        if (selectedFile)
+        {
+            identity += $" AND {NullSafeEqualSql("selected_file_id", bytesColumn + "_file_id")} AND {NullSafeEqualSql("selected_file_path", bytesColumn + "_file_path")}";
+        }
+
+        return $"(CASE WHEN {bytesColumn} IS NOT NULL AND ({legacyColumn} = {bytesColumn} OR ({legacyColumn} = {LegacySizeOverflowSentinel.ToString(CultureInfo.InvariantCulture)} AND {identity})) THEN {bytesColumn} ELSE {legacyColumn} END)";
+    }
+
+    private static string NullSafeEqualSql(string left, string right)
+        => $"({left} = {right} OR ({left} IS NULL AND {right} IS NULL))";
 
     /// <summary>
     /// Ordered registry of additive, idempotent EXPAND migrations
@@ -479,6 +494,18 @@ public sealed class PhantomDb : IDisposable
                 "ALTER TABLE source_candidates ADD COLUMN IF NOT EXISTS selected_file_size_bytes BIGINT;",
                 "ALTER TABLE availability_items ADD COLUMN IF NOT EXISTS candidate_size_bytes BIGINT;",
                 "ALTER TABLE magnet_cache ADD COLUMN IF NOT EXISTS size_bytes BIGINT;",
+                // Identity witnesses prevent legacy read(-1) -> write(-1)
+                // from associating a stale companion with a different source.
+                "ALTER TABLE source_candidates ADD COLUMN IF NOT EXISTS size_bytes_magnet TEXT;",
+                "ALTER TABLE source_candidates ADD COLUMN IF NOT EXISTS size_bytes_info_hash TEXT;",
+                "ALTER TABLE source_candidates ADD COLUMN IF NOT EXISTS selected_file_size_bytes_magnet TEXT;",
+                "ALTER TABLE source_candidates ADD COLUMN IF NOT EXISTS selected_file_size_bytes_info_hash TEXT;",
+                "ALTER TABLE source_candidates ADD COLUMN IF NOT EXISTS selected_file_size_bytes_file_id BIGINT;",
+                "ALTER TABLE source_candidates ADD COLUMN IF NOT EXISTS selected_file_size_bytes_file_path TEXT;",
+                "ALTER TABLE availability_items ADD COLUMN IF NOT EXISTS candidate_size_bytes_magnet TEXT;",
+                "ALTER TABLE availability_items ADD COLUMN IF NOT EXISTS candidate_size_bytes_info_hash TEXT;",
+                "ALTER TABLE magnet_cache ADD COLUMN IF NOT EXISTS size_bytes_magnet TEXT;",
+                "ALTER TABLE magnet_cache ADD COLUMN IF NOT EXISTS size_bytes_info_hash TEXT;",
             }),
     };
 
@@ -760,6 +787,8 @@ CREATE TABLE IF NOT EXISTS availability_items (
     -- v23 (postgres-media-size-int64-expand): 64-bit companion of the legacy
     -- 32-bit candidate_size; see PhantomDb.ResolvedSizeSql.
     candidate_size_bytes BIGINT,
+    candidate_size_bytes_magnet TEXT,
+    candidate_size_bytes_info_hash TEXT,
     candidate_seeders INTEGER,
     candidate_indexer TEXT,
     candidate_source TEXT,
@@ -872,6 +901,8 @@ CREATE TABLE IF NOT EXISTS magnet_cache (
     ttl_seconds INTEGER NOT NULL,
     source      TEXT NOT NULL,
     size_bytes  BIGINT,
+    size_bytes_magnet TEXT,
+    size_bytes_info_hash TEXT,
     PRIMARY KEY (tmdb_id, imdb_id, type, season, episode, preset)
 );
 
@@ -929,7 +960,13 @@ CREATE TABLE IF NOT EXISTS source_candidates (
     -- v23 (postgres-media-size-int64-expand): 64-bit companions of the
     -- legacy 32-bit size / selected_file_size; see PhantomDb.ResolvedSizeSql.
     size_bytes BIGINT,
+    size_bytes_magnet TEXT,
+    size_bytes_info_hash TEXT,
     selected_file_size_bytes BIGINT,
+    selected_file_size_bytes_magnet TEXT,
+    selected_file_size_bytes_info_hash TEXT,
+    selected_file_size_bytes_file_id BIGINT,
+    selected_file_size_bytes_file_path TEXT,
     PRIMARY KEY (tmdb_id, type, season, episode, preset, magnet)
 );
 CREATE INDEX IF NOT EXISTS idx_source_candidates_item_rank
@@ -1212,8 +1249,8 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
             await using var conn = await OpenAsync(ct).ConfigureAwait(false);
             await using var cmd = conn.CreateCommand();
             cmd.CommandText = _provider.TranslateUpsertSql(@"INSERT OR REPLACE INTO magnet_cache
-                (tmdb_id, imdb_id, type, season, episode, preset, magnet, info_hash, size, seeders, indexer, cached_at, ttl_seconds, source, size_bytes)
-                VALUES (@tmdb,@imdb,@type,@season,@episode,@preset,@magnet,@hash,@size,@seeders,@indexer,@cached,@ttl,@source,@sizeBytes);");
+                (tmdb_id, imdb_id, type, season, episode, preset, magnet, info_hash, size, seeders, indexer, cached_at, ttl_seconds, source, size_bytes, size_bytes_magnet, size_bytes_info_hash)
+                VALUES (@tmdb,@imdb,@type,@season,@episode,@preset,@magnet,@hash,@size,@seeders,@indexer,@cached,@ttl,@source,@sizeBytes,@magnet,@hash);");
             BindKey(cmd, key);
             cmd.AddWithValue("@preset", key.Preset);
             cmd.AddWithValue("@magnet", entry.Magnet);
@@ -1460,7 +1497,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = $@"SELECT tmdb_id,type,season,episode,preset,magnet,info_hash,indexer,title,seeders,{ResolvedSizeSql("size", "size_bytes")},rank,source,fetched_at,expires_at,
                    validation_status,validation_reason,validated_at,validation_expires_at,validation_duration_ms,validation_policy_version,
-                   selected_file_id,selected_file_path,{ResolvedSizeSql("selected_file_size", "selected_file_size_bytes")}
+                   selected_file_id,selected_file_path,{ResolvedSizeSql("selected_file_size", "selected_file_size_bytes", selectedFile: true)}
             FROM source_candidates
             WHERE tmdb_id=@tmdb AND type=@type AND season=@season AND episode=@episode AND preset=@preset
               AND (@includeExpired=1 OR expires_at >= @now)
@@ -1522,8 +1559,8 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                 await using var cmd = conn.CreateCommand();
                 cmd.Transaction = tx;
                 cmd.CommandText = @"INSERT INTO source_candidates
-                    (tmdb_id,type,season,episode,preset,magnet,info_hash,indexer,title,seeders,size,size_bytes,rank,source,fetched_at,expires_at)
-                    VALUES (@tmdb,@type,@season,@episode,@preset,@magnet,@hash,@indexer,@title,@seeders,@size,@sizeBytes,@rank,@source,@fetched,@expires)
+                    (tmdb_id,type,season,episode,preset,magnet,info_hash,indexer,title,seeders,size,size_bytes,size_bytes_magnet,size_bytes_info_hash,rank,source,fetched_at,expires_at)
+                    VALUES (@tmdb,@type,@season,@episode,@preset,@magnet,@hash,@indexer,@title,@seeders,@size,@sizeBytes,@magnet,@hash,@rank,@source,@fetched,@expires)
                     ON CONFLICT(tmdb_id,type,season,episode,preset,magnet) DO UPDATE SET
                         info_hash=excluded.info_hash,
                         indexer=excluded.indexer,
@@ -1531,6 +1568,8 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                         seeders=excluded.seeders,
                         size=excluded.size,
                         size_bytes=excluded.size_bytes,
+                        size_bytes_magnet=excluded.size_bytes_magnet,
+                        size_bytes_info_hash=excluded.size_bytes_info_hash,
                         rank=excluded.rank,
                         source=excluded.source,
                         fetched_at=excluded.fetched_at,
@@ -1585,7 +1624,11 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                     selected_file_id=@fileId,
                     selected_file_path=@filePath,
                     selected_file_size=@fileSize,
-                    selected_file_size_bytes=@fileSizeBytes
+                    selected_file_size_bytes=@fileSizeBytes,
+                    selected_file_size_bytes_magnet=magnet,
+                    selected_file_size_bytes_info_hash=info_hash,
+                    selected_file_size_bytes_file_id=@fileId,
+                    selected_file_size_bytes_file_path=@filePath
                 WHERE tmdb_id=@tmdb AND type=@type AND season=@season AND episode=@episode AND preset=@preset AND magnet=@magnet;";
             cmd.AddWithValue("@tmdb", update.TmdbId);
             cmd.AddWithValue("@type", update.Type);
@@ -1599,7 +1642,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
             cmd.AddWithValue("@validationExpires", update.ValidationExpiresAt.HasValue ? update.ValidationExpiresAt.Value.ToUnixTimeSeconds() : DBNull.Value);
             cmd.AddWithValue("@duration", (object?)update.ValidationDurationMs ?? DBNull.Value);
             cmd.AddWithValue("@policy", update.ValidationPolicyVersion);
-            cmd.AddWithValue("@fileId", (object?)update.SelectedFileId ?? DBNull.Value);
+            cmd.AddWithValue("@fileId", (object?)update.SelectedFileId ?? DBNull.Value, DbType.Int64);
             cmd.AddWithValue("@filePath", (object?)update.SelectedFilePath ?? DBNull.Value);
             cmd.AddWithValue("@fileSize", (object?)LegacySizeValue(update.SelectedFileSize) ?? DBNull.Value, DbType.Int64);
             cmd.AddWithValue("@fileSizeBytes", (object?)update.SelectedFileSize ?? DBNull.Value, DbType.Int64);
@@ -1640,7 +1683,11 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                     selected_file_id=NULL,
                     selected_file_path=NULL,
                     selected_file_size=NULL,
-                    selected_file_size_bytes=NULL
+                    selected_file_size_bytes=NULL,
+                    selected_file_size_bytes_magnet=NULL,
+                    selected_file_size_bytes_info_hash=NULL,
+                    selected_file_size_bytes_file_id=NULL,
+                    selected_file_size_bytes_file_path=NULL
                 WHERE tmdb_id=@tmdb AND type=@type AND season=@season AND episode=@episode AND preset=@preset;";
             cmd.AddWithValue("@tmdb", tmdbId);
             cmd.AddWithValue("@type", type);
@@ -2709,7 +2756,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         await using var cmd = conn.CreateCommand();
         cmd.Transaction = tx;
         cmd.CommandText = $@"SELECT tmdb_id,type,season,episode,status,checked_at,next_check_at,
-                   candidate_magnet,candidate_info_hash,{ResolvedSizeSql("candidate_size", "candidate_size_bytes")},candidate_seeders,
+                   candidate_magnet,candidate_info_hash,{ResolvedSizeSql("candidate_size", "candidate_size_bytes", "candidate_")},candidate_seeders,
                    candidate_indexer,candidate_source,probe_generation,lease_owner,attempt_count,negative_streak
             FROM availability_items
             WHERE (next_check_at <= @now OR probe_policy_hash IS NULL OR probe_policy_hash <> @policy)
@@ -2737,7 +2784,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         await using var cmd = conn.CreateCommand();
         cmd.Transaction = tx;
         cmd.CommandText = $@"SELECT tmdb_id,type,season,episode,status,checked_at,next_check_at,
-                   candidate_magnet,candidate_info_hash,{ResolvedSizeSql("candidate_size", "candidate_size_bytes")},candidate_seeders,
+                   candidate_magnet,candidate_info_hash,{ResolvedSizeSql("candidate_size", "candidate_size_bytes", "candidate_")},candidate_seeders,
                    candidate_indexer,candidate_source,probe_generation,lease_owner,attempt_count,negative_streak
             FROM availability_items
             WHERE type='episode'
@@ -2921,6 +2968,8 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                     candidate_info_hash=@hash,
                     candidate_size=@size,
                     candidate_size_bytes=@sizeBytes,
+                    candidate_size_bytes_magnet=@magnet,
+                    candidate_size_bytes_info_hash=@hash,
                     candidate_seeders=@seeders,
                     candidate_indexer=@indexer,
                     candidate_source=@source,
@@ -2978,11 +3027,11 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
             await using var cmd = conn.CreateCommand();
             cmd.CommandText = @"INSERT INTO availability_items
                     (tmdb_id, type, season, episode, status, checked_at, next_check_at,
-                     candidate_magnet, candidate_info_hash, candidate_size, candidate_size_bytes, candidate_seeders,
+                     candidate_magnet, candidate_info_hash, candidate_size, candidate_size_bytes, candidate_size_bytes_magnet, candidate_size_bytes_info_hash, candidate_seeders,
                      candidate_indexer, candidate_source, last_error_kind, last_error_message,
                      lease_owner, lease_until)
                 VALUES (@tmdb,@type,@season,@episode,'available',@checked,@next,
-                    @magnet,@hash,@size,@sizeBytes,@seeders,@indexer,@source,NULL,NULL,NULL,NULL)
+                    @magnet,@hash,@size,@sizeBytes,@magnet,@hash,@seeders,@indexer,@source,NULL,NULL,NULL,NULL)
                 ON CONFLICT(tmdb_id, type, season, episode) DO UPDATE SET
                     status='available',
                     checked_at=excluded.checked_at,
@@ -2991,6 +3040,8 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                     candidate_info_hash=COALESCE(excluded.candidate_info_hash, availability_items.candidate_info_hash),
                     candidate_size=COALESCE(excluded.candidate_size, availability_items.candidate_size),
                     candidate_size_bytes=CASE WHEN excluded.candidate_size IS NULL THEN availability_items.candidate_size_bytes ELSE excluded.candidate_size_bytes END,
+                    candidate_size_bytes_magnet=CASE WHEN excluded.candidate_size IS NULL THEN availability_items.candidate_size_bytes_magnet ELSE excluded.candidate_size_bytes_magnet END,
+                    candidate_size_bytes_info_hash=CASE WHEN excluded.candidate_size IS NULL THEN availability_items.candidate_size_bytes_info_hash ELSE excluded.candidate_size_bytes_info_hash END,
                     candidate_seeders=COALESCE(excluded.candidate_seeders, availability_items.candidate_seeders),
                     candidate_indexer=COALESCE(excluded.candidate_indexer, availability_items.candidate_indexer),
                     candidate_source=COALESCE(excluded.candidate_source, availability_items.candidate_source),
@@ -3604,7 +3655,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                    m.genres_json,m.official_rating,m.community_rating,m.original_title,m.fetched_at,m.runtime_minutes,m.relevance_score,
                    ms.tmdb_id,ms.type,ms.season,ms.episode,ms.stub_path,ms.fuse_path,ms.materialised_at,
                    a.tmdb_id,a.type,a.season,a.episode,a.status,a.checked_at,a.next_check_at,
-                   a.candidate_magnet,a.candidate_info_hash,{ResolvedSizeSql("a.candidate_size", "a.candidate_size_bytes")},a.candidate_seeders,
+                   a.candidate_magnet,a.candidate_info_hash,{ResolvedSizeSql("a.candidate_size", "a.candidate_size_bytes", "a.candidate_")},a.candidate_seeders,
                    a.candidate_indexer,a.candidate_source,a.probe_generation,a.lease_owner,a.attempt_count,a.negative_streak
             FROM tmdb_metadata m
             LEFT JOIN materialised_state ms ON ms.tmdb_id=m.tmdb_id AND ms.type='movie'
@@ -3658,7 +3709,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
                    m.genres_json,m.official_rating,m.community_rating,m.original_title,m.fetched_at,m.runtime_minutes,m.relevance_score,
                    ms.tmdb_id,ms.type,ms.season,ms.episode,ms.stub_path,ms.fuse_path,ms.materialised_at,
                    a.tmdb_id,a.type,a.season,a.episode,a.status,a.checked_at,a.next_check_at,
-                   a.candidate_magnet,a.candidate_info_hash,{ResolvedSizeSql("a.candidate_size", "a.candidate_size_bytes")},a.candidate_seeders,
+                   a.candidate_magnet,a.candidate_info_hash,{ResolvedSizeSql("a.candidate_size", "a.candidate_size_bytes", "a.candidate_")},a.candidate_seeders,
                    a.candidate_indexer,a.candidate_source,a.probe_generation,a.lease_owner,a.attempt_count,a.negative_streak
             FROM tmdb_metadata m
             LEFT JOIN materialised_state ms ON ms.tmdb_id=m.tmdb_id AND ms.type='movie'
@@ -3957,7 +4008,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         await using var conn = await OpenAsync(ct).ConfigureAwait(false);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = $@"SELECT tmdb_id,type,season,episode,status,checked_at,next_check_at,
-                   candidate_magnet,candidate_info_hash,{ResolvedSizeSql("candidate_size", "candidate_size_bytes")},candidate_seeders,
+                   candidate_magnet,candidate_info_hash,{ResolvedSizeSql("candidate_size", "candidate_size_bytes", "candidate_")},candidate_seeders,
                    candidate_indexer,candidate_source,probe_generation,lease_owner,attempt_count,negative_streak
             FROM availability_items
             WHERE tmdb_id=@tmdb AND type=@type AND season=@season AND episode=@episode

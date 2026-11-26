@@ -11,8 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   integer out of range` (source candidates, selected file, availability
   candidate, magnet cache). Schema v23 is an additive expand: nullable BIGINT
   `*_bytes` companions are added next to the existing INTEGER size columns
-  (never retyped/dropped), new builds dual-write and read through a
-  legacy-writer-tolerant resolver, and a v22 Postgres DB self-applies the
+  (never retyped/dropped), with nullable identity witnesses for magnet/hash
+  and selected-file ID/path. New builds dual-write and read through a
+  legacy-writer-tolerant resolver: a legacy reader can re-write the overflow
+  sentinel `-1`, so a changed identity must report unknown, never inherit
+  another candidate's byte count. A v22 Postgres DB self-applies the
   expand on start (no data update). SQLite DBs below v23 still require
   `scripts/phantom-wipe.sh --commit` per the pre-v1.0 policy. Proof:
   `scripts/tests/postgres-media-size-int64.test.sh`.

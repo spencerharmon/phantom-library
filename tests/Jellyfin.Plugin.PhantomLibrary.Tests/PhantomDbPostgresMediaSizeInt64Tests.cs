@@ -41,6 +41,25 @@ public sealed class PhantomDbPostgresMediaSizeInt64Tests : IAsyncLifetime
 
     private const string MigrationName = "v22_v23_media_size_bigint_companions";
 
+    // Reconstruct the exact prior shape from a fresh fixture. Fixed column list
+    // (not derived from the migration under test) so missing DDL fails parity.
+    private const string PriorSchemaSql = @"
+ALTER TABLE source_candidates DROP COLUMN size_bytes;
+ALTER TABLE source_candidates DROP COLUMN size_bytes_magnet;
+ALTER TABLE source_candidates DROP COLUMN size_bytes_info_hash;
+ALTER TABLE source_candidates DROP COLUMN selected_file_size_bytes;
+ALTER TABLE source_candidates DROP COLUMN selected_file_size_bytes_magnet;
+ALTER TABLE source_candidates DROP COLUMN selected_file_size_bytes_info_hash;
+ALTER TABLE source_candidates DROP COLUMN selected_file_size_bytes_file_id;
+ALTER TABLE source_candidates DROP COLUMN selected_file_size_bytes_file_path;
+ALTER TABLE availability_items DROP COLUMN candidate_size_bytes;
+ALTER TABLE availability_items DROP COLUMN candidate_size_bytes_magnet;
+ALTER TABLE availability_items DROP COLUMN candidate_size_bytes_info_hash;
+ALTER TABLE magnet_cache DROP COLUMN size_bytes;
+ALTER TABLE magnet_cache DROP COLUMN size_bytes_magnet;
+ALTER TABLE magnet_cache DROP COLUMN size_bytes_info_hash;
+UPDATE phantom_schema_meta SET version = 22;";
+
     // ---- pre-v23 (legacy writer / reader) SQL, verbatim from the parent commit ----
 
     private const string LegacyUpsertSourceCandidateSql = @"INSERT INTO source_candidates
@@ -90,6 +109,42 @@ public sealed class PhantomDbPostgresMediaSizeInt64Tests : IAsyncLifetime
     private const string LegacyPutMagnetSql = @"INSERT INTO magnet_cache (tmdb_id, imdb_id, type, season, episode, preset, magnet, info_hash, size, seeders, indexer, cached_at, ttl_seconds, source)
         VALUES (@tmdb,@imdb,@type,@season,@episode,@preset,@magnet,@hash,@size,@seeders,@indexer,@cached,@ttl,@source)
         ON CONFLICT (tmdb_id, imdb_id, type, season, episode, preset) DO UPDATE SET magnet = EXCLUDED.magnet, info_hash = EXCLUDED.info_hash, size = EXCLUDED.size, seeders = EXCLUDED.seeders, indexer = EXCLUDED.indexer, cached_at = EXCLUDED.cached_at, ttl_seconds = EXCLUDED.ttl_seconds, source = EXCLUDED.source;";
+
+    private const string LegacyMarkAvailableSql = @"INSERT INTO availability_items
+                    (tmdb_id, type, season, episode, status, checked_at, next_check_at,
+                     candidate_magnet, candidate_info_hash, candidate_size, candidate_seeders,
+                     candidate_indexer, candidate_source, last_error_kind, last_error_message,
+                     lease_owner, lease_until)
+                VALUES (@tmdb,@type,@season,@episode,'available',@checked,@next,
+                    @magnet,@hash,@size,@seeders,@indexer,@source,NULL,NULL,NULL,NULL)
+                ON CONFLICT(tmdb_id, type, season, episode) DO UPDATE SET
+                    status='available',
+                    checked_at=excluded.checked_at,
+                    next_check_at=excluded.next_check_at,
+                    candidate_magnet=COALESCE(excluded.candidate_magnet, availability_items.candidate_magnet),
+                    candidate_info_hash=COALESCE(excluded.candidate_info_hash, availability_items.candidate_info_hash),
+                    candidate_size=COALESCE(excluded.candidate_size, availability_items.candidate_size),
+                    candidate_seeders=COALESCE(excluded.candidate_seeders, availability_items.candidate_seeders),
+                    candidate_indexer=COALESCE(excluded.candidate_indexer, availability_items.candidate_indexer),
+                    candidate_source=COALESCE(excluded.candidate_source, availability_items.candidate_source),
+                    last_error_kind=NULL,
+                    last_error_message=NULL,
+                    lease_owner=NULL,
+                    lease_until=NULL,
+                    attempt_count=0,
+                    negative_streak=0;";
+
+    private const string LegacyValidateSql = @"UPDATE source_candidates
+                SET validation_status=@status,
+                    validation_reason=@reason,
+                    validated_at=@validated,
+                    validation_expires_at=@validationExpires,
+                    validation_duration_ms=@duration,
+                    validation_policy_version=@policy,
+                    selected_file_id=@fileId,
+                    selected_file_path=@filePath,
+                    selected_file_size=@fileSize
+                WHERE tmdb_id=@tmdb AND type=@type AND season=@season AND episode=@episode AND preset=@preset AND magnet=@magnet;";
 
     private static readonly string? Dsn = Environment.GetEnvironmentVariable("PHANTOM_TEST_POSTGRES_DSN");
 
@@ -170,6 +225,20 @@ public sealed class PhantomDbPostgresMediaSizeInt64Tests : IAsyncLifetime
         Assert.Equal(("bigint", "YES"), await ColumnTypeAsync("source_candidates", "selected_file_size_bytes"));
         Assert.Equal(("bigint", "YES"), await ColumnTypeAsync("availability_items", "candidate_size_bytes"));
         Assert.Equal(("bigint", "YES"), await ColumnTypeAsync("magnet_cache", "size_bytes"));
+
+        foreach (var (table, column) in new[]
+        {
+            ("source_candidates", "size_bytes_magnet"), ("source_candidates", "size_bytes_info_hash"),
+            ("source_candidates", "selected_file_size_bytes_magnet"), ("source_candidates", "selected_file_size_bytes_info_hash"),
+            ("source_candidates", "selected_file_size_bytes_file_path"),
+            ("availability_items", "candidate_size_bytes_magnet"), ("availability_items", "candidate_size_bytes_info_hash"),
+            ("magnet_cache", "size_bytes_magnet"), ("magnet_cache", "size_bytes_info_hash"),
+        })
+        {
+            Assert.Equal(("text", "YES"), await ColumnTypeAsync(table, column));
+        }
+
+        Assert.Equal(("bigint", "YES"), await ColumnTypeAsync("source_candidates", "selected_file_size_bytes_file_id"));
 
         // Legacy columns stay INTEGER (expand never retypes / drops).
         Assert.Equal(("integer", "YES"), await ColumnTypeAsync("source_candidates", "size"));
@@ -485,6 +554,165 @@ public sealed class PhantomDbPostgresMediaSizeInt64Tests : IAsyncLifetime
         Assert.Equal(1_000_000_000L, (await db.GetCachedMagnetAsync(new MagnetCacheKey(1399, null, "episode", 1, 3, "1080p"), default))!.Size);
     }
 
+    [Theory]
+    [InlineData("movie", "both")]
+    [InlineData("episode", "both")]
+    [InlineData("movie", "magnet")]
+    [InlineData("episode", "magnet")]
+    [InlineData("movie", "hash")]
+    [InlineData("episode", "hash")]
+    public async Task LegacyReaderWriter_SentinelMustNotTransferSizeToAnotherCandidate(string type, string change)
+    {
+        if (!Enabled)
+        {
+            return;
+        }
+
+        using var db = NewDb();
+        var (tmdb, season, episode, key) = ItemKey(type);
+        var a = Entry(FiveGiB, 'a');
+        var b = Entry(SixGiB, 'b');
+        // Test magnet and info-hash independently, not just the happy case in
+        // which both change (a magnet URI may change its trackers/display name).
+        if (change == "magnet")
+        {
+            b = b with { InfoHash = a.InfoHash };
+        }
+        else if (change == "hash")
+        {
+            b = b with { Magnet = a.Magnet };
+        }
+
+        await db.PutCachedMagnetAsync(key, a, default);
+        await db.MarkAvailabilityAvailableAsync(tmdb, type, season, episode, a, default);
+        await db.UpsertSourceCandidatesAsync(tmdb, type, season, episode, "1080p",
+            new[] { new MagnetCandidate(b.Magnet, b.InfoHash, b.Size, b.Seeders, b.Indexer) },
+            "availability", TimeSpan.FromHours(6), default);
+        Assert.Equal(SixGiB, (await db.ListSourceCandidatesAsync(tmdb, type, season, episode, "1080p", false, default)).Single().Size);
+
+        await using var conn = await OpenRawAsync();
+        // Actual old SELECT + old accessor, as in Materialiser.AppendSourceCandidatesAsync.
+        var legacyB = await LegacyReadCandidateAsync(conn, tmdb, type, season, episode);
+        Assert.Equal(b.Magnet, legacyB.Magnet);
+        Assert.Equal(b.InfoHash, legacyB.InfoHash);
+        Assert.Equal(-1L, legacyB.Size);
+
+        // Actual old cache upsert, as in AddWithCandidateRetryAsync. It leaves
+        // A's companion in place and feeds B's *read* sentinel back to storage.
+        await LegacyPutMagnetAsync(conn, tmdb, type, Math.Max(0, season), Math.Max(0, episode), legacyB.Size, legacyB);
+        var cached = (await db.GetCachedMagnetAsync(key, default))!;
+        Assert.Equal(b.Magnet, cached.Magnet);
+        Assert.Equal(b.InfoHash, cached.InfoHash);
+        Assert.Equal(-1L, cached.Size); // explicit unknown, NEVER A's 5 GiB
+
+        // Old cache read -> old availability re-mark (PhantomSourceManager.ResetCurrentAsync).
+        await using (var read = conn.CreateCommand())
+        {
+            read.CommandText = "SELECT magnet, info_hash, size FROM magnet_cache;";
+            await using var r = await read.ExecuteReaderAsync();
+            Assert.True(await r.ReadAsync());
+            legacyB = legacyB with { Magnet = r.GetString(0), InfoHash = r.GetString(1), Size = r.GetInt64(2) };
+        }
+
+        await LegacyMarkAsync(conn, tmdb, type, season, episode, legacyB);
+        var available = (await db.GetAvailabilityItemAsync(tmdb, type, season, episode, default))!;
+        Assert.Equal(b.Magnet, available.CandidateMagnet);
+        Assert.Equal(b.InfoHash, available.CandidateInfoHash);
+        Assert.Equal(-1L, available.CandidateSize);
+
+        // A candidate-less new re-mark must preserve the *invalid* witness,
+        // not bless the preceding candidate's leftover bytes for B.
+        await db.MarkAvailabilityAvailableAsync(tmdb, type, season, episode, null, default);
+        Assert.Equal(-1L, (await db.GetAvailabilityItemAsync(tmdb, type, season, episode, default))!.CandidateSize);
+
+        // New observations restore the exact 6 GiB, on both upsert paths.
+        await db.PutCachedMagnetAsync(key, b, default);
+        await db.MarkAvailabilityAvailableAsync(tmdb, type, season, episode, b, default);
+        Assert.Equal(SixGiB, (await db.GetCachedMagnetAsync(key, default))!.Size);
+        Assert.Equal(SixGiB, (await db.GetAvailabilityItemAsync(tmdb, type, season, episode, default))!.CandidateSize);
+
+        // Re-reading/writing the SAME candidate via the legacy statements can
+        // retain that candidate's exact bytes; changing identity cannot.
+        await LegacyPutMagnetAsync(conn, tmdb, type, Math.Max(0, season), Math.Max(0, episode), legacyB.Size, legacyB);
+        await LegacyMarkAsync(conn, tmdb, type, season, episode, legacyB);
+        Assert.Equal(SixGiB, (await db.GetCachedMagnetAsync(key, default))!.Size);
+        Assert.Equal(SixGiB, (await db.GetAvailabilityItemAsync(tmdb, type, season, episode, default))!.CandidateSize);
+        _output.WriteLine($"{type}/{change}: old read B=-1; cache B=-1; availability B=-1; new B={SixGiB}; same-identity legacy round trip={SixGiB}");
+    }
+
+    [Theory]
+    [InlineData("movie", "id")]
+    [InlineData("episode", "id")]
+    [InlineData("movie", "path")]
+    [InlineData("episode", "path")]
+    [InlineData("movie", "null")]
+    [InlineData("episode", "null")]
+    public async Task LegacySelectedFile_IdentityChangeInvalidatesCompanion(string type, string change)
+    {
+        if (!Enabled)
+        {
+            return;
+        }
+
+        using var db = NewDb();
+        var (tmdb, season, episode, _) = ItemKey(type);
+        var a = Entry(FiveGiB, 'a');
+        await db.UpsertSourceCandidatesAsync(tmdb, type, season, episode, "1080p",
+            new[] { new MagnetCandidate(a.Magnet, a.InfoHash, a.Size, a.Seeders, a.Indexer) },
+            "availability", TimeSpan.FromHours(6), default);
+        var update = new SourceCandidateValidationUpdate(tmdb, type, season, episode, "1080p", a.Magnet,
+            "valid", null, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow.AddHours(1), 42, "v1",
+            SelectedFileId: 0, SelectedFilePath: "a.mkv", SelectedFileSize: FiveGiB);
+        await db.UpdateSourceCandidateValidationAsync(update, default);
+        await using var conn = await OpenRawAsync();
+        var old = await LegacyReadCandidateAsync(conn, tmdb, type, season, episode, selectedFile: true);
+        Assert.Equal(-1L, old.Size);
+        var replacement = update with
+        {
+            SelectedFileId = change == "id" ? 1 : change == "null" ? null : 0,
+            SelectedFilePath = change == "path" ? "b.mkv" : change == "null" ? null : "a.mkv",
+            SelectedFileSize = old.Size,
+        };
+        await LegacyValidateAsync(conn, replacement);
+        var row = (await db.ListSourceCandidatesAsync(tmdb, type, season, episode, "1080p", false, default)).Single();
+        Assert.Equal(replacement.SelectedFileId, row.SelectedFileId);
+        Assert.Equal(replacement.SelectedFilePath, row.SelectedFilePath);
+        Assert.Equal(-1L, row.SelectedFileSize);
+        Assert.Equal(FiveGiB, row.Size); // whole-torrent size is independent
+        await db.UpdateSourceCandidateValidationAsync(replacement with { SelectedFileSize = SixGiB }, default);
+        Assert.Equal(SixGiB, (await db.ListSourceCandidatesAsync(tmdb, type, season, episode, "1080p", false, default)).Single().SelectedFileSize);
+    }
+
+    [Theory]
+    [InlineData("movie")]
+    [InlineData("episode")]
+    public async Task LegacySourceCandidate_HashChangeInvalidatesTorrentAndSelectedFileSizes(string type)
+    {
+        if (!Enabled)
+        {
+            return;
+        }
+
+        using var db = NewDb();
+        var (tmdb, season, episode, _) = ItemKey(type);
+        var a = Entry(FiveGiB, 'a');
+        await db.UpsertSourceCandidatesAsync(tmdb, type, season, episode, "1080p",
+            new[] { new MagnetCandidate(a.Magnet, a.InfoHash, a.Size, a.Seeders, a.Indexer) },
+            "availability", TimeSpan.FromHours(6), default);
+        await db.UpdateSourceCandidateValidationAsync(new SourceCandidateValidationUpdate(
+            tmdb, type, season, episode, "1080p", a.Magnet, "valid", null,
+            DateTimeOffset.UtcNow, DateTimeOffset.UtcNow.AddHours(1), 42, "v1", 0, "a.mkv", FiveGiB), default);
+        await using var conn = await OpenRawAsync();
+        var old = await LegacyReadCandidateAsync(conn, tmdb, type, season, episode);
+        var hash = new string('b', 40);
+        await LegacyUpsertCandidateAsync(conn, tmdb, type, season, episode, old.Magnet, old.Size, hash);
+        var row = (await db.ListSourceCandidatesAsync(tmdb, type, season, episode, "1080p", false, default)).Single();
+        Assert.Equal(old.Magnet, row.Magnet);
+        Assert.Equal(hash, row.InfoHash);
+        Assert.Equal(-1L, row.Size);
+        Assert.Equal(-1L, row.SelectedFileSize);
+    }
+
     // ------------------------------------------------------------------
     // Prior-schema (v22) expand: clone rehearsal + idempotency
     // ------------------------------------------------------------------
@@ -503,12 +731,7 @@ public sealed class PhantomDbPostgresMediaSizeInt64Tests : IAsyncLifetime
             await seed.CountCatalogueItemsAsync("movie", null, default);
         }
 
-        await ExecAsync(_connectionString!, @"
-ALTER TABLE source_candidates DROP COLUMN size_bytes;
-ALTER TABLE source_candidates DROP COLUMN selected_file_size_bytes;
-ALTER TABLE availability_items DROP COLUMN candidate_size_bytes;
-ALTER TABLE magnet_cache DROP COLUMN size_bytes;
-UPDATE phantom_schema_meta SET version = 22;");
+        await ExecAsync(_connectionString!, PriorSchemaSql);
         Assert.Null(await ColumnTypeOrNullAsync("source_candidates", "size_bytes"));
 
         // Seed v22 data with the LEGACY writers (the clone's data shape).
@@ -576,6 +799,9 @@ VALUES (603,'movie',-1,-1,'available',0,'m1',1900000000), (1399,'episode',1,3,'a
         Assert.Equal(0L, await ScalarLongAsync("SELECT COUNT(*) FROM source_candidates WHERE size_bytes IS NOT NULL OR selected_file_size_bytes IS NOT NULL;"));
         Assert.Equal(0L, await ScalarLongAsync("SELECT COUNT(*) FROM availability_items WHERE candidate_size_bytes IS NOT NULL;"));
         Assert.Equal(0L, await ScalarLongAsync("SELECT COUNT(*) FROM magnet_cache WHERE size_bytes IS NOT NULL;"));
+        Assert.Equal(0L, await ScalarLongAsync("SELECT COUNT(*) FROM source_candidates WHERE size_bytes_magnet IS NOT NULL OR size_bytes_info_hash IS NOT NULL OR selected_file_size_bytes_magnet IS NOT NULL OR selected_file_size_bytes_info_hash IS NOT NULL OR selected_file_size_bytes_file_id IS NOT NULL OR selected_file_size_bytes_file_path IS NOT NULL;"));
+        Assert.Equal(0L, await ScalarLongAsync("SELECT COUNT(*) FROM availability_items WHERE candidate_size_bytes_magnet IS NOT NULL OR candidate_size_bytes_info_hash IS NOT NULL;"));
+        Assert.Equal(0L, await ScalarLongAsync("SELECT COUNT(*) FROM magnet_cache WHERE size_bytes_magnet IS NOT NULL OR size_bytes_info_hash IS NOT NULL;"));
 
         // Idempotency: (a) the recorded migration is a no-op on re-apply;
         await using (var conn = await OpenRawAsync())
@@ -625,12 +851,7 @@ VALUES (603,'movie',-1,-1,'available',0,'m1',1900000000), (1399,'episode',1,3,'a
             freshShape.AddRange(await ColumnShapeAsync(t));
         }
 
-        await ExecAsync(_connectionString!, @"
-ALTER TABLE source_candidates DROP COLUMN size_bytes;
-ALTER TABLE source_candidates DROP COLUMN selected_file_size_bytes;
-ALTER TABLE availability_items DROP COLUMN candidate_size_bytes;
-ALTER TABLE magnet_cache DROP COLUMN size_bytes;
-UPDATE phantom_schema_meta SET version = 22;");
+        await ExecAsync(_connectionString!, PriorSchemaSql);
 
         using (var expanded = NewDb())
         {
@@ -677,6 +898,73 @@ UPDATE phantom_schema_meta SET version = {PhantomDb.CurrentSchemaVersion + 1};")
     // ------------------------------------------------------------------
     // helpers
     // ------------------------------------------------------------------
+
+    private static (int Tmdb, int Season, int Episode, MagnetCacheKey CacheKey) ItemKey(string type)
+        => type == "movie"
+            ? (603, -1, -1, new MagnetCacheKey(603, null, type, null, null, "1080p"))
+            : (1399, 1, 3, new MagnetCacheKey(1399, null, type, 1, 3, "1080p"));
+
+    private static async Task<MagnetCacheEntry> LegacyReadCandidateAsync(NpgsqlConnection conn, int tmdb, string type, int season, int episode, bool selectedFile = false)
+    {
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = LegacyListSourceCandidatesSql;
+        cmd.Parameters.AddWithValue("tmdb", tmdb);
+        cmd.Parameters.AddWithValue("type", type);
+        cmd.Parameters.AddWithValue("season", season);
+        cmd.Parameters.AddWithValue("episode", episode);
+        cmd.Parameters.AddWithValue("preset", "1080p");
+        cmd.Parameters.AddWithValue("includeExpired", 1);
+        cmd.Parameters.AddWithValue("now", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        await using var r = await cmd.ExecuteReaderAsync();
+        Assert.True(await r.ReadAsync());
+        return new MagnetCacheEntry
+        {
+            Magnet = r.GetString(5), InfoHash = r.GetString(6), Size = r.GetInt64(selectedFile ? 23 : 10),
+            Seeders = 9, Indexer = "prowlarr", Source = "user",
+            CachedAt = DateTimeOffset.UtcNow, Ttl = TimeSpan.FromHours(1),
+        };
+    }
+
+    private static async Task LegacyMarkAsync(NpgsqlConnection conn, int tmdb, string type, int season, int episode, MagnetCacheEntry candidate)
+    {
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = LegacyMarkAvailableSql;
+        cmd.Parameters.AddWithValue("tmdb", tmdb);
+        cmd.Parameters.AddWithValue("type", type);
+        cmd.Parameters.AddWithValue("season", season);
+        cmd.Parameters.AddWithValue("episode", episode);
+        cmd.Parameters.AddWithValue("checked", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        cmd.Parameters.AddWithValue("next", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        cmd.Parameters.AddWithValue("magnet", candidate.Magnet);
+        cmd.Parameters.AddWithValue("hash", candidate.InfoHash);
+        cmd.Parameters.AddWithValue("size", candidate.Size);
+        cmd.Parameters.AddWithValue("seeders", candidate.Seeders);
+        cmd.Parameters.AddWithValue("indexer", candidate.Indexer);
+        cmd.Parameters.AddWithValue("source", candidate.Source);
+        Assert.Equal(1, await cmd.ExecuteNonQueryAsync());
+    }
+
+    private static async Task LegacyValidateAsync(NpgsqlConnection conn, SourceCandidateValidationUpdate update)
+    {
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = LegacyValidateSql;
+        cmd.Parameters.AddWithValue("tmdb", update.TmdbId);
+        cmd.Parameters.AddWithValue("type", update.Type);
+        cmd.Parameters.AddWithValue("season", update.Season);
+        cmd.Parameters.AddWithValue("episode", update.Episode);
+        cmd.Parameters.AddWithValue("preset", update.Preset);
+        cmd.Parameters.AddWithValue("magnet", update.Magnet);
+        cmd.Parameters.AddWithValue("status", update.ValidationStatus);
+        cmd.Parameters.Add(new NpgsqlParameter("reason", NpgsqlTypes.NpgsqlDbType.Text) { Value = DBNull.Value });
+        cmd.Parameters.AddWithValue("validated", update.ValidatedAt!.Value.ToUnixTimeSeconds());
+        cmd.Parameters.AddWithValue("validationExpires", update.ValidationExpiresAt!.Value.ToUnixTimeSeconds());
+        cmd.Parameters.AddWithValue("duration", update.ValidationDurationMs!.Value);
+        cmd.Parameters.AddWithValue("policy", update.ValidationPolicyVersion);
+        cmd.Parameters.Add(new NpgsqlParameter("fileId", NpgsqlTypes.NpgsqlDbType.Bigint) { Value = (object?)update.SelectedFileId ?? DBNull.Value });
+        cmd.Parameters.Add(new NpgsqlParameter("filePath", NpgsqlTypes.NpgsqlDbType.Text) { Value = (object?)update.SelectedFilePath ?? DBNull.Value });
+        cmd.Parameters.Add(new NpgsqlParameter("fileSize", NpgsqlTypes.NpgsqlDbType.Bigint) { Value = (object?)update.SelectedFileSize ?? DBNull.Value });
+        Assert.Equal(1, await cmd.ExecuteNonQueryAsync());
+    }
 
     private static MagnetCacheEntry Entry(long size, char hashChar) => new()
     {
@@ -790,7 +1078,7 @@ UPDATE phantom_schema_meta SET version = {PhantomDb.CurrentSchemaVersion + 1};")
         return r.IsDBNull(10) ? null : r.GetInt64(10);
     }
 
-    private static async Task LegacyUpsertCandidateAsync(NpgsqlConnection conn, int tmdb, string type, int season, int episode, string magnet, long size)
+    private static async Task LegacyUpsertCandidateAsync(NpgsqlConnection conn, int tmdb, string type, int season, int episode, string magnet, long size, string? hash = null)
     {
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = LegacyUpsertSourceCandidateSql;
@@ -801,7 +1089,7 @@ UPDATE phantom_schema_meta SET version = {PhantomDb.CurrentSchemaVersion + 1};")
         cmd.Parameters.AddWithValue("episode", episode);
         cmd.Parameters.AddWithValue("preset", "1080p");
         cmd.Parameters.AddWithValue("magnet", magnet);
-        cmd.Parameters.AddWithValue("hash", magnet[^40..]);
+        cmd.Parameters.AddWithValue("hash", hash ?? magnet[^40..]);
         cmd.Parameters.AddWithValue("indexer", "prowlarr");
         cmd.Parameters.AddWithValue("title", "legacy");
         cmd.Parameters.AddWithValue("seeders", 5);
@@ -840,7 +1128,7 @@ UPDATE phantom_schema_meta SET version = {PhantomDb.CurrentSchemaVersion + 1};")
         return await cmd.ExecuteNonQueryAsync();
     }
 
-    private static async Task LegacyPutMagnetAsync(NpgsqlConnection conn, int tmdb, string type, int season, int episode, long size)
+    private static async Task LegacyPutMagnetAsync(NpgsqlConnection conn, int tmdb, string type, int season, int episode, long size, MagnetCacheEntry? candidate = null)
     {
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = LegacyPutMagnetSql;
@@ -850,8 +1138,8 @@ UPDATE phantom_schema_meta SET version = {PhantomDb.CurrentSchemaVersion + 1};")
         cmd.Parameters.AddWithValue("season", season);
         cmd.Parameters.AddWithValue("episode", episode);
         cmd.Parameters.AddWithValue("preset", "1080p");
-        cmd.Parameters.AddWithValue("magnet", "magnet:?xt=urn:btih:" + new string('z', 40));
-        cmd.Parameters.AddWithValue("hash", new string('z', 40));
+        cmd.Parameters.AddWithValue("magnet", candidate?.Magnet ?? "magnet:?xt=urn:btih:" + new string('z', 40));
+        cmd.Parameters.AddWithValue("hash", candidate?.InfoHash ?? new string('z', 40));
         cmd.Parameters.AddWithValue("size", size);
         cmd.Parameters.AddWithValue("seeders", 3);
         cmd.Parameters.AddWithValue("indexer", "prowlarr");

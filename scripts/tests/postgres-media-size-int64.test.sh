@@ -31,8 +31,10 @@
 # aliased browse read path); fresh schema shape; prior-schema (v22) self-expand
 # with predicted==actual row counts/checksums and zero data update; idempotency
 # (recorded no-op, raw DDL re-run, re-open); legacy (pre-v23) writer/reader
-# overlap; forward tolerance of a newer stamp; generation-fenced availability
-# completion. No production database is touched; no flip/contract is applied.
+# overlap (including old read(-1) -> cache replacement -> availability re-mark,
+# magnet/hash changes, selected-file ID/path changes); forward tolerance of a
+# newer stamp; generation-fenced availability completion. No production database
+# is touched; no flip/contract is applied.
 #
 # No optional skip: a missing podman / dotnet / Postgres is a FAILURE (exit 2).
 # Exit 0 = all assertions passed.
@@ -43,8 +45,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 TEST_PROJ="$REPO_ROOT/tests/Jellyfin.Plugin.PhantomLibrary.Tests/Jellyfin.Plugin.PhantomLibrary.Tests.csproj"
 TEST_CLASS="Jellyfin.Plugin.PhantomLibrary.Tests.PhantomDbPostgresMediaSizeInt64Tests"
-# 8 [Fact]s + 3 [Theory]s x 2 cases (movie + episode).
-EXPECTED_TESTS=14
+# Original 14 + 6 cache/availability sentinel, 6 selected-file and 2 source-identity cases.
+EXPECTED_TESTS=28
 PG_IMAGE="${PHANTOM_TEST_POSTGRES_IMAGE:-docker.io/library/postgres:16-alpine}"
 
 fatal() { printf 'FATAL: %s\n' "$*" >&2; exit 2; }
@@ -72,6 +74,7 @@ note "2. isolated PostgreSQL ($PG_IMAGE)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pgsize-int64.XXXXXX")"
 PGC="phantom-pgsize-int64-$$-$RANDOM"
 cleanup() {
+    dotnet build-server shutdown >/dev/null 2>&1 || true
     podman rm -f "$PGC" >/dev/null 2>&1 || true
     rm -rf "$WORK"
 }
