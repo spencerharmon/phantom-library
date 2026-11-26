@@ -66,6 +66,7 @@ public static class HomeRailSelector
     {
         [Channels.CuratedRows.KeyAvailableNow] = 1.00,
         [Channels.CuratedRows.KeyForYou] = 0.95,
+        [Channels.CuratedRows.KeyHealthiestSwarms] = 0.92,
         [Channels.CuratedRows.KeyTrending] = 0.90,
         [Channels.CuratedRows.KeyNewReleases] = 0.85,
         [Channels.CuratedRows.KeyPopular] = 0.80,

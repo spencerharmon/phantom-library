@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Rank by REAL DHT swarm health (ROI Priority 0.5). A standalone swarm-health
+  service (`tools/swarm-health/swarm_health_service.py`, libtorrent DHT node)
+  measures the distinct DHT peers behind each available item's candidate
+  infohash; the new `SwarmHealthWorker` sends due candidates to it (movies
+  first, by relevance; rechecked every `SwarmHealthRecheckHours`) and stores
+  the answers in the new `swarm_health` table (schema v24, additive expand:
+  a v23 Postgres DB self-applies it; the older color never reads it).
+  The web list view's "Critic Rating" sort now carries the swarm (live peers
+  capped at 100 > unmeasured 0.5 > dead 0) and is relabelled "Peers (DHT)"
+  on the Phantom channels by `badges.js`; phantom detail pages show "N peers"
+  instead of a tomato score. A "Healthiest swarms" Home shelf lists visible
+  titles with the largest measured swarms. Disabled while
+  `SwarmHealthServiceUrl` is empty. Metrics: `phantom_swarm_health_*`.
+
 ### Fixed
 - PostgreSQL: real >= 2 GiB movie/episode sizes no longer fail with `22003
   integer out of range` (source candidates, selected file, availability

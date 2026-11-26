@@ -121,6 +121,15 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         // reproduces the root browse on a timer + at startup.
         serviceCollection.AddHostedService<ChannelBaseItemWarmupWorker>();
 
+        // ROI Priority 0.5 (dht-swarm-health): real DHT swarm measurement of
+        // available candidates via the standalone swarm-health service, and the
+        // Peers ranking it feeds. Inert while SwarmHealthServiceUrl is empty.
+        serviceCollection.AddHttpClient<Swarm.SwarmHealthClient>(c =>
+        {
+            c.Timeout = TimeSpan.FromSeconds(90);
+        });
+        serviceCollection.AddHostedService<SwarmHealthWorker>();
+
         // SeriesAutopilot (stage-2.1 stub; rewritten in Stage 5.2).
         serviceCollection.AddSingleton<SeriesAutopilot>();
         serviceCollection.AddSingleton<ISeriesAutopilot>(sp => sp.GetRequiredService<SeriesAutopilot>());

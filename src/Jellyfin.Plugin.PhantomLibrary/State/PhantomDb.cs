@@ -175,6 +175,12 @@ public sealed record VisibleMovieRow(
 
 public sealed record VisibleSeriesRow(TmdbMetadataRow Metadata, int AvailableEpisodeCount, int MaterialisedEpisodeCount);
 
+/// <summary>An available item whose candidate infohash needs a (re)measurement of its DHT swarm.</summary>
+public sealed record SwarmHealthDueItem(int TmdbId, string Type, int Season, int Episode, string InfoHash);
+
+/// <summary>One DHT swarm measurement for a candidate infohash (ROI Priority 0.5).</summary>
+public sealed record SwarmHealthMeasurement(string InfoHash, int TmdbId, string Type, int Season, int Episode, int DhtPeers, DateTimeOffset CheckedAt);
+
 public sealed record VisibleSeasonRow(int SeriesTmdbId, int Season, int AvailableEpisodeCount, int MaterialisedEpisodeCount);
 
 public sealed record SeasonAvailabilitySummary(int KnownCount, int PlayableCount, int UnknownCount, int UnavailableCount);
@@ -376,7 +382,7 @@ public sealed record HiddenItemRow(int TmdbId, string Type, DateTimeOffset Hidde
 /// </summary>
 public sealed class PhantomDb : IDisposable
 {
-    public const int CurrentSchemaVersion = 23;
+    public const int CurrentSchemaVersion = 24;
 
     /// <summary>
     /// Sentinel written into a LEGACY 32-bit media-size column (<c>size</c>,
@@ -507,7 +513,29 @@ public sealed class PhantomDb : IDisposable
                 "ALTER TABLE magnet_cache ADD COLUMN IF NOT EXISTS size_bytes_magnet TEXT;",
                 "ALTER TABLE magnet_cache ADD COLUMN IF NOT EXISTS size_bytes_info_hash TEXT;",
             }),
+        (
+            // dht-swarm-health (ROI Priority 0.5): measured DHT swarm size per
+            // candidate infohash. EXPAND only — a brand-new table, nothing
+            // existing is touched, so an older color simply never reads it.
+            23,
+            24,
+            "v23_v24_swarm_health",
+            new[]
+            {
+                SwarmHealthTableSql,
+                SwarmHealthItemIndexSql,
+                SwarmHealthCheckedIndexSql,
+            }),
     };
+
+    private const string SwarmHealthTableSql =
+        "CREATE TABLE IF NOT EXISTS swarm_health (info_hash TEXT NOT NULL PRIMARY KEY, tmdb_id INTEGER NOT NULL, type TEXT NOT NULL, season INTEGER NOT NULL DEFAULT -1, episode INTEGER NOT NULL DEFAULT -1, dht_peers INTEGER NOT NULL, checked_at BIGINT NOT NULL);";
+
+    private const string SwarmHealthItemIndexSql =
+        "CREATE INDEX IF NOT EXISTS idx_swarm_health_item ON swarm_health(type, tmdb_id);";
+
+    private const string SwarmHealthCheckedIndexSql =
+        "CREATE INDEX IF NOT EXISTS idx_swarm_health_checked ON swarm_health(checked_at);";
 
     /// <summary>Gets the registered EXPAND migration statements for the given name (test seam).</summary>
     internal static IReadOnlyList<string> GetExpandMigrationStatements(string name)
@@ -999,6 +1027,12 @@ CREATE TABLE IF NOT EXISTS dead_swarm_confirmations (
 );
 CREATE INDEX IF NOT EXISTS idx_dead_swarm_confirmations_item
     ON dead_swarm_confirmations(tmdb_id, type, season, episode, preset);
+
+-- v24 (dht-swarm-health, ROI Priority 0.5): DHT swarm size measured per
+-- candidate infohash by the swarm-health service; drives the Peers ranking.
+CREATE TABLE IF NOT EXISTS swarm_health (info_hash TEXT NOT NULL PRIMARY KEY, tmdb_id INTEGER NOT NULL, type TEXT NOT NULL, season INTEGER NOT NULL DEFAULT -1, episode INTEGER NOT NULL DEFAULT -1, dht_peers INTEGER NOT NULL, checked_at BIGINT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_swarm_health_item ON swarm_health(type, tmdb_id);
+CREATE INDEX IF NOT EXISTS idx_swarm_health_checked ON swarm_health(checked_at);
 
 -- Surviving table from v1: indexers returned nothing for a key; back
 -- off until retry_after.
@@ -3634,6 +3668,118 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         {
             _writeLock.Release();
         }
+    }
+
+    /// <summary>
+    /// dht-swarm-health: available items whose candidate infohash has no swarm
+    /// measurement newer than <paramref name="staleBefore"/>, movies first, then
+    /// episodes, each by catalogue relevance (what users see first is measured
+    /// first). Bounded by <paramref name="limit"/>; the anti-join probes
+    /// <c>swarm_health</c>'s primary key, and the outer scan rides
+    /// <c>idx_availability_status_type</c> (status='available' only).
+    /// </summary>
+    public async Task<IReadOnlyList<SwarmHealthDueItem>> GetSwarmHealthDueItemsAsync(int limit, DateTimeOffset staleBefore, CancellationToken ct)
+    {
+        limit = Math.Max(1, limit);
+        var list = new List<SwarmHealthDueItem>(limit);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        foreach (var (itemType, metaType) in new[] { ("movie", "movie"), ("episode", "series") })
+        {
+            if (list.Count >= limit)
+            {
+                break;
+            }
+
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"SELECT a.tmdb_id, a.type, a.season, a.episode, LOWER(a.candidate_info_hash)
+                FROM availability_items a
+                LEFT JOIN tmdb_metadata m ON m.tmdb_id = a.tmdb_id AND m.type = @metaType
+                WHERE a.status = 'available' AND a.type = @type
+                  AND a.candidate_info_hash IS NOT NULL AND LENGTH(a.candidate_info_hash) = 40
+                  AND NOT EXISTS (
+                      SELECT 1 FROM swarm_health sh
+                      WHERE sh.info_hash = LOWER(a.candidate_info_hash) AND sh.checked_at >= @stale)
+                ORDER BY COALESCE(m.relevance_score, 0) DESC, a.tmdb_id, a.season, a.episode
+                LIMIT @limit;";
+            cmd.AddWithValue("@type", itemType);
+            cmd.AddWithValue("@metaType", metaType);
+            cmd.AddWithValue("@stale", staleBefore.ToUnixTimeSeconds());
+            cmd.AddWithValue("@limit", limit - list.Count);
+            await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+            while (await r.ReadAsync(ct).ConfigureAwait(false))
+            {
+                list.Add(new SwarmHealthDueItem(r.GetInt32(0), r.GetString(1), r.GetInt32(2), r.GetInt32(3), r.GetString(4)));
+            }
+        }
+
+        return list;
+    }
+
+    /// <summary>dht-swarm-health: upserts swarm measurements keyed by infohash.</summary>
+    public async Task UpsertSwarmHealthAsync(IReadOnlyCollection<SwarmHealthMeasurement> rows, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(rows);
+        if (rows.Count == 0)
+        {
+            return;
+        }
+
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var tx = await conn.BeginTransactionAsync(ct).ConfigureAwait(false);
+            foreach (var row in rows)
+            {
+                await using var cmd = conn.CreateCommand();
+                cmd.Transaction = tx;
+                cmd.CommandText = @"INSERT INTO swarm_health (info_hash,tmdb_id,type,season,episode,dht_peers,checked_at)
+                    VALUES (LOWER(@hash),@tmdb,@type,@season,@episode,@peers,@at)
+                    ON CONFLICT (info_hash) DO UPDATE SET
+                        tmdb_id = @tmdb, type = @type, season = @season, episode = @episode,
+                        dht_peers = @peers, checked_at = @at;";
+                cmd.AddWithValue("@hash", row.InfoHash);
+                cmd.AddWithValue("@tmdb", row.TmdbId);
+                cmd.AddWithValue("@type", row.Type);
+                cmd.AddWithValue("@season", row.Season);
+                cmd.AddWithValue("@episode", row.Episode);
+                cmd.AddWithValue("@peers", Math.Max(0, row.DhtPeers));
+                cmd.AddWithValue("@at", row.CheckedAt.ToUnixTimeSeconds());
+                await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            }
+
+            await tx.CommitAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// dht-swarm-health: best measured DHT peer count per TMDB id for
+    /// <paramref name="type"/> ("movie", or "episode" aggregated to its series
+    /// TMDB id), considering only measurements newer than <paramref name="freshAfter"/>.
+    /// Reads only the small <c>swarm_health</c> table via its (type, tmdb_id) index.
+    /// </summary>
+    public async Task<IReadOnlyDictionary<int, int>> GetSwarmPeersByTmdbAsync(string type, DateTimeOffset freshAfter, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        var map = new Dictionary<int, int>();
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT tmdb_id, MAX(dht_peers) FROM swarm_health
+            WHERE type = @type AND checked_at >= @fresh
+            GROUP BY tmdb_id;";
+        cmd.AddWithValue("@type", type);
+        cmd.AddWithValue("@fresh", freshAfter.ToUnixTimeSeconds());
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            map[r.GetInt32(0)] = Convert.ToInt32(r.GetValue(1), CultureInfo.InvariantCulture);
+        }
+
+        return map;
     }
 
     public async Task<IReadOnlyList<VisibleMovieRow>> ListVisibleMovieRowsAsync(CancellationToken ct)

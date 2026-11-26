@@ -585,7 +585,8 @@ public sealed partial class PhantomShowsChannel
     {
         var config = CurrentConfiguration();
         var flat = await BuildTopLevelSeriesItemsAsync(userId, cancellationToken).ConfigureAwait(false);
-        return BuildCuratedRows(flat, config);
+        var rows = BuildCuratedRows(flat, config);
+        return await SwarmHealthRows.AppendHealthiestAsync(rows, flat, _db, "episode", config, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>

@@ -218,7 +218,7 @@ UPDATE phantom_schema_meta SET version = 22;";
         }
 
         Assert.Equal(PhantomDb.CurrentSchemaVersion, await ReadVersionAsync());
-        Assert.Equal(23, PhantomDb.CurrentSchemaVersion);
+        Assert.True(PhantomDb.CurrentSchemaVersion >= 23); // v24 added swarm_health (dht-swarm-health)
 
         // Companions are BIGINT and nullable.
         Assert.Equal(("bigint", "YES"), await ColumnTypeAsync("source_candidates", "size_bytes"));

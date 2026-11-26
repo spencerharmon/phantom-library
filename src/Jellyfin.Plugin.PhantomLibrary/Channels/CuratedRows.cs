@@ -93,6 +93,7 @@ public static class CuratedRows
     public const string KeyTrending = "trending";
     public const string KeyForYou = "for_you";
     public const string KeyLeavingSoon = "leaving_soon";
+    public const string KeyHealthiestSwarms = "healthiest_swarms";
     public const string GenreKeyPrefix = "genre_";
 
     /// <summary>Build the FolderId for a row within a channel scope ("movies"/"shows").</summary>

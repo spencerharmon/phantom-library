@@ -23,6 +23,10 @@ public class PluginConfiguration : BasePluginConfiguration
     private int _sourceValidationTransientRetryMinutes;
     private int _sourceValidationLeaseMinutes;
     private int _deadSwarmBrowsePruneThreshold;
+    private int _swarmHealthIntervalSeconds;
+    private int _swarmHealthBatchSize;
+    private int _swarmHealthRecheckHours;
+    private int _swarmHealthRankWindowDays;
     private int _bulkMaterialiseRunningStaleMinutes;
     private int _bulkMaterialiseWorkerCount;
     private int _bulkMaterialiseMaxAttempts;
@@ -141,6 +145,11 @@ public class PluginConfiguration : BasePluginConfiguration
         SourceValidationTtlHours = 168;
         SourceValidationTransientRetryMinutes = 30;
         DeadSwarmBrowsePruneThreshold = 2;
+        SwarmHealthServiceUrl = string.Empty;
+        SwarmHealthIntervalSeconds = 60;
+        SwarmHealthBatchSize = 128;
+        SwarmHealthRecheckHours = 24;
+        SwarmHealthRankWindowDays = 7;
         SourceValidationLeaseMinutes = 10;
         BulkMaterialiseRunningStaleMinutes = 30;
         BulkMaterialiseWorkerCount = 2;
@@ -794,6 +803,41 @@ public class PluginConfiguration : BasePluginConfiguration
     {
         get => _deadSwarmBrowsePruneThreshold;
         set => _deadSwarmBrowsePruneThreshold = Math.Clamp(value, 1, 100);
+    }
+
+    /// <summary>
+    /// Base URL of the swarm-health DHT measurement service (ROI Priority 0.5,
+    /// <c>tools/swarm-health/</c>). Empty disables DHT swarm measurement and the
+    /// Peers ranking entirely (no requests, no BaseItem writes).
+    /// </summary>
+    public string SwarmHealthServiceUrl { get; set; }
+
+    /// <summary>Seconds between swarm-health measurement ticks.</summary>
+    public int SwarmHealthIntervalSeconds
+    {
+        get => _swarmHealthIntervalSeconds;
+        set => _swarmHealthIntervalSeconds = Math.Clamp(value, 10, 3600);
+    }
+
+    /// <summary>Candidate infohashes measured per tick.</summary>
+    public int SwarmHealthBatchSize
+    {
+        get => _swarmHealthBatchSize;
+        set => _swarmHealthBatchSize = Math.Clamp(value, 1, 256);
+    }
+
+    /// <summary>Hours after which a swarm measurement is due again.</summary>
+    public int SwarmHealthRecheckHours
+    {
+        get => _swarmHealthRecheckHours;
+        set => _swarmHealthRecheckHours = Math.Clamp(value, 1, 24 * 30);
+    }
+
+    /// <summary>Days a measurement still counts for ranking (older = treated as unmeasured).</summary>
+    public int SwarmHealthRankWindowDays
+    {
+        get => _swarmHealthRankWindowDays;
+        set => _swarmHealthRankWindowDays = Math.Clamp(value, 1, 90);
     }
 
     /// <summary>Age after which running bulk items are reset to retry on startup.</summary>

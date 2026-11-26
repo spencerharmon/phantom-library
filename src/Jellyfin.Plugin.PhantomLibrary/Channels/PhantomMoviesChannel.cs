@@ -231,7 +231,8 @@ public sealed class PhantomMoviesChannel
     {
         var config = _configProvider();
         var flatItems = await BuildFlatMovieItemsAsync(userId, cancellationToken).ConfigureAwait(false);
-        return BuildCuratedRows(flatItems, config);
+        var rows = BuildCuratedRows(flatItems, config);
+        return await SwarmHealthRows.AppendHealthiestAsync(rows, flatItems, _db, "movie", config, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>

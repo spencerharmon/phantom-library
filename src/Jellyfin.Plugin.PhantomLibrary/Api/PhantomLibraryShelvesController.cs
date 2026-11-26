@@ -101,6 +101,7 @@ public sealed class PhantomLibraryShelvesController : ControllerBase
     private static readonly Dictionary<string, int> RowOrder = new Dictionary<string, int>(StringComparer.Ordinal)
     {
         [CuratedRows.KeyAvailableNow] = 0,
+        [CuratedRows.KeyHealthiestSwarms] = 1,
         [CuratedRows.KeyNewReleases] = 1,
         [CuratedRows.KeyTrending] = 2,
         [CuratedRows.KeyPopular] = 3,

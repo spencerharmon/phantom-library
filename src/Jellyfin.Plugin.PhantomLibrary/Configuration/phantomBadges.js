@@ -600,3 +600,90 @@
         start();
     }
 })();
+
+/* Phantom Library — DHT swarm "Peers" presentation (ROI Priority 0.5).
+ *
+ * The server writes each phantom movie/series's measured DHT swarm size into
+ * the BaseItem CriticRating (live: peers capped at 100, unmeasured: 0.5,
+ * dead: 0), because the web list view only sorts by built-in fields. This
+ * script makes that legible:
+ *   - on the Phantom Movies / Phantom Shows channel pages, the "Critic Rating"
+ *     sort option and the "Sort by" button read "Peers (DHT)";
+ *   - on a phantom item's detail page (one the badge overlay above marked),
+ *     the critic-rating tomato is replaced by "N peers" (hidden when unmeasured).
+ */
+(function () {
+    'use strict';
+
+    var CHANNELS = ['80089d10394fb545b5e4d7d56a872393', '40ab6e9af516a84f46dcea7140855d88'];
+    var FROM = 'Critic Rating';
+    var TO = 'Peers (DHT)';
+    var DONE_ATTR = 'data-phantom-peers';
+
+    function onPhantomChannelPage() {
+        var h = (window.location.hash || '').toLowerCase().replace(/-/g, '');
+        for (var i = 0; i < CHANNELS.length; i++) {
+            if (h.indexOf(CHANNELS[i]) !== -1) return true;
+        }
+        return false;
+    }
+
+    function relabelSort(root) {
+        if (!onPhantomChannelPage()) return;
+        var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+        var node;
+        while ((node = walker.nextNode())) {
+            if (node.nodeValue && node.nodeValue.indexOf(FROM) !== -1) {
+                node.nodeValue = node.nodeValue.split(FROM).join(TO);
+            }
+        }
+    }
+
+    function decorateDetail() {
+        if (!document.querySelector('[data-phantom-detail-badge]')) return;
+        var els = document.querySelectorAll('.mediaInfoCriticRating:not([' + DONE_ATTR + '])');
+        for (var i = 0; i < els.length; i++) {
+            var el = els[i];
+            var value = parseFloat((el.textContent || '').replace(/[^0-9.]/g, ''));
+            el.setAttribute(DONE_ATTR, '1');
+            if (isNaN(value) || value < 1 && value > 0) {
+                el.style.display = 'none';
+                continue;
+            }
+            el.classList.remove('mediaInfoCriticRatingFresh', 'mediaInfoCriticRatingRotten');
+            el.style.backgroundImage = 'none';
+            el.style.paddingLeft = '0';
+            el.title = 'DHT swarm peers (measured)';
+            el.textContent = Math.round(value) + (value >= 100 ? '+' : '') + ' peers';
+        }
+    }
+
+    function sweep(root) {
+        try {
+            relabelSort(root || document.body);
+            decorateDetail();
+        } catch (e) {
+            console.debug('[PhantomLibrary/peers]', e);
+        }
+    }
+
+    function start() {
+        sweep(document.body);
+        new MutationObserver(function (mutations) {
+            for (var i = 0; i < mutations.length; i++) {
+                var added = mutations[i].addedNodes;
+                for (var j = 0; j < added.length; j++) {
+                    if (added[j].nodeType === 1) sweep(added[j]);
+                }
+            }
+            decorateDetail();
+        }).observe(document.body, { childList: true, subtree: true });
+        window.addEventListener('hashchange', function () { sweep(document.body); });
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', start);
+    } else {
+        start();
+    }
+})();
