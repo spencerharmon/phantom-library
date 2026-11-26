@@ -30,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bridge, supply one concrete `DHT_LISTEN_HOST`, bootstrap endpoints and writable
   `STATE_DIR`. Legacy `/measure` omits unknown counts; `/v1/measure` exposes the
   full nullable observation contract. See [service contract](tools/swarm-health/README.md).
+  Request cleanup is generation-bound so DELETE/reuse cannot cancel a successor;
+  depth-exhausting corrupt state recovers via bootstrap without masking I/O errors.
   No plugin DLL/schema or production deployment changes in this update.
 - PostgreSQL: real >= 2 GiB movie/episode sizes no longer fail with `22003
   integer out of range` (source candidates, selected file, availability

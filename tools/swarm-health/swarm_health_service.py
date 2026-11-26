@@ -124,7 +124,10 @@ class State:
             return raw.hex()
         except FileNotFoundError:
             return ""
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError, RecursionError):
+            # A byte-bounded JSON envelope can still exceed the parser's depth
+            # limit. Treat it as corruption, not a permanent restart failure.
+            # Other I/O errors deliberately propagate and fail closed.
             self.metrics["state_recoveries_total"] += 1
             return ""
 
@@ -269,10 +272,19 @@ class Service:
         future.set_result({"request_id": rid, "results": [r for r in rows if not legacy or r["dht_peers"] is not None],
                            "observations": rows, "dht_nodes": self.dht.routing_nodes})
 
-    def release(self, rid, cancelled=False):
-        if rid not in self.requests:
+    def cancel(self, rid):
+        # DELETE targets the currently registered generation. No await between
+        # lookup and release: old HTTP handlers cannot change that selection.
+        request = self.requests.get(rid)
+        return self.release(rid, request[0], cancelled=True) if request else False
+
+    def release(self, rid, future, cancelled=False):
+        # The public ID is reusable as soon as an interest is released. Cleanup
+        # owns the exact admitted future, never a successor with the same ID.
+        request = self.requests.get(rid)
+        if request is None or request[0] is not future:
             return False
-        future, hashes, _, _ = self.requests.pop(rid)
+        _, hashes, _, _ = self.requests.pop(rid)
         if not future.done():
             future.cancel()
         for h in hashes:
@@ -363,11 +375,14 @@ class Service:
                   "retry_after_s": self.cfg.RETRY_AFTER_S if status != "ok" else 0}
         return result
 
-    def legacy_deadline(self, rid):
+    def legacy_deadline(self, rid, future):
         # Existing clients send 128 hashes by default. Keep bounded request wall
         # time without discarding all progress whenever that batch outlives it.
         # Snapshots do not mutate shared jobs or enter the final-result cache.
-        _, hashes, results, _ = self.requests[rid]
+        request = self.requests.get(rid)
+        if request is None or request[0] is not future:
+            raise HttpError(409, "request cancelled")
+        _, hashes, results, _ = request
         rows = []
         for h in hashes:
             if h in results:
@@ -553,7 +568,7 @@ async def send(writer, code, body, cfg, text=False):
 
 
 async def serve(reader, writer, svc):
-    rid, disconnected = None, None
+    rid, future, disconnected = None, None, None
     try:
         try:
             method, path, headers, body = await read_request(reader, svc.cfg)
@@ -569,7 +584,7 @@ async def serve(reader, writer, svc):
         elif method == "GET" and path == "/metrics":
             await send(writer, 200, svc.exposition(), svc.cfg, text=True)
         elif method == "DELETE" and path.startswith("/measure/"):
-            cancelled = svc.release(path.removeprefix("/measure/"), cancelled=True)
+            cancelled = svc.cancel(path.removeprefix("/measure/"))
             await send(writer, 202 if cancelled else 404, {"cancelled": cancelled}, svc.cfg)
         elif method == "POST" and path in ("/measure", "/v1/measure"):
             req = json.loads(body)
@@ -579,16 +594,19 @@ async def serve(reader, writer, svc):
             disconnected = asyncio.create_task(reader.read(1))
             done, _ = await asyncio.wait((future, disconnected), timeout=svc.cfg.REQUEST_TIMEOUT_S,
                                          return_when=asyncio.FIRST_COMPLETED)
-            if future in done:
+            # asyncio.wait's done set is a snapshot. Cancellation/completion
+            # can happen after its timeout fires but before this handler resumes.
+            # Consult our future, not a replacement now registered under rid.
+            if future.done():
                 if future.cancelled():
                     raise HttpError(409, "request cancelled")
                 await send(writer, 200, future.result(), svc.cfg)
             elif disconnected in done:
-                svc.release(rid, cancelled=True)
+                svc.release(rid, future, cancelled=True)
             else:
                 svc.metrics["request_timeouts_total"] += 1
-                partial = svc.legacy_deadline(rid) if path == "/measure" else None
-                svc.release(rid, cancelled=True)
+                partial = svc.legacy_deadline(rid, future) if path == "/measure" else None
+                svc.release(rid, future, cancelled=True)
                 if partial is not None:
                     await send(writer, 200, partial, svc.cfg)
                 else:
@@ -606,7 +624,7 @@ async def serve(reader, writer, svc):
         if disconnected:
             disconnected.cancel()
         if rid:
-            svc.release(rid)
+            svc.release(rid, future)
         writer.close()
         svc.clients -= 1
 

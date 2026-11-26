@@ -5,6 +5,7 @@ The only controlled substitutes are remote DHT peers. No fake LT module, engine,
 HTTP handler, clock, cache or scheduler is injected into the service.
 """
 import concurrent.futures
+from contextlib import ExitStack, closing
 import hashlib
 import heapq
 import http.client
@@ -444,6 +445,108 @@ class Contract(unittest.TestCase):
         self.assertEqual(self.cluster.count(cancelled), 0)
         self.assertEqual(svc.metrics()["requests"], 0)
 
+    def test_delete_reuse_owns_exact_request_generation(self):
+        svc = self.start(QUERY_TIMEOUT_S=1)
+        admitted = 0
+        # Repeated real socket races: DELETE and replacement bytes are sent on
+        # preconnected sockets, without waiting for the old POST to unwind.
+        # Alternate different-hash successors and successors joining the old
+        # coalesced job. No service hooks, fake scheduler or patched clock.
+        for i in range(24):
+            old_hash, new_hash = info(1000 + 2*i), info(1001 + 2*i)
+            if i % 2:
+                new_hash = old_hash
+            self.cluster.data[old_hash] = {"delay": .15}
+            self.cluster.data[new_hash] = {"delay": .15}
+            with self.subTest(trial=i), ExitStack() as stack:
+                def connect():
+                    conn = stack.enter_context(closing(http.client.HTTPConnection("127.0.0.1", svc.port, timeout=5)))
+                    conn.connect()
+                    return conn
+
+                def receive(conn):
+                    response = conn.getresponse()
+                    return response.status, json.loads(response.read())
+
+                old, keeper, delete, new = [connect() for _ in range(4)]
+                old.request("POST", "/v1/measure", json.dumps({"info_hashes": [old_hash], "request_id": "reuse"}))
+                keeper.request("POST", "/v1/measure", json.dumps({"info_hashes": [old_hash], "request_id": "keeper"}))
+                eventually(lambda: svc.metrics()["requests"] == 2)
+                eventually(lambda: self.cluster.count(old_hash) == 3)
+                # Failed admission with the same ID must not release its owner.
+                code, body, _ = svc.measure([new_hash], request_id="reuse")
+                self.assertEqual((code, body["error"]), (409, "request_id already active"))
+                delete.request("DELETE", "/measure/reuse")
+                new.request("POST", "/v1/measure", json.dumps({"info_hashes": [new_hash], "request_id": "reuse"}))
+                self.assertEqual(receive(delete), (202, {"cancelled": True}))
+                self.assertEqual(receive(old), (409, {"error": "request cancelled"}))
+                code, body = receive(new)
+                kept_code, kept = receive(keeper)
+                self.assertEqual(kept_code, 200, kept)
+                self.assertEqual(kept["results"][0]["status"], "ok")
+                if code == 409 and body.get("error") == "request_id already active":
+                    # TCP ordering across connections is not guaranteed. Only
+                    # admission before DELETE may legitimately reject reuse.
+                    code, body, _ = svc.measure([new_hash], request_id="reuse")
+                else:
+                    admitted += 1
+                self.assertEqual(code, 200, body)
+                self.assertEqual(body["results"][0]["info_hash"], new_hash)
+                self.assertEqual(body["results"][0]["status"], "ok")
+                if new_hash == old_hash:
+                    self.assertEqual(body["results"], kept["results"])
+                self.assertEqual(self.cluster.count(old_hash), 3)
+                self.assertEqual(self.cluster.count(new_hash), 3)
+                eventually(lambda: svc.metrics()["requests"] == 0)
+        self.assertGreater(admitted, 0, "no replacement exercised concurrent old-handler cleanup")
+        self.assertEqual(svc.metrics()["cancelled_total"], 24)
+        self.assertEqual(svc.metrics()["engine_errors_total"], 0)
+
+    def test_disconnect_and_deadline_preserve_coalesced_successors(self):
+        svc = self.start(REQUEST_TIMEOUT_S=.6, QUERY_TIMEOUT_S=1)
+        for i, path in enumerate(("disconnect", "/v1/measure", "/measure")):
+            h = info(1100 + i)
+            self.cluster.data[h] = {"delay": .75}
+            with self.subTest(cleanup=path), ExitStack() as stack:
+                def connect():
+                    conn = stack.enter_context(closing(http.client.HTTPConnection("127.0.0.1", svc.port, timeout=5)))
+                    conn.connect()
+                    return conn
+
+                old = connect()
+                old.request("POST", "/v1/measure" if path == "disconnect" else path,
+                            json.dumps({"info_hashes": [h], "request_id": "reuse"}))
+                eventually(lambda: self.cluster.count(h) == 3)
+                # The newer coalesced waiter's deadline outlives the response.
+                time.sleep(.3)
+                keeper = connect()
+                keeper.request("POST", "/v1/measure", json.dumps({"info_hashes": [h], "request_id": "keeper"}))
+                eventually(lambda: svc.metrics()["requests"] == 2)
+                if path == "disconnect":
+                    old.close()
+                else:
+                    response = old.getresponse()
+                    body = json.loads(response.read())
+                    self.assertEqual(response.status, 200 if path == "/measure" else 504, body)
+                    if path == "/measure":
+                        self.assertTrue(body["request_timed_out"])
+                        self.assertEqual(body["results"], [])
+                eventually(lambda: svc.metrics()["requests"] == 1)
+                successor = connect()
+                successor.request("POST", "/v1/measure", json.dumps({"info_hashes": [h], "request_id": "reuse"}))
+                rows = []
+                for conn in (keeper, successor):
+                    response = conn.getresponse()
+                    body = json.loads(response.read())
+                    self.assertEqual(response.status, 200, body)
+                    self.assertEqual(body["results"][0]["status"], "ok")
+                    rows.append(body["results"])
+                self.assertEqual(rows[0], rows[1])
+                self.assertEqual(self.cluster.count(h), 3, "cleanup must not restart shared traversal")
+                eventually(lambda: svc.metrics()["requests"] == 0)
+        self.assertEqual(svc.metrics()["cancelled_total"], 3)
+        self.assertEqual(svc.metrics()["request_timeouts_total"], 2)
+
     def test_coalesced_waiter_admission_limit(self):
         svc = self.start(MAX_HTTP=6, MAX_REQUESTS=2, QUERY_TIMEOUT_S=1)
         h = info(350)
@@ -593,6 +696,51 @@ class Contract(unittest.TestCase):
             self.assertEqual(row["reason"], "request_deadline")
         self.assertEqual(svc.metrics()["requests"], 0)
         self.assertEqual(svc.metrics()["request_timeouts_total"], 1)
+
+    def test_deep_state_corruption_recovers_and_atomically_replaces(self):
+        state = Path(self.tmp.name) / "state/dht-state.json"
+        state.parent.mkdir()
+        # Byte-bounded is not depth-bounded: CPython raises RecursionError,
+        # not ValueError, for this 32,001-byte JSON document.
+        state.write_text("[" * 16000 + "0" + "]" * 16000)
+        self.assertEqual(state.stat().st_size, 32001)
+        # Keep the original inode open so it cannot be reused during assertions.
+        with state.open("rb") as original:
+            svc = self.start()
+            self.assertTrue(svc.ready()["ready"], "configured bootstrap must recover")
+            node_id = svc.ready()["node_id"]
+            self.assertEqual(self.row(svc, info(1200))["status"], "ok")
+            self.assertEqual(svc.metrics()["state_recoveries_total"], 1)
+            self.assertEqual(svc.metrics()["state_loads_total"], 0)
+            eventually(lambda: svc.metrics()["state_saves_total"] > 0)
+            self.assertNotEqual(state.stat().st_ino, os.fstat(original.fileno()).st_ino,
+                                "valid save must replace, not overwrite, corrupt state")
+            self.assertEqual(original.read(), b"[" * 16000 + b"0" + b"]" * 16000)
+            svc.close()
+            self.services.remove(svc)
+        saved = json.loads(state.read_bytes())
+        self.assertEqual(saved["version"], 1)
+        raw = bytes.fromhex(saved["state"])
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), saved["sha256"])
+        self.assertLessEqual(state.stat().st_size, 65536)
+        self.assertEqual(state.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(state.with_suffix(".tmp").exists())
+        # The replacement must be genuinely restorable, not just valid JSON.
+        restored = self.start(DHT_BOOTSTRAP="")
+        self.assertEqual(restored.ready()["node_id"], node_id)
+        self.assertEqual(restored.metrics()["state_loads_total"], 1)
+        self.assertEqual(restored.metrics()["state_recoveries_total"], 0)
+        self.assertEqual(self.row(restored, info(1201))["status"], "ok")
+
+    def test_state_io_error_still_fails_closed(self):
+        state = Path(self.tmp.name) / "state/dht-state.json"
+        state.mkdir(parents=True)  # deterministic open failure, even under root
+        env = dict(os.environ, STATE_DIR=str(state.parent), DHT_LISTEN_HOST="127.0.0.1")
+        failed = subprocess.run([sys.executable, str(SERVICE)], env=env, capture_output=True, timeout=5)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn(b"IsADirectoryError", failed.stderr)
+        self.assertTrue(state.is_dir())
+        self.assertFalse(state.with_suffix(".tmp").exists())
 
     def test_restart_routing_identity_and_corruption_recovery(self):
         svc = self.start()

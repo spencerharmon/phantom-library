@@ -136,8 +136,13 @@ request deadline; clients there should submit appropriately small priority batch
 ### Cancellation, deadlines and overload
 
 `DELETE /measure/<request_id>` removes that request's interests: 202 if active,
-404 otherwise. Its original waiting POST gets 409. Socket disconnect also drops
-interests. A queued hash with no interests is removed immediately; an active hash
+404 otherwise. Its original waiting POST gets 409. The ID is reusable immediately
+after release; cleanup is bound to the exact admitted request/future, so an old
+handler's cancellation, disconnect, deadline or final cleanup cannot remove a
+successor or its coalesced interests. A **new DELETE** always targets the currently
+active request with that ID: use unique IDs if cancellation retries could outlive
+a request. Socket disconnect also drops interests. A queued hash with no interests
+is removed immediately; an active hash
 with no interests stops scheduling immediately. Other coalesced requests remain
 unaffected. Native UDP transactions **cannot be recalled**; their slots stay
 charged until libtorrent's actual reply/timeout alert, even after cancellation,
@@ -231,8 +236,9 @@ external-address/network change; no guarantee across a changed public identity.
 State writes use a private-mode temporary file, flush+fsync, atomic same-directory
 replace, then directory fsync. A lifetime `node.lock` flock rejects a second owner.
 A leftover `.tmp` from a crash is ignored and overwritten, not loaded. Missing
-state bootstraps normally. Oversize, checksum/version, malformed JSON or invalid
-native state cold-starts with a recovery counter; the next valid save replaces it
+state bootstraps normally. Oversize, checksum/version, malformed JSON (including
+parser-depth exhaustion within the byte limit) or invalid native state cold-starts
+with a recovery counter; the next valid save replaces it
 (no unbounded quarantine history). **Bootstrap must be configured for corruption
 recovery.** If bootstrap is absent and saved contacts are unusable, readiness stays
 503, never a false healthy result. Mount a trusted directory; do not share it with
@@ -283,7 +289,12 @@ legacy omission, malformed/saturated filters, TTL/timestamps/eviction, query/pee
 node budgets, native slots after cancellation, cross-request coalescing/promotion,
 aging, atomic overload, disconnect/DELETE/deadlines, the legacy default 128-hash
 batch's bounded partial progress, HTTP framing/slowloris/auth,
-constant metric cardinality and state restart/corruption/locking.
+constant metric cardinality and state restart/corruption/locking. Repeated real
+DELETE/reuse socket races cover same-hash and different-hash successors alongside
+coalesced waiters. Disconnect and both API deadline paths preserve shared work.
+Deeply nested corrupt state must bootstrap, measure, increment recovery, atomically
+replace the file, and restore successfully without bootstrap on the next restart;
+real filesystem I/O errors must still fail closed.
 
 When native build dependencies are absent, the runner builds `Dockerfile.test`
 and reexecutes in rootless Podman with source mounted read-only. Python libtorrent
