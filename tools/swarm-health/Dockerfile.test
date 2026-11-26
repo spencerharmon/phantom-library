@@ -1,0 +1,7 @@
+# Dependency-complete integration environment; no simulated libtorrent binding.
+FROM docker.io/library/debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-libtorrent g++ pkg-config libtorrent-rasterbar-dev nlohmann-json3-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+CMD ["./scripts/tests/p05-swarm-health-service-contract.test.sh"]
