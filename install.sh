@@ -864,4 +864,28 @@ else
   fi
 fi
 
+# PhantomPlayerStats (p14-player-stats-overlay): the in-player stream stats
+# overlay. badges.js already bootstraps it, but inject its own tag too so the
+# overlay does not depend on the badges shim; the overlay's load guard makes a
+# double load a no-op. Same sentinel/idempotency semantics as badges.
+if [ -z "$INDEX_PATH" ]; then
+  yellow "jellyfin-web index.html not found; skipping player stats overlay install."
+  yellow "To install manually, add this line before </body> in your jellyfin-web index.html:"
+  yellow '  <script src="/Plugins/PhantomLibrary/playerstats.js" defer></script>'
+elif $SUDO grep -q 'Plugins/PhantomLibrary/playerstats\.js' "$INDEX_PATH" 2>/dev/null; then
+  green "PhantomPlayerStats shim present in $INDEX_PATH"
+else
+  bold "Injecting PhantomPlayerStats shim into $INDEX_PATH"
+  if [ ! -f "${INDEX_PATH}.phantom-orig" ]; then
+    $SUDO cp "$INDEX_PATH" "${INDEX_PATH}.phantom-orig"
+  fi
+  PLAYERSTATS_SNIPPET='<!--phantom-library-playerstats--><script src="/Plugins/PhantomLibrary/playerstats.js" defer></script>'
+  $SUDO sed -i "s|</body>|${PLAYERSTATS_SNIPPET}</body>|" "$INDEX_PATH"
+  if $SUDO grep -q 'phantom-library-playerstats' "$INDEX_PATH"; then
+    green "  injected. (Backup at ${INDEX_PATH}.phantom-orig)"
+  else
+    red "  injection failed; index.html unchanged. Inspect manually."
+  fi
+fi
+
 green "Done."

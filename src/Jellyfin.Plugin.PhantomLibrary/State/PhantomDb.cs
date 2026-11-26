@@ -1514,6 +1514,87 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
            || string.Equals(reason, "no_main_english_audio", StringComparison.Ordinal)
            || string.Equals(reason, "audio_probe_unsupported_format", StringComparison.Ordinal);
 
+    // ---- p14-player-stats-overlay: materialised source lookup ----
+
+    /// <summary>
+    /// p14-player-stats-overlay: the source a MATERIALISED item is playing from,
+    /// for the player stats overlay. Reads the newest <c>magnet_cache</c> row for
+    /// the item tuple (magnet_cache uses 0/0 for a movie's season/episode, the
+    /// real numbers for an episode), preferring <paramref name="preferredPreset"/>.
+    /// Deliberately ignores the cache TTL and imdb key half: the Materialiser
+    /// writes the winning candidate here and an expired TTL only means "re-probe
+    /// before the NEXT materialise" — the file the player has open is still that
+    /// torrent. Read-only, primary-key-prefix indexed, one row; cheap enough for
+    /// a 2–5 s poll. Returns null when no cached source exists.
+    /// </summary>
+    public async Task<MagnetCacheEntry?> GetMaterialisedSourceMagnetAsync(
+        int tmdbId, string type, int season, int episode, string preferredPreset, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = $@"SELECT magnet, info_hash, {ResolvedSizeSql("size", "size_bytes")}, seeders, indexer, cached_at, ttl_seconds, source
+            FROM magnet_cache
+            WHERE tmdb_id = @tmdb AND type = @type AND season = @season AND episode = @episode
+            ORDER BY CASE WHEN preset = @preset THEN 0 ELSE 1 END, cached_at DESC
+            LIMIT 1;";
+        cmd.AddWithValue("@tmdb", tmdbId);
+        cmd.AddWithValue("@type", type);
+        cmd.AddWithValue("@season", Math.Max(0, season));
+        cmd.AddWithValue("@episode", Math.Max(0, episode));
+        cmd.AddWithValue("@preset", preferredPreset ?? string.Empty);
+        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        if (!await r.ReadAsync(ct).ConfigureAwait(false))
+        {
+            return null;
+        }
+
+        return new MagnetCacheEntry
+        {
+            Magnet = r.GetString(0),
+            InfoHash = r.GetString(1),
+            Size = r.GetInt64(2),
+            Seeders = r.GetInt32(3),
+            Indexer = r.GetString(4),
+            CachedAt = DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(5)),
+            Ttl = TimeSpan.FromSeconds(r.GetInt64(6)),
+            Source = r.GetString(7),
+        };
+    }
+
+    /// <summary>
+    /// p14-player-stats-overlay: the indexer release title for the materialised
+    /// source (the <c>source_candidates</c> row with the same item tuple and the
+    /// same magnet or info-hash). <paramref name="season"/>/<paramref name="episode"/>
+    /// use the -1 sentinel discipline of <c>source_candidates</c>. Null when the
+    /// candidate row has been swept/never cached.
+    /// </summary>
+    public async Task<string?> GetSourceCandidateTitleAsync(
+        int tmdbId, string type, int season, int episode, string magnet, string infoHash, string preferredPreset, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(type);
+        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT title
+            FROM source_candidates
+            WHERE tmdb_id = @tmdb AND type = @type AND season = @season AND episode = @episode
+              AND (magnet = @magnet OR lower(info_hash) = lower(@hash))
+              AND title <> ''
+            ORDER BY CASE WHEN magnet = @magnet THEN 0 ELSE 1 END,
+                     CASE WHEN preset = @preset THEN 0 ELSE 1 END,
+                     fetched_at DESC
+            LIMIT 1;";
+        cmd.AddWithValue("@tmdb", tmdbId);
+        cmd.AddWithValue("@type", type);
+        cmd.AddWithValue("@season", season);
+        cmd.AddWithValue("@episode", episode);
+        cmd.AddWithValue("@magnet", magnet ?? string.Empty);
+        cmd.AddWithValue("@hash", infoHash ?? string.Empty);
+        cmd.AddWithValue("@preset", preferredPreset ?? string.Empty);
+        var value = await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
+        return value is null or DBNull ? null : Convert.ToString(value, CultureInfo.InvariantCulture);
+    }
+
     // ---- source_candidates ----
 
     public async Task<IReadOnlyList<SourceCandidateRow>> ListSourceCandidatesAsync(
