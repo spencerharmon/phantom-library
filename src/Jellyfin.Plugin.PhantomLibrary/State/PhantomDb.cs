@@ -1516,50 +1516,28 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
 
     // ---- p14-player-stats-overlay: materialised source lookup ----
 
-    /// <summary>
-    /// p14-player-stats-overlay: the source a MATERIALISED item is playing from,
-    /// for the player stats overlay. Reads the newest <c>magnet_cache</c> row for
-    /// the item tuple (magnet_cache uses 0/0 for a movie's season/episode, the
-    /// real numbers for an episode), preferring <paramref name="preferredPreset"/>.
-    /// Deliberately ignores the cache TTL and imdb key half: the Materialiser
-    /// writes the winning candidate here and an expired TTL only means "re-probe
-    /// before the NEXT materialise" — the file the player has open is still that
-    /// torrent. Read-only, primary-key-prefix indexed, one row; cheap enough for
-    /// a 2–5 s poll. Returns null when no cached source exists.
-    /// </summary>
-    public async Task<MagnetCacheEntry?> GetMaterialisedSourceMagnetAsync(
-        int tmdbId, string type, int season, int episode, string preferredPreset, CancellationToken ct)
+    private static string MaterialisedSourceKey(int tmdbId, string type, int season, int episode)
+        => FormattableString.Invariant($"materialised-source/v1/{type}/{tmdbId}/{season}/{episode}");
+
+    /// <summary>Read only the successful materialisation snapshot, never the mutable recommendation cache.</summary>
+    public async Task<MaterialisedSource?> GetMaterialisedSourceAsync(
+        MaterialisedStateRow state, CancellationToken ct)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(type);
-        await using var conn = await OpenAsync(ct).ConfigureAwait(false);
-        await using var cmd = conn.CreateCommand();
-        cmd.CommandText = $@"SELECT magnet, info_hash, {ResolvedSizeSql("size", "size_bytes")}, seeders, indexer, cached_at, ttl_seconds, source
-            FROM magnet_cache
-            WHERE tmdb_id = @tmdb AND type = @type AND season = @season AND episode = @episode
-            ORDER BY CASE WHEN preset = @preset THEN 0 ELSE 1 END, cached_at DESC
-            LIMIT 1;";
-        cmd.AddWithValue("@tmdb", tmdbId);
-        cmd.AddWithValue("@type", type);
-        cmd.AddWithValue("@season", Math.Max(0, season));
-        cmd.AddWithValue("@episode", Math.Max(0, episode));
-        cmd.AddWithValue("@preset", preferredPreset ?? string.Empty);
-        await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
-        if (!await r.ReadAsync(ct).ConfigureAwait(false))
+        var json = await GetMetaAsync(MaterialisedSourceKey(state.TmdbId, state.Type, state.Season, state.Episode), ct).ConfigureAwait(false);
+        if (json is null) return null;
+        try
         {
+            var binding = System.Text.Json.JsonSerializer.Deserialize<MaterialisedSourceBinding>(json);
+            return binding is { Version: 1 }
+                && binding.StubPath == state.StubPath && binding.FusePath == state.FusePath
+                && binding.MaterialisedAt == state.MaterialisedAt.ToUnixTimeSeconds()
+                ? binding.Source : null;
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            // Unknown/corrupt optional metadata must never guess a playing hash.
             return null;
         }
-
-        return new MagnetCacheEntry
-        {
-            Magnet = r.GetString(0),
-            InfoHash = r.GetString(1),
-            Size = r.GetInt64(2),
-            Seeders = r.GetInt32(3),
-            Indexer = r.GetString(4),
-            CachedAt = DateTimeOffset.FromUnixTimeSeconds(r.GetInt64(5)),
-            Ttl = TimeSpan.FromSeconds(r.GetInt64(6)),
-            Source = r.GetString(7),
-        };
     }
 
     /// <summary>
@@ -4863,7 +4841,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
     /// re-inserting a not-actually-evicted row does not reset its idle
     /// clock and make it look freshly materialised.
     /// </param>
-    public async Task InsertMaterialisedStateAsync(int tmdbId, string type, int season, int episode, string stubPath, string fusePath, CancellationToken ct, DateTimeOffset? materialisedAt = null)
+    public async Task InsertMaterialisedStateAsync(int tmdbId, string type, int season, int episode, string stubPath, string fusePath, CancellationToken ct, DateTimeOffset? materialisedAt = null, MaterialisedSource? source = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(type);
         ArgumentException.ThrowIfNullOrWhiteSpace(stubPath);
@@ -4873,6 +4851,9 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         {
             await using var conn = await OpenAsync(ct).ConfigureAwait(false);
             await using var cmd = conn.CreateCommand();
+            await using var tx = await conn.BeginTransactionAsync(ct).ConfigureAwait(false);
+            cmd.Transaction = tx;
+            var stamp = (materialisedAt ?? DateTimeOffset.UtcNow).ToUnixTimeSeconds();
             cmd.CommandText = _provider.TranslateUpsertSql(@"INSERT OR REPLACE INTO materialised_state
                 (tmdb_id, type, season, episode, stub_path, fuse_path, materialised_at)
                 VALUES (@tmdb, @type, @season, @episode, @stub, @fuse, @now);");
@@ -4882,8 +4863,22 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
             cmd.AddWithValue("@episode", episode);
             cmd.AddWithValue("@stub", stubPath);
             cmd.AddWithValue("@fuse", fusePath);
-            cmd.AddWithValue("@now", (materialisedAt ?? DateTimeOffset.UtcNow).ToUnixTimeSeconds());
+            cmd.AddWithValue("@now", stamp);
             await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            // Preserve a failed eviction's explicit original state; genuine new
+            // writes replace/clear the snapshot even when their paths are equal.
+            if (source is not null || materialisedAt is null)
+            {
+                cmd.Parameters.Clear();
+                cmd.CommandText = source is null
+                    ? "DELETE FROM plugin_meta WHERE key=@key;"
+                    : "INSERT INTO plugin_meta(key,value) VALUES(@key,@value) ON CONFLICT(key) DO UPDATE SET value=excluded.value;";
+                cmd.AddWithValue("@key", MaterialisedSourceKey(tmdbId, type, season, episode));
+                if (source is not null)
+                    cmd.AddWithValue("@value", System.Text.Json.JsonSerializer.Serialize(new MaterialisedSourceBinding(1, stubPath, fusePath, stamp, source)));
+                await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            }
+            await tx.CommitAsync(ct).ConfigureAwait(false);
         }
         finally
         {

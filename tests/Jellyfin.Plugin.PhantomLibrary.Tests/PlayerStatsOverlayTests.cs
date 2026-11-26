@@ -227,7 +227,8 @@ public sealed class PlayerStatsOverlayTests : IDisposable
         var now = DateTimeOffset.UtcNow;
 
         // Movie: materialised + winning magnet cached + indexer release title.
-        await db.InsertMaterialisedStateAsync(MovieTmdb, "movie", -1, -1, "/stubs/alpha.mkv", "/fuse/alpha.mkv", CancellationToken.None);
+        await db.InsertMaterialisedStateAsync(MovieTmdb, "movie", -1, -1, "/stubs/alpha.mkv", "/fuse/alpha.mkv", CancellationToken.None,
+            source: new MaterialisedSource(MovieMagnet, MovieHash.ToUpperInvariant(), 2147483648L, 120, "rig-indexer", MovieRelease));
         await db.PutCachedMagnetAsync(
             new MagnetCacheKey(MovieTmdb, "tt99000001", "movie", null, null, Preset),
             new MagnetCacheEntry
@@ -245,7 +246,8 @@ public sealed class PlayerStatsOverlayTests : IDisposable
         await SeedCandidateAsync(MovieTmdb, "movie", -1, -1, MovieMagnet, MovieHash, MovieRelease);
 
         // Episode S01E01: same shape, real season/episode numbers.
-        await db.InsertMaterialisedStateAsync(SeriesTmdb, "episode", 1, 1, "/stubs/delta-s01e01.mkv", "/fuse/delta-s01e01.mkv", CancellationToken.None);
+        await db.InsertMaterialisedStateAsync(SeriesTmdb, "episode", 1, 1, "/stubs/delta-s01e01.mkv", "/fuse/delta-s01e01.mkv", CancellationToken.None,
+            source: new MaterialisedSource(EpisodeMagnet, EpisodeHash, 734003200L, 45, "rig-tv-indexer", EpisodeRelease));
         await db.PutCachedMagnetAsync(
             new MagnetCacheKey(SeriesTmdb, "tt99100001", "episode", 1, 1, Preset),
             new MagnetCacheEntry
@@ -320,14 +322,15 @@ public sealed class PlayerStatsOverlayTests : IDisposable
         Guid? userId = null,
         string? deviceId = DeviceId,
         bool admin = false,
-        IGostreamClient? gostream = null)
+        IGostreamClient? gostream = null,
+        string preset = Preset)
     {
         var service = new PlayerStatsService(
             Library().Object,
             db,
             gostream ?? Client(),
             NullLogger<PlayerStatsService>.Instance,
-            () => new PluginConfiguration { SourcePickerPreset = Preset });
+            () => new PluginConfiguration { SourcePickerPreset = preset });
         var ctrl = new PhantomLibraryPlayerStatsController(service, _sessionManager.Object);
         var claims = new List<Claim>
         {
@@ -485,7 +488,7 @@ public sealed class PlayerStatsOverlayTests : IDisposable
     }
 
     [Fact]
-    public async Task ReleaseFallsBackToMagnetDisplayName_WhenCandidateRowIsGone()
+    public async Task ReleaseSnapshotSurvivesCandidateSweep()
     {
         using var db = await NewSeededDbAsync();
         await using (var conn = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString()))
@@ -501,8 +504,55 @@ public sealed class PlayerStatsOverlayTests : IDisposable
 
         var res = Body(await Controller(db).Current(CancellationToken.None));
 
-        Assert.Equal("Phantom Rig Delta S01E01", res.Source!.Release);
-        Assert.Equal("magnet_dn", res.Source.ReleaseSource);
+        Assert.Equal(EpisodeRelease, res.Source!.Release);
+        Assert.Equal("candidate", res.Source.ReleaseSource);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AvailabilityRefreshAndPresetChange_DoNotChangePlayingSource(bool episode)
+    {
+        using var db = await NewSeededDbAsync();
+        var tmdb = episode ? SeriesTmdb : MovieTmdb;
+        var type = episode ? "episode" : "movie";
+        var hash = episode ? EpisodeHash : MovieHash;
+        _gostream.Loaded[hash] = StatsJson(hash);
+        Playing(episode ? EpisodeItemId : MovieItemId);
+        foreach (var preset in new[] { Preset, "new-preset" })
+        {
+            // Same writes as AvailabilityProbeWorker.CompleteAvailableAsync:
+            // recommendations replace A with B, without materialising B.
+            await db.PutCachedMagnetAsync(new MagnetCacheKey(tmdb, episode ? "tt99100001" : "tt99000001", type,
+                episode ? 1 : null, episode ? 1 : null, preset), new MagnetCacheEntry
+                {
+                    Magnet = "magnet:?xt=urn:btih:" + new string('b', 40), InfoHash = new string('b', 40),
+                    Size = 42, Seeders = 999, Indexer = "replacement", Source = "availability",
+                    CachedAt = DateTimeOffset.UtcNow.AddMinutes(1), Ttl = TimeSpan.FromDays(1),
+                }, CancellationToken.None);
+            var res = Body(await Controller(db, preset: preset).Current(CancellationToken.None));
+            Assert.Equal(PlayerStatsStatus.Ok, res.Status);
+            Assert.Equal(hash, res.Source!.InfoHash);
+            Assert.Equal(episode ? EpisodeRelease : MovieRelease, res.Source.Release);
+            Assert.Equal(episode ? 734003200L : 2147483648L, res.Source.SizeBytes);
+            Assert.Equal(episode ? "rig-tv-indexer" : "rig-indexer", res.Source.Indexer);
+        }
+        Assert.All(_gostream.Requests, call => Assert.Equal("/api/library/stats?hash=" + hash, call.PathAndQuery));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task UnboundRematerialisation_NeverGuessesFromCache(bool episode)
+    {
+        using var db = await NewSeededDbAsync();
+        await db.InsertMaterialisedStateAsync(episode ? SeriesTmdb : MovieTmdb, episode ? "episode" : "movie",
+            episode ? 1 : -1, episode ? 1 : -1, "/stubs/new.mkv", "/fuse/new.mkv", CancellationToken.None);
+        Playing(episode ? EpisodeItemId : MovieItemId);
+        var res = Body(await Controller(db).Current(CancellationToken.None));
+        Assert.Equal(PlayerStatsStatus.NoSource, res.Status);
+        Assert.Null(res.Source);
+        Assert.Empty(_gostream.Requests);
     }
 
     // ---------------------------------------------------------------- gostream outcomes
@@ -782,17 +832,11 @@ public sealed class PlayerStatsOverlayTests : IDisposable
         => Assert.Equal(expected, PlayerStatsService.NormaliseInfoHash(raw));
 
     [Fact]
-    public async Task NonHexCachedHash_FallsBackToMagnetBtih()
+    public async Task NonHexBoundHash_FallsBackToMagnetBtih()
     {
         using var db = await NewSeededDbAsync();
-        await db.PutCachedMagnetAsync(
-            new MagnetCacheKey(MovieTmdb, "tt99000001", "movie", null, null, Preset),
-            new MagnetCacheEntry
-            {
-                Magnet = MovieMagnet, InfoHash = "deadbeef", Size = 10, Seeders = 1, Indexer = "x",
-                CachedAt = DateTimeOffset.UtcNow.AddMinutes(1), Ttl = TimeSpan.FromDays(1), Source = "user",
-            },
-            CancellationToken.None);
+        await db.InsertMaterialisedStateAsync(MovieTmdb, "movie", -1, -1, "/stubs/alpha.mkv", "/fuse/alpha.mkv", CancellationToken.None,
+            source: new MaterialisedSource(MovieMagnet, "deadbeef", 10, 1, "x", null));
         _gostream.Loaded[MovieHash] = StatsJson(MovieHash);
         Playing(MovieItemId);
 

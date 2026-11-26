@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 import time
 import urllib.request
@@ -242,6 +243,18 @@ def materialise(item, kind, channel, folder=None):
     expected = "movie_99000001" if kind == "movie" else "episode_99100001_s01e01"
     assert row[0] == expected and row[1] == real["Path"] and row[2] > 0, row
     print("PERSISTED", row, flush=True)
+    if os.environ.get("PHANTOM_P14") == "1":
+        # Read the authoritative endpoint after native-open, then exercise the
+        # actual injected asset in a real browser using Jellyfin's own player.
+        stats = api("/Plugins/PhantomLibrary/PlayerStats/Current", user=True)
+        assert stats["status"] == "ok" and stats["type"] == kind, stats
+        assert stats["source"]["infoHash"] == ("1" if kind == "movie" else "2") * 40, stats
+        assert stats["source"]["release"] == ("Phantom Rig Alpha" if kind == "movie" else "Phantom Rig Delta S01E01"), stats
+        assert stats["source"]["sizeBytes"] == 10485760, stats
+        assert stats["source"]["indexer"] == "rig-cache", stats
+        assert stats["stream"]["state"] == "streaming", stats
+        api(f"/Users/{USER}/Items/{guid(item)}/UserData", {"PlaybackPositionTicks": 0, "Played": False}, user=True)
+        subprocess.run(["node", str(Path(__file__).parent / "browser/player-stats.mjs"), item["Id"], kind, str(OUT)], check=True)
 
 
 def movie():

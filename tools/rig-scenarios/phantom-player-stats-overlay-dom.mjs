@@ -7,7 +7,7 @@
  * getElementsByTagName/getElementById/createElement/textContent/style, so no
  * jsdom/npm dependency is needed — same approach as phantom-kebab-mobile-dom.mjs).
  *
- * Two modes:
+ * Offline unit harness (live coverage is browser/player-stats.mjs):
  *
  *   node tools/rig-scenarios/phantom-player-stats-overlay-dom.mjs
  *       OFFLINE (default; CI/sandbox): a mocked ApiClient answering the real
@@ -17,16 +17,6 @@
  *       / collapse toggle / server "not playing"; re-arm on the next <video>
  *       loadstart; one request in flight; movie + episode render; desktop vs
  *       mobile layout; untrusted text via textContent; badges.js bootstrap.
- *
- *   node tools/rig-scenarios/phantom-player-stats-overlay-dom.mjs --live \
- *        --api http://localhost:18096 --token <user token> --device <deviceId> \
- *        --stop-item <guid> --expect-hash <40hex> [--label movie|episode]
- *       LIVE (tools/rig-scenarios/52-player-stats-overlay.sh): the same DOM, but
- *       ApiClient.ajax performs REAL authenticated HTTP to the rig on a REAL
- *       clock. Opens the player, waits for >=2 real polls carrying the expected
- *       info-hash, reports Sessions/Playing/Stopped exactly as jellyfin-web does
- *       on close, and asserts polling STOPS (no further requests over 2 full max
- *       poll periods). Prints a final `RESULT {json}` line for the scenario.
  *
  * Exits non-zero on any failed assertion.
  */
@@ -244,6 +234,56 @@ function assert(cond, msg) { if (!cond) throw new Error(msg); }
 function eq(a, b, msg) { if (a !== b) throw new Error(`${msg}: expected ${JSON.stringify(b)}, got ${JSON.stringify(a)}`); }
 
 async function offline() {
+    await test('collapsed media start during pending probe coalesces one recovery request', async () => {
+        const clock = virtualClock();
+        let resolve;
+        const pending = new Promise(r => { resolve = r; });
+        const h = boot({ responder: (_, n) => n === 1 ? pending : episodeOk(), clock,
+            dom: makeDom({ storage: { 'phantomPlayerStats.collapsed': '1' } }) });
+        const video = h.openPlayer();
+        await flush();
+        video.dispatch('loadstart');
+        video.dispatch('playing');
+        resolve(notPlaying());
+        await clock.advance(30000);
+        eq(h.calls.length, 2, 'exactly one event-driven followup');
+        eq(h.field('release'), episodeOk().source.release, 'resolved next episode');
+        eq(h.api.state().timerArmed, false, 'no collapsed polling timer');
+    });
+    for (const failure of ['not_playing', 'error']) {
+        await test(`collapsed ${failure} startup recovers on playing, episode transition, no timer`, async () => {
+            const clock = virtualClock();
+            let response = failure;
+            const h = boot({ responder: () => {
+                if (response === 'error') throw new Error('temporary failure');
+                return response === 'not_playing' ? notPlaying() : response;
+            }, clock, dom: makeDom({ storage: { 'phantomPlayerStats.collapsed': '1' } }) });
+            const video = h.openPlayer();
+            await clock.advance(1000);
+            response = movieOk();
+            video.dispatch('loadstart');
+            await flush();
+            video.dispatch('playing');
+            await clock.advance(30000);
+            assert(h.root() && h.api.state().visible, 'recoverable expansion control');
+            eq(h.api.state().timerArmed, false, 'collapsed has no timer');
+            const count = h.calls.length;
+            await clock.advance(30000);
+            eq(h.calls.length, count, 'no collapsed polling');
+            response = episodeOk();
+            video.dispatch('loadstart');
+            await flush();
+            eq(h.field('release'), response.source.release, 'next episode replaces old source');
+            h.setHidden(true);
+            video.dispatch('playing');
+            await clock.advance(30000);
+            eq(h.calls.length, count + 1, 'no background event probes');
+            h.closePlayer();
+            video.dispatch('playing');
+            await clock.advance(30000);
+            eq(h.calls.length, count + 1, 'no close event probes');
+        });
+    }
     console.log('== offline: real phantomPlayerStats.js, mocked ApiClient, virtual clock');
 
     await test('no player open → zero requests, no timer, no overlay', async () => {
@@ -484,110 +524,11 @@ async function offline() {
     });
 }
 
-/* ------------------------------------------------------------------ live mode */
-
-function parseArgs(argv) {
-    const out = {};
-    for (let i = 0; i < argv.length; i++) {
-        if (argv[i].startsWith('--')) {
-            const k = argv[i].slice(2);
-            const v = argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[++i] : true;
-            out[k] = v;
-        }
-    }
-    return out;
-}
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function live(args) {
-    const apiBase = String(args.api || 'http://localhost:18096').replace(/\/$/, '');
-    const token = args.token;
-    const device = args.device || 'phantom-rig-device';
-    const stopItem = args['stop-item'];
-    const expectHash = args['expect-hash'];
-    const label = args.label || 'item';
-    if (!token || !stopItem || !expectHash) throw new Error('--live needs --token, --stop-item and --expect-hash');
-    if (/:8096(\/|$)/.test(apiBase)) throw new Error('refusing to drive production port :8096');
-
-    const authHeader = `MediaBrowser Client="phantom-rig", Device="phantom-rig", DeviceId="${device}", Version="1", Token="${token}"`;
-    const headers = { 'X-Emby-Token': token, 'X-Emby-Authorization': authHeader };
-    const seen = [];
-    const apiClient = {
-        getUrl: (p) => `${apiBase}/${p}`,
-        ajax: async (opts) => {
-            const res = await fetch(opts.url, { method: opts.type || 'GET', headers });
-            if (!res.ok) throw Object.assign(new Error('HTTP ' + res.status), { status: res.status });
-            const body = await res.json();
-            seen.push({ at: Date.now(), body });
-            return body;
-        }
-    };
-    const realClock = { setTimeout: (fn, ms) => setTimeout(fn, ms), clearTimeout: (id) => clearTimeout(id), now: () => Date.now() };
-    const h = boot({ responder: null, clock: realClock, apiClient });
-
-    console.log(`== live (${label}): real overlay → ${apiBase}/Plugins/PhantomLibrary/PlayerStats/Current (device ${device})`);
-    h.openPlayer();
-    const deadline = Date.now() + 30000;
-    while (Date.now() < deadline && seen.filter((s) => s.body.status === 'ok').length < 2) await sleep(250);
-    const oks = seen.filter((s) => s.body.status === 'ok');
-    assert(oks.length >= 2, `expected >=2 ok polls within 30s, got statuses ${JSON.stringify(seen.map((s) => s.body.status))}`);
-    const last = oks[oks.length - 1].body;
-    eq(last.source && last.source.infoHash, expectHash, 'live payload info-hash');
-    assert(last.stream && typeof last.stream.state === 'string', 'live payload stream state');
-    eq(h.root().style.display, '', 'overlay visible while playing');
-    eq(h.field('release'), last.source.release || '—', 'overlay renders live release');
-    const gaps = oks.slice(1).map((s, i) => s.at - oks[i].at);
-    for (const g of gaps) assert(g >= 1800 && g <= 6500, `live poll gap ${g} ms outside 2–5 s (+slack)`);
-    const okCount = seen.length;
-
-    // jellyfin-web reports Stopped when the player closes / playback ends.
-    const stopped = await fetch(`${apiBase}/Sessions/Playing/Stopped`, {
-        method: 'POST',
-        headers: { ...headers, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ItemId: stopItem, MediaSourceId: stopItem.replace(/-/g, ''), PositionTicks: 10000000 })
-    });
-    assert(stopped.status >= 200 && stopped.status < 300, 'Sessions/Playing/Stopped HTTP ' + stopped.status);
-    const stopDeadline = Date.now() + 15000;
-    while (Date.now() < stopDeadline && h.api.state().polling) await sleep(250);
-    eq(h.api.state().polling, false, 'overlay stopped polling after playback stopped');
-    eq(h.root().style.display, 'none', 'overlay hidden after playback stopped');
-    const atStop = seen.length;
-    await sleep(10500); // > 2 x max poll period
-    eq(seen.length, atStop, 'zero overlay requests after playback stopped');
-
-    // And the browser-side close path: close the player route too.
-    h.closePlayer();
-    await sleep(500);
-    eq(h.api.state().polling, false, 'still not polling after close');
-
-    const result = {
-        label,
-        okPolls: okCount,
-        requestsTotal: seen.length,
-        requestsAfterStop: seen.length - atStop,
-        pollGapsMs: gaps,
-        lastOk: last,
-        stoppedStatus: seen[atStop - 1] && seen[atStop - 1].body.status
-    };
-    console.log('RESULT ' + JSON.stringify(result));
-}
-
 /* ------------------------------------------------------------------ main */
-
-const args = parseArgs(process.argv.slice(2));
-try {
-    if (args.live) {
-        await live(args);
-        console.log('LIVE OVERLAY OK');
-    } else {
-        await offline();
-        const failed = results.filter((r) => !r[0]).length;
-        console.log(`\n${results.length - failed} passed, ${failed} failed`);
-        if (failed) process.exit(1);
-    }
-} catch (e) {
-    console.error('FAIL: ' + (e && e.stack ? e.stack : e));
-    process.exit(1);
-}
-process.exit(0);
+// Live testing lives ONLY in browser/player-stats.mjs (real installed web +
+// Chromium), never in this simulated-DOM harness.
+if (process.argv.length > 2) throw new Error('No live/skip mode; run scenario 52 for real browser playback');
+await offline();
+const failed = results.filter((r) => !r[0]).length;
+console.log(`\n${results.length - failed} passed, ${failed} failed`);
+process.exit(failed ? 1 : 0);

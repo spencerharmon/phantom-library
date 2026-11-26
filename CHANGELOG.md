@@ -24,7 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`/Plugins/PhantomLibrary/playerstats.js`) is bootstrapped by `badges.js`, so
   existing installs pick it up with no new `index.html` tag (`install.sh` also
   adds one). Requires a gostream build with the stats endpoint; older gostream
-  shows "gostream unavailable". No schema change.
+  shows "gostream unavailable". Source snapshots are committed atomically with
+  successful materialisation in versioned `plugin_meta` keys (no schema change);
+  availability refreshes/preset changes cannot retarget stats. Legacy unbound
+  materialisations report "Source unknown" until rematerialised. Collapsed
+  startup probes recover on media lifecycle events without background polling.
+  P14 remains gated on native episode web-queue playback; the mandatory live
+  check now fails instead of skipping that scenario.
 - Rank by REAL DHT swarm health (ROI Priority 0.5). A standalone swarm-health
   service (`tools/swarm-health/swarm_health_service.py`, libtorrent DHT node)
   measures the distinct DHT peers behind each available item's candidate

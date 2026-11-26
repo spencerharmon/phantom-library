@@ -107,7 +107,7 @@ public static class PlayerStatsStatus
     /// <summary>Phantom item with no materialised_state row (still a phantom stub).</summary>
     public const string NotMaterialised = "not_materialised";
 
-    /// <summary>Materialised, but no cached magnet row records which source won.</summary>
+    /// <summary>Materialised, but no matching successful-source snapshot exists (including legacy state).</summary>
     public const string NoSource = "no_source";
 
     /// <summary>Source known but its info-hash is not a valid v1 BitTorrent hash.</summary>
@@ -125,8 +125,8 @@ public static class PlayerStatsStatus
 
 /// <summary>
 /// p14-player-stats-overlay. Maps a playing item to its materialised info-hash
-/// (materialised_state → magnet_cache) plus the plugin's source metadata
-/// (release title from source_candidates, size, indexer) and proxies gostream's
+/// (materialised_state → witnessed plugin_meta snapshot) plus source metadata
+/// captured from the winning candidate and proxies gostream's
 /// per-torrent <c>/api/library/stats</c> (gostream:phantom-player-stats-endpoint)
 /// server-side, so the gostream token never reaches the browser.
 ///
@@ -140,7 +140,7 @@ public sealed class PlayerStatsService
     /// <summary>Default overlay poll cadence; the task bound is 2–5 s.</summary>
     public const int DefaultPollIntervalMs = 3000;
 
-    /// <summary>Upper bound on the proxied gostream stats call (well under the poll period).</summary>
+    /// <summary>Upper bound on the proxied gostream call; the browser never overlaps requests.</summary>
     public static readonly TimeSpan GostreamStatsTimeout = TimeSpan.FromSeconds(4);
 
     private readonly ILibraryManager _libraryManager;
@@ -204,16 +204,14 @@ public sealed class PlayerStatsService
         }
 
         ident = ident with { MaterialisedAt = state.MaterialisedAt };
-        var preset = _configProvider().SourcePickerPreset ?? string.Empty;
-        var entry = await _db.GetMaterialisedSourceMagnetAsync(tmdb, type, sSentinel, eSentinel, preset, ct).ConfigureAwait(false);
+        var entry = await _db.GetMaterialisedSourceAsync(state, ct).ConfigureAwait(false);
         if (entry is null)
         {
             return ident with { Status = PlayerStatsStatus.NoSource };
         }
 
         var hash = NormaliseInfoHash(entry.InfoHash) ?? NormaliseInfoHash(ExtractBtih(entry.Magnet));
-        var title = await _db.GetSourceCandidateTitleAsync(tmdb, type, sSentinel, eSentinel, entry.Magnet, entry.InfoHash, preset, ct)
-            .ConfigureAwait(false);
+        var title = string.IsNullOrWhiteSpace(entry.Title) ? null : entry.Title;
         string? releaseSource = title is null ? null : "candidate";
         if (title is null)
         {
