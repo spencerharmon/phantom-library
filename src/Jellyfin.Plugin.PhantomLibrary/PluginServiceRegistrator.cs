@@ -136,6 +136,10 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         {
             c.Timeout = TimeSpan.FromSeconds(90);
         });
+        // p05-baseitem-writeback: bounded keyset reader over Jellyfin's own BaseItems
+        // (IDbContextFactory<JellyfinDbContext> is registered by the server) feeding the
+        // worker's resumable full-catalogue Peers score sweep.
+        serviceCollection.AddSingleton<Swarm.IChannelScorePager, Swarm.JellyfinChannelScorePager>();
         serviceCollection.AddHostedService<SwarmHealthWorker>();
 
         // SeriesAutopilot (stage-2.1 stub; rewritten in Stage 5.2).

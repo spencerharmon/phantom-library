@@ -25,6 +25,7 @@ public class PluginConfiguration : BasePluginConfiguration
     private int _deadSwarmBrowsePruneThreshold;
     private int _swarmHealthIntervalSeconds;
     private int _swarmHealthBatchSize;
+    private int _swarmHealthSyncBatchSize;
     private int _swarmHealthRecheckHours;
     private int _swarmHealthRankWindowDays;
     private int _bulkMaterialiseRunningStaleMinutes;
@@ -151,6 +152,7 @@ public class PluginConfiguration : BasePluginConfiguration
         SwarmHealthServiceUrl = string.Empty;
         SwarmHealthIntervalSeconds = 60;
         SwarmHealthBatchSize = 128;
+        SwarmHealthSyncBatchSize = 500;
         SwarmHealthRecheckHours = 24;
         SwarmHealthRankWindowDays = 7;
         SourceValidationLeaseMinutes = 10;
@@ -834,6 +836,19 @@ public class PluginConfiguration : BasePluginConfiguration
     {
         get => _swarmHealthBatchSize;
         set => _swarmHealthBatchSize = Math.Clamp(value, 1, 256);
+    }
+
+    /// <summary>
+    /// p05-baseitem-writeback: persisted phantom channel BaseItems read (keyset page) per
+    /// worker tick by the Peers score sweep. Bounds per-tick DB cost; one full sweep of a
+    /// catalogue of N titles takes ceil(N / this) ticks, which must fit inside one
+    /// measurement cycle (<see cref="SwarmHealthRecheckHours"/>) — the worker logs a
+    /// warning when a sweep overruns half of it. Never sends anything to the DHT service.
+    /// </summary>
+    public int SwarmHealthSyncBatchSize
+    {
+        get => _swarmHealthSyncBatchSize;
+        set => _swarmHealthSyncBatchSize = Math.Clamp(value, 50, 5000);
     }
 
     /// <summary>Hours after which a swarm measurement is due again.</summary>

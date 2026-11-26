@@ -29,6 +29,16 @@ internal static class SwarmHealthMetrics
         unit: "{item}",
         description: "Phantom BaseItems whose Peers (CriticRating) value was written.");
 
+    private static readonly Counter<long> SyncRowsRead = Meter.CreateCounter<long>(
+        "phantom_swarm_health_sync_rows_read_total",
+        unit: "{item}",
+        description: "Persisted phantom channel BaseItems read by the bounded Peers score sweep.");
+
+    private static readonly Counter<long> SyncSweeps = Meter.CreateCounter<long>(
+        "phantom_swarm_health_sync_sweeps_total",
+        unit: "{sweep}",
+        description: "Completed full-catalogue Peers score sweeps.");
+
     private static readonly Prometheus.Counter MeasuredProm = Prometheus.Metrics.CreateCounter(
         "phantom_swarm_health_measured_total",
         "Candidate infohashes measured on the DHT, by item type and result (live|dead).",
@@ -85,7 +95,17 @@ internal static class SwarmHealthMetrics
         }
     }
 
-    public static void SetTitles(string type, int live, int dead)
+    public static void RecordSyncRead(int count)
+    {
+        if (count > 0)
+        {
+            SyncRowsRead.Add(count);
+        }
+    }
+
+    public static void RecordSyncSweepCompleted() => SyncSweeps.Add(1);
+
+    public static void SetTitles(string type, long live, long dead)
     {
         if (type == "movie")
         {
@@ -101,6 +121,10 @@ internal static class SwarmHealthMetrics
         TitlesProm.WithLabels(type, "live").Set(live);
         TitlesProm.WithLabels(type, "dead").Set(dead);
     }
+
+    /// <summary>Current title-gauge values (what the OTel observable gauge reports).</summary>
+    internal static (long MovieLive, long MovieDead, long SeriesLive, long SeriesDead) TitlesSnapshot()
+        => (Interlocked.Read(ref _movieLive), Interlocked.Read(ref _movieDead), Interlocked.Read(ref _seriesLive), Interlocked.Read(ref _seriesDead));
 
     private static Measurement<long> Point(long value, string type, string health)
         => new(value, new KeyValuePair<string, object?>("type", type), new KeyValuePair<string, object?>("health", health));
