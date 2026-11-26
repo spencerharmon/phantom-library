@@ -111,10 +111,12 @@ public sealed class SwarmHealthWorker : IHostedService, IDisposable
             var cfg = _configProvider();
             if (string.IsNullOrWhiteSpace(cfg.SwarmHealthServiceUrl))
             {
+                SwarmHealthCache.Set(false, new Dictionary<int, int>(), new Dictionary<int, int>());
                 return;
             }
 
             await MeasureOnceAsync(cfg, ct).ConfigureAwait(false);
+            await RefreshCacheAsync(cfg, ct).ConfigureAwait(false);
             if (Interlocked.Increment(ref _ticks) % SyncEveryTicks == 1)
             {
                 await SyncBaseItemsAsync(cfg, ct).ConfigureAwait(false);
@@ -183,6 +185,15 @@ public sealed class SwarmHealthWorker : IHostedService, IDisposable
 
         _logger.LogDebug("Swarm-health measured {Measured}/{Asked} infohashes", rows.Count, byHash.Count);
         return rows.Count;
+    }
+
+    /// <summary>Reload the in-memory peers snapshot the metadata provider reads.</summary>
+    internal async Task RefreshCacheAsync(PluginConfiguration cfg, CancellationToken ct)
+    {
+        var fresh = DateTimeOffset.UtcNow.AddDays(-cfg.SwarmHealthRankWindowDays);
+        var movies = await _db.GetSwarmPeersByTmdbAsync("movie", fresh, ct).ConfigureAwait(false);
+        var series = await _db.GetSwarmPeersByTmdbAsync("episode", fresh, ct).ConfigureAwait(false);
+        SwarmHealthCache.Set(true, movies, series);
     }
 
     /// <summary>Write the Peers value onto phantom movie/series BaseItems; returns items written.</summary>
