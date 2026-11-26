@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Never send an indexer search with an empty, whitespace-only, or
+  punctuation-only title term (ROI P13; production sent `Term: [. 2026]`).
+  The term is repaired from TMDB: the original title first, then an
+  alternative or translated title. If neither works, the search falls back
+  to IMDB-id-only on indexers that support it. Otherwise the lookup is
+  skipped with a counted `degenerate_query_skipped` outcome and no indexer
+  call is made. This applies to movies and episodes, in both interactive and
+  background paths. Scoring is unchanged. See
+  [docs/tasks/p13-degenerate-query-guard.md](docs/tasks/p13-degenerate-query-guard.md).
 - Preserve independent loaded-config fields in offline gostream drift reports:
   after process binding, a missing or invalid sibling no longer hides a valid
   match or mismatch. Whole-receipt and ownership failures still invalidate all

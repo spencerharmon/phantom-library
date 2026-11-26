@@ -32,6 +32,18 @@ public interface IIndexerClient
     /// </summary>
     bool IsAvailabilityOracle => false;
 
+    /// <summary>
+    /// True if this indexer can serve a query of <paramref name="type"/>
+    /// ("movie" | "episode") from the IMDB id ALONE, with no title term.
+    /// Used by <see cref="Sources.MagnetSelector"/>'s degenerate-query guard
+    /// (p13-degenerate-query-guard): when an item's title is degenerate and
+    /// cannot be repaired from TMDB, only indexers that answer this true are
+    /// queried (IMDB-id-only); every other indexer is skipped rather than sent
+    /// an empty/punctuation-only term. Defaults to <see cref="RequiresImdb"/>
+    /// (an IMDB-only indexer is by definition IMDB-capable).
+    /// </summary>
+    bool SupportsImdbOnlyQuery(string type) => RequiresImdb;
+
     Task<IReadOnlyList<IndexerCandidate>> SearchAsync(IndexerQuery query, CancellationToken ct);
 }
 
