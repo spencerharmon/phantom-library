@@ -163,7 +163,7 @@ class Postgres:
         else:
             image = os.environ.get("PHANTOM_PARITY_POSTGRES_IMAGE", "docker.io/library/postgres:16-alpine")
             password = uuid.uuid4().hex
-            self.container = run([self.runtime, "run", "-d", "--name", self.database,
+            self.container = run([self.runtime, "run", "-d", "--name", self.database, "--shm-size=256m",
                 "-e", "POSTGRES_PASSWORD", "-p", "127.0.0.1::5432", image],
                 env={**self.env, "POSTGRES_PASSWORD": password}, capture_output=True, text=True).stdout.strip()
             mapping = run([self.runtime, "port", self.container, "5432/tcp"], capture_output=True, text=True).stdout.strip()

@@ -1,0 +1,48 @@
+name: availability-claims
+on:
+  push:
+    branches: [main, bee-p0-indexed-batch-availability]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: Owned integration runner label
+        required: false
+        default: k8s
+        type: string
+jobs:
+  claims:
+    runs-on: ["${{ inputs.runner_label || 'k8s' }}"]
+    timeout-minutes: 60
+    container:
+      image: mcr.microsoft.com/dotnet/sdk:9.0.305-noble
+    env:
+      PHANTOM_PARITY_CONTAINER_RUNTIME: docker
+      PHANTOM_TEST_RESULTS: ${{ gitea.workspace }}/artifacts/availability-claims
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Install isolated integration tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends nodejs git python3 curl patch docker.io ca-certificates xz-utils
+      - uses: actions/checkout@v4
+      - name: Actual PostgreSQL .NET claims and worker, 4M rows, old/new overlap and 35/36
+        run: ./scripts/tests/p0-availability-claims.test.sh
+      - name: Preserve every plan, timing, cache/hardware condition and parity receipt
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: availability-claims
+          if-no-files-found: error
+          path: |
+            artifacts/availability-claims/*.json
+            artifacts/availability-claims/*.log
+            artifacts/availability-claims/*.trx
+            artifacts/playback-parity-*/*.json
+            artifacts/playback-parity-*/*.log
+            artifacts/playback-parity-*/movie/*.json
+            artifacts/playback-parity-*/movie/logs/**
+            artifacts/playback-parity-*/movie/responses/**
+            artifacts/playback-parity-*/episode/*.json
+            artifacts/playback-parity-*/episode/logs/**
+            artifacts/playback-parity-*/episode/responses/**

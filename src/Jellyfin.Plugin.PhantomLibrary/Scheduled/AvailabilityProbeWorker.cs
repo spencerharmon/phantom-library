@@ -37,6 +37,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
     private CancellationTokenSource? _stopping;
     private Task? _currentTick;
     private int _running;
+    private int _batchPreference;
 
     // availability-stale-candidate-reprobe-001: claim priority a
     // stale-available-no-candidate row is promoted to for eager re-probe.
@@ -201,37 +202,17 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
                 _logger.LogWarning(ex, "Stale-available eager re-probe promotion failed");
             }
 
-            for (var i = 0; i < batch; i++)
+            await _db.RescheduleAvailabilityPolicyAsync(ComputePolicyHash(cfg), DateTimeOffset.UtcNow, serviceStopping).ConfigureAwait(false);
+            for (var i = 0; i < batch; i += 4)
             {
                 using var cts = CancellationTokenSource.CreateLinkedTokenSource(serviceStopping);
                 cts.CancelAfter(TimeSpan.FromMinutes(Math.Max(1, cfg.AvailabilityLeaseMinutes)));
-
-                // TV parity: series expansion creates episode availability work,
-                // and episode probes must not sit behind a movie backlog. Each
-                // slot gives TV expansion a chance, then probes availability
-                // with alternating episode/movie preference and fallback.
-                var expanded = i % 2 == 0 && await ExpandOneSeriesAsync(cfg, cts.Token).ConfigureAwait(false);
-                var preferredType = i % 2 == 0 ? "episode" : "movie";
-                var probed = await ProbeOneAvailabilityAsync(cfg, preferredType, cts.Token).ConfigureAwait(false);
-                if (!probed)
-                {
-                    probed = await ProbeOneAvailabilityAsync(cfg, preferredType == "episode" ? "movie" : "episode", cts.Token).ConfigureAwait(false);
-                }
-                if (!probed)
-                {
-                    probed = await ProbeOneAvailabilityAsync(cfg, preferredType: null, cts.Token).ConfigureAwait(false);
-                }
-                if (!expanded && !probed && i % 2 != 0)
-                {
-                    expanded = await ExpandOneSeriesAsync(cfg, cts.Token).ConfigureAwait(false);
-                }
-
-                var didWork = expanded || probed;
-                anyWork |= didWork;
-                if (!didWork)
-                {
-                    break;
-                }
+                var expanded = await ExpandOneSeriesAsync(cfg, cts.Token).ConfigureAwait(false);
+                // Start every leased probe immediately. Never hold a batch of
+                // expiring leases behind a serial network request backlog.
+                var probed = await ProbeAvailabilityBatchAsync(cfg, Math.Min(4, batch - i), cts.Token).ConfigureAwait(false);
+                anyWork |= expanded || probed > 0;
+                if (!expanded && probed == 0) break;
             }
 
             var nextDelay = TimeSpan.FromSeconds(Math.Max(1, anyWork ? cfg.AvailabilityProbeMinIntervalSeconds : cfg.AvailabilityProbeMaxIntervalSeconds));
@@ -269,6 +250,44 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
             return false;
         }
 
+        return await ProbeLeasedAvailabilityAsync(cfg, lease, policyHash, now, ct).ConfigureAwait(false);
+    }
+
+    internal async Task<int> ProbeAvailabilityBatchAsync(PluginConfiguration cfg, int count, CancellationToken ct)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var policyHash = ComputePolicyHash(cfg);
+        var duration = TimeSpan.FromMinutes(Math.Max(1, cfg.AvailabilityLeaseMinutes));
+        var first = Interlocked.Increment(ref _batchPreference) % 2 == 1 ? "episode" : "movie";
+        var leases = new List<AvailabilityItemRow>();
+        try
+        {
+            leases.AddRange(await _db.ClaimDueAvailabilityBatchAsync(_owner, duration, now, policyHash,
+                Math.Max(1, count / 2), ct, first).ConfigureAwait(false));
+            if (leases.Count < count)
+                leases.AddRange(await _db.ClaimDueAvailabilityBatchAsync(_owner, duration, now, policyHash,
+                    count - leases.Count, ct, first == "episode" ? "movie" : "episode").ConfigureAwait(false));
+            if (leases.Count < count)
+                leases.AddRange(await _db.ClaimDueAvailabilityBatchAsync(_owner, duration, now, policyHash,
+                    count - leases.Count, ct, first).ConfigureAwait(false));
+            var probes = new List<Task>();
+            foreach (var lease in leases) probes.Add(ProbeLeasedAvailabilityAsync(cfg, lease, policyHash, now, ct));
+            await Task.WhenAll(probes).ConfigureAwait(false);
+            return leases.Count;
+        }
+        finally
+        {
+            // Includes cancellation while acquiring the second type's slice.
+            // A crashed process still recovers via indexed lease expiry.
+            using var release = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            var releases = new List<Task>();
+            foreach (var lease in leases) releases.Add(_db.ReleaseAvailabilityLeaseAsync(lease, release.Token));
+            await Task.WhenAll(releases).ConfigureAwait(false);
+        }
+    }
+
+    private async Task<bool> ProbeLeasedAvailabilityAsync(PluginConfiguration cfg, AvailabilityItemRow lease, string policyHash, DateTimeOffset now, CancellationToken ct)
+    {
         using var timer = PhantomMetrics.TimeAvailabilityProbe();
         try
         {

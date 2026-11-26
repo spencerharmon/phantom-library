@@ -380,7 +380,7 @@ public sealed record HiddenItemRow(int TmdbId, string Type, DateTimeOffset Hidde
 /// <see cref="ExpandMigrations"/>. Proven by
 /// <c>scripts/tests/postgres-media-size-int64.test.sh</c>.
 /// </summary>
-public sealed class PhantomDb : IDisposable
+public sealed partial class PhantomDb : IDisposable
 {
     public const int CurrentSchemaVersion = 24;
 
@@ -544,6 +544,7 @@ public sealed class PhantomDb : IDisposable
     private readonly IPhantomDbProvider _provider;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
     private int _schemaEnsured;
+    private readonly SemaphoreSlim _schemaLock = new(1, 1);
     private int _connectionsOpenedForTests;
 
     /// <summary>
@@ -601,6 +602,7 @@ public sealed class PhantomDb : IDisposable
     public void Dispose()
     {
         _writeLock.Dispose();
+        _schemaLock.Dispose();
         _provider.ClearPool();
     }
 
@@ -609,15 +611,25 @@ public sealed class PhantomDb : IDisposable
         var conn = _provider.CreateConnection();
         await conn.OpenAsync(ct).ConfigureAwait(false);
         Interlocked.Increment(ref _connectionsOpenedForTests);
-        if (Interlocked.CompareExchange(ref _schemaEnsured, 1, 0) == 0)
+        if (Volatile.Read(ref _schemaEnsured) == 0)
         {
             try
             {
-                await EnsureSchemaAsync(conn, ct).ConfigureAwait(false);
+                await _schemaLock.WaitAsync(ct).ConfigureAwait(false);
+                try
+                {
+                    if (_schemaEnsured == 0)
+                    {
+                        await EnsureSchemaAsync(conn, ct).ConfigureAwait(false);
+                        if (conn is NpgsqlConnection postgres)
+                            await AvailabilitySchedule.ExpandAsync(postgres, ct).ConfigureAwait(false);
+                        Volatile.Write(ref _schemaEnsured, 1);
+                    }
+                }
+                finally { _schemaLock.Release(); }
             }
             catch
             {
-                Interlocked.Exchange(ref _schemaEnsured, 0);
                 await conn.DisposeAsync().ConfigureAwait(false);
                 throw;
             }
@@ -2711,6 +2723,13 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
     }
 
     public async Task<AvailabilityItemRow?> ClaimDueAvailabilityAsync(string owner, TimeSpan leaseDuration, DateTimeOffset now, string policyHash, CancellationToken ct, string? preferredType = null)
+    {
+        var rows = await ClaimDueAvailabilityBatchAsync(owner, leaseDuration, now, policyHash, 1, ct, preferredType).ConfigureAwait(false);
+        return rows.Count == 0 ? null : rows[0];
+    }
+
+    // SQLite only. PostgreSQL never executes the legacy policy/NULL/CASE scan.
+    private async Task<AvailabilityItemRow?> ClaimDueAvailabilitySqliteAsync(string owner, TimeSpan leaseDuration, DateTimeOffset now, string policyHash, string? preferredType, CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(owner);
         ArgumentException.ThrowIfNullOrWhiteSpace(policyHash);
