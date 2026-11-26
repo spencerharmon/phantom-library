@@ -168,7 +168,13 @@ class Postgres:
                 env={**self.env, "POSTGRES_PASSWORD": password}, capture_output=True, text=True).stdout.strip()
             mapping = run([self.runtime, "port", self.container, "5432/tcp"], capture_output=True, text=True).stdout.strip()
             self.env.update(PGHOST="127.0.0.1", PGPORT=mapping.rsplit(":", 1)[1], PGUSER="postgres", PGPASSWORD=password)
-            self.command = [self.runtime, "exec", "-i", self.container, "psql", "-U", "postgres"]
+            # Loopback TCP, not the Unix socket: the image entrypoint first runs a
+            # temporary socket-only init server (listen_addresses=''), then stops it
+            # and starts the real one. A socket probe can succeed against that
+            # transient server and the next statement then hits "the database system
+            # is starting up"; TCP is only accepted by the final server.
+            self.command = [self.runtime, "exec", "-i", "-e", "PGPASSWORD", self.container,
+                            "psql", "-h", "127.0.0.1", "-U", "postgres"]
             identity = run([self.runtime, "inspect", self.container, "--format", "{{.Image}}"], capture_output=True, text=True).stdout.strip()
             (self.root / "postgres-image.txt").write_text(image + "\n" + identity + "\n")
         self.env["PGCONNECT_TIMEOUT"] = "5"
