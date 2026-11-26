@@ -156,6 +156,31 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(2, len(api.call_args.args), "post-restart API must be read-only")
         self.assertTrue((root / "worker-configuration.json").exists())
 
+    def test_postgres_waits_for_final_tcp_server_not_initdb_socket(self):
+        pg = rig.Postgres(Path(self.tmp.name), {})
+        probes = 0
+        def run(command, **kwargs):
+            nonlocal probes
+            if command[1] == "run":
+                return subprocess.CompletedProcess(command, 0, stdout="owned-container\n")
+            if command[1] == "port":
+                return subprocess.CompletedProcess(command, 0, stdout="127.0.0.1:35432\n")
+            if command[1] == "inspect":
+                return subprocess.CompletedProcess(command, 0, stdout="owned-image\n")
+            query = kwargs["input"]
+            tcp = "-h" in command and command[command.index("-h") + 1] == "127.0.0.1"
+            if query == "SELECT 1;":
+                probes += 1
+                if tcp and probes == 1:
+                    raise subprocess.CalledProcessError(2, command, stderr="final TCP server not started")
+            if query.startswith("CREATE DATABASE") and not tcp:
+                raise subprocess.CalledProcessError(2, command, stderr="temporary initdb server stopped")
+            return subprocess.CompletedProcess(command, 0, stdout="fixture\n")
+        with patch.object(rig, "run", side_effect=run), patch.object(rig.time, "sleep"):
+            pg.open()
+        self.assertEqual(2, probes)
+        self.assertTrue(pg.created)
+
     def test_container_removal_attempted_even_if_log_capture_fails(self):
         pg = rig.Postgres(Path(self.tmp.name), {})
         pg.container = "owned-container-id"

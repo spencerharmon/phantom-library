@@ -2,4 +2,5 @@
 # Mandatory PostgreSQL + actual candidate .NET worker + movie/episode server parity.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+python3 "$ROOT/scripts/tests/playback-adapter.test.py"
 exec python3 "$ROOT/tools/rig-scenarios/availability-claims-rig.py"

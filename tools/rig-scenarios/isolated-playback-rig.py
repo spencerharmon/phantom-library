@@ -168,7 +168,10 @@ class Postgres:
                 env={**self.env, "POSTGRES_PASSWORD": password}, capture_output=True, text=True).stdout.strip()
             mapping = run([self.runtime, "port", self.container, "5432/tcp"], capture_output=True, text=True).stdout.strip()
             self.env.update(PGHOST="127.0.0.1", PGPORT=mapping.rsplit(":", 1)[1], PGUSER="postgres", PGPASSWORD=password)
-            self.command = [self.runtime, "exec", "-i", self.container, "psql", "-U", "postgres"]
+            # The image's initdb temporary server accepts Unix sockets before
+            # stopping for final startup. Probe TCP, which only the final server
+            # exposes, so SELECT 1 cannot race that stop before CREATE DATABASE.
+            self.command = [self.runtime, "exec", "-i", self.container, "psql", "-h", "127.0.0.1", "-U", "postgres"]
             identity = run([self.runtime, "inspect", self.container, "--format", "{{.Image}}"], capture_output=True, text=True).stdout.strip()
             (self.root / "postgres-image.txt").write_text(image + "\n" + identity + "\n")
         self.env["PGCONNECT_TIMEOUT"] = "5"
