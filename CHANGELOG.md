@@ -28,6 +28,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SwarmHealthServiceUrl` is empty. Metrics: `phantom_swarm_health_*`.
 
 ### Fixed
+- **Materialised channel episodes play from Jellyfin web again
+  (p14-native-episode-web-queue).** New Jellyfin patch
+  `0007-Keep-channel-hierarchy-during-latest-and-item-refresh.patch`: core's
+  channel latest refresh (Home "Latest in Phantom Shows") and the per-item
+  post-materialise refresh no longer re-parent an existing item to the channel
+  root, and the latest prune keeps the Season/Series ancestry of what it keeps.
+  Previously a Home load detached the materialised episode from its season and
+  deleted the Series, so web's all-series Play queue
+  (`/Shows/{id}/Episodes?IsMissing=false&startItemId=`) came back empty/404
+  and web reported "Unable to find a valid media source to play". The Home
+  "Latest in Phantom Shows" row now shows the native Series tile. **Operator:**
+  rebuild/redeploy the patched `Jellyfin.LiveTv.dll` (`install.sh --build`);
+  no schema change, no wipe. Regression:
+  `scripts/tests/native-episode-web-queue.test.sh`.
 - Harden the independent swarm-health service: BEP33 bloom estimates and bounded
   peer observations, unknown/partial/timeout results instead of false dead swarms,
   bounded/coalesced priority scheduling, cancellation, HTTP limits, TTL/LRU cache,
