@@ -27,6 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   titles with the largest measured swarms. Disabled while
   `SwarmHealthServiceUrl` is empty. Metrics: `phantom_swarm_health_*`.
 
+### Changed
+- Source search queries every enabled Prowlarr indexer separately (discovered at
+  runtime from `/api/v1/indexer`, TTL-cached) concurrently with Torrentio instead
+  of one aggregate `/api/v1/search`. Results are ranked after a budget
+  (`IndexerSearchBudgetMs`, default 10 s) or as soon as `MinEarlyReturnCandidates`
+  high-confidence candidates arrive; slower indexers finish in the background and
+  their releases land in the magnet cache. New OTel meter `Phantom.Indexers`. See
+  [docs/tasks/p13-parallel-indexer-search.md](docs/tasks/p13-parallel-indexer-search.md).
+
 ### Fixed
 - Harden the independent swarm-health service: BEP33 bloom estimates and bounded
   peer observations, unknown/partial/timeout results instead of false dead swarms,

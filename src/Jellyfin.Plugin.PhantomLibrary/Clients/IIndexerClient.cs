@@ -47,6 +47,30 @@ public interface IIndexerClient
     Task<IReadOnlyList<IndexerCandidate>> SearchAsync(IndexerQuery query, CancellationToken ct);
 }
 
+/// <summary>
+/// p13-parallel-indexer-search (ROI Priority 13): an indexer client that is itself
+/// a gateway to MANY upstream indexers (Prowlarr). Instead of one aggregate call
+/// whose latency is set by the slowest upstream, <c>MagnetSelector</c> discovers the
+/// enabled upstream indexers at runtime and queries each one concurrently, so a
+/// slow/hung/erroring upstream only affects its own slot.
+/// </summary>
+public interface IFanOutIndexerClient : IIndexerClient
+{
+    /// <summary>
+    /// Returns the currently enabled upstream indexers (discovered from the
+    /// gateway's own API and cached on a TTL — never hard-coded ids/names).
+    /// Throws <see cref="IndexerTransientException"/> / <see cref="IndexerAuthException"/>
+    /// when discovery fails and no cached list is available.
+    /// </summary>
+    Task<IReadOnlyList<DiscoveredIndexer>> DiscoverIndexersAsync(IndexerQuery query, CancellationToken ct);
+
+    /// <summary>Queries ONE upstream indexer. Same exception contract as <see cref="IIndexerClient.SearchAsync"/>.</summary>
+    Task<IReadOnlyList<IndexerCandidate>> SearchIndexerAsync(DiscoveredIndexer indexer, IndexerQuery query, CancellationToken ct);
+}
+
+/// <summary>An upstream indexer discovered at runtime from a gateway (Prowlarr) API.</summary>
+public sealed record DiscoveredIndexer(int Id, string Name, string Protocol);
+
 public sealed record IndexerQuery
 {
     public required string Type { get; init; } // "movie" | "episode"
