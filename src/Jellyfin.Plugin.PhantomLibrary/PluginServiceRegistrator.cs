@@ -67,6 +67,12 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
             c.DefaultRequestHeaders.UserAgent.ParseAdd("Jellyfin.Plugin.PhantomLibrary/0.2.0");
         });
 
+        // p14-player-stats-overlay: maps the playing item to its materialised
+        // info-hash + source metadata and proxies gostream /api/library/stats
+        // server-side (PhantomLibraryPlayerStatsController). Stateless; per-call
+        // cost is a few indexed reads + one bounded gostream GET.
+        serviceCollection.AddSingleton<Playback.PlayerStatsService>();
+
         // Indexers — registered as IIndexerClient in the order Prowlarr → Torrentio.
         // p13-parallel-indexer-search: the discovered Prowlarr indexer list is a
         // process-wide TTL cache (ProwlarrClient itself is a transient typed client).

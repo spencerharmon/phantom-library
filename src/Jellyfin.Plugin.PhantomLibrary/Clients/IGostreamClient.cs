@@ -43,6 +43,38 @@ public interface IGostreamClient
     /// stub. 404 is swallowed (idempotent); 5xx throws.
     /// </summary>
     Task UnprestageAsync(string stubPath, CancellationToken ct);
+
+    /// <summary>
+    /// p14-player-stats-overlay: <c>GET /api/library/stats?hash=&lt;infohash&gt;</c>
+    /// (gostream:phantom-player-stats-endpoint). Returns the live per-torrent
+    /// stream statistics, or <c>null</c> when gostream answers 404
+    /// <c>torrent_not_found</c> (hash not loaded in the engine). Authenticated
+    /// with the server-side library token; the token never leaves the plugin.
+    /// Throws <see cref="GostreamBadRequestException"/> on 4xx (auth/invalid
+    /// hash) and <see cref="GostreamServerException"/> on 5xx.
+    /// </summary>
+    Task<GostreamTorrentStats?> GetTorrentStatsAsync(string infoHash, CancellationToken ct);
+}
+
+/// <summary>
+/// gostream <c>/api/library/stats</c> response. Every measurement is nullable:
+/// gostream reports <c>null</c> for "not yet computable", never a synthetic 0.
+/// </summary>
+public sealed record GostreamTorrentStats
+{
+    public required string Hash { get; init; }
+    public int? Peers { get; init; }
+    public int? Seeders { get; init; }
+    public double? DownloadRateBytesPerSec { get; init; }
+    public long? BytesCompleted { get; init; }
+    public long? Size { get; init; }
+    public long? ReadOffset { get; init; }
+    public long? BufferedAheadBytes { get; init; }
+    public double? BufferedAheadSeconds { get; init; }
+    public string? StreamState { get; init; }
+    public System.DateTimeOffset? LastReadAt { get; init; }
+    public System.DateTimeOffset? TorrentSampledAt { get; init; }
+    public System.DateTimeOffset? StreamSampledAt { get; init; }
 }
 
 public sealed record GostreamAddRequest
