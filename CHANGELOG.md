@@ -51,8 +51,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dead (0) below unmeasured below live, leaves seasons/episodes and every
   non-Phantom item untouched, and writes just-measured titles through
   immediately. Local score backfill only: the DHT service is still asked about
-  intent-bounded due candidates only. No schema change. Proof:
-  `scripts/tests/p05-baseitem-writeback.test.sh` (real PostgreSQL + Jellyfin).
+  intent-bounded due candidates only. No schema change. The sweep cursor is
+  per library (`plugin_meta` key `swarm_health_sync_cursor:<server id>`), so
+  several Jellyfin servers (blue/green) sharing one Phantom DB each converge
+  their own library; an unqualified legacy cursor is ignored. The same sweep
+  tallies movie/series live/dead titles and publishes them to
+  `phantom_swarm_health_titles` (OTel + Prometheus) at sweep completion,
+  persisted with the cursor so a restart republishes them without a full
+  count. Proof: `scripts/tests/p05-baseitem-writeback.test.sh` (real
+  PostgreSQL + two Jellyfin servers).
 - PostgreSQL: real >= 2 GiB movie/episode sizes no longer fail with `22003
   integer out of range` (source candidates, selected file, availability
   candidate, magnet cache). Schema v23 is an additive expand: nullable BIGINT

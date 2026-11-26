@@ -9,6 +9,7 @@ using Jellyfin.Plugin.PhantomLibrary.Channels;
 using Jellyfin.Plugin.PhantomLibrary.Configuration;
 using Jellyfin.Plugin.PhantomLibrary.State;
 using Jellyfin.Plugin.PhantomLibrary.Swarm;
+using MediaBrowser.Controller;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.Movies;
 using MediaBrowser.Controller.Entities.TV;
@@ -41,12 +42,25 @@ namespace Jellyfin.Plugin.PhantomLibrary.Scheduled;
 ///      cycle. The sweep is LOCAL score backfill only: it reads <c>swarm_health</c>
 ///      and never asks the DHT service about anything — measurement admission stays
 ///      the intent-bounded step 1.
+///
+/// The sweep cursor is scoped to THIS server's library (<see cref="CursorKeyFor"/>,
+/// keyed by the stable Jellyfin server id), because the rows it pages and writes live
+/// in this server's own library DB while <c>plugin_meta</c> is shared by every server
+/// on the same Phantom database (blue/green). The same per-sweep pass also tallies the
+/// movie/series live/dead title counts that feed <c>phantom_swarm_health_titles</c>,
+/// persisted with the cursor so a restart republishes the last completed sweep's
+/// values without any full-table count.
 /// Disabled entirely while the service URL is empty.
 /// </summary>
 public sealed class SwarmHealthWorker : IHostedService, IDisposable
 {
-    /// <summary><c>plugin_meta</c> key of the persisted sweep cursor.</summary>
-    internal const string SyncCursorMetaKey = "swarm_health_sync_cursor";
+    /// <summary>
+    /// <c>plugin_meta</c> key prefix of the per-library sweep cursor. The full key is
+    /// <c>swarm_health_sync_cursor:&lt;target&gt;</c>; the unqualified legacy key
+    /// <c>swarm_health_sync_cursor</c> carries no target and is never read — its
+    /// continuation could belong to any server's library.
+    /// </summary>
+    internal const string SyncCursorMetaKeyPrefix = "swarm_health_sync_cursor:";
 
     /// <summary>A finished sweep restarts no sooner than this many ticks after it began.</summary>
     internal const int MinTicksBetweenSweeps = 10;
@@ -72,6 +86,8 @@ public sealed class SwarmHealthWorker : IHostedService, IDisposable
     private readonly ILogger<SwarmHealthWorker> _logger;
     private readonly Func<PluginConfiguration> _configProvider;
     private readonly Func<DateTimeOffset> _clock;
+    private readonly Lazy<string> _syncTarget;
+    private bool _titleGaugesRestored;
     private Timer? _timer;
     private CancellationTokenSource? _stopping;
     private Task? _currentTick;
@@ -82,8 +98,17 @@ public sealed class SwarmHealthWorker : IHostedService, IDisposable
         SwarmHealthClient client,
         ILibraryManager libraryManager,
         IChannelScorePager pager,
+        IServerApplicationHost serverHost,
         ILogger<SwarmHealthWorker> logger)
-        : this(db, client, libraryManager, pager, logger, () => Plugin.Instance?.Configuration ?? new PluginConfiguration(), () => DateTimeOffset.UtcNow)
+        : this(
+            db,
+            client,
+            libraryManager,
+            pager,
+            logger,
+            () => Plugin.Instance?.Configuration ?? new PluginConfiguration(),
+            () => DateTimeOffset.UtcNow,
+            () => (serverHost ?? throw new ArgumentNullException(nameof(serverHost))).SystemId)
     {
     }
 
@@ -94,7 +119,8 @@ public sealed class SwarmHealthWorker : IHostedService, IDisposable
         IChannelScorePager pager,
         ILogger<SwarmHealthWorker> logger,
         Func<PluginConfiguration> configProvider,
-        Func<DateTimeOffset> clock)
+        Func<DateTimeOffset> clock,
+        Func<string> syncTargetId)
     {
         _db = db ?? throw new ArgumentNullException(nameof(db));
         _client = client ?? throw new ArgumentNullException(nameof(client));
@@ -103,6 +129,31 @@ public sealed class SwarmHealthWorker : IHostedService, IDisposable
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _configProvider = configProvider ?? throw new ArgumentNullException(nameof(configProvider));
         _clock = clock ?? throw new ArgumentNullException(nameof(clock));
+        ArgumentNullException.ThrowIfNull(syncTargetId);
+        _syncTarget = new Lazy<string>(() => NormalizeTarget(syncTargetId()));
+    }
+
+    /// <summary>The library this worker's sweep pages and writes (normalized server id).</summary>
+    internal string SyncTarget => _syncTarget.Value;
+
+    /// <summary><c>plugin_meta</c> key of the sweep cursor for one target library.</summary>
+    internal static string CursorKeyFor(string target) => SyncCursorMetaKeyPrefix + NormalizeTarget(target);
+
+    /// <summary>
+    /// Stable, topology-neutral target identity: Jellyfin's server id (persisted once per
+    /// data directory, so it survives restarts and differs per library PVC). Guid forms are
+    /// canonicalised to 32 lower-case hex digits; any other form is trimmed and upper-cased.
+    /// </summary>
+    internal static string NormalizeTarget(string? target)
+    {
+        if (string.IsNullOrWhiteSpace(target))
+        {
+            throw new InvalidOperationException("Swarm-health score sweep needs a stable server/library id; none is available");
+        }
+
+        return Guid.TryParse(target, out var g)
+            ? g.ToString("N", CultureInfo.InvariantCulture)
+            : target.Trim().ToUpperInvariant();
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -295,6 +346,25 @@ public sealed class SwarmHealthWorker : IHostedService, IDisposable
     {
         var now = _clock();
         var cursor = await LoadCursorAsync(ct).ConfigureAwait(false);
+        if (!_titleGaugesRestored)
+        {
+            // After a restart the title gauges come back from the last COMPLETED sweep
+            // of this library, persisted with the cursor — no counting query.
+            _titleGaugesRestored = true;
+            if (cursor.Published is { } published)
+            {
+                PublishTitles(published);
+                _logger.LogInformation(
+                    "Swarm-health title gauges restored from sweep {Sweep}: target={Target} movie live={MovieLive} dead={MovieDead} series live={SeriesLive} dead={SeriesDead}",
+                    cursor.PublishedSweep,
+                    SyncTarget,
+                    published.MovieLive,
+                    published.MovieDead,
+                    published.SeriesLive,
+                    published.SeriesDead);
+            }
+        }
+
         if (cursor.Done)
         {
             var gap = TimeSpan.FromSeconds((double)cfg.SwarmHealthIntervalSeconds * MinTicksBetweenSweeps);
@@ -303,10 +373,18 @@ public sealed class SwarmHealthWorker : IHostedService, IDisposable
                 return SyncStepResult.Idle;
             }
 
-            cursor = new SyncCursor { Phase = 0, StartedAt = now.ToUnixTimeSeconds(), Sweep = cursor.Sweep + 1 };
+            cursor = new SyncCursor
+            {
+                Phase = 0,
+                StartedAt = now.ToUnixTimeSeconds(),
+                Sweep = cursor.Sweep + 1,
+                Published = cursor.Published,
+                PublishedSweep = cursor.PublishedSweep,
+            };
             _logger.LogInformation(
-                "Swarm-health score sweep {Sweep} started: batch={Batch} access={Access}",
+                "Swarm-health score sweep {Sweep} started: target={Target} batch={Batch} access={Access}",
                 cursor.Sweep,
+                SyncTarget,
                 cfg.SwarmHealthSyncBatchSize,
                 _pager.AccessPath);
         }
@@ -335,8 +413,20 @@ public sealed class SwarmHealthWorker : IHostedService, IDisposable
                 }
             }
 
-            var dbType = phase.ChannelId == ChannelIds.Movies ? "movie" : "episode";
+            var isMovies = phase.ChannelId == ChannelIds.Movies;
+            var dbType = isMovies ? "movie" : "episode";
             var peers = await _db.GetSwarmPeersForTmdbIdsAsync(dbType, measurable, fresh, ct).ConfigureAwait(false);
+
+            // Title-health tally for phantom_swarm_health_titles: every scored title of
+            // this library with a fresh measurement (series = best episode), counted once
+            // per sweep because it rides the same keyset batch (committed with the cursor).
+            foreach (var tmdb in measurable)
+            {
+                if (peers.TryGetValue(tmdb, out var p))
+                {
+                    cursor.Counting.Add(isMovies, live: p > 0);
+                }
+            }
             var changed = new List<BaseItem>();
             foreach (var row in page)
             {
@@ -390,16 +480,24 @@ public sealed class SwarmHealthWorker : IHostedService, IDisposable
         {
             cursor.Done = true;
             cursor.CompletedAt = now.ToUnixTimeSeconds();
+            cursor.Published = cursor.Counting.Clone();
+            cursor.PublishedSweep = cursor.Sweep;
             await SaveCursorAsync(cursor, ct).ConfigureAwait(false);
+            PublishTitles(cursor.Published);
             SwarmHealthMetrics.RecordSyncSweepCompleted();
             var took = TimeSpan.FromSeconds(cursor.CompletedAt.Value - (cursor.StartedAt ?? cursor.CompletedAt.Value));
             _logger.LogInformation(
-                "Swarm-health score sweep {Sweep} completed: read={Read} written={Written} took={Took}s cycle={Cycle}h",
+                "Swarm-health score sweep {Sweep} completed: read={Read} written={Written} took={Took}s cycle={Cycle}h target={Target} titles movie live={MovieLive} dead={MovieDead} series live={SeriesLive} dead={SeriesDead}",
                 cursor.Sweep,
                 cursor.Read,
                 cursor.Written,
                 (long)took.TotalSeconds,
-                cfg.SwarmHealthRecheckHours);
+                cfg.SwarmHealthRecheckHours,
+                SyncTarget,
+                cursor.Published.MovieLive,
+                cursor.Published.MovieDead,
+                cursor.Published.SeriesLive,
+                cursor.Published.SeriesDead);
             if (took > TimeSpan.FromHours(cfg.SwarmHealthRecheckHours / 2.0))
             {
                 _logger.LogWarning(
@@ -424,9 +522,15 @@ public sealed class SwarmHealthWorker : IHostedService, IDisposable
         return changed.Count;
     }
 
+    private static void PublishTitles(TitleCounts counts)
+    {
+        SwarmHealthMetrics.SetTitles("movie", counts.MovieLive, counts.MovieDead);
+        SwarmHealthMetrics.SetTitles("series", counts.SeriesLive, counts.SeriesDead);
+    }
+
     private async Task<SyncCursor> LoadCursorAsync(CancellationToken ct)
     {
-        var raw = await _db.GetMetaAsync(SyncCursorMetaKey, ct).ConfigureAwait(false);
+        var raw = await _db.GetMetaAsync(CursorKeyFor(SyncTarget), ct).ConfigureAwait(false);
         if (string.IsNullOrWhiteSpace(raw))
         {
             return new SyncCursor { Done = true };
@@ -437,7 +541,7 @@ public sealed class SwarmHealthWorker : IHostedService, IDisposable
             var cursor = JsonSerializer.Deserialize<SyncCursor>(raw, CursorJson) ?? new SyncCursor { Done = true };
             if (cursor.Phase < 0 || cursor.Phase > SyncPhases.Count)
             {
-                cursor = new SyncCursor { Done = true, Sweep = cursor.Sweep };
+                cursor = new SyncCursor { Done = true, Sweep = cursor.Sweep, Published = cursor.Published, PublishedSweep = cursor.PublishedSweep };
             }
 
             return cursor;
@@ -450,7 +554,7 @@ public sealed class SwarmHealthWorker : IHostedService, IDisposable
     }
 
     private Task SaveCursorAsync(SyncCursor cursor, CancellationToken ct)
-        => _db.SetMetaAsync(SyncCursorMetaKey, JsonSerializer.Serialize(cursor, CursorJson), ct);
+        => _db.SetMetaAsync(CursorKeyFor(SyncTarget), JsonSerializer.Serialize(cursor, CursorJson), ct);
 
     /// <summary>Outcome of one <see cref="SyncStepAsync"/> call.</summary>
     internal readonly record struct SyncStepResult(int Read, int Written, bool SweepCompleted)
@@ -458,7 +562,44 @@ public sealed class SwarmHealthWorker : IHostedService, IDisposable
         public static SyncStepResult Idle => new(0, 0, false);
     }
 
-    /// <summary>Persisted sweep position (JSON in <c>plugin_meta</c>).</summary>
+    /// <summary>Movie/series live/dead title counts of one library (phantom_swarm_health_titles).</summary>
+    internal sealed class TitleCounts
+    {
+        public long MovieLive { get; set; }
+
+        public long MovieDead { get; set; }
+
+        public long SeriesLive { get; set; }
+
+        public long SeriesDead { get; set; }
+
+        public void Add(bool movie, bool live)
+        {
+            if (movie)
+            {
+                if (live)
+                {
+                    MovieLive++;
+                }
+                else
+                {
+                    MovieDead++;
+                }
+            }
+            else if (live)
+            {
+                SeriesLive++;
+            }
+            else
+            {
+                SeriesDead++;
+            }
+        }
+
+        public TitleCounts Clone() => new() { MovieLive = MovieLive, MovieDead = MovieDead, SeriesLive = SeriesLive, SeriesDead = SeriesDead };
+    }
+
+    /// <summary>Persisted per-library sweep position (JSON in <c>plugin_meta</c>).</summary>
     internal sealed class SyncCursor
     {
         public int Sweep { get; set; }
@@ -476,5 +617,13 @@ public sealed class SwarmHealthWorker : IHostedService, IDisposable
         public long Read { get; set; }
 
         public long Written { get; set; }
+
+        /// <summary>Title-health tally of the sweep in progress (advances with the cursor).</summary>
+        public TitleCounts Counting { get; set; } = new();
+
+        /// <summary>Tally of the last COMPLETED sweep: what the title gauges publish.</summary>
+        public TitleCounts? Published { get; set; }
+
+        public int? PublishedSweep { get; set; }
     }
 }

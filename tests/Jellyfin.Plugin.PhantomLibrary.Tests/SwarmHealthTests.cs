@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.Metrics;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -23,7 +24,15 @@ using Xunit;
 
 namespace Jellyfin.Plugin.PhantomLibrary.Tests;
 
+/// <summary>Serialises every suite that drives the process-wide swarm-health title gauges.</summary>
+[CollectionDefinition(Name)]
+public sealed class SwarmHealthMetricsCollection
+{
+    public const string Name = "SwarmHealthMetrics";
+}
+
 /// <summary>ROI Priority 0.5 (dht-swarm-health): storage, measurement worker, scoring, shelf, client.</summary>
+[Collection(SwarmHealthMetricsCollection.Name)]
 public sealed class SwarmHealthTests : IDisposable
 {
     private const string ServiceUrl = "http://swarm-health.test:8095";
@@ -306,6 +315,112 @@ public sealed class SwarmHealthTests : IDisposable
     }
 
     [Fact]
+    public async Task Sync_TwoLibrariesSharingOnePhantomDb_InterleavedWithRestart_BothConvergeIndependently()
+    {
+        using var db = await NewDbAsync();
+        await RunTwoLibraryInterleaveAsync(db);
+    }
+
+    [Fact]
+    public void CursorKey_IsScopedToTheNormalizedServerId_NeverTheLegacyGlobalKey()
+    {
+        var id = Guid.NewGuid();
+        Assert.Equal("swarm_health_sync_cursor:" + id.ToString("N"), SwarmHealthWorker.CursorKeyFor(id.ToString("D").ToUpperInvariant()));
+        Assert.Equal(SwarmHealthWorker.CursorKeyFor(id.ToString("N")), SwarmHealthWorker.CursorKeyFor(id.ToString("B")));
+        Assert.NotEqual(SwarmHealthWorker.CursorKeyFor("a"), SwarmHealthWorker.CursorKeyFor("b"));
+        Assert.NotEqual(LegacyCursorKey, SwarmHealthWorker.CursorKeyFor(id.ToString("N")));
+        Assert.Throws<InvalidOperationException>(() => SwarmHealthWorker.NormalizeTarget(" "));
+    }
+
+    [Fact]
+    public async Task Sync_TitleGauges_EmitSweepCountsViaOtelAndPrometheus_AndRestoreAfterRestart()
+    {
+        using var db = await NewDbAsync();
+        var now = DateTimeOffset.UtcNow;
+        await db.UpsertSwarmHealthAsync(
+            new[]
+            {
+                new SwarmHealthMeasurement(Hash('a'), 1, "movie", -1, -1, 40, now),
+                new SwarmHealthMeasurement(Hash('b'), 2, "movie", -1, -1, 3, now),
+                new SwarmHealthMeasurement(Hash('c'), 3, "movie", -1, -1, 0, now),
+                new SwarmHealthMeasurement(Hash('d'), 4, "movie", -1, -1, 9, now.AddDays(-30)), // stale: unmeasured
+                new SwarmHealthMeasurement(Hash('e'), 99, "movie", -1, -1, 9, now), // not in this library
+                new SwarmHealthMeasurement(Hash('f'), 500, "episode", 1, 1, 0, now),
+                new SwarmHealthMeasurement(Hash('1'), 500, "episode", 1, 2, 6, now), // series 500: best episode live
+                new SwarmHealthMeasurement(Hash('2'), 501, "episode", 1, 1, 0, now), // series 501: dead
+                new SwarmHealthMeasurement(Hash('3'), 502, "episode", 1, 1, 0, now),
+                new SwarmHealthMeasurement(Hash('4'), 502, "episode", 1, 2, 0, now), // series 502: dead
+            },
+            default);
+        var lib = new FakeLibrary();
+        foreach (var t in new[] { 1, 2, 3, 4, 5 })
+        {
+            lib.Add(new Movie { Id = Guid.NewGuid(), ExternalId = "movie_" + t, ChannelId = ChannelIds.Movies });
+        }
+
+        for (var t = 1000; t < 1120; t++)
+        {
+            lib.Add(new Movie { Id = Guid.NewGuid(), ExternalId = "movie_" + t, ChannelId = ChannelIds.Movies }); // unmeasured filler: > one batch
+        }
+
+        lib.Add(new Movie { Id = Guid.NewGuid(), ExternalId = "orphan_00000000000000ff", ChannelId = ChannelIds.Movies });
+        foreach (var t in new[] { 500, 501, 502, 503 })
+        {
+            lib.Add(new MediaBrowser.Controller.Entities.TV.Series { Id = Guid.NewGuid(), ExternalId = "series_" + t, ChannelId = ChannelIds.Shows });
+        }
+
+        var cfg = Config();
+        cfg.SwarmHealthSyncBatchSize = 50; // the minimum: 130 rows => a multi-step sweep
+        SwarmHealthMetrics.SetTitles("movie", 0, 0);
+        SwarmHealthMetrics.SetTitles("series", 0, 0);
+        var worker = NewWorker(db, new FakeClient(new Dictionary<string, int>()), lib.Object, new FakePager(lib), () => cfg, "gauge-lib");
+        var steps = 0;
+        while (!(await worker.SyncStepAsync(cfg, default)).SweepCompleted)
+        {
+            steps++;
+            Assert.True(steps < 50);
+            Assert.Equal((0L, 0L, 0L, 0L), SwarmHealthMetrics.TitlesSnapshot()); // only a COMPLETED sweep publishes
+        }
+
+        Assert.Equal(2, steps); // two non-completing steps observed zero gauges
+        var expected = (MovieLive: 2L, MovieDead: 1L, SeriesLive: 1L, SeriesDead: 2L);
+        Assert.Equal(expected, SwarmHealthMetrics.TitlesSnapshot());
+        Assert.Equal(expected, ObserveOtelTitles());
+        Assert.Equal(expected, await ScrapePrometheusTitlesAsync());
+
+        // Process restart: statics reset; a fresh worker of the SAME library republishes
+        // the last completed sweep on its first step, before any new sweep runs.
+        SwarmHealthMetrics.SetTitles("movie", 0, 0);
+        SwarmHealthMetrics.SetTitles("series", 0, 0);
+        var other = NewWorker(db, new FakeClient(new Dictionary<string, int>()), lib.Object, new FakePager(new FakeLibrary()), () => cfg, "another-library");
+        await other.SyncStepAsync(cfg, default); // a different library: nothing of gauge-lib's leaks
+        Assert.Equal((0L, 0L, 0L, 0L), SwarmHealthMetrics.TitlesSnapshot());
+        SwarmHealthMetrics.SetTitles("movie", 0, 0);
+        SwarmHealthMetrics.SetTitles("series", 0, 0);
+        var restartedPager = new FakePager(lib);
+        var restarted = NewWorker(db, new FakeClient(new Dictionary<string, int>()), lib.Object, restartedPager, () => cfg, "gauge-lib");
+        var idle = await restarted.SyncStepAsync(cfg, default);
+        Assert.Equal(0, idle.Read); // inside the sweep gap: restored, not recounted
+        Assert.Empty(restartedPager.Calls);
+        Assert.Equal(expected, ObserveOtelTitles());
+        Assert.Equal(expected, await ScrapePrometheusTitlesAsync());
+
+        // The next sweep keeps publishing the previous result until it completes, then
+        // publishes its own (fresh) count: movie 2 turns dead.
+        await db.UpsertSwarmHealthAsync(new[] { new SwarmHealthMeasurement(Hash('b'), 2, "movie", -1, -1, 0, now) }, default);
+        var later = NewWorker(db, new FakeClient(new Dictionary<string, int>()), lib.Object, new FakePager(lib), () => cfg, "gauge-lib", () => now.AddHours(2));
+        var first = await later.SyncStepAsync(cfg, default);
+        Assert.False(first.SweepCompleted);
+        Assert.Equal(expected, ObserveOtelTitles());
+        while (!(await later.SyncStepAsync(cfg, default)).SweepCompleted)
+        {
+        }
+
+        Assert.Equal((1L, 2L, 1L, 2L), ObserveOtelTitles());
+        Assert.Equal((1L, 2L, 1L, 2L), await ScrapePrometheusTitlesAsync());
+    }
+
+    [Fact]
     public async Task Measure_WritesThroughJustMeasuredTitles_ByDeterministicChannelItemId()
     {
         using var db = await NewDbAsync();
@@ -368,13 +483,154 @@ public sealed class SwarmHealthTests : IDisposable
         Assert.False(result.ContainsKey(Hash('b')));
     }
 
-    private static string Hash(char c) => new string(char.ToLowerInvariant(c), 40).Replace(char.ToLowerInvariant(c), c);
+    internal const string LegacyCursorKey = "swarm_health_sync_cursor";
+
+    /// <summary>
+    /// p05-baseitem-writeback review 3: two Jellyfin libraries (A, B) with the SAME
+    /// channel titles but independent BaseItems share one Phantom DB. Their sweep steps
+    /// interleave one-for-one, A restarts mid-sweep, and an unqualified legacy cursor
+    /// claiming a finished sweep sits in plugin_meta. BOTH libraries must end with every
+    /// scored title non-NULL and their own completed cursor; with one shared cursor each
+    /// library would page only the other's leftovers and keep NULLs.
+    /// </summary>
+    internal static async Task RunTwoLibraryInterleaveAsync(PhantomDb db)
+    {
+        var now = DateTimeOffset.UtcNow;
+        await db.UpsertSwarmHealthAsync(
+            new[]
+            {
+                new SwarmHealthMeasurement(Hash('a'), 3, "movie", -1, -1, 21, now),
+                new SwarmHealthMeasurement(Hash('b'), 4, "movie", -1, -1, 0, now),
+                new SwarmHealthMeasurement(Hash('c'), 900, "episode", 1, 1, 5, now),
+            },
+            default);
+        await db.SetMetaAsync(LegacyCursorKey, "{\"sweep\":7,\"phase\":2,\"lastId\":\"ffffffff-ffff-ffff-ffff-ffffffffffff\",\"startedAt\":1,\"done\":false,\"read\":99}", default);
+        FakeLibrary NewLibrary()
+        {
+            var lib = new FakeLibrary();
+            for (var i = 1; i <= 250; i++)
+            {
+                lib.Add(new Movie { Id = Guid.NewGuid(), ExternalId = "movie_" + i, ChannelId = ChannelIds.Movies });
+            }
+
+            lib.Add(new Movie { Id = Guid.NewGuid(), ExternalId = "orphan_00000000000000a1", ChannelId = ChannelIds.Movies });
+            lib.Add(new MediaBrowser.Controller.Entities.TV.Series { Id = Guid.NewGuid(), ExternalId = "series_900", ChannelId = ChannelIds.Shows });
+            lib.Add(new MediaBrowser.Controller.Entities.TV.Series { Id = Guid.NewGuid(), ExternalId = "series_901", ChannelId = ChannelIds.Shows });
+            lib.Add(new Folder { Id = Guid.NewGuid(), ExternalId = "orphanseries_00000000000000b2", ChannelId = ChannelIds.Shows });
+            return lib;
+        }
+
+        var libA = NewLibrary();
+        var libB = NewLibrary();
+        const int Total = 254;
+        var cfg = Config();
+        cfg.SwarmHealthSyncBatchSize = 50; // the minimum: 254 rows => 6 steps per library
+        var targetA = Guid.NewGuid().ToString("D");
+        var targetB = Guid.NewGuid().ToString("N");
+        var a = NewWorker(db, new FakeClient(new Dictionary<string, int>()), libA.Object, new FakePager(libA), () => cfg, targetA);
+        var b = NewWorker(db, new FakeClient(new Dictionary<string, int>()), libB.Object, new FakePager(libB), () => cfg, targetB);
+        bool doneA = false, doneB = false;
+        for (var round = 0; round < 40 && !(doneA && doneB); round++)
+        {
+            if (round == 2)
+            {
+                a = NewWorker(db, new FakeClient(new Dictionary<string, int>()), libA.Object, new FakePager(libA), () => cfg, targetA.ToUpperInvariant());
+            }
+
+            if (!doneA)
+            {
+                doneA = (await a.SyncStepAsync(cfg, default)).SweepCompleted;
+            }
+
+            if (!doneB)
+            {
+                doneB = (await b.SyncStepAsync(cfg, default)).SweepCompleted;
+            }
+        }
+
+        Assert.True(doneA && doneB);
+        foreach (var lib in new[] { libA, libB })
+        {
+            Assert.All(lib.Items, i => Assert.NotNull(i.CriticRating));
+            Assert.Equal(21f, lib.ByExternal("movie_3").CriticRating);
+            Assert.Equal(0f, lib.ByExternal("movie_4").CriticRating);
+            Assert.Equal(5f, lib.ByExternal("series_900").CriticRating);
+            Assert.Equal(SwarmHealthScore.UnmeasuredScore, lib.ByExternal("series_901").CriticRating);
+            Assert.Equal(SwarmHealthScore.UnmeasuredScore, lib.ByExternal("orphanseries_00000000000000b2").CriticRating);
+        }
+
+        foreach (var target in new[] { targetA, targetB })
+        {
+            var raw = await db.GetMetaAsync(SwarmHealthWorker.CursorKeyFor(target), default);
+            Assert.NotNull(raw);
+            using var doc = System.Text.Json.JsonDocument.Parse(raw!);
+            Assert.True(doc.RootElement.GetProperty("done").GetBoolean());
+            Assert.Equal(1, doc.RootElement.GetProperty("sweep").GetInt32());
+            Assert.Equal(Total, doc.RootElement.GetProperty("read").GetInt64()); // each library read ALL its own rows once
+            Assert.Equal(2, doc.RootElement.GetProperty("published").GetProperty("movieLive").GetInt64() + doc.RootElement.GetProperty("published").GetProperty("movieDead").GetInt64());
+        }
+
+        // The unqualified legacy cursor was neither trusted nor rewritten.
+        Assert.Contains("\"sweep\":7", await db.GetMetaAsync(LegacyCursorKey, default), StringComparison.Ordinal);
+    }
+
+    private static (long, long, long, long) ObserveOtelTitles()
+    {
+        var seen = new Dictionary<string, long>(StringComparer.Ordinal);
+        using var listener = new MeterListener
+        {
+            InstrumentPublished = (instrument, l) =>
+            {
+                if (instrument.Name == "phantom_swarm_health_titles")
+                {
+                    l.EnableMeasurementEvents(instrument);
+                }
+            },
+        };
+        listener.SetMeasurementEventCallback<long>((_, value, tags, _) =>
+        {
+            string? type = null, health = null;
+            foreach (var t in tags)
+            {
+                if (t.Key == "type")
+                {
+                    type = (string?)t.Value;
+                }
+                else if (t.Key == "health")
+                {
+                    health = (string?)t.Value;
+                }
+            }
+
+            seen[type + "/" + health] = value;
+        });
+        listener.Start();
+        listener.RecordObservableInstruments();
+        return (seen["movie/live"], seen["movie/dead"], seen["series/live"], seen["series/dead"]);
+    }
+
+    private static async Task<(long, long, long, long)> ScrapePrometheusTitlesAsync()
+    {
+        using var stream = new MemoryStream();
+        await Prometheus.Metrics.DefaultRegistry.CollectAndExportAsTextAsync(stream);
+        var text = Encoding.UTF8.GetString(stream.ToArray());
+        long Value(string type, string health)
+        {
+            var prefix = $"phantom_swarm_health_titles{{type=\"{type}\",health=\"{health}\"}} ";
+            var line = text.Split('\n').Single(l => l.StartsWith(prefix, StringComparison.Ordinal));
+            return long.Parse(line[prefix.Length..], System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        return (Value("movie", "live"), Value("movie", "dead"), Value("series", "live"), Value("series", "dead"));
+    }
+
+    internal static string Hash(char c) => new string(char.ToLowerInvariant(c), 40).Replace(char.ToLowerInvariant(c), c);
 
     private static ChannelItemInfo Movie(int tmdb) => new() { Id = ChannelItemId.ForMovie(tmdb).Encode(), Name = "m" + tmdb };
 
     private static ChannelItemInfo Series(int tmdb) => new() { Id = ChannelItemId.ForSeries(tmdb).Encode(), Name = "s" + tmdb };
 
-    private static PluginConfiguration Config() => new()
+    internal static PluginConfiguration Config() => new()
     {
         SwarmHealthServiceUrl = ServiceUrl,
         SwarmHealthBatchSize = 50,
@@ -386,8 +642,8 @@ public sealed class SwarmHealthTests : IDisposable
     private static SwarmHealthWorker NewWorker(PhantomDb db, SwarmHealthClient client, ILibraryManager lib)
         => NewWorker(db, client, lib, new FakePager(new FakeLibrary()), Config);
 
-    private static SwarmHealthWorker NewWorker(PhantomDb db, SwarmHealthClient client, ILibraryManager lib, IChannelScorePager pager, Func<PluginConfiguration> cfg)
-        => new(db, client, lib, pager, NullLogger<SwarmHealthWorker>.Instance, cfg, () => DateTimeOffset.UtcNow);
+    private static SwarmHealthWorker NewWorker(PhantomDb db, SwarmHealthClient client, ILibraryManager lib, IChannelScorePager pager, Func<PluginConfiguration> cfg, string target = "library-a", Func<DateTimeOffset>? clock = null)
+        => new(db, client, lib, pager, NullLogger<SwarmHealthWorker>.Instance, cfg, clock ?? (() => DateTimeOffset.UtcNow), () => target);
 
     private async Task<PhantomDb> NewDbAsync()
     {
@@ -414,7 +670,7 @@ public sealed class SwarmHealthTests : IDisposable
         await cmd.ExecuteNonQueryAsync();
     }
 
-    private sealed class FakeClient : SwarmHealthClient
+    internal sealed class FakeClient : SwarmHealthClient
     {
         private readonly Dictionary<string, int>? _answers;
 
@@ -442,7 +698,7 @@ public sealed class SwarmHealthTests : IDisposable
     }
 
     /// <summary>In-memory stand-in for the persisted channel BaseItems + the ILibraryManager write path.</summary>
-    private sealed class FakeLibrary
+    internal sealed class FakeLibrary
     {
         private readonly Mock<ILibraryManager> _mock = new(MockBehavior.Strict);
 
@@ -476,7 +732,7 @@ public sealed class SwarmHealthTests : IDisposable
         public BaseItem ByExternal(string externalId) => Items.Single(i => i.ExternalId == externalId);
     }
 
-    private sealed class FakePager : IChannelScorePager
+    internal sealed class FakePager : IChannelScorePager
     {
         private readonly FakeLibrary _lib;
 

@@ -105,7 +105,7 @@ internal static class SwarmHealthMetrics
 
     public static void RecordSyncSweepCompleted() => SyncSweeps.Add(1);
 
-    public static void SetTitles(string type, int live, int dead)
+    public static void SetTitles(string type, long live, long dead)
     {
         if (type == "movie")
         {
@@ -121,6 +121,10 @@ internal static class SwarmHealthMetrics
         TitlesProm.WithLabels(type, "live").Set(live);
         TitlesProm.WithLabels(type, "dead").Set(dead);
     }
+
+    /// <summary>Current title-gauge values (what the OTel observable gauge reports).</summary>
+    internal static (long MovieLive, long MovieDead, long SeriesLive, long SeriesDead) TitlesSnapshot()
+        => (Interlocked.Read(ref _movieLive), Interlocked.Read(ref _movieDead), Interlocked.Read(ref _seriesLive), Interlocked.Read(ref _seriesDead));
 
     private static Measurement<long> Point(long value, string type, string health)
         => new(value, new KeyValuePair<string, object?>("type", type), new KeyValuePair<string, object?>("health", health));

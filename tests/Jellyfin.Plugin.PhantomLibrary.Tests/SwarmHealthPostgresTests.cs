@@ -14,6 +14,7 @@ namespace Jellyfin.Plugin.PhantomLibrary.Tests;
 /// peers-by-title queries behave on Postgres as on SQLite. Opt-in via
 /// PHANTOM_TEST_POSTGRES_DSN like the sibling Postgres suites.
 /// </summary>
+[Collection(SwarmHealthMetricsCollection.Name)]
 public sealed class SwarmHealthPostgresTests : IAsyncLifetime
 {
     private static readonly string? Dsn = Environment.GetEnvironmentVariable("PHANTOM_TEST_POSTGRES_DSN");
@@ -118,6 +119,19 @@ public sealed class SwarmHealthPostgresTests : IAsyncLifetime
         }
 
         Assert.Empty(await db.GetSwarmPeersForTmdbIdsAsync("movie", Array.Empty<int>(), now.AddDays(-7), default));
+    }
+
+    [Fact]
+    public async Task Sync_TwoLibrariesSharingOnePostgresPhantomDb_InterleavedWithRestart_BothConverge()
+    {
+        if (!Enabled)
+        {
+            return;
+        }
+
+        using var db = PhantomDb.CreatePostgres(_connectionString!);
+        await db.SetMetaAsync("__init__", "1", default);
+        await SwarmHealthTests.RunTwoLibraryInterleaveAsync(db);
     }
 
     private static async Task ExecAsync(string cs, string sql, bool ignoreErrors = false)
