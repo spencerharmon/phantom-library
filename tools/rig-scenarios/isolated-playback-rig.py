@@ -241,6 +241,7 @@ def scenario(kind, root, server, candidate, backend, base_env):
             "GostreamBaseUrl": f"http://127.0.0.1:{go_port}", "GostreamDiagnosticsBaseUrl": f"http://127.0.0.1:{go_port}",
             "TorrentioBaseUrl": f"http://127.0.0.1:{tmdb_port}/torrentio", "ProwlarrBaseUrl": "", "ProwlarrApiKey": "",
             "EvictionEnabled": "false", "EagerResolveEnabled": "false", "SeriesAutopilotEnabled": "false",
+            "ChannelWarmupEnabled": "false",
             "PhantomBadgeVisibility": "AlwaysShow", "SourcePickerPreset": "gostream-default",
             "PhantomStubRoot": str(root / "phantom"), "GostreamMoviesRoot": str(root / "gostream/movies"),
             "GostreamShowsRoot": str(root / "gostream/tv"), "SuggestionsCatalogueMaxItems": "10"}

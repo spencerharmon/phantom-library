@@ -78,6 +78,13 @@ rather than leaving a second weaker implementation. Preserved assertions:
 | TV badges | series **and season** omitted; episode Phantom |
 | second episode play | final File source, GUID ID, probed streams, nonempty real stream again |
 
+Fixture configuration disables scheduled channel warmup, eviction and autopilot:
+this test drives browse/materialisation explicitly. On the current plugin, the
+30-second background warmup can race native episode materialisation and remove
+the active BaseItem; that separate background-warmup behavior is **not** claimed
+covered here. Availability and materialisation workers remain enabled and real.
+No HTTP/stream/persistence assertion is skipped or retried away on a 404.
+
 Fixtures additionally populate `source_candidates` for the seeded available
 movie/episode: current browse pruning intentionally hides previously-assessed
 empty-candidate rows. This is a valid available fixture, not a relaxation of the
