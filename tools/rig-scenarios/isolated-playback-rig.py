@@ -262,7 +262,22 @@ def pinned_web(root, env):
     (root / "web-identity.json").write_text(json.dumps({"url": WEB_URL, "sha256": digest, "index_sha256": sha(index)}, indent=2))
 
 
-def scenario(kind, root, server, candidate, backend, base_env):
+def build_availability_control(root, server, candidate, env):
+    tree = root / "availability-control"
+    shutil.copytree(TOOLS / "AvailabilityRigControl", tree,
+                    ignore=shutil.ignore_patterns("bin", "obj"))
+    proc = start(["dotnet", "build", tree / "AvailabilityRigControl.csproj", "-c", "Release",
+                  "-p:UseSharedCompilation=false", "-nodeReuse:false",
+                  f"-p:CandidateDir={candidate}", f"-p:ServerDir={server}"],
+                 root / "availability-control-build.log", env)
+    try:
+        assert proc.wait(timeout=180) == 0, "test control build failed; see availability-control-build.log"
+    finally:
+        stop(proc)
+    return tree / "bin/Release/net9.0/AvailabilityRigControl.dll"
+
+
+def scenario(kind, root, server, candidate, backend, base_env, suite="playback", control=None):
     root.mkdir()
     env = base_env.copy()
     # Intentionally discard ambient production/storage/telemetry configuration.
@@ -293,6 +308,10 @@ def scenario(kind, root, server, candidate, backend, base_env):
             if not (server / dll.name).exists():
                 shutil.copy2(dll, plugin_dir / dll.name)
         assert sha(candidate / (PLUGIN + ".dll")) == sha(plugin_dir / (PLUGIN + ".dll"))
+        if control:
+            # Same load context as the candidate (no duplicate plugin instance).
+            shutil.copy2(control, plugin_dir / control.name)
+            env["PHANTOM_RIG_AVAILABILITY_CONTROL"] = "1"
         conf = ET.Element("PluginConfiguration")
         values = {"TmdbApiKey": "rig-test-key", "TmdbApiBaseUrl": f"http://127.0.0.1:{tmdb_port}/3",
             "GostreamBaseUrl": f"http://127.0.0.1:{go_port}", "GostreamDiagnosticsBaseUrl": f"http://127.0.0.1:{go_port}",
@@ -302,6 +321,13 @@ def scenario(kind, root, server, candidate, backend, base_env):
             "PhantomBadgeVisibility": "AlwaysShow", "SourcePickerPreset": "gostream-default",
             "PhantomStubRoot": str(root / "phantom"), "GostreamMoviesRoot": str(root / "gostream/movies"),
             "GostreamShowsRoot": str(root / "gostream/tv"), "SuggestionsCatalogueMaxItems": "10"}
+        if suite == "stale-candidate":
+            oracle_port = port()
+            env["PHANTOM_RIG_ORACLE_PORT"] = str(oracle_port)
+            values.update(AvailabilityProbeEnabled="false", AvailabilityProbeMinIntervalSeconds="3600",
+                          AvailabilityProbeMaxIntervalSeconds="3600", AvailabilityMaxBatchSize="1",
+                          AvailabilityYieldToUserSeconds="0", SwarmHealthServiceUrl="",
+                          TorrentioBaseUrl=f"http://127.0.0.1:{oracle_port}")
         for key, value in values.items():
             ET.SubElement(conf, key).text = value
         ET.ElementTree(conf).write(root / f"data/plugins/configurations/{PLUGIN}.xml", encoding="utf-8", xml_declaration=True)
@@ -319,6 +345,9 @@ def scenario(kind, root, server, candidate, backend, base_env):
             time.sleep(1)
         else:
             raise TimeoutError("gostream did not generate its real media fixtures")
+        if suite == "stale-candidate":
+            processes.append(start([sys.executable, TOOLS / "stale-candidate-oracle.py"], root / "logs/oracle.log", env))
+            wait_http(processes[-1], f"http://127.0.0.1:{oracle_port}", "/health")
         server_command = ["dotnet", server / "jellyfin.dll", "--datadir", root / "data", "--configdir", root / "config",
             "--cachedir", root / "cache", "--logdir", root / "logs", "--ffmpeg", env["PHANTOM_RIG_FFMPEG"]]
         server_command += ["--webdir", env["PHANTOM_RIG_WEBDIR"]] if env.get("PHANTOM_RIG_WEBDIR") else ["--nowebclient"]
@@ -374,8 +403,10 @@ def scenario(kind, root, server, candidate, backend, base_env):
             time.sleep(1)
         env["RIG_NO_RESET"] = "1"
         script = "35-channel-e2e-playback.sh" if kind == "movie" else "36-channel-episode-e2e-playback.sh"
+        command = ([sys.executable, TOOLS / "stale-candidate-scenario.py", kind] if suite == "stale-candidate"
+                   else ["bash", TOOLS / script])
         with (root / "scenario.log").open("w"):
-            proc = start(["bash", TOOLS / script], root / "scenario.log", env)
+            proc = start(command, root / "scenario.log", env)
             try:
                 result = proc.wait(timeout=600)
                 print((root / "scenario.log").read_text(), end="", flush=True)
@@ -414,6 +445,7 @@ def main():
     parser.add_argument("--scenario", choices=("movie", "episode", "both"), default="both")
     parser.add_argument("--episode-web-queue", action="store_true",
                         help="episode: regular-user native queue + real jellyfin-web/Chromium Play (desktop+mobile)")
+    parser.add_argument("--suite", choices=("playback", "stale-candidate"), default="playback")
     args = parser.parse_args()
     artifacts = REPO / "artifacts"
     artifacts.mkdir(exist_ok=True)
@@ -431,10 +463,24 @@ def main():
             env.update(PHANTOM_WEB_QUEUE="1", PHANTOM_RIG_MEDIA_SECONDS="30")
             pinned_web(root, env)
         server, candidate = build(root, env)
+        control = build_availability_control(root, server, candidate, env) if args.suite == "stale-candidate" else None
+        failures = []
         for kind in (("movie", "episode") if args.scenario == "both" else (args.scenario,)):
             results.append({"scenario": kind, "backend": args.backend, "result": "failed"})
-            results[-1] = scenario(kind, root / kind, server, candidate, args.backend, env)
-        print(f"PLAYBACK_PARITY_OK backend={args.backend} " + " ".join(r["scenario"] + "=passed" for r in results), flush=True)
+            try:
+                results[-1] = scenario(kind, root / kind, server, candidate, args.backend, env, args.suite, control)
+            except Exception as error:
+                if args.suite != "stale-candidate":
+                    raise
+                # Preserve both parity observations, but NEVER turn a failed
+                # scenario/cleanup into success. Exit nonzero after both run.
+                results[-1]["error"] = str(error)
+                failures.append(f"{kind}: {error}")
+                print(f"SCENARIO_FAILED {kind}: {error}", file=sys.stderr, flush=True)
+        if failures:
+            raise AssertionError("; ".join(failures))
+        marker = "STALE_CANDIDATE_REPROBE_OK" if args.suite == "stale-candidate" else "PLAYBACK_PARITY_OK"
+        print(f"{marker} backend={args.backend} " + " ".join(r["scenario"] + "=passed" for r in results), flush=True)
     finally:
         (root / "results.json").write_text(json.dumps(results, indent=2) + "\n")
         for directory in ("build", "ffmpeg", "web-dist"):

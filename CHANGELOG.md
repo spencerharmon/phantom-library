@@ -37,6 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [docs/tasks/p13-parallel-indexer-search.md](docs/tasks/p13-parallel-indexer-search.md).
 
 ### Fixed
+- Plugin 0.5.7.47: successful availability re-probes now invalidate the affected
+  channel when a previously assessed available movie/episode regains an empty or
+  expired candidate cache. REST browse (including series → season → episode)
+  recovers on the same running server; fresh-cache refreshes do not churn channel
+  versions. No browse SQL, scheduling priority or schema change.
 - Parallel source search preserves successful movie subqueries and parsed magnets
   when a sibling query/download redirect times out, caching late hits without
   weakening caller cancellation. Empty/rejected results remain transient while

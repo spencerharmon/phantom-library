@@ -581,6 +581,16 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
         MagnetProbeResult probe,
         CancellationToken ct)
     {
+        // Status alone is not browse eligibility: a previously assessed
+        // available item can be hidden after its candidate cache empties. Read
+        // before the upsert restores it, then invalidate only its channel after
+        // persistence. Ordinary available refreshes with live candidates (and
+        // never-assessed available rows) need no extra channel cache churn.
+        var invalidateChannel = lease.Status != "available"
+            || (lease.CandidateMagnet is not null
+                && (await _db.ListSourceCandidatesAsync(
+                    lease.TmdbId, lease.Type, lease.Season, lease.Episode,
+                    cfg.SourcePickerPreset, includeExpired: false, ct).ConfigureAwait(false)).Count == 0);
         await _db.UpsertSourceCandidatesAsync(
             lease.TmdbId,
             lease.Type,
@@ -624,7 +634,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
             null,
             ct,
             negativeStreak: 0).ConfigureAwait(false);
-        if (lease.Status != "available")
+        if (invalidateChannel)
         {
             BumpFor(lease.Type);
         }
