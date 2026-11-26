@@ -142,6 +142,52 @@ internal sealed class TmdbExternalIdsDto
     public string? ImdbId { get; set; }
 }
 
+/// <summary>
+/// <c>/movie/{id}</c> or <c>/tv/{id}</c> with
+/// <c>append_to_response=alternative_titles,translations</c> — only the
+/// title-variant fields (p13-degenerate-query-guard title repair).
+/// </summary>
+internal sealed class TmdbTitleVariantsDto
+{
+    public TmdbAlternativeTitlesDto? AlternativeTitles { get; set; }
+    public TmdbTranslationsDto? Translations { get; set; }
+}
+
+internal sealed class TmdbAlternativeTitlesDto
+{
+    // Movies use "titles", TV uses "results".
+    public TmdbAlternativeTitleDto[]? Titles { get; set; }
+    public TmdbAlternativeTitleDto[]? Results { get; set; }
+}
+
+internal sealed class TmdbAlternativeTitleDto
+{
+    [JsonPropertyName("iso_3166_1")]
+    public string? Iso31661 { get; set; }
+    public string? Title { get; set; }
+}
+
+internal sealed class TmdbTranslationsDto
+{
+    public TmdbTranslationDto[]? Translations { get; set; }
+}
+
+internal sealed class TmdbTranslationDto
+{
+    [JsonPropertyName("iso_3166_1")]
+    public string? Iso31661 { get; set; }
+    [JsonPropertyName("iso_639_1")]
+    public string? Iso6391 { get; set; }
+    public TmdbTranslationDataDto? Data { get; set; }
+}
+
+internal sealed class TmdbTranslationDataDto
+{
+    // Movies carry "title", TV carries "name".
+    public string? Title { get; set; }
+    public string? Name { get; set; }
+}
+
 internal sealed class TmdbMovieDetailsDto
 {
     public int Id { get; set; }

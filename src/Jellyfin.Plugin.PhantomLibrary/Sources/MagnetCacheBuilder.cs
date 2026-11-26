@@ -56,7 +56,7 @@ public sealed class MagnetCacheBuilder
         string type,
         int? season,
         int? episode,
-        string title,
+        string? title,
         int? year,
         CancellationToken ct);
 
@@ -74,7 +74,7 @@ public sealed class MagnetCacheBuilder
         string type,
         int? season,
         int? episode,
-        string title,
+        string? title,
         int? year,
         CancellationToken ct);
 
@@ -125,10 +125,15 @@ public sealed class MagnetCacheBuilder
         {
             var metaType = type == "movie" ? "movie" : "series";
             var meta = await db.GetTmdbMetadataAsync(tmdbId, metaType, ct).ConfigureAwait(false);
-            if (meta is null || string.IsNullOrWhiteSpace(meta.Title))
+            if (meta is null)
             {
                 return null;
             }
+
+            // A present row with an empty/degenerate title is NOT a metadata
+            // miss: pass it through so MagnetSelector's degenerate-query guard
+            // repairs it from TMDB (or skips it with the counted
+            // degenerate_query_skipped outcome) — p13-degenerate-query-guard.
 
             var imdbType = type == "movie" ? "movie" : "series";
             var imdb = await externalIds.GetImdbIdAsync(tmdbId, imdbType, ct).ConfigureAwait(false);
@@ -189,7 +194,7 @@ public sealed class MagnetCacheBuilder
         var episodeSentinel = type == "episode" ? episode ?? -1 : -1;
 
         var meta = await _resolveMeta(tmdbId, type, seasonSentinel, episodeSentinel, ct).ConfigureAwait(false);
-        if (meta is null || string.IsNullOrWhiteSpace(meta.Title))
+        if (meta is null)
         {
             _logger.LogWarning(
                 "MagnetCacheBuilder(sync): no metadata for {Type}/{Tmdb} s{Season}e{Episode}; cannot build cache",
@@ -219,21 +224,39 @@ public sealed class MagnetCacheBuilder
                     $"transient fan-out failure for {type}/{tmdbId} s{seasonSentinel}e{episodeSentinel}: {probe.ErrorKind} {probe.ErrorMessage}");
             }
 
+            if (probe.Outcome == MagnetProbeOutcome.DegenerateQuerySkipped)
+            {
+                _logger.LogWarning(
+                    "MagnetCacheBuilder(sync): {Outcome} for {Type}/{Tmdb} s{Season}e{Episode}: {Message}",
+                    MagnetSelector.DegenerateQuerySkippedKind, type, tmdbId, seasonSentinel, episodeSentinel, probe.ErrorMessage);
+                return 0;
+            }
+
             candidates = probe.Outcome == MagnetProbeOutcome.Available
                 ? probe.Candidates
                 : Array.Empty<MagnetCandidate>();
         }
         else
         {
-            candidates = await _fanOut(
-                tmdbId,
-                meta.ImdbId,
-                type,
-                type == "episode" ? season : null,
-                type == "episode" ? episode : null,
-                meta.Title,
-                meta.Year,
-                ct).ConfigureAwait(false);
+            try
+            {
+                candidates = await _fanOut(
+                    tmdbId,
+                    meta.ImdbId,
+                    type,
+                    type == "episode" ? season : null,
+                    type == "episode" ? episode : null,
+                    meta.Title,
+                    meta.Year,
+                    ct).ConfigureAwait(false);
+            }
+            catch (DegenerateQuerySkippedException ex)
+            {
+                _logger.LogWarning(
+                    "MagnetCacheBuilder(sync): {Outcome} for {Type}/{Tmdb} s{Season}e{Episode}: {Message}",
+                    MagnetSelector.DegenerateQuerySkippedKind, type, tmdbId, seasonSentinel, episodeSentinel, ex.Message);
+                return 0;
+            }
         }
 
         var ttl = TimeSpan.FromHours(Math.Max(1, cfg.MagnetCacheTtlHours));
@@ -271,7 +294,7 @@ public sealed class MagnetCacheBuilder
         try
         {
             var meta = await _resolveMeta(job.TmdbId, job.Type, job.Season, job.Episode, ct).ConfigureAwait(false);
-            if (meta is null || string.IsNullOrWhiteSpace(meta.Title))
+            if (meta is null)
             {
                 await _db.FailMagnetCacheJobAsync(
                     job.TmdbId, job.Type, job.Season, job.Episode, job.Preset,
@@ -319,6 +342,19 @@ public sealed class MagnetCacheBuilder
         {
             throw;
         }
+        catch (DegenerateQuerySkippedException ex)
+        {
+            // Degenerate, unrepairable title and no IMDB-only-capable indexer:
+            // NO indexer request was made. Record the distinct counted outcome
+            // (p13-degenerate-query-guard), not a generic exception name.
+            await _db.FailMagnetCacheJobAsync(
+                job.TmdbId, job.Type, job.Season, job.Episode, job.Preset,
+                MagnetSelector.DegenerateQuerySkippedKind, ct).ConfigureAwait(false);
+            _logger.LogWarning(
+                "MagnetCacheBuilder: {Outcome} for {Type}/{Tmdb} s{Season}e{Episode}: {Message}",
+                MagnetSelector.DegenerateQuerySkippedKind, job.Type, job.TmdbId, job.Season, job.Episode, ex.Message);
+            return new MagnetCacheBuildResult(job, 0, MagnetSelector.DegenerateQuerySkippedKind);
+        }
         catch (Exception ex)
         {
             await _db.FailMagnetCacheJobAsync(
@@ -334,6 +370,10 @@ public sealed class MagnetCacheBuilder
 }
 
 /// <summary>Search metadata for an item, resolved for the Prowlarr fan-out.</summary>
+/// <remarks>
+/// <see cref="Title"/> may be empty/degenerate: <see cref="MagnetSelector"/>
+/// owns the degenerate-query guard (repair from TMDB, IMDB-only, or skip).
+/// </remarks>
 public sealed record MagnetCacheItemMeta(string? ImdbId, string Title, int? Year);
 
 /// <summary>Outcome of building one magnet-cache job.</summary>

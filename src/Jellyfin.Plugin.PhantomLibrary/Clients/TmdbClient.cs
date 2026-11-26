@@ -240,6 +240,51 @@ public sealed class TmdbClient : ITmdbClient
     public Task<string?> GetImdbIdForSeriesAsync(int tmdbId, CancellationToken cancellationToken)
         => GetImdbIdAsync($"/tv/{tmdbId.ToString(CultureInfo.InvariantCulture)}/external_ids", cancellationToken);
 
+    /// <inheritdoc/>
+    public Task<IReadOnlyList<string>> GetMovieTitleVariantsAsync(int tmdbId, CancellationToken cancellationToken)
+        => GetTitleVariantsAsync($"/movie/{tmdbId.ToString(CultureInfo.InvariantCulture)}", cancellationToken);
+
+    /// <inheritdoc/>
+    public Task<IReadOnlyList<string>> GetSeriesTitleVariantsAsync(int tmdbId, CancellationToken cancellationToken)
+        => GetTitleVariantsAsync($"/tv/{tmdbId.ToString(CultureInfo.InvariantCulture)}", cancellationToken);
+
+    private async Task<IReadOnlyList<string>> GetTitleVariantsAsync(string endpoint, CancellationToken cancellationToken)
+    {
+        var path = BuildPath(
+            endpoint,
+            null,
+            new[] { new KeyValuePair<string, string?>("append_to_response", "alternative_titles,translations") });
+        var dto = await GetJsonAsync<TmdbTitleVariantsDto>(path, cancellationToken, allow404: true).ConfigureAwait(false);
+        if (dto is null)
+        {
+            return Array.Empty<string>();
+        }
+
+        // Indexer release names are overwhelmingly English-tagged, so rank
+        // US/GB alternative titles and English translations ahead of the rest;
+        // otherwise keep TMDB's order. Duplicates collapse case-insensitively.
+        static int Rank(string? country, string? language)
+            => string.Equals(language, "en", StringComparison.OrdinalIgnoreCase)
+               || string.Equals(country, "US", StringComparison.OrdinalIgnoreCase)
+               || string.Equals(country, "GB", StringComparison.OrdinalIgnoreCase)
+                ? 0
+                : 1;
+
+        var alt = (dto.AlternativeTitles?.Titles ?? dto.AlternativeTitles?.Results ?? Array.Empty<TmdbAlternativeTitleDto>())
+            .Select((t, i) => (Text: t.Title, Rank: Rank(t.Iso31661, null), Group: 0, Index: i));
+        var tr = (dto.Translations?.Translations ?? Array.Empty<TmdbTranslationDto>())
+            .Select((t, i) => (Text: t.Data?.Title ?? t.Data?.Name, Rank: Rank(t.Iso31661, t.Iso6391), Group: 1, Index: i));
+
+        return alt.Concat(tr)
+            .Where(x => !string.IsNullOrWhiteSpace(x.Text))
+            .OrderBy(x => x.Rank)
+            .ThenBy(x => x.Group)
+            .ThenBy(x => x.Index)
+            .Select(x => x.Text!.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
     private async Task<string?> GetImdbIdAsync(string endpoint, CancellationToken cancellationToken)
     {
         var path = BuildPath(endpoint, null, null);

@@ -8,6 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
 using Jellyfin.Plugin.PhantomLibrary.Configuration;
+using Jellyfin.Plugin.PhantomLibrary.Diagnostics;
 using Jellyfin.Plugin.PhantomLibrary.Materialisation;
 using Microsoft.Extensions.Logging;
 
@@ -35,6 +36,15 @@ public enum MagnetProbeOutcome
     DefinitiveUnavailable,
     IndeterminateTransient,
     NoCapableIndexer,
+
+    /// <summary>
+    /// The item's title was degenerate (empty / whitespace / punctuation-only),
+    /// could not be repaired from the TMDB record, and no enabled indexer can
+    /// serve it IMDB-id-only — so NO indexer request was issued
+    /// (p13-degenerate-query-guard). Not a definitive "unavailable": nothing
+    /// was searched.
+    /// </summary>
+    DegenerateQuerySkipped,
 }
 
 public sealed record MagnetProbeResult(
@@ -54,6 +64,33 @@ public sealed record MagnetProbeResult(
 
     public static MagnetProbeResult Transient(string kind, string? message)
         => new(MagnetProbeOutcome.IndeterminateTransient, Array.Empty<MagnetCandidate>(), kind, message);
+
+    public static MagnetProbeResult DegenerateQuerySkipped(string? message)
+        => new(MagnetProbeOutcome.DegenerateQuerySkipped, Array.Empty<MagnetCandidate>(), MagnetSelector.DegenerateQuerySkippedKind, message);
+}
+
+/// <summary>
+/// Raised by <see cref="MagnetSelector.SelectRankedAsync"/> (whose list-shaped
+/// return cannot carry an outcome) when the probe was
+/// <see cref="MagnetProbeOutcome.DegenerateQuerySkipped"/>, so callers such as
+/// the magnet-cache builder record the distinct
+/// <c>degenerate_query_skipped</c> outcome instead of a silent empty build.
+/// </summary>
+public sealed class DegenerateQuerySkippedException : Exception
+{
+    public DegenerateQuerySkippedException()
+    {
+    }
+
+    public DegenerateQuerySkippedException(string message)
+        : base(message)
+    {
+    }
+
+    public DegenerateQuerySkippedException(string message, Exception inner)
+        : base(message, inner)
+    {
+    }
 }
 
 /// <summary>
@@ -67,7 +104,11 @@ public sealed record MagnetProbeResult(
 /// </summary>
 public sealed class MagnetSelector
 {
+    /// <summary>Error-kind / counted outcome for a skipped degenerate query.</summary>
+    public const string DegenerateQuerySkippedKind = "degenerate_query_skipped";
+
     private readonly IEnumerable<IIndexerClient> _indexers;
+    private readonly IQueryTitleRepairSource? _titleRepair;
     private static readonly Regex EpisodeToken = new(@"\bS(?<s>\d{1,2})E(?<e>\d{1,3})\b|\b(?<s2>\d{1,2})x(?<e2>\d{1,3})\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private readonly QualityScorer _scorer;
     private readonly Func<PluginConfiguration> _configProvider;
@@ -76,23 +117,27 @@ public sealed class MagnetSelector
     public MagnetSelector(
         IEnumerable<IIndexerClient> indexers,
         QualityScorer scorer,
+        IQueryTitleRepairSource titleRepair,
         ILogger<MagnetSelector> logger)
-        : this(indexers, scorer, logger, () => Plugin.Instance?.Configuration ?? new PluginConfiguration())
+        : this(indexers, scorer, logger, () => Plugin.Instance?.Configuration ?? new PluginConfiguration(), titleRepair)
     {
     }
 
     // Test-friendly ctor: lets tests inject a synthetic configuration
-    // without spinning up Plugin.Instance.
+    // without spinning up Plugin.Instance. A null titleRepair means a
+    // degenerate title is never repaired (IMDB-only or skip only).
     internal MagnetSelector(
         IEnumerable<IIndexerClient> indexers,
         QualityScorer scorer,
         ILogger<MagnetSelector> logger,
-        Func<PluginConfiguration> configProvider)
+        Func<PluginConfiguration> configProvider,
+        IQueryTitleRepairSource? titleRepair = null)
     {
         _indexers = indexers ?? throw new ArgumentNullException(nameof(indexers));
         _scorer = scorer ?? throw new ArgumentNullException(nameof(scorer));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _configProvider = configProvider ?? throw new ArgumentNullException(nameof(configProvider));
+        _titleRepair = titleRepair;
     }
 
     /// <summary>
@@ -107,7 +152,7 @@ public sealed class MagnetSelector
         string type,
         int? season,
         int? episode,
-        string title,
+        string? title,
         int? year,
         CancellationToken ct)
     {
@@ -127,14 +172,18 @@ public sealed class MagnetSelector
         string type,
         int? season,
         int? episode,
-        string title,
+        string? title,
         int? year,
         CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(type);
-        ArgumentException.ThrowIfNullOrWhiteSpace(title);
 
         var probe = await ProbeAsync(tmdbId, imdbId, type, season, episode, title, year, ct).ConfigureAwait(false);
+        if (probe.Outcome == MagnetProbeOutcome.DegenerateQuerySkipped)
+        {
+            throw new DegenerateQuerySkippedException(probe.ErrorMessage ?? DegenerateQuerySkippedKind);
+        }
+
         return probe.Outcome == MagnetProbeOutcome.Available ? probe.Candidates : Array.Empty<MagnetCandidate>();
     }
 
@@ -182,7 +231,7 @@ public sealed class MagnetSelector
         string type,
         int? season,
         int? episode,
-        string title,
+        string? title,
         int? year,
         CancellationToken ct)
         => ProbeCoreAsync(tmdbId, imdbId, type, season, episode, title, year, availabilityOracleOnly: false, ct);
@@ -205,7 +254,7 @@ public sealed class MagnetSelector
         string type,
         int? season,
         int? episode,
-        string title,
+        string? title,
         int? year,
         CancellationToken ct)
         => ProbeCoreAsync(tmdbId, imdbId, type, season, episode, title, year, availabilityOracleOnly: true, ct);
@@ -222,13 +271,47 @@ public sealed class MagnetSelector
         string type,
         int? season,
         int? episode,
-        string title,
+        string? title,
         int? year,
         bool availabilityOracleOnly,
         CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(type);
-        ArgumentException.ThrowIfNullOrWhiteSpace(title);
+
+        var enabled = EnabledIndexers(availabilityOracleOnly);
+        if (enabled.Count == 0)
+        {
+            return MagnetProbeResult.Transient("no_enabled_indexers", "No enabled indexers are configured");
+        }
+
+        // Degenerate-query guard (ROI P13, p13-degenerate-query-guard): the ONE
+        // choke point every indexer request flows through (materialise,
+        // details/source picker, availability sweep + reconcile, magnet-cache
+        // builder — interactive and background, movie and episode). Resolve a
+        // non-degenerate title term BEFORE any SearchAsync, repairing from the
+        // TMDB record, else fall back to IMDB-id-only indexers, else skip.
+        var term = await ResolveQueryTermAsync(tmdbId, imdbId, type, season, episode, title, ct).ConfigureAwait(false);
+        if (term.Skip)
+        {
+            return MagnetProbeResult.DegenerateQuerySkipped(term.Message);
+        }
+
+        if (term.Title is null)
+        {
+            // IMDB-id-only: query only the indexers that can serve it.
+            enabled = enabled.Where(i => i.SupportsImdbOnlyQuery(type)).ToList();
+            if (enabled.Count == 0)
+            {
+                PhantomMetrics.DegenerateQuery(type, DegenerateQuerySkippedKind);
+                _logger.LogWarning(
+                    "Degenerate query skipped for {Type}/{Tmdb} s{Season}e{Episode}: title {Title} unrepairable and no enabled indexer serves an IMDB-only query",
+                    type, tmdbId, season, episode, title);
+                return MagnetProbeResult.DegenerateQuerySkipped(
+                    $"degenerate title '{title}' unrepairable; no enabled indexer serves an IMDB-only {type} query");
+            }
+
+            PhantomMetrics.DegenerateQuery(type, "imdb_only");
+        }
 
         var query = new IndexerQuery
         {
@@ -236,17 +319,11 @@ public sealed class MagnetSelector
             Tmdb = tmdbId,
             Imdb = type == "movie" ? imdbId : null,
             SeriesImdb = type == "episode" ? imdbId : null,
-            Title = title,
+            Title = term.Title,
             Year = year,
             Season = season,
             Episode = episode,
         };
-
-        var enabled = EnabledIndexers(availabilityOracleOnly);
-        if (enabled.Count == 0)
-        {
-            return MagnetProbeResult.Transient("no_enabled_indexers", "No enabled indexers are configured");
-        }
 
         var aggregated = new List<IndexerCandidate>();
         var failures = new List<string>();
@@ -415,6 +492,81 @@ public sealed class MagnetSelector
         }).ToList();
 
         return MagnetProbeResult.Available(candidates);
+    }
+
+    private readonly record struct QueryTerm(string? Title, bool Skip, string? Message);
+
+    /// <summary>
+    /// Resolve the title term for an indexer query. Normal titles are only
+    /// normalised (trim / whitespace collapse — the scorer never sees the query
+    /// term, so ranking is unchanged). A degenerate title is repaired from the
+    /// TMDB record (original title → alternative/translated titles); if none is
+    /// usable and an IMDB id exists, returns a null title (IMDB-id-only query);
+    /// otherwise <c>Skip</c> with the counted <c>degenerate_query_skipped</c>
+    /// outcome. A title is NEVER fabricated.
+    /// </summary>
+    private async Task<QueryTerm> ResolveQueryTermAsync(
+        int tmdbId,
+        string? imdbId,
+        string type,
+        int? season,
+        int? episode,
+        string? title,
+        CancellationToken ct)
+    {
+        var normalised = QueryTitleGuard.Normalize(title);
+        if (normalised is not null)
+        {
+            return new QueryTerm(normalised, false, null);
+        }
+
+        if (_titleRepair is not null)
+        {
+            QueryTitleRepair? repair;
+            try
+            {
+                repair = await _titleRepair.RepairAsync(tmdbId, type, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // A failed TMDB repair lookup is not proof the item is
+                // unrepairable; continue to the IMDB-only / skip decision
+                // (which still never sends a degenerate term).
+                _logger.LogWarning(ex, "Degenerate-title repair lookup failed for {Type}/{Tmdb}", type, tmdbId);
+                repair = null;
+            }
+
+            var repaired = QueryTitleGuard.Normalize(repair?.Title);
+            if (repaired is not null)
+            {
+                var outcome = repair!.Source == QueryTitleSource.OriginalTitle
+                    ? "repaired_original_title"
+                    : "repaired_alternate_title";
+                PhantomMetrics.DegenerateQuery(type, outcome);
+                _logger.LogInformation(
+                    "Degenerate title {Title} for {Type}/{Tmdb} s{Season}e{Episode} repaired from TMDB {Source}: {Repaired}",
+                    title, type, tmdbId, season, episode, repair.Source, repaired);
+                return new QueryTerm(repaired, false, null);
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(imdbId))
+        {
+            _logger.LogInformation(
+                "Degenerate title {Title} for {Type}/{Tmdb} s{Season}e{Episode} unrepairable; falling back to IMDB-only query ({Imdb})",
+                title, type, tmdbId, season, episode, imdbId);
+            return new QueryTerm(null, false, null);
+        }
+
+        PhantomMetrics.DegenerateQuery(type, DegenerateQuerySkippedKind);
+        _logger.LogWarning(
+            "Degenerate query skipped for {Type}/{Tmdb} s{Season}e{Episode}: title {Title} unrepairable from TMDB and no IMDB id",
+            type, tmdbId, season, episode, title);
+        return new QueryTerm(null, true, $"degenerate title '{title}' unrepairable from TMDB and no IMDB id");
     }
 
     /// <summary>

@@ -468,6 +468,12 @@ internal sealed class StubTmdbClient : ITmdbClient
     public Task<string?> GetImdbIdForMovieAsync(int tmdbId, CancellationToken ct) => Task.FromResult<string?>(null);
     public Task<string?> GetImdbIdForSeriesAsync(int tmdbId, CancellationToken ct) => Task.FromResult<string?>(null);
 
+    public Task<IReadOnlyList<string>> GetMovieTitleVariantsAsync(int tmdbId, CancellationToken ct)
+        => Task.FromResult<IReadOnlyList<string>>(Array.Empty<string>());
+
+    public Task<IReadOnlyList<string>> GetSeriesTitleVariantsAsync(int tmdbId, CancellationToken ct)
+        => Task.FromResult<IReadOnlyList<string>>(Array.Empty<string>());
+
     public Task<IReadOnlyList<TmdbSearchHit>> DiscoverMoviesAsync(int page, string? languageCode, CancellationToken ct)
     {
         DiscoverMoviePageCalls.Add(page);

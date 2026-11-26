@@ -48,6 +48,14 @@ public sealed class ProwlarrClient : IIndexerClient
         }
     }
 
+    /// <summary>
+    /// Prowlarr movie searches include an IMDB-id term (<c>query=tt…</c>) so a
+    /// movie can be served from the IMDB id alone; episode searches are text
+    /// only (<c>"Title SxxEyy"</c>) and cannot.
+    /// </summary>
+    public bool SupportsImdbOnlyQuery(string type)
+        => string.Equals(type, "movie", StringComparison.OrdinalIgnoreCase);
+
     public async Task<IReadOnlyList<IndexerCandidate>> SearchAsync(IndexerQuery query, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(query);
@@ -62,7 +70,11 @@ public sealed class ProwlarrClient : IIndexerClient
         var queries = BuildSearchQueries(query, isEpisode);
         if (queries.Count == 0)
         {
-            return Array.Empty<IndexerCandidate>();
+            // No IMDB term (episodes never send one) and a missing/degenerate
+            // title: there is nothing honest to search for. Abstain instead of
+            // sending an empty/punctuation-only term (p13-degenerate-query-guard)
+            // or reporting a definitive empty result.
+            throw new IndexerNotApplicableException("Prowlarr has no non-degenerate query term for this item");
         }
 
         var results = new List<IndexerCandidate>();
@@ -298,12 +310,16 @@ public sealed class ProwlarrClient : IIndexerClient
 
     private static string BuildTextQuery(IndexerQuery q)
     {
-        if (string.IsNullOrWhiteSpace(q.Title))
+        // Degenerate-query guard (p13): never build "<punctuation> <year>"
+        // (the production "Term: [. 2026]") — a title with no letter/digit
+        // yields NO text term at all.
+        var title = Sources.QueryTitleGuard.Normalize(q.Title);
+        if (title is null)
         {
             return string.Empty;
         }
 
-        var s = q.Title!;
+        var s = title;
         if (string.Equals(q.Type, "episode", StringComparison.OrdinalIgnoreCase)
             && q.Season is int se && q.Episode is int ep)
         {
