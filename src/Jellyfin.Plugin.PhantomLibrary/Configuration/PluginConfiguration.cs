@@ -30,6 +30,9 @@ public class PluginConfiguration : BasePluginConfiguration
     private int _indexerProbeTimeoutSeconds;
     private int _minEarlyReturnCandidates;
     private int _earlyReturnMinElapsedMs;
+    private int _indexerSearchBudgetMs;
+    private int _prowlarrIndexerDiscoveryTtlMinutes;
+    private int _indexerLateCollectorMaxConcurrent;
     private string _sourceValidationPolicyVersion = "sv14-parser-audio-v1";
     private string _allowedVideoContainers = "mkv";
 
@@ -160,6 +163,13 @@ public class PluginConfiguration : BasePluginConfiguration
         FastIndexerEarlyReturnEnabled = true;
         MinEarlyReturnCandidates = 1;
         EarlyReturnMinElapsedMs = 250;
+        // p13-parallel-indexer-search (ROI Priority 13): per-indexer fan-out with a
+        // budgeted collector. At the budget the selector ranks whatever arrived and
+        // proceeds; still-running requests finish in the background (bounded by
+        // IndexerProbeTimeoutSeconds) and land in the magnet cache.
+        IndexerSearchBudgetMs = 10000;
+        ProwlarrIndexerDiscoveryTtlMinutes = 15;
+        IndexerLateCollectorMaxConcurrent = 16;
         GostreamToken = string.Empty;
 
         MetricsOtlpEnabled = false;
@@ -899,6 +909,46 @@ public class PluginConfiguration : BasePluginConfiguration
     {
         get => _earlyReturnMinElapsedMs;
         set => _earlyReturnMinElapsedMs = Math.Clamp(value, 0, 10000);
+    }
+
+    /// <summary>
+    /// p13-parallel-indexer-search: wall-clock budget (milliseconds) for one
+    /// source search in <c>MagnetSelector.ProbeCoreAsync</c>. Every indexer
+    /// (Torrentio + each discovered Prowlarr indexer) is queried concurrently;
+    /// when the budget elapses the selector ranks every candidate received so
+    /// far and returns, regardless of any single indexer's latency. Requests
+    /// still running at the budget are NOT discarded: they continue in the
+    /// background (each still capped by <see cref="IndexerProbeTimeoutSeconds"/>)
+    /// and their results are written to the magnet cache. Clamped to [500, 120000].
+    /// </summary>
+    public int IndexerSearchBudgetMs
+    {
+        get => _indexerSearchBudgetMs;
+        set => _indexerSearchBudgetMs = Math.Clamp(value, 500, 120000);
+    }
+
+    /// <summary>
+    /// p13-parallel-indexer-search: how long (minutes) the enabled-indexer list
+    /// discovered from Prowlarr's <c>/api/v1/indexer</c> is reused before it is
+    /// re-fetched. Indexer ids/names are always discovered at runtime, never
+    /// configured. Clamped to [1, 1440].
+    /// </summary>
+    public int ProwlarrIndexerDiscoveryTtlMinutes
+    {
+        get => _prowlarrIndexerDiscoveryTtlMinutes;
+        set => _prowlarrIndexerDiscoveryTtlMinutes = Math.Clamp(value, 1, 1440);
+    }
+
+    /// <summary>
+    /// p13-parallel-indexer-search: maximum number of searches whose
+    /// past-budget indexer requests may keep running in the background at
+    /// once. Past this bound a new search's late requests are cancelled
+    /// (counted as <c>late_dropped</c>) instead of piling up. Clamped to [1, 256].
+    /// </summary>
+    public int IndexerLateCollectorMaxConcurrent
+    {
+        get => _indexerLateCollectorMaxConcurrent;
+        set => _indexerLateCollectorMaxConcurrent = Math.Clamp(value, 1, 256);
     }
 
     /// <summary>Optional shared secret sent to gostream mutation/validation endpoints.</summary>

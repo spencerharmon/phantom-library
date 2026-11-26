@@ -6,6 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Source search queries every enabled Prowlarr indexer separately (discovered at
+  runtime from `/api/v1/indexer`, TTL-cached) concurrently with Torrentio instead
+  of one aggregate `/api/v1/search`. Results are ranked after a budget
+  (`IndexerSearchBudgetMs`, default 10 s) or as soon as `MinEarlyReturnCandidates`
+  high-confidence candidates arrive; slower indexers finish in the background and
+  their releases land in the magnet cache. New OTel meter `Phantom.Indexers`. See
+  [docs/tasks/p13-parallel-indexer-search.md](docs/tasks/p13-parallel-indexer-search.md).
+
 ### Fixed
 - Preserve independent loaded-config fields in offline gostream drift reports:
   after process binding, a missing or invalid sibling no longer hides a valid

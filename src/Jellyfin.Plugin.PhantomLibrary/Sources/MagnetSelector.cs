@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
@@ -8,6 +9,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.PhantomLibrary.Clients;
 using Jellyfin.Plugin.PhantomLibrary.Configuration;
+using Jellyfin.Plugin.PhantomLibrary.Diagnostics;
 using Jellyfin.Plugin.PhantomLibrary.Materialisation;
 using Microsoft.Extensions.Logging;
 
@@ -65,19 +67,31 @@ public sealed record MagnetProbeResult(
 ///
 /// Plan §4.2.0.
 /// </summary>
-public sealed class MagnetSelector
+public sealed class MagnetSelector : IDisposable
 {
     private readonly IEnumerable<IIndexerClient> _indexers;
     private static readonly Regex EpisodeToken = new(@"\bS(?<s>\d{1,2})E(?<e>\d{1,3})\b|\b(?<s2>\d{1,2})x(?<e2>\d{1,3})\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private readonly QualityScorer _scorer;
     private readonly Func<PluginConfiguration> _configProvider;
     private readonly ILogger<MagnetSelector> _logger;
+    private readonly ILateIndexerResultSink? _lateSink;
+
+    // p13-parallel-indexer-search: past-budget indexer requests outlive the
+    // probe that started them. They are bounded by the per-request timeout and
+    // IndexerLateCollectorMaxConcurrent, and ALL of them are cancelled when the
+    // host disposes this singleton (shutdown).
+    private readonly CancellationTokenSource _lifetimeCts = new();
+    private readonly CancellationToken _lifetime;
+    private readonly ConcurrentDictionary<long, Task> _lateWork = new();
+    private long _lateWorkSeq;
+    private int _lateCollectorsActive;
 
     public MagnetSelector(
         IEnumerable<IIndexerClient> indexers,
         QualityScorer scorer,
-        ILogger<MagnetSelector> logger)
-        : this(indexers, scorer, logger, () => Plugin.Instance?.Configuration ?? new PluginConfiguration())
+        ILogger<MagnetSelector> logger,
+        ILateIndexerResultSink lateSink)
+        : this(indexers, scorer, logger, () => Plugin.Instance?.Configuration ?? new PluginConfiguration(), lateSink)
     {
     }
 
@@ -87,12 +101,32 @@ public sealed class MagnetSelector
         IEnumerable<IIndexerClient> indexers,
         QualityScorer scorer,
         ILogger<MagnetSelector> logger,
-        Func<PluginConfiguration> configProvider)
+        Func<PluginConfiguration> configProvider,
+        ILateIndexerResultSink? lateSink = null)
     {
         _indexers = indexers ?? throw new ArgumentNullException(nameof(indexers));
         _scorer = scorer ?? throw new ArgumentNullException(nameof(scorer));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _configProvider = configProvider ?? throw new ArgumentNullException(nameof(configProvider));
+        _lateSink = lateSink;
+        _lifetime = _lifetimeCts.Token;
+    }
+
+    /// <summary>Number of probes whose past-budget requests are still running in the background.</summary>
+    internal int LateCollectorsActive => Volatile.Read(ref _lateCollectorsActive);
+
+    /// <summary>Completes when every background (past-budget) collection has finished. Test/diagnostic hook.</summary>
+    internal Task WhenLateWorkIdleAsync() => Task.WhenAll(_lateWork.Values.ToArray());
+
+    /// <summary>Cancels every still-running background indexer request (host shutdown).</summary>
+    public void Dispose()
+    {
+        if (!_lifetimeCts.IsCancellationRequested)
+        {
+            _lifetimeCts.Cancel();
+        }
+
+        _lifetimeCts.Dispose();
     }
 
     /// <summary>
@@ -248,104 +282,155 @@ public sealed class MagnetSelector
             return MagnetProbeResult.Transient("no_enabled_indexers", "No enabled indexers are configured");
         }
 
-        var aggregated = new List<IndexerCandidate>();
-        var failures = new List<string>();
-        var abstentions = new List<string>();
-
-        // Concurrent probe fan-out (ROI Priority 9, ttfb-parallel-indexer-probe):
-        // start every enabled indexer's SearchAsync immediately and await them
-        // together rather than in a sequential foreach, so a slow indexer
-        // (notably Prowlarr's server-side multi-indexer meta-search) no longer
-        // serialises ahead of the others. Each indexer is wrapped in its own
-        // try/catch with the SAME outcome classification as the previous
-        // sequential loop, so one indexer's exception/abstention/timeout never
-        // blocks or drops another's results. A bounded per-indexer timeout
-        // (IndexerProbeTimeoutSeconds) is enforced via a linked
-        // CancellationTokenSource so a single slow indexer cannot inflate the
-        // whole probe past a fixed ceiling; its cancellation is surfaced as a
-        // per-indexer transient failure, exactly like any other failure.
+        // p13-parallel-indexer-search (ROI Priority 13): per-indexer fan-out under a
+        // search BUDGET. Every plain indexer (Torrentio) is one request; every
+        // fan-out gateway (Prowlarr) first discovers its enabled upstream indexers
+        // (runtime, TTL-cached) and then issues one request PER upstream indexer —
+        // all concurrently. A budgeted collector gathers results as they arrive and
+        // stops at the first of: (a) every request finished, (b) the budget
+        // (IndexerSearchBudgetMs, default 10 s) elapsed, (c) early return — at least
+        // MinEarlyReturnCandidates candidates with seeders >= MinSeeders are in and
+        // EarlyReturnMinElapsedMs has passed (FastIndexerEarlyReturnEnabled).
+        // Requests still running at that point are NOT discarded: they continue in
+        // the background (each still capped by IndexerProbeTimeoutSeconds, all
+        // cancelled on shutdown) and their results are re-ranked with the in-budget
+        // ones and written to the magnet cache via ILateIndexerResultSink.
         ct.ThrowIfCancellationRequested();
-        var perIndexerTimeout = TimeSpan.FromSeconds(_configProvider().IndexerProbeTimeoutSeconds);
+        var cfg = _configProvider();
+        var requestCts = CancellationTokenSource.CreateLinkedTokenSource(_lifetime);
+        var run = new ProbeRun(query, tmdbId, type, season, episode, TimeSpan.FromSeconds(cfg.IndexerProbeTimeoutSeconds), requestCts.Token);
 
-        // Per-indexer scratch results keyed by list index so aggregation order
-        // is deterministic (enabled-list order), independent of completion order.
-        var results = new (List<IndexerCandidate> Hits, string? Failure, string? Abstention)[enabled.Count];
+        // While the caller is waiting, its cancellation cancels every request
+        // (interactive preemption / request abort). Once this probe has returned,
+        // the link is removed so background requests outlive the caller.
+        var callerLink = ct.Register(static s => ((CancellationTokenSource)s!).Cancel(), requestCts);
 
-        var tasks = new Task[enabled.Count];
+        var top = new List<FanOutRequest>(enabled.Count);
         for (var i = 0; i < enabled.Count; i++)
         {
-            var slot = i;
-            var indexer = enabled[slot];
-            tasks[slot] = Task.Run(async () =>
-            {
-                using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                timeoutCts.CancelAfter(perIndexerTimeout);
-                try
-                {
-                    var hits = await indexer.SearchAsync(query, timeoutCts.Token).ConfigureAwait(false);
-                    if (hits is { Count: > 0 })
-                    {
-                        results[slot].Hits = new List<IndexerCandidate>(hits);
-                    }
-                }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested)
-                {
-                    // The CALLER cancelled the whole probe — propagate, don't
-                    // reclassify as a per-indexer failure.
-                    throw;
-                }
-                catch (OperationCanceledException ex)
-                {
-                    // Per-indexer timeout only (timeoutCts fired, caller ct did not):
-                    // isolate as a transient failure so peers still count.
-                    results[slot].Failure = $"{indexer.Name}:timeout";
-                    _logger.LogWarning(ex, "Indexer {Indexer} timed out after {Timeout}s for {Type}/{Tmdb}", indexer.Name, perIndexerTimeout.TotalSeconds, type, tmdbId);
-                }
-                catch (IndexerNotApplicableException ex)
-                {
-                    // Abstention: the indexer cannot serve this query as-is (e.g. Torrentio
-                    // with no IMDB id). Not a failure and not transient — do not count it.
-                    results[slot].Abstention = indexer.Name;
-                    _logger.LogDebug(ex, "Indexer {Indexer} abstained (not applicable) for {Type}/{Tmdb}", indexer.Name, type, tmdbId);
-                }
-                catch (IndexerAuthException ex)
-                {
-                    results[slot].Failure = $"{indexer.Name}:auth";
-                    _logger.LogWarning(ex, "Indexer {Indexer} returned auth failure for {Type}/{Tmdb}", indexer.Name, type, tmdbId);
-                }
-                catch (Exception ex)
-                {
-                    results[slot].Failure = $"{indexer.Name}:transient";
-                    _logger.LogWarning(ex, "Indexer {Indexer} failed for {Type}/{Tmdb}", indexer.Name, type, tmdbId);
-                }
-            });
+            var indexer = enabled[i];
+            top.Add(indexer is IFanOutIndexerClient gateway
+                ? StartDiscovery(run, gateway, i)
+                : StartRequest(run, i, -1, indexer.Name, indexer.Name, isFanOutChild: false, t => indexer.SearchAsync(query, t)));
         }
 
-        // Await the whole fan-out. A caller-driven cancellation surfaces as an
-        // OperationCanceledException from at least one task and propagates here.
-        // ROI Priority 9 (ttfb-fast-indexer-early-return): when enabled, race
-        // the fan-out instead of always waiting for the slowest indexer — see
-        // AwaitFanOutAsync for the bounded early-return rule.
-        var cfgForEarlyReturn = _configProvider();
-        await AwaitFanOutAsync(tasks, results, cfgForEarlyReturn, ct).ConfigureAwait(false);
-
-        // Aggregate in deterministic enabled-list order.
-        foreach (var r in results)
+        var pending = new List<FanOutRequest>(top);
+        var collected = new List<FanOutRequest>();
+        var budgetExpired = false;
+        var sw = Stopwatch.StartNew();
+        using (var budgetCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
         {
-            if (r.Hits is { Count: > 0 })
+            var budgetTask = Task.Delay(TimeSpan.FromMilliseconds(cfg.IndexerSearchBudgetMs), budgetCts.Token);
+            try
             {
-                aggregated.AddRange(r.Hits);
+                while (pending.Count > 0)
+                {
+                    var waitSet = new Task[pending.Count + 1];
+                    for (var i = 0; i < pending.Count; i++)
+                    {
+                        waitSet[i] = pending[i].Task;
+                    }
+
+                    waitSet[^1] = budgetTask;
+                    var done = await Task.WhenAny(waitSet).ConfigureAwait(false);
+                    ct.ThrowIfCancellationRequested();
+                    if (done == budgetTask)
+                    {
+                        budgetExpired = true;
+                        break;
+                    }
+
+                    Collect(pending, collected, pending.First(p => p.Task == done));
+
+                    if (cfg.FastIndexerEarlyReturnEnabled
+                        && pending.Count > 0
+                        && sw.ElapsedMilliseconds >= cfg.EarlyReturnMinElapsedMs
+                        && CountPassing(collected, cfg.MinSeeders) >= cfg.MinEarlyReturnCandidates)
+                    {
+                        break;
+                    }
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Caller cancelled: callerLink has already cancelled every request;
+                // drain them in the background (metrics + disposal) without caching.
+                run.BudgetClosed = true;
+                callerLink.Dispose();
+                HandOffRemaining(run, pending, collected, requestCts, write: false);
+                throw;
+            }
+            finally
+            {
+                budgetCts.Cancel();
+            }
+        }
+
+        run.BudgetClosed = true;
+        callerLink.Dispose();
+
+        // Anything that finished in the same instant the budget fired is in-budget.
+        FanOutRequest? finished;
+        while ((finished = pending.FirstOrDefault(p => p.Task.IsCompleted)) is not null)
+        {
+            Collect(pending, collected, finished);
+        }
+
+        if (budgetExpired && pending.Count > 0)
+        {
+            IndexerSearchMetrics.RecordBudgetExpired(type, CountPassing(collected, cfg.MinSeeders));
+            _logger.LogInformation(
+                "Indexer search budget {Budget}ms expired for {Type}/{Tmdb} with {Pending} request(s) still running; ranking {Collected} received candidate(s), late results go to the magnet cache",
+                cfg.IndexerSearchBudgetMs, type, tmdbId, pending.Count, collected.Sum(c => c.Hits?.Count ?? 0));
+        }
+
+        var fallbackLabel = enabled[0].Name;
+        HandOffRemaining(run, pending, collected, requestCts, write: true, fallbackLabel);
+
+        var aggregated = Aggregate(collected);
+
+        // Classify per TOP-LEVEL client so one failing upstream Prowlarr indexer
+        // does not turn the whole gateway into a failure when its siblings ran.
+        var failures = new List<string>();
+        var abstentions = new List<string>();
+        var stillPending = 0;
+        foreach (var t in top)
+        {
+            if (!t.Collected)
+            {
+                stillPending++;
+                continue;
             }
 
-            if (r.Failure is not null)
+            if (t.Failure is not null)
             {
-                failures.Add(r.Failure);
+                failures.Add(t.Failure);
+                continue;
             }
 
-            if (r.Abstention is not null)
+            if (t.Abstention is not null)
             {
-                abstentions.Add(r.Abstention);
+                abstentions.Add(t.Abstention);
+                continue;
             }
+
+            if (!t.IsDiscovery || t.Children is not { Count: > 0 } kids)
+            {
+                continue;
+            }
+
+            if (kids.Any(k => k.Collected && k.Succeeded))
+            {
+                continue;
+            }
+
+            if (kids.Any(k => !k.Collected))
+            {
+                stillPending++;
+                continue;
+            }
+
+            failures.Add(string.Join(";", kids.Select(k => k.Failure ?? k.Label)));
         }
 
         if (aggregated.Count == 0)
@@ -353,6 +438,13 @@ public sealed class MagnetSelector
             if (failures.Count > 0)
             {
                 return MagnetProbeResult.Transient("indexer_partial_or_total_failure", string.Join(";", failures));
+            }
+
+            if (stillPending > 0)
+            {
+                return MagnetProbeResult.Transient(
+                    "indexer_budget_expired",
+                    $"no candidate within {cfg.IndexerSearchBudgetMs}ms; {pending.Count} indexer request(s) still running");
             }
 
             if (abstentions.Count == enabled.Count)
@@ -369,7 +461,75 @@ public sealed class MagnetSelector
             return MagnetProbeResult.DefinitiveUnavailable();
         }
 
-        var cfg = _configProvider();
+        var candidates = Rank(aggregated, type, season, episode, _configProvider(), fallbackLabel);
+        if (candidates.Count == 0)
+        {
+            if (failures.Count > 0)
+            {
+                return MagnetProbeResult.Transient("indexer_partial_failure_all_candidates_rejected", string.Join(";", failures));
+            }
+
+            if (stillPending > 0)
+            {
+                return MagnetProbeResult.Transient(
+                    "indexer_budget_expired_all_candidates_rejected",
+                    $"{aggregated.Count} candidate(s) rejected; {pending.Count} indexer request(s) still running");
+            }
+
+            _logger.LogInformation("Scorer rejected all {N} candidates for {Type}/{Tmdb}", aggregated.Count, type, tmdbId);
+            return MagnetProbeResult.DefinitiveUnavailable();
+        }
+
+        return MagnetProbeResult.Available(candidates);
+    }
+
+    private static void Collect(List<FanOutRequest> pending, List<FanOutRequest> collected, FanOutRequest req)
+    {
+        pending.Remove(req);
+        req.Collected = true;
+        collected.Add(req);
+        if (req.Children is { Count: > 0 } kids)
+        {
+            pending.AddRange(kids);
+        }
+    }
+
+    private static int CountPassing(IEnumerable<FanOutRequest> collected, int minSeeders)
+        => collected.Sum(r => r.Hits?.Count(h => h.Seeders >= minSeeders) ?? 0);
+
+    /// <summary>
+    /// Union of the collected requests' hits in deterministic (enabled-list,
+    /// discovered-list) order, independent of arrival order. The same release
+    /// reported by several upstream indexers of ONE gateway is kept once.
+    /// </summary>
+    private static List<IndexerCandidate> Aggregate(IEnumerable<FanOutRequest> collected)
+    {
+        var list = new List<IndexerCandidate>();
+        var seen = new HashSet<(int, string)>();
+        foreach (var r in collected.Where(r => r.Hits is { Count: > 0 }).OrderBy(r => r.Major).ThenBy(r => r.Minor))
+        {
+            foreach (var h in r.Hits!)
+            {
+                if (r.IsFanOutChild && !seen.Add((r.Major, h.InfoHash.ToUpperInvariant())))
+                {
+                    continue;
+                }
+
+                list.Add(h);
+            }
+        }
+
+        return list;
+    }
+
+    private List<MagnetCandidate> Rank(
+        List<IndexerCandidate> aggregated,
+        string type,
+        int? season,
+        int? episode,
+        PluginConfiguration cfg,
+        string fallbackLabel)
+    {
         var ranked = _scorer.RankCandidates(
             aggregated,
             cfg.QualityPreset,
@@ -379,17 +539,6 @@ public sealed class MagnetSelector
             cfg.ResolutionFallbackOrder,
             cfg.SeederWeight,
             cfg.PreferredResolution);
-
-        if (ranked.Count == 0)
-        {
-            if (failures.Count > 0)
-            {
-                return MagnetProbeResult.Transient("indexer_partial_failure_all_candidates_rejected", string.Join(";", failures));
-            }
-
-            _logger.LogInformation("Scorer rejected all {N} candidates for {Type}/{Tmdb}", aggregated.Count, type, tmdbId);
-            return MagnetProbeResult.DefinitiveUnavailable();
-        }
 
         var episodeRanked = string.Equals(type, "episode", StringComparison.OrdinalIgnoreCase)
             && season.HasValue
@@ -402,99 +551,288 @@ public sealed class MagnetSelector
                     .ToList()
                 : ranked;
 
-        var candidates = episodeRanked.Select(picked =>
+        return episodeRanked.Select(picked =>
         {
-            var indexerLabel = !string.IsNullOrWhiteSpace(picked.IndexerName)
-                ? picked.IndexerName!
-                : (enabled.FirstOrDefault()?.Name ?? "unknown");
-
+            var indexerLabel = !string.IsNullOrWhiteSpace(picked.IndexerName) ? picked.IndexerName! : fallbackLabel;
             return new MagnetCandidate(picked.Magnet, picked.InfoHash, picked.Size, picked.Seeders, indexerLabel)
             {
                 Title = picked.Title,
             };
         }).ToList();
+    }
 
-        return MagnetProbeResult.Available(candidates);
+    /// <summary>Starts one indexer request with the per-request timeout; never throws (outcome is classified on the request).</summary>
+    private FanOutRequest StartRequest(
+        ProbeRun run,
+        int major,
+        int minor,
+        string client,
+        string label,
+        bool isFanOutChild,
+        Func<CancellationToken, Task<IReadOnlyList<IndexerCandidate>>> search)
+    {
+        var req = new FanOutRequest(major, minor, client, label, IsDiscovery: false, isFanOutChild);
+        req.Task = Task.Run(async () =>
+        {
+            var sw = Stopwatch.StartNew();
+            string status;
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(run.RequestToken);
+            timeoutCts.CancelAfter(run.PerRequestTimeout);
+            try
+            {
+                var hits = await search(timeoutCts.Token).ConfigureAwait(false);
+                if (hits is { Count: > 0 })
+                {
+                    req.Hits = new List<IndexerCandidate>(hits);
+                }
+
+                req.Succeeded = true;
+                status = IndexerSearchMetrics.StatusOk;
+            }
+            catch (OperationCanceledException) when (run.RequestToken.IsCancellationRequested)
+            {
+                // Caller cancelled while waiting, late-collector bound hit, or shutdown.
+                req.Failure = $"{label}:cancelled";
+                status = IndexerSearchMetrics.StatusCancelled;
+            }
+            catch (OperationCanceledException ex)
+            {
+                req.Failure = $"{label}:timeout";
+                status = IndexerSearchMetrics.StatusTimeout;
+                _logger.LogWarning(ex, "Indexer {Indexer} timed out after {Timeout}s for {Type}/{Tmdb}", label, run.PerRequestTimeout.TotalSeconds, run.Type, run.TmdbId);
+            }
+            catch (IndexerNotApplicableException ex)
+            {
+                // Abstention: the indexer cannot serve this query as-is (e.g. Torrentio
+                // with no IMDB id). Not a failure and not transient — do not count it.
+                req.Abstention = label;
+                status = IndexerSearchMetrics.StatusAbstain;
+                _logger.LogDebug(ex, "Indexer {Indexer} abstained (not applicable) for {Type}/{Tmdb}", label, run.Type, run.TmdbId);
+            }
+            catch (IndexerAuthException ex)
+            {
+                req.Failure = $"{label}:auth";
+                status = IndexerSearchMetrics.StatusAuth;
+                _logger.LogWarning(ex, "Indexer {Indexer} returned auth failure for {Type}/{Tmdb}", label, run.Type, run.TmdbId);
+            }
+            catch (Exception ex)
+            {
+                req.Failure = $"{label}:transient";
+                status = IndexerSearchMetrics.StatusError;
+                _logger.LogWarning(ex, "Indexer {Indexer} failed for {Type}/{Tmdb}", label, run.Type, run.TmdbId);
+            }
+
+            IndexerSearchMetrics.RecordRequest(
+                client,
+                label,
+                status,
+                run.BudgetClosed ? IndexerSearchMetrics.PhaseLate : IndexerSearchMetrics.PhaseInBudget,
+                sw.Elapsed.TotalMilliseconds,
+                req.Hits?.Count ?? 0);
+        });
+        return req;
+    }
+
+    /// <summary>Discovers a gateway's enabled upstream indexers, then starts one request per indexer.</summary>
+    private FanOutRequest StartDiscovery(ProbeRun run, IFanOutIndexerClient gateway, int major)
+    {
+        var req = new FanOutRequest(major, -1, gateway.Name, gateway.Name, IsDiscovery: true, IsFanOutChild: false);
+        req.Task = Task.Run(async () =>
+        {
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(run.RequestToken);
+            timeoutCts.CancelAfter(run.PerRequestTimeout);
+            try
+            {
+                var discovered = await gateway.DiscoverIndexersAsync(run.Query, timeoutCts.Token).ConfigureAwait(false);
+                var kids = new List<FanOutRequest>(discovered.Count);
+                for (var j = 0; j < discovered.Count; j++)
+                {
+                    var ix = discovered[j];
+                    kids.Add(StartRequest(run, major, j, gateway.Name, ix.Name, isFanOutChild: true, t => gateway.SearchIndexerAsync(ix, run.Query, t)));
+                }
+
+                req.Children = kids;
+                req.Succeeded = true;
+            }
+            catch (OperationCanceledException) when (run.RequestToken.IsCancellationRequested)
+            {
+                req.Failure = $"{gateway.Name}:cancelled";
+            }
+            catch (OperationCanceledException ex)
+            {
+                req.Failure = $"{gateway.Name}:discovery_timeout";
+                _logger.LogWarning(ex, "{Gateway} indexer discovery timed out", gateway.Name);
+            }
+            catch (IndexerAuthException ex)
+            {
+                req.Failure = $"{gateway.Name}:auth";
+                _logger.LogWarning(ex, "{Gateway} indexer discovery auth failure", gateway.Name);
+            }
+            catch (Exception ex)
+            {
+                req.Failure = $"{gateway.Name}:discovery_failed";
+                _logger.LogWarning(ex, "{Gateway} indexer discovery failed", gateway.Name);
+            }
+        });
+        return req;
     }
 
     /// <summary>
-    /// Awaits the per-indexer probe fan-out tasks. When
-    /// <see cref="PluginConfiguration.FastIndexerEarlyReturnEnabled"/> is off
-    /// (the default), this is exactly <c>Task.WhenAll(tasks)</c> — full-wait
-    /// behavior is byte-for-byte unchanged. When enabled, this races the
-    /// fan-out: after each indexer completes, if at least
-    /// <see cref="PluginConfiguration.MinEarlyReturnCandidates"/>
-    /// MinSeeders-passing candidates have been aggregated so far from ANY
-    /// completed indexer(s) (never a hardcoded specific indexer) AND at least
-    /// <see cref="PluginConfiguration.EarlyReturnMinElapsedMs"/> has elapsed
-    /// since the fan-out started, this method returns immediately WITHOUT
-    /// awaiting the still-pending indexer task(s). Those pending tasks are
-    /// deliberately NOT cancelled — they keep running in the background
-    /// (e.g. so their result can still populate the shared magnet cache for
-    /// a future hit); this method only observes their eventual
-    /// faults/results via a fire-and-forget continuation so a background
-    /// failure never surfaces as an unobserved task exception. A caller-driven
-    /// cancellation (the outer <paramref name="ct"/>) still propagates as an
-    /// <see cref="OperationCanceledException"/> exactly as the plain
-    /// <c>Task.WhenAll</c> path would.
+    /// Hands still-running requests to a background collector (bounded by
+    /// IndexerLateCollectorMaxConcurrent). With <paramref name="write"/>, each late
+    /// arrival is re-ranked together with everything received so far and written
+    /// to the magnet cache; nothing that arrives late is discarded.
     /// </summary>
-    private static async Task AwaitFanOutAsync(
-        Task[] tasks,
-        (List<IndexerCandidate> Hits, string? Failure, string? Abstention)[] results,
-        PluginConfiguration cfg,
-        CancellationToken ct)
+    private void HandOffRemaining(
+        ProbeRun run,
+        List<FanOutRequest> pending,
+        List<FanOutRequest> collected,
+        CancellationTokenSource requestCts,
+        bool write,
+        string fallbackLabel = "unknown")
     {
-        if (!cfg.FastIndexerEarlyReturnEnabled || tasks.Length <= 1)
+        if (pending.Count == 0)
         {
-            await Task.WhenAll(tasks).ConfigureAwait(false);
+            requestCts.Dispose();
             return;
         }
 
-        var stopwatch = Stopwatch.StartNew();
-        var pending = new List<Task>(tasks);
-
-        while (pending.Count > 0)
+        var counted = false;
+        if (write)
         {
-            var completed = await Task.WhenAny(pending).ConfigureAwait(false);
-            pending.Remove(completed);
-
-            // Rethrows a caller-driven OperationCanceledException exactly as
-            // Task.WhenAll would; per-indexer failures/timeouts/abstentions
-            // were already caught and classified inside the task itself, so
-            // this never throws for those cases.
-            await completed.ConfigureAwait(false);
-
-            if (stopwatch.ElapsedMilliseconds < cfg.EarlyReturnMinElapsedMs)
+            var max = _configProvider().IndexerLateCollectorMaxConcurrent;
+            if (Interlocked.Increment(ref _lateCollectorsActive) > max)
             {
-                continue;
+                Interlocked.Decrement(ref _lateCollectorsActive);
+                _logger.LogWarning(
+                    "Late indexer collectors at bound ({Max}); cancelling {Pending} past-budget request(s) for {Type}/{Tmdb}",
+                    max, pending.Count, run.Type, run.TmdbId);
+                requestCts.Cancel();
+                write = false;
             }
-
-            var passingCandidates = 0;
-            foreach (var r in results)
+            else
             {
-                if (r.Hits is { Count: > 0 })
-                {
-                    passingCandidates += r.Hits.Count(h => h.Seeders >= cfg.MinSeeders);
-                }
-            }
-
-            if (passingCandidates >= cfg.MinEarlyReturnCandidates)
-            {
-                // Let the remaining slower indexer(s) keep running in the
-                // background (never cancelled); just observe their
-                // fault/result so it never becomes an unobserved exception.
-                foreach (var remaining in pending)
-                {
-                    _ = remaining.ContinueWith(
-                        static t => _ = t.Exception,
-                        CancellationToken.None,
-                        TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
-                        TaskScheduler.Default);
-                }
-
-                return;
+                counted = true;
             }
         }
+
+        var remaining = new List<FanOutRequest>(pending);
+        var soFar = new List<FanOutRequest>(collected);
+        var id = Interlocked.Increment(ref _lateWorkSeq);
+        var work = Task.Run(() => CollectLateAsync(run, remaining, soFar, requestCts, write, counted, fallbackLabel));
+        _lateWork[id] = work;
+        _ = work.ContinueWith(
+            _ => _lateWork.TryRemove(id, out Task? _),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    private async Task CollectLateAsync(
+        ProbeRun run,
+        List<FanOutRequest> pending,
+        List<FanOutRequest> all,
+        CancellationTokenSource requestCts,
+        bool write,
+        bool counted,
+        string fallbackLabel)
+    {
+        try
+        {
+            while (pending.Count > 0)
+            {
+                var done = await Task.WhenAny(pending.Select(p => p.Task)).ConfigureAwait(false);
+                var req = pending.First(p => p.Task == done);
+                Collect(pending, all, req);
+                if (!write || _lateSink is null || req.Hits is not { Count: > 0 })
+                {
+                    continue;
+                }
+
+                var ranked = Rank(Aggregate(all), run.Type, run.Season, run.Episode, _configProvider(), fallbackLabel);
+                if (ranked.Count == 0)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    await _lateSink.WriteAsync(
+                        new LateIndexerResult(run.TmdbId, run.Type, run.Season, run.Episode, ranked),
+                        _lifetime).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
+                {
+                    write = false;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Writing late indexer results for {Type}/{Tmdb} to the magnet cache failed", run.Type, run.TmdbId);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Late indexer collector for {Type}/{Tmdb} failed", run.Type, run.TmdbId);
+        }
+        finally
+        {
+            requestCts.Dispose();
+            if (counted)
+            {
+                Interlocked.Decrement(ref _lateCollectorsActive);
+            }
+        }
+    }
+
+    private sealed class ProbeRun(
+        IndexerQuery query,
+        int tmdbId,
+        string type,
+        int? season,
+        int? episode,
+        TimeSpan perRequestTimeout,
+        CancellationToken requestToken)
+    {
+        private volatile bool _budgetClosed;
+
+        public IndexerQuery Query { get; } = query;
+
+        public int TmdbId { get; } = tmdbId;
+
+        public string Type { get; } = type;
+
+        public int? Season { get; } = season;
+
+        public int? Episode { get; } = episode;
+
+        public CancellationToken RequestToken { get; } = requestToken;
+
+        public TimeSpan PerRequestTimeout { get; } = perRequestTimeout;
+
+        /// <summary>Set once the caller has been answered; later completions are "late".</summary>
+        public bool BudgetClosed
+        {
+            get => _budgetClosed;
+            set => _budgetClosed = value;
+        }
+    }
+
+    private sealed record FanOutRequest(int Major, int Minor, string Client, string Label, bool IsDiscovery, bool IsFanOutChild)
+    {
+        public Task Task { get; set; } = Task.CompletedTask;
+
+        public List<IndexerCandidate>? Hits { get; set; }
+
+        public string? Failure { get; set; }
+
+        public string? Abstention { get; set; }
+
+        public bool Succeeded { get; set; }
+
+        public bool Collected { get; set; }
+
+        public List<FanOutRequest>? Children { get; set; }
     }
 
     internal static int EpisodeSpecificityScore(string? title, int season, int episode)
