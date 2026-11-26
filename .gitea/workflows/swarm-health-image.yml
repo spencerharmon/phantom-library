@@ -13,7 +13,7 @@ jobs:
     # Optional isolated CI capacity; the normal shared swarm runner is k8s.
     runs-on: ["${{ vars.SWARM_HEALTH_RUNNER_LABEL || 'k8s' }}"]
     container:
-      image: nixery.dev/shell/git/docker/python3
+      image: nixery.dev/shell/git/docker/python3@sha256:4e645994761b3c4fc20f2b3dda0a5dff1ddeec8a9b46d17baf002f0838f58306
     steps:
       - name: checkout exact source revision
         env:
