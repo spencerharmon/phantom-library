@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Helm chart 2.13.0: opt-in `swarmHealth.enabled` / `serviceUrl` durably manage
+  `SwarmHealthServiceUrl` before every plugin boot, on retained and fresh PVCs.
+  Disabled management leaves operator settings alone; an explicitly managed empty
+  URL clears the service setting. One XML-aware merge replaces the Prowlarr-only
+  text substitutions, preserving unrelated fields/secrets and rejecting malformed
+  input without replacing config. See `docs/swarm-health-chart-config.md`.
 - Rank by REAL DHT swarm health (ROI Priority 0.5). A standalone swarm-health
   service (`tools/swarm-health/swarm_health_service.py`, libtorrent DHT node)
   measures the distinct DHT peers behind each available item's candidate

@@ -50,7 +50,9 @@ type: application
 # PHANTOM_LOADTIME_THRESHOLDS_PATH env in templates/loadtime-daily-cronjob.yaml) as a NEW OCI chart
 # version; the published 2.11.0 predates it and chart versions are immutable. BREAKING when
 # loadtimeDaily.enabled=true: thresholds.existingClaim is now required.
-version: 2.12.0
+# 2.13.0: optional swarmHealth managed URL; unified, safe pre-start XML merge for fresh and
+# retained PVCs (also replaces the Prowlarr sed path). No topology or endpoint baked into defaults.
+version: 2.13.0
 # Tracks the app milestone, not a container tag (images are digest-pinned in values).
 appVersion: "m14"
 keywords:
