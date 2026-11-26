@@ -27,12 +27,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   titles with the largest measured swarms. Disabled while
   `SwarmHealthServiceUrl` is empty. Metrics: `phantom_swarm_health_*`.
 
+### Changed
+- Source search queries every enabled Prowlarr indexer separately (discovered at
+  runtime from `/api/v1/indexer`, TTL-cached) concurrently with Torrentio instead
+  of one aggregate `/api/v1/search`. Results are ranked after a budget
+  (`IndexerSearchBudgetMs`, default 10 s) or as soon as `MinEarlyReturnCandidates`
+  high-confidence candidates arrive; slower indexers finish in the background and
+  their releases land in the magnet cache. New OTel meter `Phantom.Indexers`. See
+  [docs/tasks/p13-parallel-indexer-search.md](docs/tasks/p13-parallel-indexer-search.md).
+
 ### Fixed
 - Plugin 0.5.7.47: successful availability re-probes now invalidate the affected
   channel when a previously assessed available movie/episode regains an empty or
   expired candidate cache. REST browse (including series → season → episode)
   recovers on the same running server; fresh-cache refreshes do not churn channel
   versions. No browse SQL, scheduling priority or schema change.
+- Parallel source search preserves successful movie subqueries and parsed magnets
+  when a sibling query/download redirect times out, caching late hits without
+  weakening caller cancellation. Empty/rejected results remain transient while
+  sibling indexers are pending. The early-return minimum now wakes the collector
+  independently of request completions (including the default 250 ms minimum).
 - Harden the independent swarm-health service: BEP33 bloom estimates and bounded
   peer observations, unknown/partial/timeout results instead of false dead swarms,
   bounded/coalesced priority scheduling, cancellation, HTTP limits, TTL/LRU cache,

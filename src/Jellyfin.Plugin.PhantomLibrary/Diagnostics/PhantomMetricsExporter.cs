@@ -97,7 +97,7 @@ public sealed class PhantomMetricsExporter : IHostedService, IDisposable
                 // Defaults first, then explicit OTEL identity. AddService's generated
                 // instance ID is SDK/process-scoped, not a fresh ID per provider.
                 .ConfigureResource(r => r.AddService("jellyfin-phantom-library").AddEnvironmentVariableDetector())
-                .AddMeter(PhantomFlowMetrics.MeterName)
+                .AddMeter(PhantomFlowMetrics.MeterName, IndexerSearchMetrics.MeterName)
                 .AddOtlpExporter((exporterOptions, readerOptions) =>
                 {
                     // Setting Endpoint programmatically makes the OTLP SDK use the

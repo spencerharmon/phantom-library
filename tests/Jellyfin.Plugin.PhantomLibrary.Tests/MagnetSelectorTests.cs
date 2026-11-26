@@ -908,7 +908,7 @@ public class MagnetSelectorTests
     }
 
     [Fact]
-    public async Task EarlyReturn_MinElapsedFloorNotYetPassed_StillWaitsForSlowIndexer()
+    public async Task EarlyReturn_MinElapsedFloorNotYetPassed_WaitsForFloorNotSlowIndexer()
     {
         // Even with a fast indexer already satisfying MinEarlyReturnCandidates,
         // a non-zero EarlyReturnMinElapsedMs floor must be respected: the
@@ -919,6 +919,7 @@ public class MagnetSelectorTests
         cfg.FastIndexerEarlyReturnEnabled = true;
         cfg.MinEarlyReturnCandidates = 1;
         cfg.EarlyReturnMinElapsedMs = 300;
+        var releaseSlow = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
         var fast = new Mock<IIndexerClient>(MockBehavior.Strict);
         fast.SetupGet(i => i.IsEnabled).Returns(true);
@@ -932,25 +933,25 @@ public class MagnetSelectorTests
         slower.Setup(i => i.SearchAsync(It.IsAny<IndexerQuery>(), It.IsAny<CancellationToken>()))
             .Returns(async (IndexerQuery _, CancellationToken t) =>
             {
-                await Task.Delay(TimeSpan.FromMilliseconds(500), t).ConfigureAwait(false);
+                await releaseSlow.Task.WaitAsync(t).ConfigureAwait(false);
                 return (IReadOnlyList<IndexerCandidate>)new[] { MakeCandidate("Movie B 1080p", 5, 20) };
             });
 
         var scorer = new Materialisation.QualityScorer(NullLogger<Materialisation.QualityScorer>.Instance);
-        var sel = new MagnetSelector(new[] { fast.Object, slower.Object }, scorer, NullLogger<MagnetSelector>.Instance, () => cfg);
+        using var sel = new MagnetSelector(new[] { fast.Object, slower.Object }, scorer, NullLogger<MagnetSelector>.Instance, () => cfg);
 
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var probe = await sel.ProbeAsync(1, "tt1", "movie", null, null, "Movie", 2020, CancellationToken.None);
         sw.Stop();
 
-        // The elapsed floor (300ms) forced this probe to keep waiting past
-        // the fast indexer's near-instant completion, so BOTH indexers'
-        // candidates end up aggregated (the slower one finished at ~500ms,
-        // itself past the 300ms floor, before the next WhenAny iteration
-        // could re-check and early-return).
-        Assert.True(sw.ElapsedMilliseconds >= 300, $"expected to honor the {cfg.EarlyReturnMinElapsedMs}ms floor, took {sw.Elapsed}");
+        // The minimum remains a floor, not a requirement for another indexer
+        // completion. The obsolete collector waited until the slow response.
+        Assert.InRange(sw.ElapsedMilliseconds, 300, 1000);
         Assert.Equal(MagnetProbeOutcome.Available, probe.Outcome);
-        Assert.Equal(2, probe.Candidates.Count);
+        Assert.Single(probe.Candidates);
+        Assert.Equal(1, sel.LateCollectorsActive);
+        releaseSlow.SetResult();
+        await sel.WhenLateWorkIdleAsync().WaitAsync(TimeSpan.FromSeconds(2));
     }
 
     [Fact]

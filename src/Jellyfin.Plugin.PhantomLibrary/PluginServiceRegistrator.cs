@@ -68,6 +68,9 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         });
 
         // Indexers — registered as IIndexerClient in the order Prowlarr → Torrentio.
+        // p13-parallel-indexer-search: the discovered Prowlarr indexer list is a
+        // process-wide TTL cache (ProwlarrClient itself is a transient typed client).
+        serviceCollection.AddSingleton<ProwlarrIndexerDirectory>();
         serviceCollection.AddHttpClient<ProwlarrClient>(c =>
         {
             c.Timeout = TimeSpan.FromSeconds(30);
@@ -90,6 +93,9 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         serviceCollection.AddSingleton<QualityScorer>();
         // Degenerate-query guard title repair (p13-degenerate-query-guard).
         serviceCollection.AddSingleton<IQueryTitleRepairSource, TmdbQueryTitleRepairSource>();
+        // p13-parallel-indexer-search: past-budget indexer results land in the
+        // magnet cache through this sink.
+        serviceCollection.AddSingleton<ILateIndexerResultSink, MagnetCacheLateResultWriter>();
         serviceCollection.AddSingleton<MagnetSelector>();
         serviceCollection.AddSingleton<TmdbExternalIdResolver>();
         serviceCollection.AddSingleton<MagnetCacheBuilder>();
