@@ -32,6 +32,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
     private readonly Func<PluginConfiguration> _configProvider;
     private readonly ProbeDelegate _probe;
     private readonly ProbeDelegate _reconcileProbe;
+    private readonly TimeProvider _timeProvider;
     private readonly string _owner = $"availability-{Environment.MachineName}-{Guid.NewGuid():N}";
     private Timer? _timer;
     private CancellationTokenSource? _stopping;
@@ -93,7 +94,8 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
         ILogger<AvailabilityProbeWorker> logger,
         Func<PluginConfiguration> configProvider,
         ProbeDelegate? probe,
-        ProbeDelegate? reconcileProbe = null)
+        ProbeDelegate? reconcileProbe = null,
+        TimeProvider? timeProvider = null)
     {
         _db = db ?? throw new ArgumentNullException(nameof(db));
         _selector = selector ?? throw new ArgumentNullException(nameof(selector));
@@ -110,6 +112,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
         // path already uses, so the SAME quality scorer + high-confidence bar
         // applies — never a relaxed bar.
         _reconcileProbe = reconcileProbe ?? _selector.ProbeAsync;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -141,6 +144,22 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
 
     private async Task TickAsync(CancellationToken serviceStopping)
     {
+        // Timer callbacks must observe leases even while a sequential batch is
+        // waiting on a slow indexer. The DB independently throttles SQL attempts.
+        var cfg = _configProvider();
+        try
+        {
+            await _db.RefreshAvailabilityBacklogAsync(ComputePolicyHash(cfg), _timeProvider.GetUtcNow(), serviceStopping).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (serviceStopping.IsCancellationRequested)
+        {
+            return;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Availability backlog observation failed; previous sample remains stale");
+        }
+
         if (Interlocked.Exchange(ref _running, 1) == 1)
         {
             return;
@@ -148,7 +167,6 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
 
         try
         {
-            var cfg = _configProvider();
             if (!cfg.AvailabilityProbeEnabled)
             {
                 return;

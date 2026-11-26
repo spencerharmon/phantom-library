@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Committed availability claims/completions by movie/episode and priority/background,
+  plus five-minute cached eligible/dormant/leased/scheduled backlog on the existing
+  OTel 1.10 pipeline. Read-only P0 acceptance probe retains PostgreSQL and Mimir
+  evidence, rejects incomplete 24-hour windows, and verifies post-sizing Flux receipts.
+  See `docs/tasks/p0-probe-load-observability.md`. No schema or deployment change.
 - Helm chart 2.13.0: opt-in `swarmHealth.enabled` / `serviceUrl` durably manage
   `SwarmHealthServiceUrl` before every plugin boot, on retained and fresh PVCs.
   Disabled management leaves operator settings alone; an explicitly managed empty
@@ -28,6 +33,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SwarmHealthServiceUrl` is empty. Metrics: `phantom_swarm_health_*`.
 
 ### Fixed
+- Shared CI validation recognizes only the exact, job-scoped playback manual
+  runner and swarm-image runner overrides, retaining the shared `k8s` fallback.
+  Playback and concurrent-index SDK jobs explicitly use Bash; checkout bootstrap
+  and mandatory PostgreSQL tests remain enforced by the P0 preflight.
+- P0 acceptance requires positively observed in-window claims/completions rather
+  than interpolated progress from outside the window. Backlog limits now include
+  conservative start/end boundary values; CPU integration is unchanged. Actual CLI
+  regressions cover both media types, both work counters, and eligible/leased backlog.
 - Harden the independent swarm-health service: BEP33 bloom estimates and bounded
   peer observations, unknown/partial/timeout results instead of false dead swarms,
   bounded/coalesced priority scheduling, cancellation, HTTP limits, TTL/LRU cache,

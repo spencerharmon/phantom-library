@@ -8,6 +8,9 @@ on:
 jobs:
   concurrent-index-expand:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
     timeout-minutes: 15
     container:
       image: mcr.microsoft.com/dotnet/sdk:9.0.305-noble

@@ -166,7 +166,10 @@ public sealed record AvailabilityItemRow(
     int ProbeGeneration,
     string? LeaseOwner,
     int AttemptCount = 0,
-    int NegativeStreak = 0);
+    int NegativeStreak = 0)
+{
+    internal string ClaimLane { get; init; } = "background";
+}
 
 public sealed record VisibleMovieRow(
     TmdbMetadataRow Metadata,
@@ -601,6 +604,7 @@ public sealed class PhantomDb : IDisposable
     public void Dispose()
     {
         _writeLock.Dispose();
+        _backlogLock.Dispose();
         _provider.ClearPool();
     }
 
@@ -2710,6 +2714,62 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         cmd.AddWithValue("@fetched", row.FetchedAt.ToUnixTimeSeconds());
     }
 
+    private readonly SemaphoreSlim _backlogLock = new(1, 1);
+    private long _backlogAttemptAt;
+
+    internal async Task RefreshAvailabilityBacklogAsync(string policyHash, DateTimeOffset now, CancellationToken ct)
+    {
+        if (!await _backlogLock.WaitAsync(0, ct).ConfigureAwait(false))
+        {
+            return;
+        }
+
+        try
+        {
+            var timestamp = now.ToUnixTimeSeconds();
+            if (timestamp - _backlogAttemptAt < 300)
+            {
+                return;
+            }
+
+            // Bound failed attempts as well as successful scans; scrapes never query SQL.
+            _backlogAttemptAt = timestamp;
+            await using var conn = await OpenAsync(ct).ConfigureAwait(false);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandTimeout = 10;
+            cmd.CommandText = @"SELECT type, CASE
+                WHEN lease_until >= @now THEN 'leased'
+                WHEN next_check_at <= @now OR probe_policy_hash IS NULL OR probe_policy_hash <> @policy THEN 'eligible'
+                WHEN last_error_kind IN ('no_capable_indexer','unreleased') THEN 'dormant'
+                ELSE 'scheduled' END AS state, COUNT(*)
+                FROM availability_items WHERE type IN ('movie','episode') GROUP BY type, state;";
+            cmd.AddWithValue("@now", timestamp);
+            cmd.AddWithValue("@policy", policyHash);
+            var counts = new Dictionary<(string Type, string State), long>();
+            await using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+            while (await reader.ReadAsync(ct).ConfigureAwait(false))
+            {
+                counts[(reader.GetString(0), reader.GetString(1))] = reader.GetInt64(2);
+            }
+
+            var measurements = new List<System.Diagnostics.Metrics.Measurement<long>>();
+            foreach (var type in new[] { "movie", "episode" })
+            {
+                foreach (var state in new[] { "eligible", "dormant", "leased", "scheduled" })
+                {
+                    measurements.Add(new System.Diagnostics.Metrics.Measurement<long>(counts.GetValueOrDefault((type, state)),
+                        new KeyValuePair<string, object?>("media_type", type), new KeyValuePair<string, object?>("state", state)));
+                }
+            }
+
+            Diagnostics.PhantomFlowMetrics.PublishAvailabilityBacklog(measurements.ToArray(), timestamp);
+        }
+        finally
+        {
+            _backlogLock.Release();
+        }
+    }
+
     public async Task<AvailabilityItemRow?> ClaimDueAvailabilityAsync(string owner, TimeSpan leaseDuration, DateTimeOffset now, string policyHash, CancellationToken ct, string? preferredType = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(owner);
@@ -2771,6 +2831,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
             }
 
             await tx.CommitAsync(ct).ConfigureAwait(false);
+            Diagnostics.PhantomFlowMetrics.RecordAvailability(false, row.Type, row.ClaimLane);
             return row with { ProbeGeneration = generation, LeaseOwner = owner, AttemptCount = row.AttemptCount + 1 };
         }
         finally
@@ -2791,7 +2852,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         cmd.Transaction = tx;
         cmd.CommandText = $@"SELECT tmdb_id,type,season,episode,status,checked_at,next_check_at,
                    candidate_magnet,candidate_info_hash,{ResolvedSizeSql("candidate_size", "candidate_size_bytes", "candidate_")},candidate_seeders,
-                   candidate_indexer,candidate_source,probe_generation,lease_owner,attempt_count,negative_streak
+                   candidate_indexer,candidate_source,probe_generation,lease_owner,attempt_count,negative_streak,priority
             FROM availability_items
             WHERE (next_check_at <= @now OR probe_policy_hash IS NULL OR probe_policy_hash <> @policy)
               AND (lease_until IS NULL OR lease_until < @now)
@@ -2804,7 +2865,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         cmd.AddWithValue("@policy", policyHash);
         cmd.AddWithValue("@preferred", (object?)preferredType ?? DBNull.Value, DbType.String);
         await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
-        return await r.ReadAsync(ct).ConfigureAwait(false) ? ReadAvailability(r) : null;
+        return await r.ReadAsync(ct).ConfigureAwait(false) ? ReadAvailability(r) with { ClaimLane = r.GetInt32(17) > 0 ? "priority" : "background" } : null;
     }
 
     private static async Task<AvailabilityItemRow?> TryReadDueEpisodeAfterCursorAsync(
@@ -2819,7 +2880,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         cmd.Transaction = tx;
         cmd.CommandText = $@"SELECT tmdb_id,type,season,episode,status,checked_at,next_check_at,
                    candidate_magnet,candidate_info_hash,{ResolvedSizeSql("candidate_size", "candidate_size_bytes", "candidate_")},candidate_seeders,
-                   candidate_indexer,candidate_source,probe_generation,lease_owner,attempt_count,negative_streak
+                   candidate_indexer,candidate_source,probe_generation,lease_owner,attempt_count,negative_streak,priority
             FROM availability_items
             WHERE type='episode'
               AND (@cursor IS NULL OR tmdb_id > @cursor)
@@ -2835,7 +2896,7 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
         cmd.AddWithValue("@now", now.ToUnixTimeSeconds());
         cmd.AddWithValue("@policy", policyHash);
         await using var r = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
-        return await r.ReadAsync(ct).ConfigureAwait(false) ? ReadAvailability(r) : null;
+        return await r.ReadAsync(ct).ConfigureAwait(false) ? ReadAvailability(r) with { ClaimLane = r.GetInt32(17) > 0 ? "priority" : "background" } : null;
     }
 
     private static async Task<long?> GetLongMetaInTransactionAsync(DbConnection conn, DbTransaction tx, string key, CancellationToken ct)
@@ -3039,6 +3100,8 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
             var updated = await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) == 1;
             if (updated)
             {
+                // The guarded UPDATE has committed, even if relevance refresh later fails.
+                Diagnostics.PhantomFlowMetrics.RecordAvailability(true, lease.Type, lease.ClaimLane);
                 await RefreshRelevanceScoreAsync(conn, lease.TmdbId, lease.Type, checkedAt, ct).ConfigureAwait(false);
             }
 
@@ -3131,7 +3194,13 @@ CREATE INDEX IF NOT EXISTS idx_magnet_cache_jobs_claim
             cmd.AddWithValue("@episode", lease.Episode);
             cmd.AddWithValue("@owner", lease.LeaseOwner ?? string.Empty);
             cmd.AddWithValue("@generation", lease.ProbeGeneration);
-            return await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) == 1;
+            var updated = await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false) == 1;
+            if (updated)
+            {
+                Diagnostics.PhantomFlowMetrics.RecordAvailability(true, lease.Type, lease.ClaimLane);
+            }
+
+            return updated;
         }
         finally
         {

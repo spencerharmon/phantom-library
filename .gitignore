@@ -18,3 +18,4 @@ __pycache__/
 *.local.json
 appsettings.Development.json
 /.cave/
+/.p0-test-runtime/

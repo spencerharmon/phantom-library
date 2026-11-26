@@ -8,7 +8,8 @@
 # Guards against the workflow silently rotting:
 #   - the workflow file exists and PARSES as valid YAML.
 #   - every .gitea/workflows/*.yml and *.yaml job selects only supported
-#     runner labels (ubuntu-latest or k8s), using parsed YAML, not grep.
+#     runner labels (ubuntu-latest or k8s), plus two exact operator-controlled
+#     per-job fallback exceptions, using parsed YAML, not grep.
 #   - SDK-container jobs install Node, git, and CA certificates before
 #     actions/checkout (Gitea needs Node inside the job container).
 #   - it declares `container:` (runs inside a container, not bare on the
@@ -50,6 +51,13 @@ fatal() { printf '\033[31mFATAL: %s\033[0m\n' "$*" >&2; exit 2; }
 [[ -f "$BUILD_SCRIPT" ]] || fatal "shared CI script not found: $BUILD_SCRIPT"
 [[ -x "$BUILD_SCRIPT" ]] || fatal "shared CI script not executable: $BUILD_SCRIPT"
 
+head_ "scoped runner-policy regression"
+if python3 "$REPO_ROOT/scripts/tests/gitea-runner-policy.test.py"; then
+    ok "runner policy accepts documented overrides and rejects arbitrary expressions"
+else
+    bad "runner-policy regressions failed"
+fi
+
 head_ "YAML parse, supported runner labels, and SDK checkout bootstrap"
 if python3 - "$REPO_ROOT/.gitea/workflows" <<'PY'
 import re
@@ -57,6 +65,11 @@ import shlex
 import sys
 from pathlib import Path
 import yaml
+
+sys.dont_write_bytecode = True
+directory = Path(sys.argv[1])
+sys.path.insert(0, str(directory.parent.parent / 'tools' / 'ci'))
+from gitea_runner_policy import supported_runner
 
 def checkout_missing_packages(steps):
     installed = set()
@@ -90,24 +103,31 @@ assert not checkout_missing_packages(fixed_steps)
 print('Regression red/green: original checkout-first rejected; '
       'reordering alone rejected; Node + git before checkout accepted')
 
-directory = Path(sys.argv[1])
 workflows = sorted([*directory.glob('*.yml'), *directory.glob('*.yaml')])
 assert workflows, 'no Gitea workflows found'
-supported = {'ubuntu-latest', 'k8s'}
 failures = 0
 job_count = 0
 for path in workflows:
     with path.open() as f:
         workflow = yaml.safe_load(f)
     jobs = workflow['jobs']
+    if path.name == 'nonrig-gate.yaml':
+        job = jobs['nonrig-build-test']
+        pg = job['services']['postgres']
+        assert pg['image'] == 'postgres:16-alpine'
+        assert 'pg_isready' in pg['options'] and '--health-retries 30' in pg['options']
+        dsn = dict(part.split('=', 1) for part in job['env']['PHANTOM_TEST_POSTGRES_DSN'].split(';'))
+        assert dsn['Host'] == 'postgres' and dsn['Port'] == '5432'
+        assert dsn['Username'] == pg['env']['POSTGRES_USER']
+        assert dsn['Password'] == pg['env']['POSTGRES_PASSWORD']
+        assert dsn['Database'] == pg['env']['POSTGRES_DB']
+        assert any(step.get('run') == './tools/ci/nonrig-build-test.sh'
+                   and not step.get('if') and not step.get('continue-on-error') for step in job['steps'])
     assert isinstance(jobs, dict) and jobs, f'{path.name}: no jobs found'
     for name, job in jobs.items():
         job_count += 1
         selector = job.get('runs-on')
-        labels = [selector] if isinstance(selector, str) else selector
-        if (not isinstance(labels, list) or not labels
-                or any(not isinstance(label, str) or label not in supported
-                       for label in labels)):
+        if not supported_runner(workflow, path.name, name, selector):
             print(f'FAIL {path.name}:{name}: unsupported runs-on {selector!r}',
                   file=sys.stderr)
             failures += 1
@@ -115,8 +135,9 @@ for path in workflows:
         image = container.get('image', '') if isinstance(container, dict) else container
         if not image.startswith('mcr.microsoft.com/dotnet/sdk:'):
             continue
-        assert job.get('defaults', {}).get('run', {}).get('shell') == 'bash', \
-            f'{path.name}:{name}: SDK steps require bash for pipefail'
+        if job.get('defaults', {}).get('run', {}).get('shell') != 'bash':
+            print(f'FAIL {path.name}:{name}: SDK steps require bash for pipefail', file=sys.stderr)
+            failures += 1
         missing = checkout_missing_packages(job.get('steps', []))
         if missing:
             print(f'FAIL {path.name}:{name}: SDK checkout before '
@@ -179,13 +200,14 @@ else
 fi
 
 head_ "toolchain-agnostic dry run of the shared CI script"
-if PHANTOM_CI_DRYRUN=1 PHANTOM_CI_PKILL=0 bash "$BUILD_SCRIPT" >/tmp/gitea-nonrig-dryrun.$$.log 2>&1; then
+dryrun_log="$(mktemp "${TMPDIR:-/tmp}/gitea-nonrig-dryrun.XXXXXX.log")"
+if PHANTOM_CI_DRYRUN=1 PHANTOM_CI_PKILL=0 bash "$BUILD_SCRIPT" >"$dryrun_log" 2>&1; then
     ok "PHANTOM_CI_DRYRUN=1 tools/ci/nonrig-build-test.sh exits 0"
 else
-    bad "dry run of tools/ci/nonrig-build-test.sh failed; see /tmp/gitea-nonrig-dryrun.$$.log"
-    sed 's/^/    /' /tmp/gitea-nonrig-dryrun.$$.log >&2 || true
+    bad "dry run of tools/ci/nonrig-build-test.sh failed; see $dryrun_log"
+    sed 's/^/    /' "$dryrun_log" >&2
 fi
-rm -f "/tmp/gitea-nonrig-dryrun.$$.log"
+rm -f "$dryrun_log"
 
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"
 [ "$fail_count" -eq 0 ]

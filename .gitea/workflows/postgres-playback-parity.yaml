@@ -13,7 +13,12 @@ on:
 
 jobs:
   playback:
+    # This exact manual override is scoped to this job in gitea_runner_policy.py.
+    # Push/PR or an empty dispatch input retain the supported shared k8s runner.
     runs-on: ["${{ inputs.runner_label || 'k8s' }}"]
+    defaults:
+      run:
+        shell: bash
     timeout-minutes: 45
     container:
       image: mcr.microsoft.com/dotnet/sdk:9.0.305-noble
