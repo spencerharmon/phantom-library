@@ -123,6 +123,16 @@ positive partial observations and explicitly confirmed sampled zeros remain in
 `measured_at` readers retain that field. New ingestion should adopt
 `/v1/measure` and inspect status/checked_at, not infer freshness from HTTP 200.
 
+The default MAX_BATCH remains 256 to admit the existing worker's **128-hash**
+batch. If that legacy batch reaches REQUEST_TIMEOUT_S, return 200 with completed
+results plus any positive partial snapshot, `request_timed_out: true` and
+`retry_after_s`, rather than discard all progress. Unfinished rows in observations
+carry `reason: "request_deadline"`; unqueried/silent rows are null with status
+`timeout`, never zero. Snapshotting does not mutate/cache shared work; remaining
+interests are then cancelled normally. This keeps the old int-valued client useful
+without unbounded batch latency. `/v1/measure` retains explicit HTTP 504 at its
+request deadline; clients there should submit appropriately small priority batches.
+
 ### Cancellation, deadlines and overload
 
 `DELETE /measure/<request_id>` removes that request's interests: 202 if active,
@@ -138,8 +148,8 @@ is fabricated for cancelled work.
 Admission of a batch is atomic. MAX_REQUESTS or MAX_QUEUE exhaustion returns 429;
 connection-cap exhaustion returns a best-effort 503 then closes the socket
 (possibly TCP reset after the response if unread bytes remain). Not-ready/failed
-engine returns 503. Request wall deadline including queue wait returns 504 and
-releases interests. 429/503/504 include integer `Retry-After`; callers must back
+engine returns 503. The `/v1/measure` request wall deadline including queue wait
+returns 504 and releases interests (legacy partial-result behavior is above). 429/503/504 include integer `Retry-After`; callers must back
 off with jitter and avoid immediate retries. Invalid input 400, excessive payload
 413, excessive headers 431, read deadline 408, missing/incorrect configured token
 401. No retry loop lives in the service.
@@ -168,7 +178,7 @@ closed. Durations may be fractional; count/port settings must be integers.
 | API_TOKEN | empty | Optional Bearer secret, at most 4096 ASCII characters |
 | STATE_DIR / DHT_BRIDGE | /var/lib/swarm-health / sibling dht-bridge | Writable persistent directory / executable path |
 | MAX_HTTP / MAX_REQUESTS | 64 / 32 | 4..256 / 1..128; requests <= HTTP slots - 2 |
-| MAX_BATCH / MAX_QUEUE | 32 / 256 | 1..256 / 1..4096; queue budget includes active hash |
+| MAX_BATCH / MAX_QUEUE | 256 / 256 | 1..256 / 1..4096; queue budget includes active hash |
 | MAX_BODY / MAX_HEADER | 16384 / 8192 | 128..1048576 / 256..16384 bytes |
 | MAX_CHUNKS | 256 | 1..1024; chunk-size frame <=80 bytes |
 | HTTP_READ_S / HTTP_WRITE_S | 5 / 3 | .1..30 / .1..10; read deadline covers headers + entire body |
@@ -243,7 +253,7 @@ are counter (`*_total`) or gauge. Enumerated series:
 
 - Outcomes: `outcome_{ok,partial,unsupported,timeout}_total` (one per measured hash,
   not per HTTP waiter); `started_total`, `queries_total`, `query_timeouts_total`,
-  `budget_exhausted_total`, `coalesced_total`, `cancelled_total`, `overload_total`,
+  `budget_exhausted_total`, `coalesced_total`, `cancelled_total`, `request_timeouts_total`, `overload_total`,
   `http_rejected_total`, `http_write_timeouts_total`, `engine_errors_total`.
 - Cache: `cache_hits_total`, `cache_expired_total`, `cache_evictions_total`,
   `cache_entries`.
@@ -271,7 +281,8 @@ Checks the BEP33 published vector (1256 inserted IPs -> 1225 estimate), overlapp
 bloom unions, deduplicated peers, explicit zero vs silence on a healthy table,
 legacy omission, malformed/saturated filters, TTL/timestamps/eviction, query/peer/
 node budgets, native slots after cancellation, cross-request coalescing/promotion,
-aging, atomic overload, disconnect/DELETE/deadlines, HTTP framing/slowloris/auth,
+aging, atomic overload, disconnect/DELETE/deadlines, the legacy default 128-hash
+batch's bounded partial progress, HTTP framing/slowloris/auth,
 constant metric cardinality and state restart/corruption/locking.
 
 When native build dependencies are absent, the runner builds `Dockerfile.test`

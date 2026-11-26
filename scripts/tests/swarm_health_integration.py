@@ -188,7 +188,11 @@ class Process:
                         UNKNOWN_TTL_S="0.2", HTTP_READ_S="0.4", MAX_BODY="512", MAX_CHUNKS="4",
                         MEASURE_TIMEOUT_S="2", QUERY_TIMEOUT_S="0.6", REQUEST_TIMEOUT_S="6",
                         STATE_SAVE_S="0.2", PRIORITY_AGING_S="5", SETTLE_S="0")
-        settings.update({k: str(v) for k, v in env.items()})
+        for key, value in env.items():
+            if value is None:
+                settings.pop(key, None)  # exercise the service's production default
+            else:
+                settings[key] = str(value)
         self.proc = subprocess.Popen([sys.executable, str(SERVICE)], env=settings,
                                      stdout=self.log, stderr=self.log)
         try:
@@ -566,6 +570,29 @@ class Contract(unittest.TestCase):
         self.assertLess(time.monotonic() - before, .8)
         eventually(lambda: svc.metrics()["requests"] == 0)
         self.assertEqual(svc.metrics()["active"], 0)
+
+    def test_legacy_default_128_hash_batch_preserves_progress_at_deadline(self):
+        svc = self.start(MAX_BATCH=None, MAX_QUEUE=None, MAX_BODY=None,
+                         REQUEST_TIMEOUT_S=.3, QUERY_TIMEOUT_S=1)
+        hashes = [info(i) for i in range(100, 228)]
+        for h in hashes[1:]:
+            self.cluster.data[h] = {"silent": True}
+        before = time.monotonic()
+        code, body, _ = svc.http("POST", "/measure", {"info_hashes": hashes})
+        self.assertEqual(code, 200, body)
+        self.assertTrue(body["request_timed_out"])
+        self.assertLess(time.monotonic() - before, 1)
+        self.assertEqual(len(body["observations"]), 128)
+        self.assertEqual(len(body["results"]), 1)
+        self.assertEqual(body["results"][0]["info_hash"], hashes[0])
+        self.assertEqual(body["results"][0]["status"], "ok")
+        self.assertEqual(body["results"][0]["dht_peers"], 0)  # actual empty filters
+        for row in body["observations"][1:]:
+            self.assertIsNone(row["dht_peers"])
+            self.assertIsNone(row["checked_at"])
+            self.assertEqual(row["reason"], "request_deadline")
+        self.assertEqual(svc.metrics()["requests"], 0)
+        self.assertEqual(svc.metrics()["request_timeouts_total"], 1)
 
     def test_restart_routing_identity_and_corruption_recovery(self):
         svc = self.start()

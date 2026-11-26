@@ -27,7 +27,7 @@ import uuid
 LIMITS = {
     "LISTEN_PORT": (8095, 1, 65535), "DHT_PORT": (6881, 0, 65535),
     "MAX_HTTP": (64, 4, 256), "MAX_REQUESTS": (32, 1, 128),
-    "MAX_BATCH": (32, 1, 256), "MAX_QUEUE": (256, 1, 4096),
+    "MAX_BATCH": (256, 1, 256), "MAX_QUEUE": (256, 1, 4096),
     "MAX_BODY": (16384, 128, 1048576), "MAX_HEADER": (8192, 256, 16384),
     "MAX_CHUNKS": (256, 1, 1024), "HTTP_READ_S": (5, .1, 30),
     "HTTP_WRITE_S": (3, .1, 10), "REQUEST_TIMEOUT_S": (60, .1, 300),
@@ -339,15 +339,16 @@ class Service:
                  for i in range(0, len(raw) - 25, 26)]
         self.add_nodes(job, nodes)
 
-    def finish(self, job):
+    def observation(self, job, incomplete=False):
+        incomplete |= job.incomplete
         seeders = estimate(job.seed_bits) if job.scrapes else None
         total = estimate(job.seed_bits | job.peer_bits) if job.scrapes else None
         if total is None and job.scrapes:
-            job.incomplete = True
+            incomplete = True
         if job.peers:
             total = max(total or 0, len(job.peers))
         status = ("timeout" if not job.replies else "unsupported" if not job.scrapes and not job.peers
-                  else "partial" if job.incomplete else "ok")
+                  else "partial" if incomplete else "ok")
         # Zero requires valid empty filters on every contacted node, no dropped
         # responses/budgets. A routing table full of nodes is NOT such evidence.
         if status != "ok":
@@ -360,6 +361,29 @@ class Service:
                   "status": status, "observed_peers": len(job.peers),
                   "queries": len(job.queried), "replies": job.replies,
                   "retry_after_s": self.cfg.RETRY_AFTER_S if status != "ok" else 0}
+        return result
+
+    def legacy_deadline(self, rid):
+        # Existing clients send 128 hashes by default. Keep bounded request wall
+        # time without discarding all progress whenever that batch outlives it.
+        # Snapshots do not mutate shared jobs or enter the final-result cache.
+        _, hashes, results, _ = self.requests[rid]
+        rows = []
+        for h in hashes:
+            if h in results:
+                rows.append(results[h])
+            else:
+                row = self.observation(self.jobs[h], incomplete=True)
+                row["reason"] = "request_deadline"
+                rows.append(row)
+        return {"request_id": rid, "request_timed_out": True,
+                "retry_after_s": self.cfg.RETRY_AFTER_S,
+                "results": [r for r in rows if r["dht_peers"] is not None],
+                "observations": rows, "dht_nodes": self.dht.routing_nodes}
+
+    def finish(self, job):
+        result = self.observation(job)
+        status = result["status"]
         self.metrics[f"outcome_{status}_total"] += 1
         ttl = self.cfg.CACHE_TTL_S if status == "ok" else min(self.cfg.UNKNOWN_TTL_S, self.cfg.CACHE_TTL_S)
         self.cache[job.h] = (result, time.monotonic() + ttl)
@@ -449,7 +473,7 @@ class Service:
 
     def exposition(self):
         fixed = ("state_loads_total state_saves_total state_recoveries_total cache_hits_total cache_expired_total "
-                 "cache_evictions_total coalesced_total overload_total cancelled_total query_timeouts_total "
+                 "cache_evictions_total coalesced_total overload_total cancelled_total query_timeouts_total request_timeouts_total "
                  "started_total queries_total budget_exhausted_total engine_errors_total http_rejected_total http_write_timeouts_total "
                  "outcome_ok_total outcome_partial_total outcome_timeout_total outcome_unsupported_total").split()
         values = {key: self.metrics[key] for key in fixed}
@@ -562,8 +586,13 @@ async def serve(reader, writer, svc):
             elif disconnected in done:
                 svc.release(rid, cancelled=True)
             else:
+                svc.metrics["request_timeouts_total"] += 1
+                partial = svc.legacy_deadline(rid) if path == "/measure" else None
                 svc.release(rid, cancelled=True)
-                raise HttpError(504, "request deadline exceeded")
+                if partial is not None:
+                    await send(writer, 200, partial, svc.cfg)
+                else:
+                    raise HttpError(504, "request deadline exceeded")
         else:
             raise HttpError(404, "not found")
     except HttpError as e:
