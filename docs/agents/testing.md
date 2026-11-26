@@ -14,6 +14,16 @@ artifact injection, prerequisites, retained evidence and Gitea execution.
 The legacy clone/systemd instructions below apply to other scenarios, **not**
 the isolated 35/36 check.
 
+`./scripts/tests/availability-stale-candidate-reprobe-live-rig.test.sh` also uses
+this owned PostgreSQL rig (`--suite stale-candidate`), not the old clone. It
+asserts movie/episode browse exclusion, exactly one real hosted-worker tick,
+external HTTP re-probe/candidate persistence and restored REST visibility.
+A test-only control assembly exposes the existing private tick and repository
+reads without changing the production plugin. See [its contract and observed
+cache-invalidation failure](../tasks/availability-stale-candidate-reprobe-verify-001.md).
+The check intentionally fails on that application defect; structural/unit tests
+or repository-only visibility cannot substitute for REST restoration.
+
 Operator does not want to be in the loop for every test cycle.
 Run live integration tests yourself against a clone of the
 operator's production Jellyfin and gostream state. This doc
