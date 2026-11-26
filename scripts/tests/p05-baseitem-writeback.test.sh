@@ -353,8 +353,22 @@ for _ in $(seq 1 60); do  # channel entities are created on the first /Channels 
     sleep 1
 done
 [[ "$n_channels" -ge 2 ]] || fatal "Phantom channels never listed (got $n_channels)"
-api_get "$WORK/browse-movies.json" "$B/Channels/$MOVIES_CH/Items?userId=$USER_ID&Limit=1"
-api_get "$WORK/browse-shows.json" "$B/Channels/$SHOWS_CH/Items?userId=$USER_ID&Limit=1"
+q() { sqlite3 "$JFDB" "$@"; }
+SCORED_WHERE="((Type='$T_MOVIE' AND TopParentId='$MOVIES_CH_U' AND ChannelId='$MOVIES_CH_U') OR (Type IN ('$T_SERIES','$T_FOLDER') AND TopParentId='$SHOWS_CH_U' AND ChannelId='$SHOWS_CH_U'))"
+EXPECTED_SCORED=$((N_MOVIES + N_ORPHAN_MOVIES + N_SERIES + N_ORPHAN_SERIES))
+# The browse persists channel items as BaseItems; when the first browse races
+# the channel refresh (transient 500) the retried request can return before
+# every item is persisted. Re-browse until the persisted catalogue converges
+# (bounded), instead of counting a half-written channel.
+persisted=0
+for attempt in $(seq 1 40); do
+    api_get "$WORK/browse-movies.json" "$B/Channels/$MOVIES_CH/Items?userId=$USER_ID&Limit=1"
+    api_get "$WORK/browse-shows.json" "$B/Channels/$SHOWS_CH/Items?userId=$USER_ID&Limit=1"
+    persisted="$(q "SELECT count(*) FROM BaseItems WHERE $SCORED_WHERE")"
+    [[ "$persisted" -ge "$EXPECTED_SCORED" ]] && break
+    echo "   browse $attempt: $persisted of $EXPECTED_SCORED titles persisted; waiting" >&2
+    sleep 3
+done
 # Episode path parity (scenario 36 shape): series -> season -> episodes for 3 measured series.
 for s in 1 2 3; do
     sid="$(sqlite3 "$JFDB" "SELECT lower(replace(Id,'-','')) FROM BaseItems WHERE ExternalId='series_$((7100000+s))'")"
@@ -363,12 +377,9 @@ for s in 1 2 3; do
     season="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["Items"][0]["Id"])' "$WORK/browse-series-$s.json")"
     api_get "$WORK/browse-season-$s.json" "$B/Channels/$SHOWS_CH/Items?userId=$USER_ID&folderId=$season"
 done
-q() { sqlite3 "$JFDB" "$@"; }
-SCORED_WHERE="((Type='$T_MOVIE' AND TopParentId='$MOVIES_CH_U' AND ChannelId='$MOVIES_CH_U') OR (Type IN ('$T_SERIES','$T_FOLDER') AND TopParentId='$SHOWS_CH_U' AND ChannelId='$SHOWS_CH_U'))"
 N_SCORED="$(q "SELECT count(*) FROM BaseItems WHERE $SCORED_WHERE")"
 N_EPISODES="$(q "SELECT count(*) FROM BaseItems WHERE Type='MediaBrowser.Controller.Entities.TV.Episode' AND ChannelId='$SHOWS_CH_U'")"
 N_ORPHANS="$(q "SELECT count(*) FROM BaseItems WHERE $SCORED_WHERE AND (ExternalId LIKE 'orphan\\_%' ESCAPE '\\' OR ExternalId LIKE 'orphanseries\\_%' ESCAPE '\\')")"
-EXPECTED_SCORED=$((N_MOVIES + N_ORPHAN_MOVIES + N_SERIES + N_ORPHAN_SERIES))
 echo "   persisted: $N_SCORED scored titles ($N_ORPHANS orphan/non-TMDB), $N_EPISODES episodes"
 check "every seeded title persisted as a channel BaseItem ($N_SCORED == $EXPECTED_SCORED)" test "$N_SCORED" -eq "$EXPECTED_SCORED"
 check "> 2000 Phantom titles seeded" test "$N_SCORED" -gt 2000
