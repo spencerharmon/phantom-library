@@ -106,6 +106,7 @@ done
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/p05-writeback.XXXXXX")"
 PGC="phantom-p05-writeback-$$-$RANDOM"
 JF_PID=""
+JF_LOG=""
 MOCK_PID=""
 cleanup() {
     local rc=$?
@@ -245,6 +246,7 @@ start_jf() {  # $1 = stdout log name
             --logdir "$WORK/log" --nowebclient --ffmpeg "$(command -v ffmpeg || echo /usr/bin/ffmpeg)"
     ) >"$WORK/$1" 2>&1 &
     JF_PID=$!
+    JF_LOG="$WORK/$1"
     for _ in $(seq 1 180); do
         kill -0 "$JF_PID" 2>/dev/null || { tail -40 "$WORK/$1"; fatal "jellyfin exited during startup"; }
         [[ "$(curl -s -o /dev/null -w '%{http_code}' "$B/System/Info/Public")" == 200 ]] \
@@ -285,6 +287,29 @@ login() {
 }
 login
 api() { curl -sf --max-time 900 -H "X-Emby-Token: $TOK" "$@"; }
+# api_get OUT URL: GET with retry. A channel refresh running right after the
+# seed can answer a transient 5xx / time out; retry it, and only give up with a
+# diagnostic (HTTP status, body head, Jellyfin log tail) instead of a bare
+# `curl -f` exit 22 under set -e.
+api_get() {
+    local out="$1" url="$2" code="" attempt
+    for attempt in $(seq 1 40); do
+        code="$(curl -s --max-time 900 -o "$out" -w '%{http_code}' -H "X-Emby-Token: $TOK" "$url" || true)"
+        if [[ "$code" == 200 ]] && python3 -c 'import json,sys;json.load(open(sys.argv[1]))' "$out" 2>/dev/null; then
+            return 0
+        fi
+        echo "   api retry $attempt: HTTP ${code:-none} for $url" >&2
+        sleep 3
+    done
+    echo "---- last response body (head) ----" >&2
+    head -c 2000 "$out" >&2 || true
+    echo >&2
+    if [[ -n "$JF_LOG" ]]; then
+        echo "---- $(basename "$JF_LOG") tail ----" >&2
+        tail -60 "$JF_LOG" >&2 || true
+    fi
+    fatal "GET $url failed after 40 attempts (last HTTP status ${code:-none})"
+}
 for _ in $(seq 1 60); do
     [[ "$(psqlc -c "SELECT to_regclass('public.swarm_health') IS NOT NULL AND to_regclass('public.plugin_meta') IS NOT NULL")" == t ]] && break
     sleep 1
@@ -320,18 +345,23 @@ for i in $(seq 1 "$N_ORPHAN_SERIES"); do
     d="$WORK/gostream/tv/Gostream Only Series $i/Season 01"; mkdir -p "$d"
     head -c 64 /dev/zero >"$d/Gostream Only Series $i S01E01.mkv"
 done
+n_channels=0
 for _ in $(seq 1 60); do  # channel entities are created on the first /Channels listing
-    [[ "$(api "$B/Channels?userId=$USER_ID" | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["Items"]))')" -ge 2 ]] && break
+    api_get "$WORK/channels.json" "$B/Channels?userId=$USER_ID"
+    n_channels="$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1]))["Items"]))' "$WORK/channels.json")"
+    [[ "$n_channels" -ge 2 ]] && break
     sleep 1
 done
-api "$B/Channels/$MOVIES_CH/Items?userId=$USER_ID&Limit=1" >/dev/null
-api "$B/Channels/$SHOWS_CH/Items?userId=$USER_ID&Limit=1" >/dev/null
+[[ "$n_channels" -ge 2 ]] || fatal "Phantom channels never listed (got $n_channels)"
+api_get "$WORK/browse-movies.json" "$B/Channels/$MOVIES_CH/Items?userId=$USER_ID&Limit=1"
+api_get "$WORK/browse-shows.json" "$B/Channels/$SHOWS_CH/Items?userId=$USER_ID&Limit=1"
 # Episode path parity (scenario 36 shape): series -> season -> episodes for 3 measured series.
 for s in 1 2 3; do
     sid="$(sqlite3 "$JFDB" "SELECT lower(replace(Id,'-','')) FROM BaseItems WHERE ExternalId='series_$((7100000+s))'")"
     [[ -n "$sid" ]] || fatal "series_$((7100000+s)) BaseItem was not persisted by the shows browse"
-    season="$(api "$B/Channels/$SHOWS_CH/Items?userId=$USER_ID&folderId=$sid" | python3 -c 'import json,sys;print(json.load(sys.stdin)["Items"][0]["Id"])')"
-    api "$B/Channels/$SHOWS_CH/Items?userId=$USER_ID&folderId=$season" >/dev/null
+    api_get "$WORK/browse-series-$s.json" "$B/Channels/$SHOWS_CH/Items?userId=$USER_ID&folderId=$sid"
+    season="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["Items"][0]["Id"])' "$WORK/browse-series-$s.json")"
+    api_get "$WORK/browse-season-$s.json" "$B/Channels/$SHOWS_CH/Items?userId=$USER_ID&folderId=$season"
 done
 q() { sqlite3 "$JFDB" "$@"; }
 SCORED_WHERE="((Type='$T_MOVIE' AND TopParentId='$MOVIES_CH_U' AND ChannelId='$MOVIES_CH_U') OR (Type IN ('$T_SERIES','$T_FOLDER') AND TopParentId='$SHOWS_CH_U' AND ChannelId='$SHOWS_CH_U'))"
@@ -408,6 +438,12 @@ for _ in $(seq 1 $((RECHECK_H * 3600))); do
 done
 CYCLE_SECS=$(( $(date +%s) - CYCLE_START ))
 grep -q 'Swarm-health score sweep 1 completed' "$WORK/jf-3.log" || fatal "sweep 1 did not complete inside the ${RECHECK_H}h cycle"
+# Snapshot the cursor NOW, right after the completion line: the worker
+# legitimately starts sweep 2 MinTicksBetweenSweeps ticks after sweep 1 STARTED
+# (it is a standing loop), which resets the cursor. Section H asserts on this
+# snapshot, not on whatever sweep is in flight later.
+CURSOR_DONE="$(psqlc -c "SELECT value FROM plugin_meta WHERE key='swarm_health_sync_cursor'")"
+echo "   cursor at sweep-1 completion: $CURSOR_DONE"
 # let in-flight measurement ticks (write-through) drain: wait until every candidate was asked
 for _ in $(seq 1 120); do
     asked="$(python3 -c 'import json,sys;print(len({h for l in open(sys.argv[1]) for h in json.loads(l)["requested"]}))' "$WORK/observations.jsonl" 2>/dev/null || echo 0)"
@@ -531,9 +567,9 @@ start_jf jf-4.log
 login
 rest_check() {  # $1 channel id  $2 label
     local ch="$1" label="$2"
-    api "$B/Items?ParentId=$ch&userId=$USER_ID&Limit=50&StartIndex=0" >"$WORK/rest-default-$label.json"
-    api "$B/Items?ParentId=$ch&userId=$USER_ID&SortBy=CriticRating,SortName&SortOrder=Descending,Ascending&Limit=50&StartIndex=0" >"$WORK/rest-desc1-$label.json"
-    api "$B/Items?ParentId=$ch&userId=$USER_ID&SortBy=CriticRating,SortName&SortOrder=Descending,Ascending&Limit=50&StartIndex=50" >"$WORK/rest-desc2-$label.json"
+    api_get "$WORK/rest-default-$label.json" "$B/Items?ParentId=$ch&userId=$USER_ID&Limit=50&StartIndex=0"
+    api_get "$WORK/rest-desc1-$label.json" "$B/Items?ParentId=$ch&userId=$USER_ID&SortBy=CriticRating,SortName&SortOrder=Descending,Ascending&Limit=50&StartIndex=0"
+    api_get "$WORK/rest-desc2-$label.json" "$B/Items?ParentId=$ch&userId=$USER_ID&SortBy=CriticRating,SortName&SortOrder=Descending,Ascending&Limit=50&StartIndex=50"
     python3 - "$WORK/expected.tsv" "$WORK/rest-default-$label.json" "$WORK/rest-desc1-$label.json" "$WORK/rest-desc2-$label.json" "$label" <<'PY'
 import json, sys
 exp_rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[1])]
@@ -588,8 +624,12 @@ stop_jf
 head_ "H. no schema change (old/new color overlap)"
 check "phantom schema version unchanged (v$SCHEMA_BEFORE)" test "$(psqlc -c 'SELECT version FROM phantom_schema_meta')" == "$SCHEMA_BEFORE"
 check "no table added/removed in the phantom DB" test "$(psqlc -c "SELECT string_agg(table_name, ',' ORDER BY table_name) FROM information_schema.tables WHERE table_schema='public'")" == "$TABLES_BEFORE"
-check "sweep cursor stored in the existing plugin_meta table, marked done" \
-    python3 -c 'import json,sys;c=json.loads(sys.argv[1]);sys.exit(0 if c["done"] and c["sweep"]==1 else 1)' "$(psqlc -c "SELECT value FROM plugin_meta WHERE key='swarm_health_sync_cursor'")"
+# Assert on the snapshot taken at sweep-1 completion (a later sweep may be in
+# flight by now and has reset the live cursor — that is correct behaviour).
+check "sweep cursor in the existing plugin_meta table recorded a completed sweep (sweep>=1, done, completedAt, read==$N_SCORED)" \
+    python3 -c 'import json,sys;c=json.loads(sys.argv[1]);n=int(sys.argv[2]);sys.exit(0 if c["sweep"]>=1 and c["done"] and c.get("completedAt") and c["read"]==n else 1)' "$CURSOR_DONE" "$N_SCORED"
+check "live cursor still lives in plugin_meta with sweep >= 1 (standing loop)" \
+    python3 -c 'import json,sys;c=json.loads(sys.argv[1]);sys.exit(0 if c["sweep"]>=1 else 1)' "$(psqlc -c "SELECT value FROM plugin_meta WHERE key='swarm_health_sync_cursor'")"
 
 # ---------------------------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"
