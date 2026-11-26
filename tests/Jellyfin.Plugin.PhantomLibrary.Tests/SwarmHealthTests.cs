@@ -120,6 +120,29 @@ public sealed class SwarmHealthTests : IDisposable
     }
 
     [Fact]
+    public async Task Db_PeersForTmdbIds_IsThePerBatchSliceOfTheFullAggregate()
+    {
+        using var db = await NewDbAsync();
+        var now = DateTimeOffset.UtcNow;
+        await db.UpsertSwarmHealthAsync(
+            new[]
+            {
+                new SwarmHealthMeasurement(Hash('a'), 1, "movie", -1, -1, 4, now),
+                new SwarmHealthMeasurement(Hash('b'), 2, "movie", -1, -1, 0, now),
+                new SwarmHealthMeasurement(Hash('c'), 3, "movie", -1, -1, 8, now.AddDays(-30)), // stale
+                new SwarmHealthMeasurement(Hash('d'), 9, "episode", 1, 1, 2, now),
+                new SwarmHealthMeasurement(Hash('e'), 9, "episode", 1, 2, 6, now),
+            },
+            default);
+
+        var movies = await db.GetSwarmPeersForTmdbIdsAsync("movie", new[] { 1, 2, 3, 4 }, now.AddDays(-7), default);
+        var series = await db.GetSwarmPeersForTmdbIdsAsync("episode", new[] { 9 }, now.AddDays(-7), default);
+
+        Assert.Equal(new Dictionary<int, int> { [1] = 4, [2] = 0 }, movies);
+        Assert.Equal(6, series[9]);
+    }
+
+    [Fact]
     public async Task Worker_MeasuresDueCandidatesOncePerInfohash_AndStoresOnlyAnsweredOnes()
     {
         using var db = await NewDbAsync();
@@ -128,7 +151,7 @@ public sealed class SwarmHealthTests : IDisposable
         await InsertAvailabilityAsync(400, "episode", 1, 2, "available", Hash('f')); // same infohash
         await InsertAvailabilityAsync(302, "movie", -1, -1, "available", Hash('9'));
         var client = new FakeClient(new Dictionary<string, int> { [Hash('e')] = 14, [Hash('f')] = 0 });
-        var worker = NewWorker(db, client, new Mock<ILibraryManager>(MockBehavior.Strict).Object);
+        var worker = NewWorker(db, client, new FakeLibrary().Object);
 
         var stored = await worker.MeasureOnceAsync(Config(), default);
 
@@ -154,40 +177,151 @@ public sealed class SwarmHealthTests : IDisposable
         Assert.Empty(await db.GetSwarmPeersByTmdbAsync("movie", DateTimeOffset.UtcNow.AddDays(-1), default));
     }
 
+    [Theory]
+    [InlineData("movie_11", ScoredTitleKind.Measurable, 11)]
+    [InlineData("series_12", ScoredTitleKind.Measurable, 12)]
+    [InlineData("orphan_0123456789abcdef", ScoredTitleKind.Orphan, 0)]
+    [InlineData("orphanseries_0123456789abcdef", ScoredTitleKind.Orphan, 0)]
+    [InlineData("season_12_s01", ScoredTitleKind.NotScored, 0)]
+    [InlineData("episode_12_s01e02", ScoredTitleKind.NotScored, 0)]
+    [InlineData("orphanepisode_0123456789abcdef", ScoredTitleKind.NotScored, 0)]
+    [InlineData(null, ScoredTitleKind.NotScored, 0)]
+    [InlineData("tt12345", ScoredTitleKind.NotScored, 0)]
+    public void Classify_ScoresMovieSeriesAndOrphanTitlesOnly(string? externalId, ScoredTitleKind kind, int tmdb)
+        => Assert.Equal((kind, tmdb), SwarmHealthScore.Classify(externalId));
+
     [Fact]
-    public async Task Worker_Sync_WritesPeersOntoPhantomBaseItems_SkipsUnchanged()
+    public void TargetFor_OrphanIsUnmeasured_DeadBelowUnmeasuredBelowLive_NotScoredIsNull()
+    {
+        var peers = new Dictionary<int, int> { [1] = 7, [2] = 0 };
+        Assert.Equal(7f, SwarmHealthScore.TargetFor("movie_1", peers));
+        Assert.Equal(0f, SwarmHealthScore.TargetFor("series_2", peers));
+        Assert.Equal(SwarmHealthScore.UnmeasuredScore, SwarmHealthScore.TargetFor("movie_3", peers));
+        Assert.Equal(SwarmHealthScore.UnmeasuredScore, SwarmHealthScore.TargetFor("orphan_abc", peers));
+        Assert.Null(SwarmHealthScore.TargetFor("episode_1_s01e01", peers));
+        Assert.True(SwarmHealthScore.TargetFor("series_2", peers) < SwarmHealthScore.TargetFor("orphan_abc", peers));
+        Assert.True(SwarmHealthScore.TargetFor("orphan_abc", peers) < SwarmHealthScore.TargetFor("movie_1", peers));
+    }
+
+    [Fact]
+    public async Task Sync_SweepsWholeCatalogueInBoundedKeysetBatches_IncludingOrphansAndNullRatings()
     {
         using var db = await NewDbAsync();
         var now = DateTimeOffset.UtcNow;
         await db.UpsertSwarmHealthAsync(
             new[]
             {
-                new SwarmHealthMeasurement(Hash('a'), 11, "movie", -1, -1, 37, now),
-                new SwarmHealthMeasurement(Hash('b'), 12, "movie", -1, -1, 0, now),
+                new SwarmHealthMeasurement(Hash('a'), 5, "movie", -1, -1, 37, now),
+                new SwarmHealthMeasurement(Hash('b'), 6, "movie", -1, -1, 0, now),
+                new SwarmHealthMeasurement(Hash('c'), 9000, "episode", 1, 1, 3, now),
+                new SwarmHealthMeasurement(Hash('d'), 9000, "episode", 1, 2, 12, now),
             },
             default);
-        var live = new Movie { Id = Guid.NewGuid(), ExternalId = "movie_11" };
-        var dead = new Movie { Id = Guid.NewGuid(), ExternalId = "movie_12", CriticRating = 5f };
-        var unmeasured = new Movie { Id = Guid.NewGuid(), ExternalId = "movie_13" };
-        var already = new Movie { Id = Guid.NewGuid(), ExternalId = "movie_14", CriticRating = SwarmHealthScore.UnmeasuredScore };
-        var lib = new Mock<ILibraryManager>(MockBehavior.Loose);
-        lib.Setup(l => l.GetItemList(It.Is<InternalItemsQuery>(q => q.ChannelIds.Contains(ChannelIds.Movies))))
-            .Returns(new List<BaseItem> { live, dead, unmeasured, already });
-        lib.Setup(l => l.GetItemList(It.Is<InternalItemsQuery>(q => q.ChannelIds.Contains(ChannelIds.Shows))))
-            .Returns(new List<BaseItem>());
-        var updated = new List<BaseItem>();
-        lib.Setup(l => l.UpdateItemAsync(It.IsAny<BaseItem>(), It.IsAny<BaseItem>(), It.IsAny<ItemUpdateType>(), It.IsAny<CancellationToken>()))
-            .Callback<BaseItem, BaseItem, ItemUpdateType, CancellationToken>((i, _, _, _) => updated.Add(i))
-            .Returns(Task.CompletedTask);
-        var worker = NewWorker(db, new FakeClient(new Dictionary<string, int>()), lib.Object);
+        var lib = new FakeLibrary();
+        for (var i = 1; i <= 120; i++)
+        {
+            lib.Add(new Movie { Id = Guid.NewGuid(), ExternalId = "movie_" + i, ChannelId = ChannelIds.Movies, CriticRating = i % 3 == 0 ? 42f : null });
+        }
 
-        var written = await worker.SyncBaseItemsAsync(Config(), default);
+        for (var i = 0; i < 7; i++)
+        {
+            lib.Add(new Movie { Id = Guid.NewGuid(), ExternalId = "orphan_" + i.ToString("x16", System.Globalization.CultureInfo.InvariantCulture), ChannelId = ChannelIds.Movies });
+        }
 
-        Assert.Equal(3, written);
-        Assert.Equal(37f, live.CriticRating);
-        Assert.Equal(0f, dead.CriticRating);
-        Assert.Equal(SwarmHealthScore.UnmeasuredScore, unmeasured.CriticRating);
-        Assert.DoesNotContain(already, updated);
+        var series = new MediaBrowser.Controller.Entities.TV.Series { Id = Guid.NewGuid(), ExternalId = "series_9000", ChannelId = ChannelIds.Shows };
+        lib.Add(series);
+        var orphanSeries = new Folder { Id = Guid.NewGuid(), ExternalId = "orphanseries_00000000000000aa", ChannelId = ChannelIds.Shows };
+        lib.Add(orphanSeries);
+        var episode = new MediaBrowser.Controller.Entities.TV.Episode { Id = Guid.NewGuid(), ExternalId = "episode_9000_s01e01", ChannelId = ChannelIds.Shows, CriticRating = null };
+        lib.Add(episode);
+        var pager = new FakePager(lib);
+        var cfg = Config();
+        cfg.SwarmHealthSyncBatchSize = 50;
+        var worker = NewWorker(db, new FakeClient(new Dictionary<string, int>()), lib.Object, pager, () => cfg);
+
+        var steps = 0;
+        SwarmHealthWorker.SyncStepResult step;
+        do
+        {
+            step = await worker.SyncStepAsync(cfg, default);
+            Assert.InRange(step.Read, 0, cfg.SwarmHealthSyncBatchSize);
+            steps++;
+        }
+        while (!step.SweepCompleted && steps < 100);
+
+        Assert.True(step.SweepCompleted);
+        Assert.Equal(3, steps); // 129 rows at 50/step: ceil(129/50), crossing phases within a step's budget
+        Assert.All(pager.Calls, c => Assert.InRange(c.Limit, 1, cfg.SwarmHealthSyncBatchSize));
+        Assert.All(lib.Items.Where(i => i is Movie || i.ExternalId!.StartsWith("series_", StringComparison.Ordinal) || i.ExternalId!.StartsWith("orphanseries_", StringComparison.Ordinal)), i => Assert.NotNull(i.CriticRating));
+        Assert.Equal(37f, lib.ByExternal("movie_5").CriticRating);
+        Assert.Equal(0f, lib.ByExternal("movie_6").CriticRating);
+        Assert.Equal(SwarmHealthScore.UnmeasuredScore, lib.ByExternal("movie_7").CriticRating);
+        Assert.Equal(SwarmHealthScore.UnmeasuredScore, lib.ByExternal("movie_9").CriticRating); // stale 42 rewritten
+        Assert.Equal(SwarmHealthScore.UnmeasuredScore, lib.ByExternal("orphan_0000000000000003").CriticRating);
+        Assert.Equal(12f, series.CriticRating); // best episode swarm
+        Assert.Equal(SwarmHealthScore.UnmeasuredScore, orphanSeries.CriticRating);
+        Assert.Null(episode.CriticRating); // never a sweep partition
+        Assert.DoesNotContain(lib.Updated, i => i is MediaBrowser.Controller.Entities.TV.Episode);
+
+        // A second step right away is idle (sweep gap), never a re-scan.
+        var idle = await worker.SyncStepAsync(cfg, default);
+        Assert.Equal(0, idle.Read);
+    }
+
+    [Fact]
+    public async Task Sync_CancelledMidSweep_ResumesFromPersistedCursor_WithoutRereadingCommittedBatches()
+    {
+        using var db = await NewDbAsync();
+        var lib = new FakeLibrary();
+        for (var i = 1; i <= 100; i++)
+        {
+            lib.Add(new Movie { Id = Guid.NewGuid(), ExternalId = "movie_" + i, ChannelId = ChannelIds.Movies });
+        }
+
+        var cfg = Config();
+        cfg.SwarmHealthSyncBatchSize = 50;
+        var pager = new FakePager(lib);
+        var first = NewWorker(db, new FakeClient(new Dictionary<string, int>()), lib.Object, pager, () => cfg);
+        var step = await first.SyncStepAsync(cfg, default);
+        Assert.Equal(50, step.Read);
+        Assert.Equal(50, lib.Items.Count(i => i.CriticRating is not null));
+
+        // Cancellation before the next batch commits: nothing is written, cursor unchanged.
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => first.SyncStepAsync(cfg, cts.Token));
+        Assert.Equal(50, lib.Items.Count(i => i.CriticRating is not null));
+
+        // "Restart": a brand-new worker instance continues after the last committed id.
+        var resumedPager = new FakePager(lib);
+        var second = NewWorker(db, new FakeClient(new Dictionary<string, int>()), lib.Object, resumedPager, () => cfg);
+        var resumed = await second.SyncStepAsync(cfg, default);
+        Assert.Equal(50, resumed.Read); // only the 50 not yet committed
+        Assert.Equal(50, resumed.Written);
+        Assert.NotNull(resumedPager.Calls[0].After);
+        var tail = await second.SyncStepAsync(cfg, default); // exactly-full page: one empty read closes the phase
+        Assert.True(tail.SweepCompleted);
+        Assert.Equal(0, tail.Read);
+        Assert.All(lib.Items, i => Assert.Equal(SwarmHealthScore.UnmeasuredScore, i.CriticRating));
+    }
+
+    [Fact]
+    public async Task Measure_WritesThroughJustMeasuredTitles_ByDeterministicChannelItemId()
+    {
+        using var db = await NewDbAsync();
+        await InsertAvailabilityAsync(701, "movie", -1, -1, "available", Hash('e'));
+        await InsertAvailabilityAsync(702, "episode", 1, 1, "available", Hash('f'));
+        var lib = new FakeLibrary();
+        var movie = new Movie { Id = FakeLibrary.ChannelItemGuid("movie_701", ChannelIds.MoviesName, typeof(Movie)), ExternalId = "movie_701", ChannelId = ChannelIds.Movies };
+        var series = new MediaBrowser.Controller.Entities.TV.Series { Id = FakeLibrary.ChannelItemGuid("series_702", ChannelIds.ShowsName, typeof(MediaBrowser.Controller.Entities.TV.Series)), ExternalId = "series_702", ChannelId = ChannelIds.Shows };
+        lib.Add(movie);
+        lib.Add(series);
+        var worker = NewWorker(db, new FakeClient(new Dictionary<string, int> { [Hash('e')] = 250, [Hash('f')] = 0 }), lib.Object, new FakePager(lib), Config);
+
+        Assert.Equal(2, await worker.MeasureOnceAsync(Config(), default));
+
+        Assert.Equal(100f, movie.CriticRating);
+        Assert.Equal(0f, series.CriticRating);
     }
 
     [Fact]
@@ -250,7 +384,10 @@ public sealed class SwarmHealthTests : IDisposable
     };
 
     private static SwarmHealthWorker NewWorker(PhantomDb db, SwarmHealthClient client, ILibraryManager lib)
-        => new(db, client, lib, NullLogger<SwarmHealthWorker>.Instance, Config);
+        => NewWorker(db, client, lib, new FakePager(new FakeLibrary()), Config);
+
+    private static SwarmHealthWorker NewWorker(PhantomDb db, SwarmHealthClient client, ILibraryManager lib, IChannelScorePager pager, Func<PluginConfiguration> cfg)
+        => new(db, client, lib, pager, NullLogger<SwarmHealthWorker>.Instance, cfg, () => DateTimeOffset.UtcNow);
 
     private async Task<PhantomDb> NewDbAsync()
     {
@@ -301,6 +438,66 @@ public sealed class SwarmHealthTests : IDisposable
                 .Where(h => _answers.ContainsKey(h))
                 .ToDictionary(h => h, h => _answers[h], StringComparer.OrdinalIgnoreCase);
             return Task.FromResult(result);
+        }
+    }
+
+    /// <summary>In-memory stand-in for the persisted channel BaseItems + the ILibraryManager write path.</summary>
+    private sealed class FakeLibrary
+    {
+        private readonly Mock<ILibraryManager> _mock = new(MockBehavior.Strict);
+
+        public FakeLibrary()
+        {
+            _mock.Setup(l => l.GetItemById(It.IsAny<Guid>())).Returns<Guid>(id => Items.FirstOrDefault(i => i.Id == id)!);
+            _mock.Setup(l => l.GetNewItemId(It.IsAny<string>(), It.IsAny<Type>())).Returns<string, Type>(NewItemId);
+            _mock.Setup(l => l.UpdateItemsAsync(It.IsAny<IReadOnlyList<BaseItem>>(), It.IsAny<BaseItem>(), It.IsAny<ItemUpdateType>(), It.IsAny<CancellationToken>()))
+                .Returns<IReadOnlyList<BaseItem>, BaseItem, ItemUpdateType, CancellationToken>((items, _, _, ct) =>
+                {
+                    ct.ThrowIfCancellationRequested();
+                    Updated.AddRange(items);
+                    return Task.CompletedTask;
+                });
+        }
+
+        public List<BaseItem> Items { get; } = new();
+
+        public List<BaseItem> Updated { get; } = new();
+
+        public ILibraryManager Object => _mock.Object;
+
+        /// <summary>Same derivation as Jellyfin's LibraryManager.GetNewItemId (case-insensitive ids).</summary>
+        public static Guid NewItemId(string key, Type type)
+            => new(System.Security.Cryptography.MD5.HashData(Encoding.Unicode.GetBytes((type.FullName + key).ToLowerInvariant())));
+
+        public static Guid ChannelItemGuid(string externalId, string channelName, Type type) => NewItemId(externalId + channelName + "16", type);
+
+        public void Add(BaseItem item) => Items.Add(item);
+
+        public BaseItem ByExternal(string externalId) => Items.Single(i => i.ExternalId == externalId);
+    }
+
+    private sealed class FakePager : IChannelScorePager
+    {
+        private readonly FakeLibrary _lib;
+
+        public FakePager(FakeLibrary lib) => _lib = lib;
+
+        public List<(ChannelScorePhase Phase, Guid? After, int Limit)> Calls { get; } = new();
+
+        public string AccessPath => "fake";
+
+        public Task<IReadOnlyList<ChannelScoreRow>> NextPageAsync(ChannelScorePhase phase, Guid? afterId, int limit, CancellationToken ct)
+        {
+            ct.ThrowIfCancellationRequested();
+            Calls.Add((phase, afterId, limit));
+            IReadOnlyList<ChannelScoreRow> page = _lib.Items
+                .Where(i => i.ChannelId == phase.ChannelId && i.GetType().FullName == phase.ItemType)
+                .Where(i => afterId is null || string.CompareOrdinal(i.Id.ToString("D").ToUpperInvariant(), afterId.Value.ToString("D").ToUpperInvariant()) > 0)
+                .OrderBy(i => i.Id.ToString("D").ToUpperInvariant(), StringComparer.Ordinal)
+                .Take(limit)
+                .Select(i => new ChannelScoreRow(i.Id, i.ExternalId, i.CriticRating))
+                .ToList();
+            return Task.FromResult(page);
         }
     }
 

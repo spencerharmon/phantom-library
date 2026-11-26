@@ -22,6 +22,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SwarmHealthServiceUrl` is empty. Metrics: `phantom_swarm_health_*`.
 
 ### Fixed
+- Peers (DHT) score write-back now converges on the WHOLE Phantom catalogue
+  within one measurement cycle (p05-baseitem-writeback). The old sync wrote at
+  most 2000 BaseItems every 10 ticks, re-enumerated every channel item each
+  time and skipped gostream-only (non-TMDB) titles, so large catalogues kept
+  `CriticRating = NULL` — which PostgreSQL's DESC sort lists FIRST. The
+  `SwarmHealthWorker` now runs one bounded step of a resumable keyset sweep per
+  tick (`SwarmHealthSyncBatchSize`, default 500 rows, index seek on
+  `IX_BaseItems_Type_TopParentId_Id`; cursor in `plugin_meta`, so restarts and
+  cancellation resume), scores orphan movies/series as unmeasured (0.5), keeps
+  dead (0) below unmeasured below live, leaves seasons/episodes and every
+  non-Phantom item untouched, and writes just-measured titles through
+  immediately. Local score backfill only: the DHT service is still asked about
+  intent-bounded due candidates only. No schema change. Proof:
+  `scripts/tests/p05-baseitem-writeback.test.sh` (real PostgreSQL + Jellyfin).
 - PostgreSQL: real >= 2 GiB movie/episode sizes no longer fail with `22003
   integer out of range` (source candidates, selected file, availability
   candidate, magnet cache). Schema v23 is an additive expand: nullable BIGINT
