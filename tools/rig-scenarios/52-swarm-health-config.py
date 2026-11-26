@@ -163,7 +163,7 @@ def eventually(predicate, process, log, seconds=90):
 
 
 @contextlib.contextmanager
-def host(root, rig):
+def host(build, rig):
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
@@ -174,7 +174,7 @@ def host(root, rig):
                                        '<EnableSSDP>false</EnableSSDP><EnableUPnP>false</EnableUPnP>'
                                        '<LocalNetworkAddresses><string>127.0.0.1</string></LocalNetworkAddresses></NetworkConfiguration>')
     log = rig / 'host.log'
-    command = ['dotnet', str(root / 'jellyfin/Jellyfin.Server/bin/Release/net9.0/jellyfin.dll'),
+    command = ['dotnet', str(build / 'jellyfin/Jellyfin.Server/bin/Release/net9.0/jellyfin.dll'),
                '--datadir', str(rig / 'data'), '--configdir', str(config), '--cachedir', str(rig / 'cache'),
                '--logdir', str(rig / 'logs'), '--nowebclient', '--ffmpeg', shutil.which('ffmpeg') or 'ffmpeg']
     env = {k: v for k, v in os.environ.items() if not k.startswith(('PHANTOM_', 'JELLYFIN_', 'POSTGRES_'))}
@@ -206,7 +206,7 @@ def host(root, rig):
                 process.wait()
 
 
-def rig_tests(root, work):
+def rig_tests(root, work, build):
     received = []
 
     class Service(BaseHTTPRequestHandler):
@@ -240,9 +240,9 @@ def rig_tests(root, work):
             startup(root, work, cfg, values(endpoint))
             plugin_dir = rig / 'data/plugins' / PLUGIN
             plugin_dir.mkdir()
-            output = root / 'src' / PLUGIN / 'bin/Release/net9.0'
+            output = build / 'src' / PLUGIN / 'bin/Release/net9.0'
             # Include transitive plugin dependencies, not duplicate Jellyfin host assemblies.
-            host_output = root / 'jellyfin/Jellyfin.Server/bin/Release/net9.0'
+            host_output = build / 'jellyfin/Jellyfin.Server/bin/Release/net9.0'
             for dll in output.glob('*.dll'):
                 if not (host_output / dll.name).exists():
                     shutil.copy2(dll, plugin_dir / dll.name)
@@ -252,7 +252,7 @@ def rig_tests(root, work):
             for restart in range(2):
                 startup(root, work, cfg, values(endpoint))
                 received.clear()
-                with host(root, rig) as (base, token, process, log):
+                with host(build, rig) as (base, token, process, log):
                     loaded = request(base, f'/Plugins/{PLUGIN_ID}/Configuration', token=token)
                     assert loaded['SwarmHealthServiceUrl'] == endpoint, loaded
                     if not fresh:
@@ -286,7 +286,7 @@ def rig_tests(root, work):
             received.clear()
             with sqlite3.connect(cfg.parent / 'PhantomLibrary/phantom.db') as connection:
                 connection.execute('DELETE FROM swarm_health')
-            with host(root, rig) as (base, token, process, log):
+            with host(build, rig) as (base, token, process, log):
                 loaded = request(base, f'/Plugins/{PLUGIN_ID}/Configuration', token=token)
                 assert loaded['SwarmHealthServiceUrl'] == ''
                 if not fresh:
@@ -310,9 +310,11 @@ if __name__ == '__main__':
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--work', type=Path, required=True)
     parser.add_argument('--chart-only', action='store_true')
+    # Tree holding the built plugin + Jellyfin server; defaults to --root (in-place build).
+    parser.add_argument('--build-root', type=Path)
     args = parser.parse_args()
     if args.chart_only:
         chart_tests(args.root, args.work)
     else:
-        rig_tests(args.root, args.work)
+        rig_tests(args.root, args.work, args.build_root or args.root)
         print('ALL PASS: p05-swarm-health-config', flush=True)
