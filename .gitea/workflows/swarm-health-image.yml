@@ -1,0 +1,34 @@
+name: locked swarm-health image
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'tools/swarm-health/**'
+      - 'scripts/tests/*swarm*'
+      - 'tools/ci/swarm-health-image.sh'
+      - '.gitea/workflows/swarm-health-image.yml'
+  workflow_dispatch:
+jobs:
+  build-test-publish:
+    # Optional isolated CI capacity; the normal shared swarm runner is k8s.
+    runs-on: ["${{ vars.SWARM_HEALTH_RUNNER_LABEL || 'k8s' }}"]
+    container:
+      image: nixery.dev/shell/git/docker/python3@sha256:4e645994761b3c4fc20f2b3dda0a5dff1ddeec8a9b46d17baf002f0838f58306
+    steps:
+      - name: checkout exact source revision
+        env:
+          CHECKOUT_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          AUTH="$(printf 'x-access-token:%s' "$CHECKOUT_TOKEN" | base64 -w0)"
+          git -c "http.extraHeader=AUTHORIZATION: basic $AUTH" fetch --depth=1 origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: build locked image, offline HTTP and UDP, publish, pull digest and repeat
+        env:
+          REGISTRY_URL: ${{ vars.REGISTRY_URL }}
+          REGISTRY_USERNAME: ${{ vars.REGISTRY_USERNAME }}
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: ./tools/ci/swarm-health-image.sh

@@ -274,9 +274,8 @@ prowlarr:
 # Projects the plugin's PluginConfiguration.ProwlarrBaseUrl/ProwlarrApiKey into the deployed
 # Jellyfin.Plugin.PhantomLibrary.xml on the jellyfin-var-lib PVC, so the plugin's MagnetSelector
 # treats the in-cluster Prowlarr (rendered above) as a capable indexer for no-IMDB titles. Runs as
-# an idempotent init container (patches the existing XML in place; a fresh/never-configured install
-# still boots and writes the file itself, so the patch step tolerates the file being absent on
-# first boot and simply skips). The API key is sourced from a k8s Secret — NEVER inline in
+# an idempotent pre-start XML merge (fresh PVCs get a minimal PluginConfiguration; retained PVCs
+# reconcile only managed fields). The API key is sourced from a k8s Secret — NEVER inline in
 # values/git — materialised out of band by the flux cross-dep `phantom-library-prowlarr-apikey-
 # secret` (data key `ProwlarrApiKey`). Leave `apiKeySecretName` empty to skip wiring entirely (the
 # plugin then behaves exactly as before: Torrentio-only, ProwlarrBaseUrl/ProwlarrApiKey stay empty).
@@ -288,6 +287,19 @@ prowlarrConfig:
   # flux repo). Empty disables the init container (no Prowlarr wiring rendered).
   apiKeySecretName: "prowlarr-apikey"
   apiKeySecretKey: "ProwlarrApiKey"
+
+# ---------------------------------------------------- managed plugin configuration --
+pluginConfigMerge:
+  # Python stdlib XML merge replaces the old Prowlarr-only sed init path.
+  image: "docker.io/library/python:3.12-slim@sha256:191083cdf6c7bda8c76158983163ead5d5cf7b77cf3033e805bb0f5296f51b4b"
+swarmHealth:
+  # false = unmanaged: leave any retained PVC value untouched; fresh defaults remain disabled.
+  # true = reconcile SwarmHealthServiceUrl on EVERY start. Values changes roll the Pod.
+  enabled: false
+  # Runtime HTTP(S) base URL, e.g. http://swarm-health.example.com:8095.
+  # Empty with enabled=true explicitly clears/disables. No auth, query, fragment or whitespace.
+  # Invalid input / malformed XML fails init without replacing config or logging secrets.
+  serviceUrl: ""
 
 # ------------------------------------------------------------------------ warmup cache --
 # SINGLE SOURCE OF TRUTH for the warmup sizing. gostream enforces quotaGb as GiB (quota =

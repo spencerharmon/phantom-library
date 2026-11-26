@@ -1,0 +1,11 @@
+{{- if and .Values.components.workload (or .Values.prowlarrConfig.apiKeySecretName .Values.swarmHealth.enabled) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "phantom-library.fullname" . }}-plugin-config
+  labels:
+    {{- include "phantom-library.labels" . | nindent 4 }}
+data:
+  merge-plugin-config.py: |
+{{ .Files.Get "files/merge-plugin-config.py" | indent 4 }}
+{{- end }}

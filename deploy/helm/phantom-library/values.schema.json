@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "swarmHealth": {
+      "type": "object",
+      "required": ["enabled", "serviceUrl"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "serviceUrl": {"type": "string"}
+      }
+    },
+    "pluginConfigMerge": {
+      "type": "object",
+      "required": ["image"],
+      "properties": {
+        "image": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}
