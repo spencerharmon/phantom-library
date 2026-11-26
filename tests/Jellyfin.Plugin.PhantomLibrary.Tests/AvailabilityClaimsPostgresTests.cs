@@ -33,7 +33,10 @@ public sealed class AvailabilityClaimsPostgresTests(ITestOutputHelper output)
 
     private async Task<object?> Sql(string sql)
     {
-        await using var command = new NpgsqlCommand(sql, _connection) { CommandTimeout = 600 };
+        // Fixture seeding and clone rehearsal touch 4M rows on shared CI disk.
+        // This is NOT the claim budget: every actual claim EXPLAIN below still
+        // unconditionally rejects >=5ms, including physical reads, without retry.
+        await using var command = new NpgsqlCommand(sql, _connection) { CommandTimeout = 1200 };
         return await command.ExecuteScalarAsync();
     }
 
