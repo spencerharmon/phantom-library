@@ -607,8 +607,9 @@
  * the BaseItem CriticRating (live: peers capped at 100, unmeasured: 0.5,
  * dead: 0), because the web list view only sorts by built-in fields. This
  * script makes that legible:
- *   - on the Phantom Movies / Phantom Shows channel pages, the "Critic Rating"
- *     sort option and the "Sort by" button read "Peers (DHT)";
+ *   - on the Phantom Movies / Phantom Shows channel pages, the critic-rating
+ *     sort option ("Critics rating" in en-us) and the "Sort by" button read
+ *     "Peers (DHT)";
  *   - on a phantom item's detail page (one the badge overlay above marked),
  *     the critic-rating tomato is replaced by "N peers" (hidden when unmeasured).
  */
@@ -616,16 +617,22 @@
     'use strict';
 
     var CHANNELS = ['80089d10394fb545b5e4d7d56a872393', '40ab6e9af516a84f46dcea7140855d88'];
-    var FROM = 'Critic Rating';
+    // jellyfin-web en-us: CriticRating = "Critics rating", OptionCriticRating = "Critics Rating".
+    var FROM = /Critics?\s+[Rr]ating/g;
     var TO = 'Peers (DHT)';
     var DONE_ATTR = 'data-phantom-peers';
+
+    var TITLES = ['Phantom Movies', 'Phantom Shows'];
 
     function onPhantomChannelPage() {
         var h = (window.location.hash || '').toLowerCase().replace(/-/g, '');
         for (var i = 0; i < CHANNELS.length; i++) {
             if (h.indexOf(CHANNELS[i]) !== -1) return true;
         }
-        return false;
+        // Fallback: the page header names the channel.
+        var title = document.querySelector('.pageTitle, .headerTitle');
+        var text = title ? (title.textContent || '').trim() : '';
+        return TITLES.indexOf(text) !== -1;
     }
 
     function relabelSort(root) {
@@ -633,9 +640,11 @@
         var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
         var node;
         while ((node = walker.nextNode())) {
-            if (node.nodeValue && node.nodeValue.indexOf(FROM) !== -1) {
-                node.nodeValue = node.nodeValue.split(FROM).join(TO);
+            if (node.nodeValue && FROM.test(node.nodeValue)) {
+                FROM.lastIndex = 0;
+                node.nodeValue = node.nodeValue.replace(FROM, TO);
             }
+            FROM.lastIndex = 0;
         }
     }
 

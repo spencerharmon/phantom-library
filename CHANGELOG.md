@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- "Peers (DHT)" sort label: jellyfin-web's en-us string is "Critics rating" (not
+  "Critic Rating"), so the relabel never matched; it now matches either form and
+  also recognises the Phantom channel page by its header. The swarm-health
+  BaseItem sync now converges the whole catalogue in one pass and writes
+  orphan/non-TMDB channel items as unmeasured, so no NULL rating sorts first.
+
 ### Added
 - Helm chart 2.13.0: opt-in `swarmHealth.enabled` / `serviceUrl` durably manage
   `SwarmHealthServiceUrl` before every plugin boot, on retained and fresh PVCs.

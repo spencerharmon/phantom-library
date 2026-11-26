@@ -36,8 +36,12 @@ public sealed class SwarmHealthWorker : IHostedService, IDisposable
     /// <summary>BaseItem sync cadence, in measurement ticks.</summary>
     internal const int SyncEveryTicks = 10;
 
-    /// <summary>Upper bound on BaseItem writes per sync pass (bounds write bursts).</summary>
-    internal const int MaxBaseItemWritesPerSync = 2000;
+    /// <summary>
+    /// Upper bound on BaseItem writes per sync pass. Large enough that a whole catalogue converges in
+    /// one pass: an unwritten item has a NULL CriticRating, which Postgres sorts FIRST on a descending
+    /// "Peers (DHT)" sort.
+    /// </summary>
+    internal const int MaxBaseItemWritesPerSync = 50000;
 
     private readonly PhantomDb _db;
     private readonly SwarmHealthClient _client;
@@ -210,12 +214,13 @@ public sealed class SwarmHealthWorker : IHostedService, IDisposable
                     break;
                 }
 
-                if (!ChannelItemId.TryParse(item.ExternalId, out var id) || id.TmdbId is not { } tmdb)
-                {
-                    continue;
-                }
-
-                var target = SwarmHealthScore.ToCriticRating(peersByTmdb.TryGetValue(tmdb, out var p) ? p : null);
+                // Orphan/non-TMDB channel items have no measurable candidate: write them as
+                // unmeasured so they never sit on top of the descending sort as NULL.
+                int? peers = ChannelItemId.TryParse(item.ExternalId, out var id) && id.TmdbId is { } tmdb
+                    && peersByTmdb.TryGetValue(tmdb, out var p)
+                        ? p
+                        : null;
+                var target = SwarmHealthScore.ToCriticRating(peers);
                 if (SwarmHealthScore.SameRating(item.CriticRating, target))
                 {
                     continue;

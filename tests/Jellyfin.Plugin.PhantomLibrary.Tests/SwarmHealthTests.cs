@@ -170,9 +170,10 @@ public sealed class SwarmHealthTests : IDisposable
         var dead = new Movie { Id = Guid.NewGuid(), ExternalId = "movie_12", CriticRating = 5f };
         var unmeasured = new Movie { Id = Guid.NewGuid(), ExternalId = "movie_13" };
         var already = new Movie { Id = Guid.NewGuid(), ExternalId = "movie_14", CriticRating = SwarmHealthScore.UnmeasuredScore };
+        var orphan = new Movie { Id = Guid.NewGuid(), ExternalId = "orphan_0123456789abcdef" };
         var lib = new Mock<ILibraryManager>(MockBehavior.Loose);
         lib.Setup(l => l.GetItemList(It.Is<InternalItemsQuery>(q => q.ChannelIds.Contains(ChannelIds.Movies))))
-            .Returns(new List<BaseItem> { live, dead, unmeasured, already });
+            .Returns(new List<BaseItem> { live, dead, unmeasured, already, orphan });
         lib.Setup(l => l.GetItemList(It.Is<InternalItemsQuery>(q => q.ChannelIds.Contains(ChannelIds.Shows))))
             .Returns(new List<BaseItem>());
         var updated = new List<BaseItem>();
@@ -183,10 +184,11 @@ public sealed class SwarmHealthTests : IDisposable
 
         var written = await worker.SyncBaseItemsAsync(Config(), default);
 
-        Assert.Equal(3, written);
+        Assert.Equal(4, written);
         Assert.Equal(37f, live.CriticRating);
         Assert.Equal(0f, dead.CriticRating);
         Assert.Equal(SwarmHealthScore.UnmeasuredScore, unmeasured.CriticRating);
+        Assert.Equal(SwarmHealthScore.UnmeasuredScore, orphan.CriticRating); // never left NULL (sorts first)
         Assert.DoesNotContain(already, updated);
     }
 
