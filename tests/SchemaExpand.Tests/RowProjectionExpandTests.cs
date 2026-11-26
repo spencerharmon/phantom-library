@@ -379,6 +379,22 @@ public sealed class RowProjectionExpandTests(ITestOutputHelper output) : IAsyncL
     }
 
     [Fact]
+    public async Task FullBigintLiteralRangeDoesNotBreakLegacyWrites()
+    {
+        var projection = new AdditiveRowProjection("bounds", 1, "movie",
+            new RowProjectionColumn("minimum", long.MinValue, E.Number(long.MinValue)),
+            new RowProjectionColumn("maximum", long.MaxValue, E.Number(long.MaxValue)));
+        Assert.True(await SchemaExpandMigrator.ApplyAsync(_db, "bounds", Array.Empty<string>(), new[] { projection }, default));
+        Assert.Equal(long.MinValue, await ScalarAsync("SELECT minimum FROM movie WHERE id=1"));
+        Assert.Equal(long.MaxValue, await ScalarAsync("SELECT maximum FROM movie WHERE id=1"));
+        await using var tx = await _db.BeginTransactionAsync();
+        await SqlAsync("INSERT INTO movie (id) VALUES (10)");
+        Assert.Equal(long.MinValue, await ScalarAsync("SELECT minimum FROM movie WHERE id=10"));
+        Assert.Equal(long.MaxValue, await ScalarAsync("SELECT maximum FROM movie WHERE id=10"));
+        await tx.RollbackAsync();
+    }
+
+    [Fact]
     public async Task TransactionOnlyProjectionTreatsSqlLikeTextAsData()
     {
         const string literal = "unknown'; UPDATE movie SET priority=999; -- $$";

@@ -33,7 +33,9 @@ public sealed class RowExpression
     public static RowExpression TextColumn(string name) => Column(name, Kind.Text, "text");
 
     /// <summary>A literal bigint value.</summary>
-    public static RowExpression Number(long value) => new($"({value.ToString(CultureInfo.InvariantCulture)}::pg_catalog.int8)", Kind.Number, Array.Empty<(string, Kind)>());
+    // Quote the complete signed literal before casting: -9223372036854775808::int8
+    // otherwise casts its positive magnitude first and overflows on a legacy write.
+    public static RowExpression Number(long value) => new($"('{value.ToString(CultureInfo.InvariantCulture)}'::pg_catalog.int8)", Kind.Number, Array.Empty<(string, Kind)>());
 
     /// <summary>A literal text value (never executable SQL).</summary>
     public static RowExpression Text(string value)

@@ -48,7 +48,7 @@ import xml.etree.ElementTree as ET
 ns = {'t': 'http://microsoft.com/schemas/VisualStudio/TeamTest/2010'}
 root = ET.parse(sys.argv[1]).getroot()
 results = root.findall('.//t:UnitTestResult', ns)
-expected = {'ConcurrentIndexExpandTests': 35, 'SchemaExpandMigratorPostgresTests': 12, 'RowProjectionExpandTests': 37}
+expected = {'ConcurrentIndexExpandTests': 35, 'SchemaExpandMigratorPostgresTests': 12, 'RowProjectionExpandTests': 38}
 for cls, count in expected.items():
     selected = [r for r in results if cls + '.' in r.attrib['testName']]
     assert len(selected) == count, (cls, count, len(selected))

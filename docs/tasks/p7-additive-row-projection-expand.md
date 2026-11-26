@@ -104,8 +104,8 @@ protocol; malicious changes to ownership metadata are not a supported second eng
 Requires .NET 9 + Python 3 and rootless Podman (provisions pinned disposable
 PostgreSQL 16.16) or `PHANTOM_TEST_POSTGRES_DSN` for an isolated fixture server.
 It compiles the actual production executor files, not a mock. Missing database,
-skipped test, unexpected count or nonzero exit fails. **84 executed / 84 passed**
-is required: 37 projection cases, all 35 existing concurrent-index/refusal cases,
+skipped test, unexpected count or nonzero exit fails. **85 executed / 85 passed**
+is required: 38 projection cases, all 35 existing concurrent-index/refusal cases,
 and all 12 unchanged legacy helper tests. The old harness still runs its original
 47 cases separately, with unchanged assertions and exact accounting.
 
@@ -113,7 +113,7 @@ Coverage: movie/episode old/new INSERT, upsert, lease acquisition/completion,
 priority/status/checked_at transitions, NULL/future/expired leases, output spoofing,
 unrelated updates, defaults/relfilenode/legacy counts/checksums/ctid/xmin unchanged,
 fresh-vs-expanded shape, replay/OIDs, raw-helper rejection of legitimate compiled
-projection, literal SQL-like data safety, conflicting/external/future definitions,
+projection, full bigint literal range and SQL-like text data safety, conflicting/external/future definitions,
 missing/disabled/moved triggers and function/default drift, atomic prefix rollback,
 cancellation inside prefix and suffix, backend loss, racing colors/cancelled waiter,
 final-suffix drift detection and owned invalid concurrent-index recovery.
