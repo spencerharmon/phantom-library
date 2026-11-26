@@ -139,6 +139,11 @@ optional skip/continue-on-error. Actions service aliases do not resolve on this
 runner's host network, so CI deliberately uses the same random-port container
 lifecycle tested locally rather than a fixed host-global PostgreSQL port. It
 uploads evidence even on failure and runs for main, PRs, manual dispatch and the
-implementation branch. It does not build or flip a production image.
+implementation branch. Manual dispatch accepts `runner_label` (default `k8s`)
+so an owned disposable runner can execute this same mandatory check without
+waiting behind or disturbing unrelated CI. This changes only scheduling, never
+the check, backend or assertions. The runner must supply the same Docker/socket
+and daemon-loopback networking contract above. It does not build or flip a
+production image.
 
 No operator deployment steps are needed: this changes test infrastructure only.

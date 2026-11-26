@@ -4,10 +4,16 @@ on:
     branches: [main, bee-p0-postgres-playback-parity-rig]
   pull_request:
   workflow_dispatch:
+    inputs:
+      runner_label:
+        description: 'Runner label (an owned disposable runner may isolate a manual CI check)'
+        required: false
+        default: k8s
+        type: string
 
 jobs:
   playback:
-    runs-on: [k8s]
+    runs-on: ["${{ inputs.runner_label || 'k8s' }}"]
     timeout-minutes: 45
     container:
       image: mcr.microsoft.com/dotnet/sdk:9.0.305-noble
