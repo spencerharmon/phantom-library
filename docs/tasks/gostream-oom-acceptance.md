@@ -93,6 +93,17 @@ ownership disagreement produces `DRIFT_MISMATCH` (exit 3); an unbound reconciler
 or missing revision cannot be `observed` or enable `DRIFT_MATCH` (exit 0).
 Otherwise unobservable evidence produces `DRIFT_INCOMPLETE` (exit 2).
 
+Unreadable or malformed optional `--flux` input (including invalid JSON, duplicate
+keys, wrong kind, or invalid status/revision types) is isolated to the Flux
+receipt. Its state and binding remain `unobservable`, with a Flux-local `reason`
+(limited to 240 characters), and no partial revision/ownership proof is published.
+Independent env, image, and process-bound config observations remain in the
+report: any established mismatch still yields `DRIFT_MISMATCH`/3; otherwise the
+result is `DRIFT_INCOMPLETE`/2, never `DRIFT_MATCH`/0. Missing Flux input,
+unobservable ownership, and absent/blank revisions also include reasons. Valid
+foreign ownership still yields mismatch/3. Required Deployment/expected-tuning
+validation remains global and fail-closed (`INCOMPLETE`/2).
+
 Binding plus a retained revision is **not** proof of a ready/current reconcile,
 loaded process configuration, or rollout. Missing config remains incomplete,
 and `rollout_at` is always null. Revision observation retains the existing
@@ -108,6 +119,9 @@ and the existing drift, acceptance, and pre-rollout suites. Run
 and malformed/stale/foreign evidence regressions. Run
 `./scripts/tests/gostream-drift-field-isolation.test.sh` for independent field
 evidence in both directions, including raw lossy numbers and binding controls.
+Run `./scripts/tests/gostream-drift-optional-flux-isolation.test.sh` for optional
+Flux parse/read failures combined with independent drift and required-input
+fail-closed controls.
 
 ## Pre-Rollout Diagnostics
 

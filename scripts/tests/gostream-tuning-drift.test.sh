@@ -61,7 +61,8 @@ run('foreign namespace', 2, 'INCOMPLETE', dict(full, deployment=d), contains=('f
 d = json.loads(json.dumps(deployment)); d['metadata']['name'] = 'other'
 run('foreign name', 2, 'INCOMPLETE', dict(full, deployment=d), contains=('foreign',))
 run('malformed deployment JSON', 2, 'INCOMPLETE', dict(full, deployment='{not json'))
-run('malformed flux kind', 2, 'INCOMPLETE', dict(full, flux={'kind': 'ConfigMap'}))
+run('malformed flux kind', 2, 'DRIFT_INCOMPLETE', dict(full, flux={'kind': 'ConfigMap'}),
+    contains=('"binding": "unobservable"', 'unusable Flux evidence: expected Flux Kustomization/HelmRelease'))
 d = json.loads(json.dumps(deployment))
 d['spec']['template']['spec']['containers'][0]['image'] = 'example.com/stream:v1'
 run('image mismatch', 3, 'DRIFT_MISMATCH', dict(full, deployment=d))

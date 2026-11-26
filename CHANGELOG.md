@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Preserve independent tuning drift when optional offline Flux evidence is
+  malformed or unreadable. Drift reports retain env/image/process-bound config
+  observations and a Flux-local reason: any mismatch exits 3, otherwise incomplete
+  exits 2. Required-input, ownership, and exact-number checks stay strict. No
+  deployment or restart; see the [drift guide](docs/tasks/gostream-oom-acceptance.md#tuning-drift).
 - Preserve independent loaded-config fields in offline gostream drift reports:
   after process binding, a missing or invalid sibling no longer hides a valid
   match or mismatch. Whole-receipt and ownership failures still invalidate all
