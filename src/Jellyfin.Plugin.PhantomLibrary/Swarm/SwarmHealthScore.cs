@@ -6,6 +6,19 @@ using MediaBrowser.Controller.Channels;
 
 namespace Jellyfin.Plugin.PhantomLibrary.Swarm;
 
+/// <summary>How the BaseItem score sweep treats a persisted channel item (p05-baseitem-writeback).</summary>
+public enum ScoredTitleKind
+{
+    /// <summary>Not a movie/series title (season, episode, unknown): never written.</summary>
+    NotScored,
+
+    /// <summary>A TMDB-backed movie/series title: scored from its fresh measurement.</summary>
+    Measurable,
+
+    /// <summary>A gostream-only title without a TMDB id: always the unmeasured score.</summary>
+    Orphan,
+}
+
 /// <summary>
 /// Pure swarm-health ranking rules (ROI Priority 0.5).
 ///
@@ -35,6 +48,61 @@ public static class SwarmHealthScore
             <= 0 => 0f,
             _ => Math.Min(dhtPeers.Value, MaxScore),
         };
+
+    /// <summary>ExternalId prefix of a gostream-only (no TMDB match) series folder in the Shows channel.</summary>
+    public const string OrphanSeriesPrefix = "orphanseries_";
+
+    /// <summary>
+    /// p05-baseitem-writeback: which persisted channel BaseItem carries a Peers score.
+    /// Movie (<c>movie_&lt;tmdb&gt;</c>) and series (<c>series_&lt;tmdb&gt;</c>) titles are
+    /// <see cref="ScoredTitleKind.Measurable"/> by TMDB id; orphan movies
+    /// (<c>orphan_&lt;hash&gt;</c>) and orphan series folders (<c>orphanseries_&lt;hash&gt;</c>)
+    /// have no TMDB id and therefore no candidate to measure — they are
+    /// <see cref="ScoredTitleKind.Orphan"/> and always score <see cref="UnmeasuredScore"/>.
+    /// Seasons, episodes and anything unparseable are <see cref="ScoredTitleKind.NotScored"/>
+    /// and must be left untouched.
+    /// </summary>
+    public static (ScoredTitleKind Kind, int TmdbId) Classify(string? externalId)
+    {
+        if (string.IsNullOrEmpty(externalId))
+        {
+            return (ScoredTitleKind.NotScored, 0);
+        }
+
+        if (externalId.StartsWith(OrphanSeriesPrefix, StringComparison.Ordinal))
+        {
+            return (ScoredTitleKind.Orphan, 0);
+        }
+
+        if (!ChannelItemId.TryParse(externalId, out var id))
+        {
+            return (ScoredTitleKind.NotScored, 0);
+        }
+
+        return id.Kind switch
+        {
+            ChannelItemId.KindMovie or ChannelItemId.KindSeries when id.TmdbId is { } tmdb => (ScoredTitleKind.Measurable, tmdb),
+            ChannelItemId.KindOrphan => (ScoredTitleKind.Orphan, 0),
+            _ => (ScoredTitleKind.NotScored, 0),
+        };
+    }
+
+    /// <summary>
+    /// Target CriticRating for a persisted channel row, or null when the row is not a
+    /// scored title (left untouched). <paramref name="peersByTmdb"/> holds the best fresh
+    /// measurement per TMDB id (series already aggregated over their episodes).
+    /// </summary>
+    public static float? TargetFor(string? externalId, IReadOnlyDictionary<int, int> peersByTmdb)
+    {
+        ArgumentNullException.ThrowIfNull(peersByTmdb);
+        var (kind, tmdb) = Classify(externalId);
+        return kind switch
+        {
+            ScoredTitleKind.Measurable => ToCriticRating(peersByTmdb.TryGetValue(tmdb, out var p) ? p : null),
+            ScoredTitleKind.Orphan => UnmeasuredScore,
+            _ => null,
+        };
+    }
 
     /// <summary>True when the stored rating already equals the target (float-tolerant).</summary>
     public static bool SameRating(float? current, float target)
