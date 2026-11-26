@@ -53,6 +53,10 @@ spec:
       {{- include "phantom-library.workloadSelector" . | nindent 6 }}
   template:
     metadata:
+      {{- if or .Values.prowlarrConfig.apiKeySecretName .Values.swarmHealth.enabled }}
+      annotations:
+        checksum/plugin-config-merge: {{ .Files.Get "files/merge-plugin-config.py" | sha256sum }}
+      {{- end }}
       labels:
         {{- include "phantom-library.workloadSelector" . | nindent 8 }}
         app.kubernetes.io/part-of: phantom-library
@@ -69,46 +73,35 @@ spec:
         {{- end }}
       imagePullSecrets:
         - name: {{ .Values.imagePullSecret }}
-      {{- if .Values.prowlarrConfig.apiKeySecretName }}
+      {{- if or .Values.prowlarrConfig.apiKeySecretName .Values.swarmHealth.enabled }}
       initContainers:
-        # Project prowlarrConfig.baseUrl/the Secret-sourced API key into the plugin's persisted
-        # Jellyfin.Plugin.PhantomLibrary.xml (jellyfin-var-lib PVC) BEFORE the workload container
-        # starts, so MagnetSelector/ProwlarrClient see Prowlarr as configured/enabled from boot.
-        # Idempotent + safe on every restart: enforces these two fields to the chart's values every
-        # start (same pattern as PHANTOM_POSTGRES_* env overrides above — the chart is the source of
-        # truth for THESE two fields only; every other plugin setting is left untouched). No-ops
-        # quietly if the config file does not exist yet (a brand-new PVC before Jellyfin's first
-        # boot has written its defaults) — the NEXT restart after that first boot picks it up.
-        - name: wire-prowlarr-config
-          image: docker.io/library/busybox:1.36
-          command: ["sh", "-c"]
-          args:
-            - |
-              set -eu
-              cfg=/var/lib/jellyfin/plugins/configurations/Jellyfin.Plugin.PhantomLibrary.xml
-              if [ ! -f "$cfg" ]; then
-                echo "wire-prowlarr-config: $cfg not present yet (first boot) — skipping, will apply on next restart"
-                exit 0
-              fi
-              base_url="{{ .Values.prowlarrConfig.baseUrl }}"
-              api_key="$(cat /prowlarr-secret/{{ .Values.prowlarrConfig.apiKeySecretKey }})"
-              if grep -q '<ProwlarrBaseUrl>' "$cfg"; then
-                sed -i "s#<ProwlarrBaseUrl>.*</ProwlarrBaseUrl>#<ProwlarrBaseUrl>${base_url}</ProwlarrBaseUrl>#" "$cfg"
-              else
-                sed -i "s#</PluginConfiguration>#  <ProwlarrBaseUrl>${base_url}</ProwlarrBaseUrl>\n</PluginConfiguration>#" "$cfg"
-              fi
-              if grep -q '<ProwlarrApiKey>' "$cfg"; then
-                sed -i "s#<ProwlarrApiKey>.*</ProwlarrApiKey>#<ProwlarrApiKey>${api_key}</ProwlarrApiKey>#" "$cfg"
-              else
-                sed -i "s#</PluginConfiguration>#  <ProwlarrApiKey>${api_key}</ProwlarrApiKey>\n</PluginConfiguration>#" "$cfg"
-              fi
-              echo "wire-prowlarr-config: ProwlarrBaseUrl/ProwlarrApiKey set in $cfg"
+        # One pre-start XML merge for managed plugin fields, on fresh AND retained PVCs.
+        - name: wire-plugin-config
+          image: {{ .Values.pluginConfigMerge.image | quote }}
+          command: ["python3", "/plugin-config/merge-plugin-config.py"]
+          env:
+            {{- if .Values.swarmHealth.enabled }}
+            # Empty string explicitly disables the service; absent env leaves PVC config alone.
+            - name: PHANTOM_SWARM_HEALTH_SERVICE_URL
+              value: {{ .Values.swarmHealth.serviceUrl | quote }}
+            {{- end }}
+            {{- if .Values.prowlarrConfig.apiKeySecretName }}
+            - name: PHANTOM_PROWLARR_BASE_URL
+              value: {{ .Values.prowlarrConfig.baseUrl | quote }}
+            - name: PHANTOM_PROWLARR_API_KEY_FILE
+              value: {{ printf "/prowlarr-secret/%s" .Values.prowlarrConfig.apiKeySecretKey | quote }}
+            {{- end }}
           volumeMounts:
             - name: jellyfin-var-lib
               mountPath: /var/lib/jellyfin
+            - name: plugin-config-merge
+              mountPath: /plugin-config
+              readOnly: true
+            {{- if .Values.prowlarrConfig.apiKeySecretName }}
             - name: prowlarr-secret
               mountPath: /prowlarr-secret
               readOnly: true
+            {{- end }}
       {{- end }}
       containers:
         # ----- combined gostream + Jellyfin (one mount namespace; FUSE producer + consumer) -----
@@ -283,6 +276,11 @@ spec:
             secretName: {{ .Values.configSecretName }}
         - name: plugin-preload
           emptyDir: {}
+        {{- if or .Values.prowlarrConfig.apiKeySecretName .Values.swarmHealth.enabled }}
+        - name: plugin-config-merge
+          configMap:
+            name: {{ include "phantom-library.fullname" . }}-plugin-config
+        {{- end }}
         {{- if .Values.prowlarrConfig.apiKeySecretName }}
         - name: prowlarr-secret
           secret:
