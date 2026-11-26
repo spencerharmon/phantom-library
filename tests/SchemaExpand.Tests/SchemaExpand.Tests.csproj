@@ -15,6 +15,8 @@
     <Compile Include="../../src/Jellyfin.Plugin.PhantomLibrary/State/Db/SchemaExpandMigrator.cs" Link="SchemaExpandMigrator.cs" />
     <Compile Include="../../src/Jellyfin.Plugin.PhantomLibrary/State/Db/ExpandIndex.cs" Link="ExpandIndex.cs" />
     <Compile Include="../../src/Jellyfin.Plugin.PhantomLibrary/State/Db/ConcurrentIndexExpand.cs" Link="ConcurrentIndexExpand.cs" />
+    <Compile Include="../../src/Jellyfin.Plugin.PhantomLibrary/State/Db/AdditiveRowProjection.cs" Link="AdditiveRowProjection.cs" />
+    <Compile Include="../../src/Jellyfin.Plugin.PhantomLibrary/State/Db/RowProjectionExpand.cs" Link="RowProjectionExpand.cs" />
     <Compile Include="../Jellyfin.Plugin.PhantomLibrary.Tests/SchemaExpandMigratorPostgresTests.cs" Link="SchemaExpandMigratorPostgresTests.cs" />
   </ItemGroup>
 </Project>

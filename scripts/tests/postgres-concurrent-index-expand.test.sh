@@ -40,6 +40,7 @@ export PHANTOM_TEST_POSTGRES_REQUIRED=1 MSBUILDDISABLENODEREUSE=1 DOTNET_CLI_TEL
 # Compile the production helper files directly, plus its unchanged legacy tests.
 # No Jellyfin clone/patch or second mock implementation is needed for this substrate.
 dotnet test "$ROOT/tests/SchemaExpand.Tests/SchemaExpand.Tests.csproj" \
+    --filter 'FullyQualifiedName~ConcurrentIndexExpandTests|FullyQualifiedName~SchemaExpandMigratorPostgresTests' \
     -p:UseSharedCompilation=false --logger 'trx;LogFileName=expand.trx' \
     --logger 'console;verbosity=normal' --results-directory "$RESULTS" 2>&1 | tee "$RESULTS/dotnet.log"
 python3 - "$RESULTS/expand.trx" <<'PY'

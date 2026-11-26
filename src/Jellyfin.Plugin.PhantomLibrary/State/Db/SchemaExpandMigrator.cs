@@ -126,7 +126,43 @@ public static class SchemaExpandMigrator
         // Classification and execution must see identical SQL, even for mutable inputs.
         var snapshot = statements.ToArray();
         EnsureAdditiveOnly(snapshot);
-        return ConcurrentIndexExpand.ApplyAsync(connection, migrationName, snapshot, ct);
+        return ConcurrentIndexExpand.ApplyAsync(connection, migrationName, snapshot, Array.Empty<AdditiveRowProjection>(), ct);
+    }
+
+    /// <summary>
+    /// Applies closed row projections in the same transactional prefix as literal
+    /// columns, before any index build. Existing raw-SQL grammar is unchanged.
+    /// </summary>
+    /// <param name="connection">Open caller connection outside a transaction.</param>
+    /// <param name="migrationName">Stable, immutable expand identity.</param>
+    /// <param name="statements">Existing additive SQL prefix and concurrent suffix.</param>
+    /// <param name="projections">Closed, versioned definitions introducing only new columns.</param>
+    /// <param name="ct">Cancellation bounds locks, DDL and builds.</param>
+    /// <returns>True on new apply/repair, false on verified replay.</returns>
+    public static Task<bool> ApplyAsync(NpgsqlConnection connection, string migrationName, IReadOnlyList<string> statements, IReadOnlyList<AdditiveRowProjection> projections, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentException.ThrowIfNullOrWhiteSpace(migrationName);
+        ArgumentNullException.ThrowIfNull(statements);
+        ArgumentNullException.ThrowIfNull(projections);
+        var snapshot = statements.ToArray();
+        var rows = projections.ToArray();
+        EnsureAdditiveOnly(snapshot);
+        if (rows.Any(p => p is null) || rows.Select(p => p.Name).Distinct(StringComparer.Ordinal).Count() != rows.Length)
+        {
+            throw new ArgumentException("Projection names must be distinct and definitions non-null", nameof(projections));
+        }
+
+        foreach (var row in rows)
+        {
+            if (rows.Where(p => p.Table == row.Table && p != row).SelectMany(p => p.Columns)
+                .Any(c => row.Columns.Any(o => o.Name == c.Name) || row.Sources.Any(s => s.Name == c.Name)))
+            {
+                throw new ArgumentException("Projections must not share outputs or read another projection's outputs", nameof(projections));
+            }
+        }
+
+        return ConcurrentIndexExpand.ApplyAsync(connection, migrationName, snapshot, rows, ct);
     }
 
     /// <summary>

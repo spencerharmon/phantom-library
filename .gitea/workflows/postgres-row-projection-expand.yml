@@ -1,0 +1,40 @@
+name: PostgreSQL additive row projection expand
+on:
+  push:
+    branches: [main, bee-p7-additive-row-projection-expand]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  row-projection-expand:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      image: mcr.microsoft.com/dotnet/sdk:9.0.305-noble
+    services:
+      postgres:
+        # Isolated fixture only; no deployed/shared DSN or availability backfill.
+        image: docker.io/library/postgres@sha256:9d9e487c1bd6413c52ccb3c02f46c8e37fa1e1d1a32a84519eb4e68d0ad1da30
+        env:
+          POSTGRES_USER: phantom
+          POSTGRES_PASSWORD: fixture-only
+          POSTGRES_DB: expand_test
+        options: --health-cmd "pg_isready -U phantom -d expand_test" --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      PHANTOM_TEST_POSTGRES_DSN: Host=postgres;Username=phantom;Password=fixture-only;Database=expand_test
+      PHANTOM_TEST_RESULTS: ${{ gitea.workspace }}/test-results/row-projection-expand
+      MSBUILDDISABLENODEREUSE: '1'
+    steps:
+      - name: Install checkout and result-accounting tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends nodejs git python3 ca-certificates
+      - uses: actions/checkout@v4
+      - name: Actual helper, mandatory PostgreSQL, exact executed-test accounting
+        run: ./scripts/tests/postgres-row-projection-expand.test.sh
+      - name: Retain SQLSTATE, catalogue, legacy row-count and TRX evidence
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: postgres-row-projection-expand
+          path: test-results/row-projection-expand
