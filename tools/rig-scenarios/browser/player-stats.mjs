@@ -13,7 +13,10 @@ process.env.TMPDIR = process.env.PHANTOM_P14_BROWSER_TMPDIR || '/var/tmp';
 const browser = await chromium.launch({ executablePath: process.env.PHANTOM_P14_CHROMIUM || undefined,
     args: ['--no-sandbox', '--autoplay-policy=no-user-gesture-required'] });
 const page = await browser.newPage({ viewport: kind === 'episode' ? { width: 390, height: 844 } : { width: 1280, height: 900 } });
-const stats = [], errors = [], assets = [], streams = [], playback = [], consoleLog = [];
+const stats = [], errors = [], assets = [], streams = [], playback = [], consoleLog = [], statsRequests = [];
+page.on('request', request => {
+    if (request.url().includes('/PlayerStats/Current')) statsRequests.push(Date.now());
+});
 page.on('console', m => consoleLog.push(m.text().replace(/(api_key=|Token=)[^&\s"']+/gi, '$1<redacted>')));
 page.on('pageerror', e => errors.push(e.message));
 page.on('response', async response => {
@@ -43,6 +46,12 @@ try {
         const root = document.getElementById('phantom-player-stats');
         return root && root.getAttribute('data-status') === 'ok' && root.style.display !== 'none';
     }, null, { timeout: 60000 });
+    // A media response header alone is not playback: require the real browser
+    // to decode bytes and advance while the installed overlay polls.
+    await page.waitForFunction(() => {
+        const video = document.querySelector('video.htmlvideoplayer');
+        return video && video.currentTime > 1 && !video.paused && video.readyState >= 2;
+    });
     await page.waitForTimeout(7000);
     const ok = stats.filter(x => x.body.status === 'ok');
     assert.ok(ok.length >= 3, JSON.stringify(stats));
@@ -71,18 +80,18 @@ try {
     ]);
     await page.waitForFunction(() => !window.__phantomPlayerStats.state().polling, null, { timeout: 15000 });
     await page.waitForTimeout(1000); // settle a possible response already in flight
-    const count = stats.length;
+    const count = statsRequests.length;
     await page.waitForTimeout(7000);
-    assert.equal(stats.length, count, 'zero polling after stop');
+    assert.equal(statsRequests.length, count, 'zero requests after stop (including failed/pending requests)');
     const state = await page.evaluate(() => window.__phantomPlayerStats.state());
     assert.equal(state.timerArmed, false);
     assert.equal(state.visible, false);
-    const receipt = { kind, result: 'passed', okPolls: ok.length, streams, afterStopPolls: stats.length-count,
+    const receipt = { kind, result: 'passed', okPolls: ok.length, streams, afterStopPolls: statsRequests.length-count,
         overlaySha256: createHash('sha256').update(assets[0].body).digest('hex'), state };
     writeFileSync(out + '/browser-' + kind + '.json', JSON.stringify(receipt, null, 2));
     console.log('PLAYER_STATS_BROWSER_OK', JSON.stringify(receipt));
 } finally {
-    writeFileSync(out + '/browser-debug-' + kind + '.json', JSON.stringify({ url: page.url(), stats, errors, streams, playback, consoleLog }, null, 2));
+    writeFileSync(out + '/browser-debug-' + kind + '.json', JSON.stringify({ url: page.url(), stats, statsRequests, errors, streams, playback, consoleLog }, null, 2));
     await page.screenshot({ path: out + '/browser-final-' + kind + '.png' });
     writeFileSync(out + '/browser-final-' + kind + '.html', await page.content());
     await browser.close();

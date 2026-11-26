@@ -27,6 +27,14 @@ class AdapterTests(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
 
+    def test_player_stats_runtime_refuses_host_network_before_starting_services(self):
+        result = subprocess.run([sys.executable, rig.TOOLS / "player-stats-runtime.py",
+            self.tmp.name, self.tmp.name, self.tmp.name, os.readlink("/proc/self/ns/net")],
+            capture_output=True, text=True)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("must run in its own network namespace", result.stderr)
+        self.assertFalse((Path(self.tmp.name) / "movie").exists())
+
     def test_sqlite_fixtures_and_upsert_preserve_values(self):
         db = PhantomDatabase()
         db.execute("CREATE TABLE plugin_meta(key TEXT PRIMARY KEY,value TEXT); PRAGMA user_version=21;")

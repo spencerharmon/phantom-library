@@ -458,8 +458,9 @@ def main():
     parser.add_argument("--suite", choices=("playback", "stale-candidate"), default="playback")
     parser.add_argument("--player-stats", action="store_true", help="mandatory :18096 real web/browser stats for both item types")
     args = parser.parse_args()
-    if args.player_stats and args.scenario != "both":
-        parser.error("--player-stats requires both movie and episode")
+    if args.player_stats and (args.scenario != "both" or args.backend != "sqlite"
+                              or args.suite != "playback" or args.episode_web_queue):
+        parser.error("--player-stats requires --backend sqlite, both items and the playback suite")
     artifacts = REPO / "artifacts"
     artifacts.mkdir(exist_ok=True)
     root = Path(tempfile.mkdtemp(prefix="playback-parity-", dir=artifacts))
@@ -479,6 +480,19 @@ def main():
         if args.episode_web_queue or args.player_stats:
             pinned_web(root, env)
         server, candidate = build(root, env)
+        if args.player_stats:
+            # Downloads/builds happen above. The live half is completely offline
+            # in a private user/network namespace: fixed :18096 cannot collide
+            # with another task's port-forward or accidentally hit production.
+            try:
+                run(["unshare", "--user", "--map-root-user", "--net", "--", sys.executable,
+                     TOOLS / "player-stats-runtime.py", root, server, candidate,
+                     os.readlink("/proc/self/ns/net")], env=env)
+            finally:
+                if (root / "results.json").exists():
+                    results = json.loads((root / "results.json").read_text())
+            assert len(results) == 2 and all(r["result"] == "passed" for r in results), results
+            return
         control = build_availability_control(root, server, candidate, env) if args.suite == "stale-candidate" else None
         failures = []
         for kind in (("movie", "episode") if args.scenario == "both" else (args.scenario,)):

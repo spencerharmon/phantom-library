@@ -36,8 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   availability refreshes/preset changes cannot retarget stats. Legacy unbound
   materialisations report "Source unknown" until rematerialised. Collapsed
   startup probes recover on media lifecycle events without background polling.
-  P14 remains gated on native episode web-queue playback; the mandatory live
-  check now fails instead of skipping that scenario.
+  Plugin 0.5.7.49 includes mandatory isolated movie/episode web playback proof
+  with the native queue fix, decoded browser media, served asset identity and
+  zero stats requests after stop; missing live prerequisites fail, never skip.
 - Rank by REAL DHT swarm health (ROI Priority 0.5). A standalone swarm-health
   service (`tools/swarm-health/swarm_health_service.py`, libtorrent DHT node)
   measures the distinct DHT peers behind each available item's candidate

@@ -163,7 +163,10 @@ PY
 pass "gostream mock stats endpoint"
 
 # ---------------------------------------------------------------------------
-note "4. live-rig scenario 52 (movie + episode on :18096)"
+note "4. isolated rig ownership and fixed-port collision regressions"
+python3 "$REPO_ROOT/scripts/tests/playback-adapter.test.py"
+
+note "5. live-rig scenario 52 (movie + episode on :18096)"
 [[ -x "$SCENARIO" ]] || fatal "scenario not executable: $SCENARIO"
 # No PHANTOM_P14_LIVE_RIG switch: missing tools/build/browser/live server FAIL.
 PHANTOM_REPO_ROOT="$REPO_ROOT" bash "$SCENARIO" | tee "$WORK/scenario-52.log"

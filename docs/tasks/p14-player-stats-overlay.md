@@ -1,4 +1,4 @@
-# P14 — player source and stream stats (rework; not yet accepted)
+# P14 — player source and stream stats (0.5.7.49; review pending)
 
 ## API and source ownership
 
@@ -54,48 +54,59 @@ beehive submodule worktree exec phantom-library bee-p14-player-stats-overlay -- 
 ```
 
 35 .NET controller/fake-gostream/SQLite tests; 19 simulated-DOM lifecycle tests;
-real HTTP mock contract; then **mandatory** scenario 52. There is no live-skip
+real HTTP mock contract; 14 rig adapter/ownership tests; then **mandatory** scenario 52. There is no live-skip
 switch. Missing prerequisites or failed browser playback fail the whole command.
 The old simulated-DOM `--live` path and clone/systemd scenario were removed.
 
 Scenario 52 reuses `isolated-playback-rig.py --backend sqlite --player-stats`:
 - Builds v10.11.9 Jellyfin with all repository patches and this checkout's plugin.
 - Creates fresh synthetic state and owns/cleans every service; no production DB,
-  global rig, systemd unit or deployment. Port 18096 collisions fail closed.
+  global rig, systemd unit or deployment. After downloads/builds, runs the live
+  half in a private rootless Linux user/network namespace (`unshare`, loopback
+  only). Host port-forwards cannot collide with :18096 or receive test requests.
+  The runtime refuses the host network namespace before starting any service.
 - Uses pinned, SHA256-verified official Jellyfin web 10.11.11, injecting **only**
   the badges tag, so the actual bootstrap must fetch this build's overlay.
 - Logs into real Chromium/Jellyfin, clicks the real Play button, verifies live
   source/stream payloads, 2–5s cadence, desktop/mobile layout, served asset bytes
-  against source, HTTP media requests, and zero polling after browser Back causes
-  Jellyfin to report Stopped. Native REST playback also saves 4096 stream bytes.
+  against source, decoded/advancing browser media, and zero stats requests
+  (including pending/failed requests) after browser Back causes Jellyfin to report
+  Stopped. Native REST playback also saves 4096 stream bytes.
 - Uses 90-second generated media; the general parity rig's two-second fixtures
   were too short to test multiple stats polls.
 - Retains per-run `artifacts/playback-parity-*/` build/server/plugin/web hashes,
   raw responses, stream bytes, screenshots and cleanup receipts. Synthetic browser
   console tokens are redacted. Build servers/node reuse are disabled.
 
-Requires .NET 9, Node/npm, Python, patch and public network downloads. Playwright
+Requires .NET 9, Node/npm, Python, patch, Linux `unshare`/`ip` with unprivileged
+user/network namespaces and public network downloads (only for the build phase). Playwright
 is lockfile-pinned in `tools/rig-scenarios/browser`; it uses host Chromium if
 available or fetches its matching browser. `PHANTOM_P14_CHROMIUM` can select a
 compatible browser. Existing `PHANTOM_PARITY_{SERVER,PLUGIN,FFMPEG}` artifact
 injection supports iteration; release proof should use the default candidate build.
-`PHANTOM_P14_WEB_ARCHIVE` can reuse the **same hash-verified** archive offline.
+`PHANTOM_RIG_WEB_ARCHIVE` can reuse the **same hash-verified** archive offline.
 See `docs/tasks/postgres-playback-parity-rig.md` for the base rig contract.
 
-## Current gate: native episode queue prerequisite
+## Native queue prerequisite and delivery boundary
 
-Full default check currently **fails**, honestly. Movie browser playback passes
-with live stats and zero polls after stop. Episode REST native-open, stream bytes
-and stats pass, but the real web Play path first calls the all-series endpoint:
+`p14-native-episode-web-queue` landed Jellyfin patch 0007, preserving channel
+Season/Series ancestry during Home Latest and per-item refresh. The original
+attempt failed at the real all-series episode Play queue; no fixture SQL or
+browser queue bypass was used to hide it. Scenario 52 now passes with that patch
+and this plugin: movie desktop and episode mobile both stream bytes, render the
+actual embedded overlay, poll live stats and stop all requests after Back.
+The rig shares `pinned_web` and `PHANTOM_RIG_MEDIA_SECONDS` with the native-queue
+suite rather than keeping a parallel web/bootstrap implementation.
 
-`GET /Shows/{seriesId}/Episodes?IsVirtualUnaired=false&IsMissing=false&UserId=...&Fields=Chapters,Trickplay&limit=100&startItemId={episodeId}`
+Final full-check evidence (2026-11-26): 35/35 .NET, 19/19 DOM, 14/14 rig adapter
+checks; both movies/episodes read HTTP206/4096 bytes; real browser decoded media,
+three successful stats polls each at 3000ms, Stopped204, zero subsequent requests.
+Build-bound installed plugin SHA256:
+`a4e426073c4a6012df4a79f8ba72ceb043b639606eda4fd411b3f8e2697e392a`;
+served asset SHA256:
+`195c9511462732558ae99eed797f86020140650bfdcb32e1041c3ff48ac8a908`.
 
-It returns `200 {Items:[],TotalRecordCount:0}`. The season-scoped endpoint lists the
-same materialised episode (`LocationType=FileSystem`), and the same user can stream
-it. Jellyfin web shows "Unable to find a valid media source to play" before any
-PlaybackInfo/player/stats request. The likely boundary is native
-`Series.GetEpisodes` (SeriesPresentationUniqueKey + Season aggregation) versus
-`Season.GetEpisodes`; no fixture SQL or browser queue bypass was added to hide it.
-Hive prerequisite `p14-native-episode-web-queue` owns that fix and its independent
-native API/browser regression. P14 remains TODO-blocked until the prerequisite
-lands and the full mandatory check passes. This is not a production rollout.
+This is isolated synthetic live proof, not a production rollout or real torrent
+swarm measurement. Delivery still requires the linked gostream endpoint, the
+patched Jellyfin server, and installation/restart with plugin 0.5.7.49. No schema
+migration, nested gostream pin or production database change is needed.
