@@ -10,7 +10,8 @@ on:
   workflow_dispatch:
 jobs:
   build-test-publish:
-    runs-on: [k8s]
+    # Optional isolated CI capacity; the normal shared swarm runner is k8s.
+    runs-on: ["${{ vars.SWARM_HEALTH_RUNNER_LABEL || 'k8s' }}"]
     container:
       image: nixery.dev/shell/git/docker/python3
     steps:
