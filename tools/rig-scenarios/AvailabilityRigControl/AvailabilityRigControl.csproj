@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <Reference Include="Jellyfin.Plugin.PhantomLibrary" HintPath="$(CandidateDir)/Jellyfin.Plugin.PhantomLibrary.dll" Private="false" />
+    <Reference Include="MediaBrowser.Common" HintPath="$(ServerDir)/MediaBrowser.Common.dll" Private="false" />
+    <Reference Include="MediaBrowser.Model" HintPath="$(ServerDir)/MediaBrowser.Model.dll" Private="false" />
+  </ItemGroup>
+</Project>
