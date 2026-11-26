@@ -23,6 +23,7 @@ internal static class ConcurrentIndexExpand
     // key definitions instead of indkey. Opclasses/collations/options remain OIDs.
     private const string Signature = @"jsonb_build_object(
         'method', am.amname, 'unique', i.indisunique, 'nulls_not_distinct', i.indnullsnotdistinct,
+        'primary', i.indisprimary, 'exclusion', i.indisexclusion,
         'keys', i.indnkeyatts, 'attributes', i.indnatts,
         'columns', ARRAY(SELECT pg_catalog.pg_get_indexdef(i.indexrelid, n, false)
                          FROM generate_series(1, i.indnatts) n),
@@ -254,7 +255,7 @@ CREATE TABLE IF NOT EXISTS phantom_expand_index_builds (
     {
         await using var command = connection.CreateCommand();
         command.CommandText = $@"SELECT COALESCE(i.indrelid::bigint,0), {Signature},
-            COALESCE(i.indisvalid AND i.indisready AND i.indislive AND NOT i.indisprimary AND NOT i.indisexclusion, false), c.oid::bigint
+            COALESCE(i.indisvalid AND i.indisready AND i.indislive, false), c.oid::bigint
             FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace ns ON ns.oid=c.relnamespace
             LEFT JOIN pg_catalog.pg_index i ON i.indexrelid=c.oid
             LEFT JOIN pg_catalog.pg_am am ON am.oid=c.relam

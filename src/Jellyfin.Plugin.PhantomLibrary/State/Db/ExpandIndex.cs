@@ -7,7 +7,7 @@ namespace Jellyfin.Plugin.PhantomLibrary.State.Db;
 /// <summary>A deliberately small SQL grammar, not a general-purpose SQL parser.</summary>
 internal sealed record ExpandIndex(string Name, string? Schema, string Table, string Keys, string Predicate, bool Unique, bool Concurrent)
 {
-    internal const string Identifier = @"[a-z_][a-z0-9_]{0,62}";
+    internal const string Identifier = @"(?-i:[A-Za-z_][A-Za-z0-9_]{0,62})";
     private const string Literal = @"(?:-?[0-9]+(?:\.[0-9]+)?|'(?:[^'\\]|'')*'|TRUE|FALSE|NULL)";
     private const string Key = Identifier + @"(?:\s+(?:ASC|DESC))?(?:\s+NULLS\s+(?:FIRST|LAST))?";
     private const string Term = Identifier + @"\s*(?:(?:=|<>|!=|<=|>=|<|>)\s*" + Literal + @"|IS\s+(?:NOT\s+)?NULL)";

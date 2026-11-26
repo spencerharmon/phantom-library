@@ -399,6 +399,19 @@ public sealed class ConcurrentIndexExpandTests(ITestOutputHelper output) : IAsyn
     }
 
     [Fact]
+    public async Task PromotedPrimaryKeyIsAValidConflictNotAnInvalidBuild()
+    {
+        await SqlAsync(_db, "TRUNCATE build; INSERT INTO build VALUES (1),(2)");
+        Assert.True(await ApplyAsync("primary", UniqueIndex));
+        var oid = await OidAsync("unique_lookup");
+        await SqlAsync(_db, "ALTER TABLE build ADD CONSTRAINT unique_lookup PRIMARY KEY USING INDEX unique_lookup");
+        await Assert.ThrowsAsync<InvalidOperationException>(() => ApplyAsync("primary", UniqueIndex));
+        Assert.Equal(oid, await OidAsync("unique_lookup"));
+        Assert.True(await ValidAsync("unique_lookup"));
+        Assert.False(await ReceiptAsync("primary"));
+    }
+
+    [Fact]
     public async Task LaterIndexFailureDoesNotRebuildEarlierValidIndex()
     {
         var statements = new[] { Index, UniqueIndex };

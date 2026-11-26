@@ -96,8 +96,8 @@ pinned isolated PostgreSQL 16.16 image) or `PHANTOM_TEST_POSTGRES_DSN` pointing 
 **disposable** server with CREATE SCHEMA and test-backend termination privileges.
 The xUnit fixture requires the DSN; missing/unreachable DB is a failure, never skip.
 The harness compiles the actual helper sources and unchanged transactional tests
-without needing the Jellyfin server. Exactly **46** tests must execute and pass:
-34 concurrent/phase/ownership cases plus 12 existing helper tests. TRX, SQLSTATE,
+without needing the Jellyfin server. Exactly **47** tests must execute and pass:
+35 concurrent/phase/ownership cases plus 12 existing helper tests. TRX, SQLSTATE,
 OID/validity, legacy row counts/checksums, and PostgreSQL logs are retained at the
 printed evidence path (`PHANTOM_TEST_RESULTS` can select it).
 
