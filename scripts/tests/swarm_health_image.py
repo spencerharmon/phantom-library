@@ -51,7 +51,7 @@ else:
         "--build-arg", "SOURCE_DATE_EPOCH=" + epoch, "-t", image, "tools/swarm-health")
 inspection = json.loads(engine("image", "inspect", image))[0]
 config = inspection["Config"]
-assert config["User"] == "10001:10001", "root/wrong runtime UID"
+assert config.get("User") == "10001:10001", "root/wrong runtime UID"
 assert config["Entrypoint"] == ["python3", "/app/swarm_health_service.py"], "runtime downloader/wrong entrypoint"
 assert not config.get("Cmd"), "unexpected runtime command"
 assert config["Labels"]["org.opencontainers.image.revision"] == revision, "wrong source label"
@@ -76,8 +76,12 @@ try:
         "--entrypoint", "python3", image_id, "/app/fixture/swarm_health_image_fixture.py", "peers")
     containers.append(fixture)
     with tempfile.TemporaryDirectory() as directory:
+        # Docker cp preserves the source directory mode but assigns root ownership;
+        # permit traversal by the image's real non-root UID on remote daemons too.
+        os.chmod(directory, 0o755)
         for name in ("swarm_health_image_fixture.py", "swarm_health_integration.py"):
             shutil.copy(ROOT / "scripts/tests" / name, directory)
+            os.chmod(Path(directory) / name, 0o644)
         run("cp", directory + "/.", fixture + ":/app/fixture")
     run("start", fixture)
     for _ in range(100):
