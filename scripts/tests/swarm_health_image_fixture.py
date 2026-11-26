@@ -69,6 +69,7 @@ elif sys.argv[1] == "inventory":
     assert os.getuid() == os.getgid() == 10001
     provenance = Path("/usr/share/swarm-health")
     subprocess.run(["sha256sum", "-c", str(provenance / "files.sha256")], check=True, stdout=sys.stderr)
+    subprocess.run(["sha256sum", "-c", str(provenance / "runtime-files.sha256")], check=True, stdout=sys.stderr)
     expected = json.loads(sys.argv[2])
     for path, digest in expected.items():
         assert hashlib.sha256(Path(path).read_bytes()).hexdigest() == digest, "wrong source: " + path
@@ -78,6 +79,7 @@ elif sys.argv[1] == "inventory":
         assert not Path(path).exists(), "unexpected runtime tool: " + path
     print(json.dumps({"source": sys.argv[3], "uid": os.getuid(), "python": sys.version,
                       "files": (provenance / "files.sha256").read_text(),
+                      "runtime_files": (provenance / "runtime-files.sha256").read_text(),
                       "runtime_packages": (provenance / "runtime-packages.tsv").read_text(),
                       "build_packages": (provenance / "build-packages.tsv").read_text()}))
 elif sys.argv[1] == "state":

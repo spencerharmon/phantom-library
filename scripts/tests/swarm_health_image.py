@@ -73,12 +73,12 @@ try:
     volume_created = True
     run("create", "--name", fixture, "--network", "none",
         "--mount", "type=volume,source=" + volume + ",target=/var/lib/swarm-health,readonly",
-        "--entrypoint", "python3", image_id, "/fixture/swarm_health_image_fixture.py", "peers")
+        "--entrypoint", "python3", image_id, "/app/fixture/swarm_health_image_fixture.py", "peers")
     containers.append(fixture)
     with tempfile.TemporaryDirectory() as directory:
         for name in ("swarm_health_image_fixture.py", "swarm_health_integration.py"):
             shutil.copy(ROOT / "scripts/tests" / name, directory)
-        run("cp", directory + "/.", fixture + ":/fixture")
+        run("cp", directory + "/.", fixture + ":/app/fixture")
     run("start", fixture)
     for _ in range(100):
         probe = subprocess.run([ENGINE, "exec", fixture, "cat", "/tmp/bootstrap"], capture_output=True, text=True)
@@ -88,7 +88,7 @@ try:
         time.sleep(.1)
     else:
         raise AssertionError("controlled UDP fixture failed to start")
-    inventory = json.loads(engine("exec", fixture, "python3", "/fixture/swarm_health_image_fixture.py", "inventory", json.dumps(expected), revision))
+    inventory = json.loads(engine("exec", fixture, "python3", "/app/fixture/swarm_health_image_fixture.py", "inventory", json.dumps(expected), revision))
     for phase in ("cold-start", "restart"):
         args = ["run", "-d", "--name", service, "--network", "container:" + fixture,
                 "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
@@ -101,7 +101,7 @@ try:
             args += ["-e", key + "=" + value]
         run(*args, image_id)
         containers.append(service)
-        run("exec", fixture, "python3", "/fixture/swarm_health_image_fixture.py", "probe", phase)
+        run("exec", fixture, "python3", "/app/fixture/swarm_health_image_fixture.py", "probe", phase)
         # A long save interval ensures this checks the actual SIGTERM final save.
         run("stop", "--time", "8", service)
         result = json.loads(engine("inspect", service))[0]
@@ -110,7 +110,7 @@ try:
         assert "libtorrent=2.0.11" in logs, logs
         print("PASS: SIGTERM exit=0 within 8s, native libtorrent=2.0.11; " + phase)
         # Fixture has the same volume read-only; inspection is also UID 10001.
-        run("exec", fixture, "python3", "/fixture/swarm_health_image_fixture.py", "state")
+        run("exec", fixture, "python3", "/app/fixture/swarm_health_image_fixture.py", "state")
         run("rm", service)
         containers.remove(service)
     # Read-only state must fail closed instead of running root or falling back to ephemeral state.

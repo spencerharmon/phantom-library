@@ -6,6 +6,77 @@ schema, crawler, torrent handles, payload download, announce, or candidate
 sampling/enumeration. Only bounded caller-submitted v1 infohashes become health
 observations. Movie and episode hashes use the identical protocol.
 
+## Locked runnable image
+
+`Dockerfile` packages this existing service and native bridge, **not** a new
+service owner. The production entrypoint is exec-form
+`["python3", "/app/swarm_health_service.py"]`; no checkout, compiler, pip, apt-get,
+plugin, database or crawler runs at startup. Nothing is downloaded after pull.
+The runtime is UID/GID **10001:10001**, HTTP **8095/TCP**, DHT **6881/UDP**,
+SIGTERM shutdown (allow at least **10 seconds**). It runs with read-only root,
+all capabilities dropped and no-new-privileges.
+
+Mount `/var/lib/swarm-health` (or set `STATE_DIR`) as writable, retained storage
+owned by 10001:10001, directory mode 0700. Container-engine named volumes inherit
+that ownership from the image; Kubernetes PVCs need provisioning ownership or an
+appropriate init/fsGroup arrangement. Do not override the entrypoint or mount
+source/dependencies over `/app`. Keep one owner per volume; use Recreate. A failed
+permission check must fail startup, not silently switch to ephemeral state.
+The service persists node identity/contacts only, never observations or secrets.
+
+The image targets **linux/amd64**. Its Debian trixie base is pinned by index digest
+in the Dockerfile. Both stages use the signed Debian **20261124T000000Z** snapshot
+and compare the **entire** downloaded archive set against checked-in SHA256 locks
+before offline installation: `build-packages.sha256` (53 archives),
+`runtime-packages.sha256` (15 archives). This pins all transitive dependencies,
+not only top-level names. Native libtorrent is **2.0.11-1**, Python
+**3.13.5-2+deb13u5**, compiler GCC **14.2.0-19**, nlohmann JSON **3.11.3-2.1**.
+There is **no Python libtorrent binding**. Base content is pinned by OCI digest;
+added package provenance is in the two locks. Regenerate deliberately using
+`lock-packages.sh build|runtime` inside the exact base, review every changed
+version/hash, then rebuild and rerun tests. Never replace a failed snapshot/hash
+check with a floating mirror or disable signature checks.
+
+`/usr/share/swarm-health/` contains source revision/date, Dockerfile and native
+source, dependency locks, full build/runtime dpkg inventories, application hashes
+and hashes of the interpreter and linked libraries. The revision is also the OCI
+`org.opencontainers.image.revision` label; builds refuse content that differs
+from that commit. Dependency/application bytes are reproducible from these locked
+inputs; OCI serialization/layer metadata can differ across Docker/Podman versions,
+so consumers must pin the **tested published digest**, not infer one from a tag.
+
+Run from the repository root, with Python 3 and Podman (or `CONTAINER_ENGINE=docker`):
+
+```sh
+./scripts/tests/p05-swarm-health-service-image.test.sh
+# Or verify an already published artifact (digest and exact source must be supplied):
+SWARM_HEALTH_IMAGE=registry.example.com/images/swarm-health@sha256:<digest> \
+SWARM_HEALTH_SOURCE_REVISION=<full-source-commit> \
+./scripts/tests/p05-swarm-health-service-image.test.sh
+```
+
+The test builds the locked image by default; an override **must** be a digest and
+is pulled. It verifies image config, packaged source hashes, UID, library version
+and checksums. It boots the actual production ENTRYPOINT in a separate container
+sharing a `--network none` namespace with the service-contract controlled UDP
+fixture. HTTP tests prove real scrape counts vs unknown, then SIGTERM exit=0,
+checksummed 0600 state, container replacement on the same volume with a changed
+bind IP and **no bootstrap**, preserved identity, restored contacts and new UDP
+queries. Read-only state must fail closed. Only fixture code is copied to the
+fixture container: no source or native dependency mounts into the service.
+
+`.gitea/workflows/swarm-health-image.yml` uses the existing self-hosted Gitea
+runner and nixery tools. Configure repo variables `REGISTRY_URL`,
+`REGISTRY_USERNAME`, secret `REGISTRY_TOKEN` with package-write permission. It
+publishes `<registry>/<username>/swarm-health:<full-source-sha>` only after the
+image test passes, then pulls the digest and repeats the same test. The exact
+`PUBLISHED_AND_VERIFIED` digest and JSON inventories are in its logs. Registry
+credentials live in a temporary Docker client config outside the build context;
+never in build args, source, layers or runtime defaults. No registry/site address
+is compiled into the service. The image tag is discoverability, not the deploy
+contract; Flux consumes that run's immutable digest. This workflow publishes only
+and never changes Flux, the plugin image, production routing or a database.
+
 ## Image and deployment handoff
 
 Runtime: Python **3.11+**, maintained **libtorrent-rasterbar 2.0.x** (tested against

@@ -32,6 +32,10 @@ COPY Dockerfile build-bridge.sh dht_bridge.cpp lock-packages.sh build-packages.s
 RUN python3 -c 'import os,re; assert re.fullmatch("[0-9a-f]{40}",os.environ["SOURCE_REVISION"]); assert int(os.environ["SOURCE_DATE_EPOCH"])>0' \
     && printf '%s\n' "$SOURCE_REVISION" > /usr/share/swarm-health/source-revision \
     && printf '%s\n' "$SOURCE_DATE_EPOCH" > /usr/share/swarm-health/source-date-epoch \
+    && ldd /app/dht-bridge /usr/bin/python3.13 > /usr/share/swarm-health/runtime-linkage.txt \
+    && { printf '%s\n' /usr/bin/python3.13; awk '/=> \// {print $3} $1 ~ /^\// {print $1}' /usr/share/swarm-health/runtime-linkage.txt; } \
+       | LC_ALL=C sort -u | xargs sha256sum > /usr/share/swarm-health/runtime-files.sha256 \
+    && rm /usr/share/swarm-health/runtime-linkage.txt \
     && sha256sum /app/* /usr/share/swarm-health/* > /usr/share/swarm-health/files.sha256
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 STATE_DIR=/var/lib/swarm-health
 WORKDIR /app
