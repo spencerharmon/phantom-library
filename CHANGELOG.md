@@ -13,6 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   BaseItem sync now converges the whole catalogue in one pass and writes
   orphan/non-TMDB channel items as unmeasured, so no NULL rating sorts first.
 
+### Availability scheduling
+- PostgreSQL claims now use stored scheduling buckets and due-time keysets,
+  bounded `FOR UPDATE SKIP LOCKED` batches, and atomic generation-fenced leases
+  without the process-wide claim semaphore. The real worker starts up to four
+  leased probes together and releases them on cancellation. Movie/episode slots
+  alternate; interactive priority remains ahead of background work.
+- Additive, concurrent-index expand keeps old named-column writers compatible.
+  Initial admission and policy changes use resumable, rate-limited 256-row slices,
+  not whole-table policy-mismatch claim scans. SQLite retains its single-writer
+  backend. No destructive migration, production deployment or color flip.
+  See `docs/tasks/p0-indexed-batch-availability.md` for query inventory and checks.
+
 ### Added
 - Helm chart 2.13.0: opt-in `swarmHealth.enabled` / `serviceUrl` durably manage
   `SwarmHealthServiceUrl` before every plugin boot, on retained and fresh PVCs.
