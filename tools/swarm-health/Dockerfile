@@ -1,4 +1,4 @@
-# Locked linux/amd64 build. Base index also pins the selected platform manifest.
+# Locked linux/amd64 build. The base digest is the exact amd64 OCI manifest.
 FROM docker.io/library/debian:trixie-slim@sha256:ab3b3c8c5159eebfca4376430132d53c4d425f869c765ecbe47177a030da575d AS build
 WORKDIR /src/tools/swarm-health
 COPY lock-packages.sh build-packages.sha256 ./

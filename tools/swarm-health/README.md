@@ -24,8 +24,8 @@ source/dependencies over `/app`. Keep one owner per volume; use Recreate. A fail
 permission check must fail startup, not silently switch to ephemeral state.
 The service persists node identity/contacts only, never observations or secrets.
 
-The image targets **linux/amd64**. Its Debian trixie base is pinned by index digest
-in the Dockerfile. Both stages use the signed Debian **20261124T000000Z** snapshot
+The image targets **linux/amd64**. Its Debian trixie base is pinned by the exact
+amd64 OCI manifest digest in the Dockerfile. Both stages use the signed Debian **20261124T000000Z** snapshot
 and compare the **entire** downloaded archive set against checked-in SHA256 locks
 before offline installation: `build-packages.sha256` (53 archives),
 `runtime-packages.sha256` (15 archives). This pins all transitive dependencies,
