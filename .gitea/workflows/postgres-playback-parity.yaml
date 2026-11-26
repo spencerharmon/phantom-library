@@ -11,24 +11,18 @@ jobs:
     timeout-minutes: 45
     container:
       image: mcr.microsoft.com/dotnet/sdk:9.0.305-noble
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_PASSWORD: isolated-parity-only
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s --health-timeout 5s --health-retries 20
+    # The self-hosted runner uses host networking: Actions service aliases do
+    # not resolve there. Let the rig own a uniquely named PostgreSQL container
+    # and an ephemeral loopback port via the runner's mounted Docker socket.
+    # Never use a host-global postgres:5432 or stop another job's service.
     env:
-      PHANTOM_PARITY_PGHOST: postgres
-      PHANTOM_PARITY_PGUSER: postgres
-      PHANTOM_PARITY_PGPASSWORD: isolated-parity-only
+      PHANTOM_PARITY_CONTAINER_RUNTIME: docker
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - name: Install test/build tools
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends nodejs git python3 curl patch postgresql-client ca-certificates xz-utils
+          apt-get install -y --no-install-recommends nodejs git python3 curl patch docker.io ca-certificates xz-utils
       - uses: actions/checkout@v4
       - name: PostgreSQL movie AND episode native-open playback (mandatory)
         run: ./scripts/tests/postgres-playback-parity.test.sh

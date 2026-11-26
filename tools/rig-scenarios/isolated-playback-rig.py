@@ -139,6 +139,9 @@ class Postgres:
     def __init__(self, root, env):
         self.root, self.env = root, env
         self.container = None
+        self.runtime = os.environ.get("PHANTOM_PARITY_CONTAINER_RUNTIME", "podman")
+        if self.runtime not in ("podman", "docker"):
+            raise ValueError("container runtime must be podman or docker")
         self.database = "parity_" + uuid.uuid4().hex
         self.created = False
         self.command = []
@@ -159,22 +162,26 @@ class Postgres:
         else:
             image = os.environ.get("PHANTOM_PARITY_POSTGRES_IMAGE", "docker.io/library/postgres:16-alpine")
             password = uuid.uuid4().hex
-            self.container = run(["podman", "run", "-d", "--name", self.database,
-                "-e", "POSTGRES_PASSWORD=" + password, "-p", "127.0.0.1::5432", image],
-                capture_output=True, text=True).stdout.strip()
-            mapping = run(["podman", "port", self.container, "5432/tcp"], capture_output=True, text=True).stdout.strip()
+            self.container = run([self.runtime, "run", "-d", "--name", self.database,
+                "-e", "POSTGRES_PASSWORD", "-p", "127.0.0.1::5432", image],
+                env={**self.env, "POSTGRES_PASSWORD": password}, capture_output=True, text=True).stdout.strip()
+            mapping = run([self.runtime, "port", self.container, "5432/tcp"], capture_output=True, text=True).stdout.strip()
             self.env.update(PGHOST="127.0.0.1", PGPORT=mapping.rsplit(":", 1)[1], PGUSER="postgres", PGPASSWORD=password)
-            self.command = ["podman", "exec", "-i", self.container, "psql", "-U", "postgres"]
-            identity = run(["podman", "inspect", self.container, "--format", "{{.Image}}"], capture_output=True, text=True).stdout.strip()
+            self.command = [self.runtime, "exec", "-i", self.container, "psql", "-U", "postgres"]
+            identity = run([self.runtime, "inspect", self.container, "--format", "{{.Image}}"], capture_output=True, text=True).stdout.strip()
             (self.root / "postgres-image.txt").write_text(image + "\n" + identity + "\n")
+        self.env["PGCONNECT_TIMEOUT"] = "5"
+        last_error = ""
         for _ in range(60):
             try:
                 self.sql("SELECT 1;")
                 break
-            except subprocess.CalledProcessError:
+            except subprocess.CalledProcessError as error:
+                last_error = error.stderr
                 time.sleep(1)
         else:
-            raise RuntimeError("PostgreSQL test service not ready")
+            (self.root / "postgres-connect-error.txt").write_text(last_error)
+            raise RuntimeError("PostgreSQL test service not ready: " + last_error)
         self.sql(f"CREATE DATABASE {self.database};")
         self.created = True
         self.env.update(PHANTOM_POSTGRES_HOST=self.env["PGHOST"], PHANTOM_POSTGRES_PORT=self.env["PGPORT"],
@@ -191,9 +198,9 @@ class Postgres:
         if self.container:
             try:
                 with (self.root / "postgres.log").open("w") as log:
-                    run(["podman", "logs", self.container], stdout=log, stderr=subprocess.STDOUT)
+                    run([self.runtime, "logs", self.container], stdout=log, stderr=subprocess.STDOUT)
             finally:
-                run(["podman", "rm", "-f", self.container], capture_output=True)
+                run([self.runtime, "rm", "-f", self.container], capture_output=True)
         elif self.created:
             self.sql(f"DROP DATABASE {self.database} WITH (FORCE);")
 

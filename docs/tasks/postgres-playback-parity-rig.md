@@ -21,7 +21,8 @@ beehive submodule worktree exec phantom-library bee-p0-postgres-playback-parity-
 ## Runtime and build contract
 
 Linux, Python >=3.12, .NET 9 SDK/runtime, `patch`, network access to public
-Jellyfin source/FFmpeg and NuGet, and either rootless `podman` or `psql` plus an
+Jellyfin source/FFmpeg and NuGet, and either rootless `podman`, `docker` with an
+owned test daemon/socket, or `psql` plus an
 explicit disposable PostgreSQL test service. The default builds upstream
 Jellyfin **v10.11.9** with **every** repository `scripts/jellyfin-patches/*.patch`
 in a unique throwaway build tree, then builds **this checkout's plugin source**
@@ -41,7 +42,8 @@ its actual version. The real native-open assertions reject an unpatched server.
 `PHANTOM_PARITY_KEEP_BUILD=1` retains the build tree; this never skips scenarios.
 
 PostgreSQL defaults to a new `postgres:16-alpine` container per scenario, bound to
-an OS-assigned loopback port. Image ID and exact `SELECT version()` are retained.
+an OS-assigned loopback port. `PHANTOM_PARITY_CONTAINER_RUNTIME=docker` selects
+Docker instead of the rootless-Podman default. Image ID and exact `SELECT version()` are retained.
 `PHANTOM_PARITY_POSTGRES_IMAGE` may pin a different tag/digest for an experiment.
 For CI, `PHANTOM_PARITY_PGHOST`, `PHANTOM_PARITY_PGPORT` (5432),
 `PHANTOM_PARITY_PGUSER` (postgres), and required `PHANTOM_PARITY_PGPASSWORD` select
@@ -86,7 +88,9 @@ not the Jellyfin/plugin playback, probe, claim/worker or persistence path.
 ## Isolation, evidence, CI
 
 Every run owns `artifacts/playback-parity-<random>/`, fresh synthetic startup-wizard
-user `a`, distinct ports, process groups, and PostgreSQL databases. No copied user
+user `a`, distinct ports, process groups, and PostgreSQL databases. It applies
+and reads back the fixture config through the live plugin API after startup,
+so bootstrap's XML rewrites cannot silently replace mock endpoints with defaults. No copied user
 seed, global `/tmp` filenames, user-systemd units, broad `pkill`, production DB,
 image deployment or blue/green flip. SIGINT/SIGTERM and failure paths unwind owned
 processes/DBs; successful cleanup writes a receipt. A port collision fails closed,
@@ -98,7 +102,10 @@ versions, candidate/deployed DLL hashes, all server assembly hashes, PostgreSQL
 identity **without password**, discovery/native-open/badge/persistence responses,
 4096 real stream bytes per assertion, scenario logs/results, and cleanup receipts.
 The workflow `.gitea/workflows/postgres-playback-parity.yaml` runs on the Gitea
-`k8s` runner with a PostgreSQL service; no optional skip/continue-on-error. It
+`k8s` runner using its Docker socket for the owned PostgreSQL container; no
+optional skip/continue-on-error. Actions service aliases do not resolve on this
+runner's host network, so CI deliberately uses the same random-port container
+lifecycle tested locally rather than a fixed host-global PostgreSQL port. It
 uploads evidence even on failure and runs for main, PRs, manual dispatch and the
 implementation branch. It does not build or flip a production image.
 
