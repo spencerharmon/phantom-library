@@ -28,7 +28,7 @@ env.update(MSBUILDDISABLENODEREUSE="1", DOTNET_CLI_TELEMETRY_OPTOUT="1", PHANTOM
     "cpu_affinity": sorted(os.sched_getaffinity(0)),
     "host_physical_memory_bytes": os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"),
     "postgres_container_shared_memory_bytes": 256 * 1024 * 1024,
-    "cache": "normal planner; no drop_caches, forced scan setting, prewarm or fastest-of retries"}, indent=2))
+    "cache": "seed/rehearsal VACUUM/ANALYZE/CHECKPOINT complete before measurement; normal planner; no drop_caches, forced scan setting, prewarm or fastest-of retries"}, indent=2))
 pg = parity.Postgres(root, env.copy())
 def terminate(signum, frame):
     raise KeyboardInterrupt(f"terminated by signal {signum}")

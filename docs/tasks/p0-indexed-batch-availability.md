@@ -78,8 +78,12 @@ Before/after JSON plans, PostgreSQL settings, hardware/cache assumptions, exact
 TRX accounting and server receipts are retained. Every claim variant rejects
 any Seq Scan node and execution >=5ms. EXPLAIN executes the actual claim command
 (including UPDATE and trigger), rolled back after each measurement. Initial
-seed/index writes and ordinary VACUUM/ANALYZE are disclosed; this is not a cold
-host-cache benchmark. PostgreSQL containers get 256MiB shared memory so normal
+seed/index writes, ordinary VACUUM/ANALYZE and a durability CHECKPOINT before
+both baseline and candidate measurements are disclosed; this is not a cold
+host-cache benchmark. The checkpoint finishes the synthetic millions-row fixture
+write storm before measuring steady-state claims; real policy maintenance remains
+capped at 256 rows. Every claim still includes its actual lease UPDATE and every
+physical read/write in the strict <5ms guard, without a timing retry. PostgreSQL containers get 256MiB shared memory so normal
 parallel VACUUM of the 4M-row clone can complete (64MiB Docker defaults failed).
 
 Rehearsal computes predicted counts before availability UPDATEs. Actual bounded

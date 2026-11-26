@@ -70,6 +70,7 @@ CASE WHEN n%6=2 THEN NULL ELSE {Now.AddDays(-1).ToUnixTimeSeconds()} END,
 FROM generate_series(1,{Rows}) n;
 ANALYZE availability_items");
             Assert.Equal((long)Rows, await Sql("SELECT count(*) FROM availability_items"));
+            await Sql("CHECKPOINT");
             await SaveBeforePlans();
             await File.WriteAllTextAsync(Path.Combine(_evidence, "postgres-settings.json"), (string)(await Sql(@"SELECT json_agg(s)::text FROM
 (SELECT name,setting,unit,source FROM pg_settings WHERE category LIKE 'Query Tuning%' OR name IN ('server_version','shared_buffers','effective_cache_size','work_mem','max_connections','track_io_timing')) s"))!);
@@ -106,6 +107,12 @@ WHERE claim_bucket=-1 RETURNING 1) SELECT count(*) FROM changed"))!;
             Assert.Equal((long)Rows, await Sql($"SELECT count(*) FROM availability_items WHERE next_check_at >= {future} AND probe_policy_hash='stable'"));
             output.WriteLine($"CLONE REHEARSAL predicted={predicted} scheduler_actual={actual}; legacy_writer_predicted={legacyPredicted} actual={legacyActual}; slices <=256; rate limit enforced; legacy due/policy unchanged");
             await Sql("VACUUM (ANALYZE) availability_items");
+            // Finish synthetic bulk preparation before measuring steady-state
+            // claims. Otherwise a dirty buffer eviction can synchronously flush
+            // the fixture's millions-row write storm during an unrelated claim.
+            // The real rescheduler is capped at 256 rows, not this fixture storm.
+            await Sql("CHECKPOINT");
+            output.WriteLine("FIXTURE VACUUM/ANALYZE and durability CHECKPOINT complete before claim measurement; no per-query warmup/retry");
             await ExplainVariants("empty");
 
             // Only 192 due rows among 4M; both kinds, all six ordering buckets.
