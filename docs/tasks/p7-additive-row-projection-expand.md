@@ -123,5 +123,9 @@ Unrelated test-class DDL teardown is isolated from projection fault injection
 remain genuinely concurrent. TRX, SQLSTATE, OID/shape, row checksum and PostgreSQL
 logs are retained at the printed evidence directory. Gitea's
 `.gitea/workflows/postgres-row-projection-expand.yml` invokes this exact script with
-a disposable service container and uploads artifacts. No optional skip or shared
-application DSN. No operator action, plugin rollout or production flip is needed.
+a disposable PostgreSQL 16 cluster inside the SDK job container and uploads artifacts.
+It disables package auto-start, initializes a private data directory, listens ONLY
+on a private Unix socket (no TCP), and stops that cluster on exit. This works on
+both bridge- and host-network runners: Gitea host networking does not provide the
+usual `postgres` service DNS alias. No optional skip or shared application DSN.
+No operator action, plugin rollout or production flip is needed.

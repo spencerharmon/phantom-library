@@ -11,27 +11,44 @@ jobs:
     timeout-minutes: 15
     container:
       image: mcr.microsoft.com/dotnet/sdk:9.0.305-noble
-    services:
-      postgres:
-        # Isolated fixture only; no deployed/shared DSN or availability backfill.
-        image: docker.io/library/postgres@sha256:9d9e487c1bd6413c52ccb3c02f46c8e37fa1e1d1a32a84519eb4e68d0ad1da30
-        env:
-          POSTGRES_USER: phantom
-          POSTGRES_PASSWORD: fixture-only
-          POSTGRES_DB: expand_test
-        options: --health-cmd "pg_isready -U phantom -d expand_test" --health-interval 2s --health-timeout 5s --health-retries 30
     env:
-      PHANTOM_TEST_POSTGRES_DSN: Host=postgres;Username=phantom;Password=fixture-only;Database=expand_test
       PHANTOM_TEST_RESULTS: ${{ gitea.workspace }}/test-results/row-projection-expand
       MSBUILDDISABLENODEREUSE: '1'
     steps:
-      - name: Install checkout and result-accounting tools
+      - name: Install checkout, accounting and isolated PostgreSQL tools
         run: |
+          # Never auto-start a package's system cluster in a host-network runner.
+          printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+          chmod +x /usr/sbin/policy-rc.d
           apt-get update
-          apt-get install -y --no-install-recommends nodejs git python3 ca-certificates
+          apt-get install -y --no-install-recommends nodejs git python3 ca-certificates postgresql-16
       - uses: actions/checkout@v4
-      - name: Actual helper, mandatory PostgreSQL, exact executed-test accounting
-        run: ./scripts/tests/postgres-row-projection-expand.test.sh
+      - name: Actual helper, mandatory socket-only PostgreSQL, exact accounting
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A private Unix socket works on both bridge- and host-network Actions
+          # runners. No alias assumptions, host port, shared cluster or deployed DSN.
+          fixture="$(mktemp -d)"
+          mkdir -p "$fixture/socket" "$PHANTOM_TEST_RESULTS"
+          chown -R postgres:postgres "$fixture"
+          pg=/usr/lib/postgresql/16/bin
+          cleanup() {
+            status=$?
+            if [[ -f "$fixture/data/postmaster.pid" ]]; then
+              runuser -u postgres -- "$pg/pg_ctl" -D "$fixture/data" -m immediate -w stop || status=1
+            fi
+            if [[ -f "$fixture/postgres.log" ]]; then
+              cp "$fixture/postgres.log" "$PHANTOM_TEST_RESULTS/postgres.log" || status=1
+            fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+          runuser -u postgres -- "$pg/initdb" -D "$fixture/data" --username=phantom --auth=trust
+          runuser -u postgres -- "$pg/pg_ctl" -D "$fixture/data" -l "$fixture/postgres.log" -o "-k $fixture/socket -h ''" -w start
+          runuser -u postgres -- "$pg/createdb" -h "$fixture/socket" -U phantom expand_test
+          export PHANTOM_TEST_POSTGRES_DSN="Host=$fixture/socket;Username=phantom;Database=expand_test"
+          ./scripts/tests/postgres-row-projection-expand.test.sh
       - name: Retain SQLSTATE, catalogue, legacy row-count and TRX evidence
         if: always()
         uses: actions/upload-artifact@v3
