@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Plugin 0.5.7.48: shared PostgreSQL per-indexer admission/backoff for Torrentio
+  and every discovered Prowlarr indexer. Honours Retry-After and indexerstatus
+  disabled-until, backs off repeated errors, probes recovery and prioritises
+  interactive over queued/in-flight background requests without refunding tokens.
+  Adds health/skip metrics. Schema v25 is an additive, idempotent Postgres expand;
+  old colours tolerate the new table. **BREAKING for SQLite only: requires wipe**
+  per `docs/operator-wipe-validation.md`. See
+  `docs/tasks/p13-indexer-health-backoff.md` for tests and rollout boundaries.
 - Helm chart 2.13.0: opt-in `swarmHealth.enabled` / `serviceUrl` durably manage
   `SwarmHealthServiceUrl` before every plugin boot, on retained and fresh PVCs.
   Disabled management leaves operator settings alone; an explicitly managed empty

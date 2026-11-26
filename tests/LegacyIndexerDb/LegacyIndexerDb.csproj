@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- The harness fetches and SHA256-verifies the UNMODIFIED v24 repository source. -->
+    <Compile Include="$(LegacyPhantomDbSource)" Link="PhantomDb.cs" />
+    <Compile Include="../../src/Jellyfin.Plugin.PhantomLibrary/State/Db/*.cs" />
+    <Compile Include="../../src/Jellyfin.Plugin.PhantomLibrary/Channels/ChannelItemId.cs" />
+    <Compile Include="../../src/Jellyfin.Plugin.PhantomLibrary/Sources/MagnetCandidate.cs" />
+    <PackageReference Include="Npgsql" Version="9.0.4" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.0" />
+  </ItemGroup>
+  <Target Name="RequireLegacySource" BeforeTargets="CoreCompile">
+    <Error Condition="!Exists('$(LegacyPhantomDbSource)')" Text="Run scripts/tests/p13-indexer-health-backoff.test.sh for the verified legacy source fixture." />
+  </Target>
+</Project>

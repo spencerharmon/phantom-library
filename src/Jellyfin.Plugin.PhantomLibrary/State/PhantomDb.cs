@@ -382,7 +382,7 @@ public sealed record HiddenItemRow(int TmdbId, string Type, DateTimeOffset Hidde
 /// </summary>
 public sealed class PhantomDb : IDisposable
 {
-    public const int CurrentSchemaVersion = 24;
+    public const int CurrentSchemaVersion = 25;
 
     /// <summary>
     /// Sentinel written into a LEGACY 32-bit media-size column (<c>size</c>,
@@ -526,6 +526,7 @@ public sealed class PhantomDb : IDisposable
                 SwarmHealthItemIndexSql,
                 SwarmHealthCheckedIndexSql,
             }),
+        (24, 25, "v24_v25_indexer_health", new[] { IndexerHealthStore.TableSql }),
     };
 
     private const string SwarmHealthTableSql =
@@ -544,6 +545,7 @@ public sealed class PhantomDb : IDisposable
     private readonly IPhantomDbProvider _provider;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
     private int _schemaEnsured;
+    private readonly SemaphoreSlim _schemaGate = new(1, 1);
     private int _connectionsOpenedForTests;
 
     /// <summary>
@@ -601,23 +603,37 @@ public sealed class PhantomDb : IDisposable
     public void Dispose()
     {
         _writeLock.Dispose();
+        _schemaGate.Dispose();
         _provider.ClearPool();
     }
+
+    internal Task<DbConnection> OpenIndexerHealthConnectionAsync(CancellationToken ct) => OpenAsync(ct);
 
     private async Task<DbConnection> OpenAsync(CancellationToken ct)
     {
         var conn = _provider.CreateConnection();
         await conn.OpenAsync(ct).ConfigureAwait(false);
         Interlocked.Increment(ref _connectionsOpenedForTests);
-        if (Interlocked.CompareExchange(ref _schemaEnsured, 1, 0) == 0)
+        if (Volatile.Read(ref _schemaEnsured) == 0)
         {
             try
             {
-                await EnsureSchemaAsync(conn, ct).ConfigureAwait(false);
+                await _schemaGate.WaitAsync(ct).ConfigureAwait(false);
+                try
+                {
+                    if (_schemaEnsured == 0)
+                    {
+                        await EnsureSchemaAsync(conn, ct).ConfigureAwait(false);
+                        Volatile.Write(ref _schemaEnsured, 1);
+                    }
+                }
+                finally
+                {
+                    _schemaGate.Release();
+                }
             }
             catch
             {
-                Interlocked.Exchange(ref _schemaEnsured, 0);
                 await conn.DisposeAsync().ConfigureAwait(false);
                 throw;
             }
@@ -730,7 +746,7 @@ public sealed class PhantomDb : IDisposable
         await using (var cmd = conn.CreateCommand())
         {
             cmd.Transaction = tx;
-            cmd.CommandText = SchemaV10Sql;
+            cmd.CommandText = SchemaV10Sql + IndexerHealthStore.TableSql;
             await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
 

@@ -38,13 +38,15 @@ public sealed class ProwlarrClient : IFanOutIndexerClient
     private readonly Func<(string baseUrl, string apiKey)> _configProvider;
     private readonly ProwlarrIndexerDirectory _directory;
 
-    public ProwlarrClient(HttpClient http, ILogger<ProwlarrClient> logger, ProwlarrIndexerDirectory directory)
+    private readonly IndexerHealthGate? _health;
+
+    public ProwlarrClient(HttpClient http, ILogger<ProwlarrClient> logger, ProwlarrIndexerDirectory directory, IndexerHealthGate health)
         : this(
             http,
             logger,
             () => (Plugin.Instance?.Configuration.ProwlarrBaseUrl ?? string.Empty,
                    Plugin.Instance?.Configuration.ProwlarrApiKey ?? string.Empty),
-            directory)
+            directory, health)
     {
     }
 
@@ -53,12 +55,14 @@ public sealed class ProwlarrClient : IFanOutIndexerClient
         HttpClient http,
         ILogger<ProwlarrClient> logger,
         Func<(string, string)> configProvider,
-        ProwlarrIndexerDirectory? directory = null)
+        ProwlarrIndexerDirectory? directory = null,
+        IndexerHealthGate? health = null)
     {
         _http = http;
         _logger = logger;
         _configProvider = configProvider;
         _directory = directory ?? new ProwlarrIndexerDirectory();
+        _health = health;
     }
 
     public string Name => "Prowlarr";
@@ -181,17 +185,18 @@ public sealed class ProwlarrClient : IFanOutIndexerClient
             throw new IndexerNotApplicableException("Prowlarr has no non-degenerate query term for this item");
         }
 
+        await RefreshStatusAsync(baseUrl, apiKey, ct).ConfigureAwait(false);
+
         var results = new List<IndexerCandidate>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         IndexerTransientException? transient = null;
         OperationCanceledException? cancellation = null;
         var successfulResponses = 0;
 
-        // The movie IMDB-id and title+year queries run concurrently too, so one
-        // indexer's latency is max(queries), not their sum. Results are unioned in
-        // query order (deterministic), independent of completion order.
+        // Schedule both movie terms, but admit each HTTP request through the
+        // same shared upstream budget. Union in deterministic query order.
         var attempts = queries
-            .Select(queryStr => SearchTorznabAsync(baseUrl, apiKey, indexer, queryStr, cat, ct))
+            .Select(queryStr => SearchTorznabAsync(baseUrl, apiKey, indexer, queryStr, cat, query, ct))
             .ToList();
         try
         {
@@ -288,6 +293,7 @@ public sealed class ProwlarrClient : IFanOutIndexerClient
         DiscoveredIndexer indexer,
         string queryStr,
         string cat,
+        IndexerQuery query,
         CancellationToken ct)
     {
         var url = string.Format(
@@ -299,6 +305,52 @@ public sealed class ProwlarrClient : IFanOutIndexerClient
             cat,
             Uri.EscapeDataString(apiKey));
 
+        var key = IndexerHealthGate.Key(Name, baseUrl, indexer.Id);
+        var doc = _health is null
+            ? await FetchDocumentAsync(url, apiKey, indexer, ct).ConfigureAwait(false)
+            : await _health.RunAsync(key, Name, indexer.Name, query.Interactive,
+                token => FetchDocumentAsync(url, apiKey, indexer, token), ct, deadline: query.Deadline).ConfigureAwait(false);
+
+        var results = new List<IndexerCandidate>();
+        OperationCanceledException? cancellation = null;
+        IndexerTransientException? deferred = null;
+        foreach (var item in doc.Descendants().Where(e => e.Name.LocalName == "item"))
+        {
+            try
+            {
+                var candidate = await MapTorznabItemAsync(item, indexer, key, query, ct).ConfigureAwait(false);
+                if (candidate is not null)
+                {
+                    results.Add(candidate);
+                }
+            }
+            catch (OperationCanceledException ex)
+            {
+                cancellation ??= ex;
+            }
+            catch (IndexerTransientException ex)
+            {
+                // Keep directly usable siblings, but never classify an entirely
+                // deferred/failed redirect set as a successful empty response.
+                deferred ??= ex;
+            }
+        }
+
+        if (cancellation is not null)
+        {
+            throw new IndexerPartialCancellationException(results.ToArray(), cancellation);
+        }
+
+        if (results.Count == 0 && deferred is not null)
+        {
+            throw deferred;
+        }
+
+        return results;
+    }
+
+    private async Task<XDocument> FetchDocumentAsync(string url, string apiKey, DiscoveredIndexer indexer, CancellationToken ct)
+    {
         using var req = new HttpRequestMessage(HttpMethod.Get, url);
         req.Headers.Add("X-Api-Key", apiKey);
         using var resp = await SendAsync(req, indexer.Name, ct).ConfigureAwait(false);
@@ -323,36 +375,14 @@ public sealed class ProwlarrClient : IFanOutIndexerClient
                 throw new IndexerAuthException($"Prowlarr indexer {indexer.Name} rejected credentials (torznab {code})");
             }
 
-            throw new IndexerTransientException($"Prowlarr indexer {indexer.Name} torznab error {code}: {description}");
-        }
-
-        var results = new List<IndexerCandidate>();
-        OperationCanceledException? cancellation = null;
-        foreach (var item in doc.Descendants().Where(e => e.Name.LocalName == "item"))
-        {
-            try
+            throw new IndexerTransientException($"Prowlarr indexer {indexer.Name} torznab error {code}: {description}")
             {
-                var candidate = await MapTorznabItemAsync(item, indexer, ct).ConfigureAwait(false);
-                if (candidate is not null)
-                {
-                    results.Add(candidate);
-                }
-            }
-            catch (OperationCanceledException ex)
-            {
-                // The XML is already here. Keep directly usable magnets on
-                // either side of a stalled redirect; further network I/O still
-                // observes ct. Do not turn cancellation into a successful empty.
-                cancellation ??= ex;
-            }
+                HealthStatus = code == "429" ? "429" : "error",
+                RetryAfterMs = IndexerHealthGate.HttpFailure(resp, Name).RetryAfterMs,
+            };
         }
 
-        if (cancellation is not null)
-        {
-            throw new IndexerPartialCancellationException(results.ToArray(), cancellation);
-        }
-
-        return results;
+        return doc;
     }
 
     /// <summary>Sends a request, mapping transport/HTTP failures onto the indexer exception contract.</summary>
@@ -383,15 +413,16 @@ public sealed class ProwlarrClient : IFanOutIndexerClient
 
         if (!resp.IsSuccessStatusCode)
         {
+            var failure = IndexerHealthGate.HttpFailure(resp, Name);
             resp.Dispose();
             _logger.LogWarning("Prowlarr {What} returned {Status}; treating as transient", what, status);
-            throw new IndexerTransientException($"Prowlarr {what} returned HTTP {status}");
+            throw failure;
         }
 
         return resp;
     }
 
-    private async Task<IndexerCandidate?> MapTorznabItemAsync(XElement item, DiscoveredIndexer indexer, CancellationToken ct)
+    private async Task<IndexerCandidate?> MapTorznabItemAsync(XElement item, DiscoveredIndexer indexer, string key, IndexerQuery query, CancellationToken ct)
     {
         string? Child(string localName) => item.Elements().FirstOrDefault(e => e.Name.LocalName == localName)?.Value;
 
@@ -433,7 +464,10 @@ public sealed class ProwlarrClient : IFanOutIndexerClient
             var download = !string.IsNullOrWhiteSpace(link) ? link : enclosureUrl;
             if (!string.IsNullOrWhiteSpace(download))
             {
-                magnet = await TryResolveMagnetRedirectAsync(download!, ct).ConfigureAwait(false);
+                magnet = _health is null
+                    ? await TryResolveMagnetRedirectAsync(download!, ct).ConfigureAwait(false)
+                    : await _health.RunAsync(key, Name, indexer.Name, query.Interactive,
+                        token => TryResolveMagnetRedirectAsync(download!, token), ct, deadline: query.Deadline).ConfigureAwait(false);
             }
         }
 
@@ -494,16 +528,21 @@ public sealed class ProwlarrClient : IFanOutIndexerClient
         catch (HttpRequestException ex)
         {
             _logger.LogDebug(ex, "Prowlarr download URL could not be resolved to magnet");
-            return null;
+            throw new IndexerTransientException("Prowlarr download transport failure", ex);
         }
         catch (TaskCanceledException ex) when (!ct.IsCancellationRequested)
         {
             _logger.LogDebug(ex, "Prowlarr download URL timed out resolving magnet");
-            return null;
+            throw new IndexerTransientException("Prowlarr download timed out", ex);
         }
 
         using (resp)
         {
+            if ((int)resp.StatusCode >= 400)
+            {
+                throw IndexerHealthGate.HttpFailure(resp, Name);
+            }
+
             var location = resp.Headers.Location?.ToString();
             if (!string.IsNullOrWhiteSpace(location)
                 && location.StartsWith("magnet:", StringComparison.OrdinalIgnoreCase))
@@ -513,6 +552,50 @@ public sealed class ProwlarrClient : IFanOutIndexerClient
         }
 
         return null;
+    }
+
+    private async Task RefreshStatusAsync(string baseUrl, string apiKey, CancellationToken ct)
+    {
+        if (_health is null)
+        {
+            return;
+        }
+
+        try
+        {
+            // The status endpoint has its own shared 15s budget, independent of
+            // the 15-minute indexer discovery cache. Never shorten an existing
+            // Retry-After when Prowlarr returns a healthy/older snapshot.
+            await _health.RunAsync(IndexerHealthGate.Key(Name, baseUrl, -1), Name, "indexerstatus", false, async token =>
+            {
+                using var req = new HttpRequestMessage(HttpMethod.Get, baseUrl.TrimEnd('/') + "/api/v1/indexerstatus");
+                req.Headers.Add("X-Api-Key", apiKey);
+                using var resp = await SendAsync(req, "indexerstatus", token).ConfigureAwait(false);
+                var body = await resp.Content.ReadAsStreamAsync(token).ConfigureAwait(false);
+                var statuses = await JsonSerializer.DeserializeAsync<List<ProwlarrStatusDto>>(body, JsonOpts, token).ConfigureAwait(false)
+                    ?? throw new IndexerTransientException("Prowlarr indexerstatus: expected array");
+                foreach (var status in statuses.Where(s => s.IndexerId > 0 && s.DisabledTill.HasValue))
+                {
+                    await _health.DisableUntilAsync(IndexerHealthGate.Key(Name, baseUrl, status.IndexerId), status.DisabledTill!.Value, token).ConfigureAwait(false);
+                }
+
+                return true;
+            }, ct, control: true).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
+        {
+            _logger.LogWarning(ex, "Prowlarr status refresh timed out; keeping persisted backoff");
+        }
+        catch (IndexerTransientException ex) when (ex.HealthStatus != "skip_busy")
+        {
+            _logger.LogDebug(ex, "Prowlarr status refresh deferred; keeping persisted backoff");
+        }
+    }
+
+    private sealed class ProwlarrStatusDto
+    {
+        public int IndexerId { get; set; }
+        public DateTimeOffset? DisabledTill { get; set; }
     }
 
     private static List<string> BuildSearchQueries(IndexerQuery query, bool isEpisode)

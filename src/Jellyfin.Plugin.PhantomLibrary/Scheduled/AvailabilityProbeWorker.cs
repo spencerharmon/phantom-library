@@ -141,6 +141,7 @@ public sealed class AvailabilityProbeWorker : IHostedService, IDisposable
 
     private async Task TickAsync(CancellationToken serviceStopping)
     {
+        using var searchPriority = new Clients.IndexerSearchScope();
         if (Interlocked.Exchange(ref _running, 1) == 1)
         {
             return;

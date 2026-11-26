@@ -14,7 +14,8 @@ threw away results the fast indexers had already returned.
 - Each discovered indexer is queried via Prowlarr's per-indexer Torznab endpoint
   `GET /{id}/api?t=search&q=…&cat=2000|5000&extended=1` (API key as `X-Api-Key`
   header and `apikey` param). Query shape unchanged: movie = IMDB id ∪
-  title+year (both concurrent), episode = `Title SxxEyy`. Torznab parse: magnet
+  title+year (both scheduled concurrently; since 0.5.7.48 each is admitted by
+  the shared per-indexer budget), episode = `Title SxxEyy`. Torznab parse: magnet
   from `magneturl` attr → magnet `link`/`enclosure` → `infohash` attr → http
   link redirect; seeders/peers/size from `torznab:attr`. `<error code=100..102>`
   → auth, other `<error>` → transient.
@@ -57,6 +58,11 @@ threw away results the fast indexers had already returned.
   timer is removed after waking (no busy loop when fewer than N hits exist).
 - P6 separation preserved: `ProbeAvailabilityAsync` still only runs
   availability-oracle indexers (Torrentio); Prowlarr discovery never runs there.
+
+Since 0.5.7.48, all production clients use the shared admission/backoff gate;
+see [indexer health](p13-indexer-health-backoff.md) for PostgreSQL state,
+interactive preemption and additional health/skip metrics. The former ungoverned
+per-indexer HTTP path is not used by production DI.
 
 ## Metrics (OTel 1.10.x, meter `Phantom.Indexers`, exported by `PhantomMetricsExporter`)
 

@@ -291,6 +291,7 @@ public sealed class MagnetCacheBuilder
     {
         ArgumentNullException.ThrowIfNull(job);
         ArgumentNullException.ThrowIfNull(cfg);
+        using var searchPriority = new Clients.IndexerSearchScope();
         try
         {
             var meta = await _resolveMeta(job.TmdbId, job.Type, job.Season, job.Episode, ct).ConfigureAwait(false);

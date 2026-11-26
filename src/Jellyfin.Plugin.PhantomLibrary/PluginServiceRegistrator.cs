@@ -70,6 +70,8 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
         // Indexers — registered as IIndexerClient in the order Prowlarr → Torrentio.
         // p13-parallel-indexer-search: the discovered Prowlarr indexer list is a
         // process-wide TTL cache (ProwlarrClient itself is a transient typed client).
+        serviceCollection.AddSingleton<IndexerHealthStore>();
+        serviceCollection.AddSingleton<IndexerHealthGate>();
         serviceCollection.AddSingleton<ProwlarrIndexerDirectory>();
         serviceCollection.AddHttpClient<ProwlarrClient>(c =>
         {

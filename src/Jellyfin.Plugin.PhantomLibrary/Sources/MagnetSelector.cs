@@ -15,22 +15,6 @@ using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Plugin.PhantomLibrary.Sources;
 
-/// <summary>
-/// Chosen magnet candidate returned by <see cref="MagnetSelector"/>.
-/// Identical shape to the cached row in <c>magnet_cache</c> minus the
-/// cache bookkeeping, so callers can flow this straight into a
-/// <c>GostreamAddRequest</c> or into the cache.
-/// </summary>
-public sealed record MagnetCandidate(
-    string Magnet,
-    string InfoHash,
-    long Size,
-    int Seeders,
-    string Indexer)
-{
-    public string? Title { get; init; }
-}
-
 public enum MagnetProbeOutcome
 {
     Available,
@@ -348,6 +332,7 @@ public sealed class MagnetSelector : IDisposable
 
         var query = new IndexerQuery
         {
+            Interactive = IndexerSearchScope.IsInteractive && !availabilityOracleOnly,
             Type = type,
             Tmdb = tmdbId,
             Imdb = type == "movie" ? imdbId : null,
@@ -387,7 +372,7 @@ public sealed class MagnetSelector : IDisposable
             var indexer = enabled[i];
             top.Add(indexer is IFanOutIndexerClient gateway
                 ? StartDiscovery(run, gateway, i)
-                : StartRequest(run, i, -1, indexer.Name, indexer.Name, isFanOutChild: false, t => indexer.SearchAsync(query, t)));
+                : StartRequest(run, i, -1, indexer.Name, indexer.Name, isFanOutChild: false, t => indexer.SearchAsync(query with { Deadline = DateTimeOffset.UtcNow + run.PerRequestTimeout }, t)));
         }
 
         var pending = new List<FanOutRequest>(top);
@@ -715,6 +700,11 @@ public sealed class MagnetSelector : IDisposable
                 status = IndexerSearchMetrics.StatusAuth;
                 _logger.LogWarning(ex, "Indexer {Indexer} returned auth failure for {Type}/{Tmdb}", label, run.Type, run.TmdbId);
             }
+            catch (IndexerTransientException ex) when (ex.HealthStatus is not null)
+            {
+                req.Failure = $"{label}:{ex.HealthStatus}";
+                status = ex.HealthStatus;
+            }
             catch (Exception ex)
             {
                 req.Failure = $"{label}:transient";
@@ -748,7 +738,7 @@ public sealed class MagnetSelector : IDisposable
                 for (var j = 0; j < discovered.Count; j++)
                 {
                     var ix = discovered[j];
-                    kids.Add(StartRequest(run, major, j, gateway.Name, ix.Name, isFanOutChild: true, t => gateway.SearchIndexerAsync(ix, run.Query, t)));
+                    kids.Add(StartRequest(run, major, j, gateway.Name, ix.Name, isFanOutChild: true, t => gateway.SearchIndexerAsync(ix, run.Query with { Deadline = DateTimeOffset.UtcNow + run.PerRequestTimeout }, t)));
                 }
 
                 req.Children = kids;

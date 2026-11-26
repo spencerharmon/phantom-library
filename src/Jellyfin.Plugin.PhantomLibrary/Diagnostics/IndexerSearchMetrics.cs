@@ -105,6 +105,25 @@ internal static class IndexerSearchMetrics
         }
     }
 
+    private static readonly Counter<long> Health = Meter.CreateCounter<long>("phantom_indexer_health_total");
+    private static readonly Histogram<double> HttpLatency = Meter.CreateHistogram<double>("phantom_indexer_http_duration_ms", "ms");
+
+    internal static void RecordHealth(string client, string indexer, string status, bool interactive, double elapsedMs)
+    {
+        var tags = new[]
+        {
+            new KeyValuePair<string, object?>("client", client),
+            new KeyValuePair<string, object?>("indexer", indexer),
+            new KeyValuePair<string, object?>("status", status),
+            new KeyValuePair<string, object?>("priority", interactive ? "interactive" : "background"),
+        };
+        Health.Add(1, tags);
+        if (!status.StartsWith("skip_", System.StringComparison.Ordinal))
+        {
+            HttpLatency.Record(elapsedMs, tags);
+        }
+    }
+
     /// <summary>Record that a search's budget expired holding <paramref name="candidates"/> candidates.</summary>
     public static void RecordBudgetExpired(string itemType, int candidates)
         => BudgetExpired.Record(candidates, new KeyValuePair<string, object?>("item_type", itemType));

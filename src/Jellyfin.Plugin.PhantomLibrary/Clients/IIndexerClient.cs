@@ -73,6 +73,9 @@ public sealed record DiscoveredIndexer(int Id, string Name, string Protocol);
 
 public sealed record IndexerQuery
 {
+    /// <summary>Background callers explicitly opt out before fan-out; default is interactive.</summary>
+    public bool Interactive { get; init; } = true;
+    internal DateTimeOffset? Deadline { get; init; }
     public required string Type { get; init; } // "movie" | "episode"
     public string? Imdb { get; init; }
     public int? Tmdb { get; init; }
@@ -107,6 +110,8 @@ public sealed class IndexerAuthException : Exception
 /// <summary>Transient or indeterminate indexer failure; callers must not treat it as a definitive empty result.</summary>
 public sealed class IndexerTransientException : Exception
 {
+    internal string? HealthStatus { get; init; }
+    internal long RetryAfterMs { get; init; }
     public IndexerTransientException() { }
     public IndexerTransientException(string message) : base(message) { }
     public IndexerTransientException(string message, Exception inner) : base(message, inner) { }
