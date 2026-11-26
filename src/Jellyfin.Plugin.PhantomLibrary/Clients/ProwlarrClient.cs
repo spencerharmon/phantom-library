@@ -95,6 +95,13 @@ public sealed class ProwlarrClient : IFanOutIndexerClient
             return Array.Empty<IndexerCandidate>();
         }
 
+        // Retain the client-level degenerate-query backstop even for callers
+        // outside MagnetSelector: abstain before issuing discovery traffic.
+        if (BuildSearchQueries(query, string.Equals(query.Type, "episode", StringComparison.OrdinalIgnoreCase)).Count == 0)
+        {
+            throw new IndexerNotApplicableException("Prowlarr has no non-degenerate query term for this item");
+        }
+
         var indexers = await DiscoverIndexersAsync(query, ct).ConfigureAwait(false);
         var tasks = indexers.Select(async ix =>
         {
@@ -177,6 +184,7 @@ public sealed class ProwlarrClient : IFanOutIndexerClient
         var results = new List<IndexerCandidate>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         IndexerTransientException? transient = null;
+        OperationCanceledException? cancellation = null;
         var successfulResponses = 0;
 
         // The movie IMDB-id and title+year queries run concurrently too, so one
@@ -202,6 +210,16 @@ public sealed class ProwlarrClient : IFanOutIndexerClient
                 hits = await attempt.ConfigureAwait(false);
                 successfulResponses++;
             }
+            catch (OperationCanceledException ex)
+            {
+                // Do not let a timed-out sibling erase successful attempts.
+                // Preserve cancellation (including direct caller cancellation),
+                // carrying hits to the collector that owns the timeout token.
+                cancellation ??= ex;
+                hits = ex is IndexerPartialCancellationException partial
+                    ? partial.Candidates
+                    : Array.Empty<IndexerCandidate>();
+            }
             catch (IndexerTransientException ex)
             {
                 transient ??= ex;
@@ -215,6 +233,11 @@ public sealed class ProwlarrClient : IFanOutIndexerClient
                     results.Add(hit);
                 }
             }
+        }
+
+        if (cancellation is not null)
+        {
+            throw new IndexerPartialCancellationException(results.ToArray(), cancellation);
         }
 
         if (successfulResponses == 0 && transient is not null)
@@ -304,13 +327,29 @@ public sealed class ProwlarrClient : IFanOutIndexerClient
         }
 
         var results = new List<IndexerCandidate>();
+        OperationCanceledException? cancellation = null;
         foreach (var item in doc.Descendants().Where(e => e.Name.LocalName == "item"))
         {
-            var candidate = await MapTorznabItemAsync(item, indexer, ct).ConfigureAwait(false);
-            if (candidate is not null)
+            try
             {
-                results.Add(candidate);
+                var candidate = await MapTorznabItemAsync(item, indexer, ct).ConfigureAwait(false);
+                if (candidate is not null)
+                {
+                    results.Add(candidate);
+                }
             }
+            catch (OperationCanceledException ex)
+            {
+                // The XML is already here. Keep directly usable magnets on
+                // either side of a stalled redirect; further network I/O still
+                // observes ct. Do not turn cancellation into a successful empty.
+                cancellation ??= ex;
+            }
+        }
+
+        if (cancellation is not null)
+        {
+            throw new IndexerPartialCancellationException(results.ToArray(), cancellation);
         }
 
         return results;
@@ -445,6 +484,7 @@ public sealed class ProwlarrClient : IFanOutIndexerClient
             return null;
         }
 
+        ct.ThrowIfCancellationRequested();
         using var req = new HttpRequestMessage(HttpMethod.Get, uri);
         HttpResponseMessage resp;
         try

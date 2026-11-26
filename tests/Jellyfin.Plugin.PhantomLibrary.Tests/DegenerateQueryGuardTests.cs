@@ -527,7 +527,7 @@ public sealed class DegenerateQueryGuardTests : IDisposable
     }
 
     /// <summary>
-    /// Recording fake HTTP backend for Prowlarr (<c>/api/v1/search</c>),
+    /// Recording fake HTTP backend for Prowlarr (discovery + per-indexer Torznab),
     /// Torrentio (<c>/stream/...</c>) and TMDB (<c>/3/...</c>). Every outbound
     /// request URL is recorded; each indexer answers with one high-seeder
     /// 1080p candidate so a successful probe is observable.
@@ -557,8 +557,8 @@ public sealed class DegenerateQueryGuardTests : IDisposable
             lock (_gate)
             {
                 return Requests
-                    .Where(u => u.StartsWith(ProwlarrBase + "/api/v1/search", StringComparison.Ordinal))
-                    .Select(u => System.Web.HttpUtility.ParseQueryString(new Uri(u).Query)["query"] ?? string.Empty)
+                    .Where(u => u.StartsWith(ProwlarrBase + "/1/api?", StringComparison.Ordinal))
+                    .Select(u => System.Web.HttpUtility.ParseQueryString(new Uri(u).Query)["q"] ?? string.Empty)
                     .ToList();
             }
         }
@@ -572,11 +572,17 @@ public sealed class DegenerateQueryGuardTests : IDisposable
             }
 
             string body;
-            if (url.StartsWith(ProwlarrBase, StringComparison.Ordinal))
+            if (url == ProwlarrBase + "/api/v1/indexer")
+            {
+                body = "[{\"id\":1,\"name\":\"torznab-x\",\"enable\":true,\"protocol\":\"torrent\"}]";
+            }
+            else if (url.StartsWith(ProwlarrBase + "/1/api?", StringComparison.Ordinal))
             {
                 var hash = "P" + Math.Abs(url.GetHashCode(StringComparison.Ordinal)).ToString("X8", System.Globalization.CultureInfo.InvariantCulture);
-                body = "[{\"title\":\"Release 1080p WEB\",\"size\":5000000000,\"seeders\":200,\"leechers\":1,"
-                    + "\"magnetUrl\":\"magnet:?xt=urn:btih:" + hash + "\",\"indexer\":\"torznab-x\"}]";
+                body = ParallelIndexerSearchTests.FakeProwlarr.Torznab("torznab-x", new[]
+                {
+                    new ParallelIndexerSearchTests.TorznabItem("Release 1080p WEB", hash, 200, 5000000000),
+                });
             }
             else if (url.StartsWith(TorrentioBase, StringComparison.Ordinal))
             {

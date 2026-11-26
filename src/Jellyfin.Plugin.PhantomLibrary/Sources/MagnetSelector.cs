@@ -393,21 +393,34 @@ public sealed class MagnetSelector : IDisposable
         var pending = new List<FanOutRequest>(top);
         var collected = new List<FanOutRequest>();
         var budgetExpired = false;
-        var sw = Stopwatch.StartNew();
         using (var budgetCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
         {
             var budgetTask = Task.Delay(TimeSpan.FromMilliseconds(cfg.IndexerSearchBudgetMs), budgetCts.Token);
+            Task? earlyWake = cfg.FastIndexerEarlyReturnEnabled
+                ? Task.Delay(TimeSpan.FromMilliseconds(cfg.EarlyReturnMinElapsedMs), budgetCts.Token)
+                : null;
+            var earlyMinimumReached = false;
             try
             {
                 while (pending.Count > 0)
                 {
-                    var waitSet = new Task[pending.Count + 1];
+                    if (earlyMinimumReached
+                        && CountPassing(collected, cfg.MinSeeders) >= cfg.MinEarlyReturnCandidates)
+                    {
+                        break;
+                    }
+
+                    var waitSet = new Task[pending.Count + (earlyWake is null ? 1 : 2)];
                     for (var i = 0; i < pending.Count; i++)
                     {
                         waitSet[i] = pending[i].Task;
                     }
 
-                    waitSet[^1] = budgetTask;
+                    waitSet[pending.Count] = budgetTask;
+                    if (earlyWake is not null)
+                    {
+                        waitSet[^1] = earlyWake;
+                    }
                     var done = await Task.WhenAny(waitSet).ConfigureAwait(false);
                     ct.ThrowIfCancellationRequested();
                     if (done == budgetTask)
@@ -416,15 +429,17 @@ public sealed class MagnetSelector : IDisposable
                         break;
                     }
 
-                    Collect(pending, collected, pending.First(p => p.Task == done));
-
-                    if (cfg.FastIndexerEarlyReturnEnabled
-                        && pending.Count > 0
-                        && sw.ElapsedMilliseconds >= cfg.EarlyReturnMinElapsedMs
-                        && CountPassing(collected, cfg.MinSeeders) >= cfg.MinEarlyReturnCandidates)
+                    if (done == earlyWake)
                     {
-                        break;
+                        // Wake even if N hits arrived before the minimum and
+                        // every remaining request is hung. Remove the timer once
+                        // consumed so insufficient hits cannot cause a busy loop.
+                        earlyMinimumReached = true;
+                        earlyWake = null;
+                        continue;
                     }
+
+                    Collect(pending, collected, pending.First(p => p.Task == done));
                 }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -472,7 +487,7 @@ public sealed class MagnetSelector : IDisposable
         var stillPending = 0;
         foreach (var t in top)
         {
-            if (!t.Collected)
+            if (!collected.Contains(t))
             {
                 stillPending++;
                 continue;
@@ -495,14 +510,17 @@ public sealed class MagnetSelector : IDisposable
                 continue;
             }
 
-            if (kids.Any(k => k.Collected && k.Succeeded))
+            // Empty/rejected successes do not settle the gateway while a
+            // sibling is pending. Use the in-budget snapshot, not state that
+            // the late collector could mutate after handoff.
+            if (kids.Any(k => !collected.Contains(k)))
             {
+                stillPending++;
                 continue;
             }
 
-            if (kids.Any(k => !k.Collected))
+            if (kids.Any(k => k.Succeeded))
             {
-                stillPending++;
                 continue;
             }
 
@@ -562,7 +580,6 @@ public sealed class MagnetSelector : IDisposable
     private static void Collect(List<FanOutRequest> pending, List<FanOutRequest> collected, FanOutRequest req)
     {
         pending.Remove(req);
-        req.Collected = true;
         collected.Add(req);
         if (req.Children is { Count: > 0 } kids)
         {
@@ -673,6 +690,13 @@ public sealed class MagnetSelector : IDisposable
             }
             catch (OperationCanceledException ex)
             {
+                // Only a local timeout may salvage partial results. The caller/
+                // shutdown cancellation branch above deliberately never caches.
+                if (ex is IndexerPartialCancellationException partial && partial.Candidates.Count > 0)
+                {
+                    req.Hits = new List<IndexerCandidate>(partial.Candidates);
+                }
+
                 req.Failure = $"{label}:timeout";
                 status = IndexerSearchMetrics.StatusTimeout;
                 _logger.LogWarning(ex, "Indexer {Indexer} timed out after {Timeout}s for {Type}/{Tmdb}", label, run.PerRequestTimeout.TotalSeconds, run.Type, run.TmdbId);
@@ -980,8 +1004,6 @@ public sealed class MagnetSelector : IDisposable
         public string? Abstention { get; set; }
 
         public bool Succeeded { get; set; }
-
-        public bool Collected { get; set; }
 
         public List<FanOutRequest>? Children { get; set; }
     }

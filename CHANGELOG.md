@@ -37,6 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [docs/tasks/p13-parallel-indexer-search.md](docs/tasks/p13-parallel-indexer-search.md).
 
 ### Fixed
+- Parallel source search preserves successful movie subqueries and parsed magnets
+  when a sibling query/download redirect times out, caching late hits without
+  weakening caller cancellation. Empty/rejected results remain transient while
+  sibling indexers are pending. The early-return minimum now wakes the collector
+  independently of request completions (including the default 250 ms minimum).
 - Harden the independent swarm-health service: BEP33 bloom estimates and bounded
   peer observations, unknown/partial/timeout results instead of false dead swarms,
   bounded/coalesced priority scheduling, cancellation, HTTP limits, TTL/LRU cache,

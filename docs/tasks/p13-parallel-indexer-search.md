@@ -35,14 +35,26 @@ threw away results the fast indexers had already returned.
   `MagnetCacheLateResultWriter` → `source_candidates`
   (`source=late_indexer_result`, preset `SourcePickerPreset`, movie -1/-1
   sentinels, episode real s/e). Host shutdown disposes the singleton selector,
-  cancelling every background request.
+  cancelling every background request. Partial movie subqueries and already
+  parsed Torznab magnets survive a sibling/redirect timeout: an internal
+  `IndexerPartialCancellationException` carries completed hits while retaining
+  `OperationCanceledException` semantics. Only the collector that owns the
+  timeout may salvage these hits; caller/shutdown cancellation still wins and
+  does not cache them. Partial completions retain `status=timeout` metrics with
+  their real candidate count rather than masquerading as a full success.
 - Caller cancellation (interactive preemption, request abort) still cancels all
   requests and propagates `OperationCanceledException` while the caller waits;
   after the probe returns, the caller link is dropped so late work outlives it.
 - Outcome classification is per top-level client: a Prowlarr gateway is a
   failure only if discovery failed or every discovered indexer failed. No
   candidate yet with requests still running → `IndeterminateTransient`
-  (`indexer_budget_expired`), never `DefinitiveUnavailable`.
+  (`indexer_budget_expired`), never `DefinitiveUnavailable`. Empty or scorer-
+  rejected successes do not mask pending siblings. Classification uses the
+  in-budget snapshot, not mutable state in the background collector.
+- The early-return minimum has its own one-shot wakeup. N candidates received
+  before the default 250 ms minimum return at that minimum even if all other
+  indexers are hung; it is not necessary to wait for another response. The
+  timer is removed after waking (no busy loop when fewer than N hits exist).
 - P6 separation preserved: `ProbeAvailabilityAsync` still only runs
   availability-oracle indexers (Torrentio); Prowlarr discovery never runs there.
 
@@ -71,4 +83,16 @@ by the operator's indexer set).
 `ParallelIndexerSearchTests` (in-process fake Prowlarr: fast / hung /
 slow-past-budget / 5xx / disabled / usenet; real `ProwlarrClient`,
 `MagnetSelector`, SQLite `PhantomDb`), `ProwlarrClientTests`,
-`MagnetSelectorTests`. Movie and episode. Inits `jellyfin/` if absent.
+`MagnetSelectorTests`, `DegenerateQueryGuardTests`. Movie and episode. Inits
+`jellyfin/` if absent. The degenerate-title guard and TMDB repair remain intact
+on the per-indexer path (including standalone-client abstention before discovery).
+
+Rework regressions assert actual `source_candidates` rows for an 800 ms movie
+IMDB response with a hung title/year sibling (and the reverse), 500 ms budget,
+5 s request timeout. Parsed magnets on both sides of a hung redirect are also
+preserved. Empty/rejected + pending classification and nonzero early minima
+(default 250 ms and configured 600 ms) cover movie and episode; direct-client
+and selector cancellation assertions ensure partial hits do not weaken preemption.
+The old timing test that expected a 300 ms minimum to wait for the next slow
+response was replaced with a floor-plus-upper-bound assertion and a controlled
+late completion.

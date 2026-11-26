@@ -401,11 +401,164 @@ public sealed class ParallelIndexerSearchTests : IDisposable
         }
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task AsymmetricMovieTimeout_PreservesSuccessfulLateSubqueryInCache(bool imdbResponds)
+    {
+        var cfg = Config(500, earlyReturn: false);
+        var db = await NewDbAsync();
+        var fake = new FakeProwlarr(ApiKey);
+        fake.AddIndexer(71, Ix("asymmetric"), true, IndexerBehaviour.Hang());
+        fake.QueryBehaviour = (_, q) => q.StartsWith("tt", StringComparison.Ordinal) == imdbResponds
+            ? IndexerBehaviour.Respond(TimeSpan.FromMilliseconds(800), Item("Movie 1080p LATE", "ABCD1234", 50))
+            : IndexerBehaviour.Hang();
+        using var metrics = new MetricCapture(_tag);
+        var (selector, _) = Build(fake, cfg, db);
+        using (selector)
+        {
+            var sw = Stopwatch.StartNew();
+            var probe = await selector.ProbeAsync(7601, "tt0000008", "movie", null, null, "Movie", 2020, CancellationToken.None);
+            Assert.True(sw.ElapsedMilliseconds < 1000, $"budget overrun: {sw.ElapsedMilliseconds}ms");
+            Assert.Equal(MagnetProbeOutcome.IndeterminateTransient, probe.Outcome);
+            await selector.WhenLateWorkIdleAsync().WaitAsync(TimeSpan.FromSeconds(8));
+            var rows = await db.ListSourceCandidatesAsync(7601, "movie", -1, -1, "gostream-default", false, CancellationToken.None);
+            var row = Assert.Single(rows);
+            Assert.Equal("ABCD1234", row.InfoHash);
+            Assert.Equal(50, row.Seeders);
+            Assert.Equal(MagnetCacheLateResultWriter.SourceTag, row.Source);
+            Assert.Equal(2, fake.TorznabHits(71));
+            Assert.Equal(0, selector.LateCollectorsActive);
+        }
+
+        Assert.Contains(metrics.Snapshot(IndexerSearchMetrics.RequestsName), m =>
+            (string?)m.Tags["indexer"] == Ix("asymmetric") && (string?)m.Tags["status"] == "timeout" && (string?)m.Tags["phase"] == "late");
+        Assert.Contains(metrics.Snapshot(IndexerSearchMetrics.CandidatesName), m => m.Value == 1);
+    }
+
+    [Theory]
+    [InlineData("movie")]
+    [InlineData("episode")]
+    public async Task RedirectTimeout_PreservesOtherParsedLateItemsInCache(string type)
+    {
+        var cfg = Config(500, earlyReturn: false);
+        var db = await NewDbAsync();
+        var fake = new FakeProwlarr(ApiKey);
+        // A redirect needing network I/O between two directly usable magnets
+        // must not erase either hit from an otherwise valid Torznab response.
+        fake.AddIndexer(72, Ix("redirect"), true, IndexerBehaviour.Respond(TimeSpan.FromMilliseconds(800),
+            Item("Movie S01E02 1080p FIRST", "AAAA1234", 50),
+            new TorznabItem("Movie S01E02 1080p HUNG", "", 50, 5L * 1024 * 1024 * 1024, BaseUrl + "/hung-download?apikey=" + ApiKey),
+            Item("Movie S01E02 1080p LAST", "BBBB1234", 50)));
+        var (selector, _) = Build(fake, cfg, db);
+        using (selector)
+        {
+            var episode = type == "episode";
+            var probe = await selector.ProbeAsync(7602, "tt0000009", type, episode ? 1 : null, episode ? 2 : null, "Movie", 2020, CancellationToken.None);
+            Assert.Equal(MagnetProbeOutcome.IndeterminateTransient, probe.Outcome);
+            await selector.WhenLateWorkIdleAsync().WaitAsync(TimeSpan.FromSeconds(8));
+            var rows = await db.ListSourceCandidatesAsync(7602, type, episode ? 1 : -1, episode ? 2 : -1, "gostream-default", false, CancellationToken.None);
+            Assert.Equal(new[] { "AAAA1234", "BBBB1234" }, rows.Select(r => r.InfoHash).OrderBy(h => h));
+            Assert.All(rows, r => Assert.Equal(MagnetCacheLateResultWriter.SourceTag, r.Source));
+            Assert.True(fake.DownloadHits > 0);
+        }
+    }
+
+    [Theory]
+    [InlineData("movie", false)]
+    [InlineData("episode", false)]
+    [InlineData("movie", true)]
+    [InlineData("episode", true)]
+    public async Task Budget_EmptyOrRejectedSuccessWithPendingSibling_RemainsTransient(string type, bool rejected)
+    {
+        var cfg = Config(500, earlyReturn: false);
+        var db = await NewDbAsync();
+        var fake = new FakeProwlarr(ApiKey);
+        fake.AddIndexer(73, Ix("empty"), true, IndexerBehaviour.Respond(TimeSpan.Zero,
+            rejected ? new[] { Item("Movie S01E02 1080p WEAK", "CCCC1234", 1) } : Array.Empty<TorznabItem>()));
+        fake.AddIndexer(74, Ix("late"), true, IndexerBehaviour.Respond(TimeSpan.FromMilliseconds(1000), Item("Movie S01E02 1080p LATE", "DDDD1234", 50)));
+        var (selector, _) = Build(fake, cfg, db);
+        using (selector)
+        {
+            var episode = type == "episode";
+            var probe = await selector.ProbeAsync(7603, "tt0000010", type, episode ? 1 : null, episode ? 2 : null, "Movie", 2020, CancellationToken.None);
+            Assert.Equal(MagnetProbeOutcome.IndeterminateTransient, probe.Outcome);
+            Assert.Equal(rejected ? "indexer_budget_expired_all_candidates_rejected" : "indexer_budget_expired", probe.ErrorKind);
+            await selector.WhenLateWorkIdleAsync().WaitAsync(TimeSpan.FromSeconds(3));
+            var rows = await db.ListSourceCandidatesAsync(7603, type, episode ? 1 : -1, episode ? 2 : -1, "gostream-default", false, CancellationToken.None);
+            Assert.Equal("DDDD1234", Assert.Single(rows).InfoHash);
+        }
+    }
+
+    [Theory]
+    [InlineData("movie", null)]
+    [InlineData("episode", null)]
+    [InlineData("movie", 600)]
+    [InlineData("episode", 600)]
+    public async Task EarlyReturn_WakesAtMinimumEvenWhenNoMoreRequestsComplete(string type, int? minimumMs)
+    {
+        var cfg = Config(1500, earlyReturn: true);
+        cfg.EarlyReturnMinElapsedMs = minimumMs ?? new PluginConfiguration().EarlyReturnMinElapsedMs;
+        Assert.True(cfg.EarlyReturnMinElapsedMs > 0);
+        var db = await NewDbAsync();
+        var fake = new FakeProwlarr(ApiKey);
+        fake.AddIndexer(75, Ix("fast"), true, IndexerBehaviour.Respond(TimeSpan.Zero, Item("Movie S01E02 1080p FAST", "EEEE1234", 50)));
+        fake.AddIndexer(76, Ix("hung"), true, IndexerBehaviour.Hang());
+        var (selector, _) = Build(fake, cfg, db);
+        using (selector)
+        {
+            var episode = type == "episode";
+            var sw = Stopwatch.StartNew();
+            var probe = await selector.ProbeAsync(7604, "tt0000011", type, episode ? 1 : null, episode ? 2 : null, "Movie", 2020, CancellationToken.None);
+            Assert.InRange(sw.ElapsedMilliseconds, cfg.EarlyReturnMinElapsedMs - 20, cfg.EarlyReturnMinElapsedMs + 500);
+            Assert.Equal(MagnetProbeOutcome.Available, probe.Outcome);
+            Assert.Equal("EEEE1234", Assert.Single(probe.Candidates).InfoHash);
+            Assert.Equal(1, selector.LateCollectorsActive);
+            selector.Dispose();
+            await selector.WhenLateWorkIdleAsync().WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.Equal(0, selector.LateCollectorsActive);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PartialMovieResponse_CallerCancellationStillPropagatesWithoutCaching(bool directClient)
+    {
+        var cfg = Config(5000, earlyReturn: false);
+        var db = await NewDbAsync();
+        var fake = new FakeProwlarr(ApiKey);
+        fake.AddIndexer(77, Ix("partial"), true, IndexerBehaviour.Hang());
+        fake.QueryBehaviour = (_, q) => q.StartsWith("tt", StringComparison.Ordinal)
+            ? IndexerBehaviour.Respond(TimeSpan.Zero, Item("Movie 1080p FAST", "FFFF1234", 50))
+            : IndexerBehaviour.Hang();
+        var (selector, client) = Build(fake, cfg, db);
+        using (selector)
+        using (var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300)))
+        {
+            if (directClient)
+            {
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => client.SearchIndexerAsync(
+                    new DiscoveredIndexer(77, Ix("partial"), "torrent"),
+                    new IndexerQuery { Type = "movie", Imdb = "tt0000012", Title = "Movie" }, cts.Token));
+            }
+            else
+            {
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => selector.ProbeAsync(
+                    7605, "tt0000012", "movie", null, null, "Movie", 2020, cts.Token));
+                await selector.WhenLateWorkIdleAsync().WaitAsync(TimeSpan.FromSeconds(2));
+            }
+
+            Assert.Empty(await db.ListSourceCandidatesAsync(7605, "movie", -1, -1, "gostream-default", false, CancellationToken.None));
+            Assert.Equal(2, fake.TorznabHits(77));
+        }
+    }
+
     // ------------------------------------------------------------------
     // Fake Prowlarr
     // ------------------------------------------------------------------
 
-    internal sealed record TorznabItem(string Title, string Hash, int Seeders, long Size);
+    internal sealed record TorznabItem(string Title, string Hash, int Seeders, long Size, string? DownloadUrl = null);
 
     internal sealed class IndexerBehaviour
     {
@@ -434,14 +587,19 @@ public sealed class ParallelIndexerSearchTests : IDisposable
         private readonly object _lock = new();
         private int _aggregateHits;
         private int _listHits;
+        private int _downloadHits;
 
         public FakeProwlarr(string apiKey) => _apiKey = apiKey;
 
         public bool FailIndexerList { get; set; }
 
+        public Func<int, string, IndexerBehaviour>? QueryBehaviour { get; set; }
+
         public int AggregateSearchHits => Volatile.Read(ref _aggregateHits);
 
         public int IndexerListHits => Volatile.Read(ref _listHits);
+
+        public int DownloadHits => Volatile.Read(ref _downloadHits);
 
         public int TorznabHits(int id)
         {
@@ -467,6 +625,12 @@ public sealed class ParallelIndexerSearchTests : IDisposable
             if (headerKey != _apiKey && queryKey != _apiKey)
             {
                 return new HttpResponseMessage(HttpStatusCode.Unauthorized);
+            }
+
+            if (path == "/hung-download")
+            {
+                Interlocked.Increment(ref _downloadHits);
+                await Task.Delay(Timeout.Infinite, ct);
             }
 
             if (path == "/api/v1/indexer")
@@ -525,7 +689,8 @@ public sealed class ParallelIndexerSearchTests : IDisposable
                     return new HttpResponseMessage(HttpStatusCode.NotFound);
                 }
 
-                var b = ix.Behaviour;
+                var q = System.Web.HttpUtility.ParseQueryString(request.RequestUri.Query)["q"] ?? string.Empty;
+                var b = QueryBehaviour?.Invoke(id, q) ?? ix.Behaviour;
                 if (b.Hangs)
                 {
                     await Task.Delay(Timeout.Infinite, ct);
@@ -558,7 +723,7 @@ public sealed class ParallelIndexerSearchTests : IDisposable
             sb.Append("<title>").Append(SecurityElement.Escape(indexer)).Append("</title>");
             foreach (var it in items)
             {
-                var magnet = "magnet:?xt=urn:btih:" + it.Hash + "&dn=" + Uri.EscapeDataString(it.Title);
+                var magnet = it.DownloadUrl ?? ("magnet:?xt=urn:btih:" + it.Hash + "&dn=" + Uri.EscapeDataString(it.Title));
                 sb.Append("<item>");
                 sb.Append("<title>").Append(SecurityElement.Escape(it.Title)).Append("</title>");
                 sb.Append("<size>").Append(it.Size).Append("</size>");
@@ -566,7 +731,10 @@ public sealed class ParallelIndexerSearchTests : IDisposable
                 sb.Append("<torznab:attr name=\"seeders\" value=\"").Append(it.Seeders).Append("\"/>");
                 sb.Append("<torznab:attr name=\"peers\" value=\"").Append(it.Seeders + 3).Append("\"/>");
                 sb.Append("<torznab:attr name=\"infohash\" value=\"").Append(it.Hash).Append("\"/>");
-                sb.Append("<torznab:attr name=\"magneturl\" value=\"").Append(SecurityElement.Escape(magnet)).Append("\"/>");
+                if (it.DownloadUrl is null)
+                {
+                    sb.Append("<torznab:attr name=\"magneturl\" value=\"").Append(SecurityElement.Escape(magnet)).Append("\"/>");
+                }
                 sb.Append("</item>");
             }
 
