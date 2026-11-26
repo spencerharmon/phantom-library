@@ -1,5 +1,19 @@
 # Testing Phantom Library
 
+## Isolated movie/episode parity (preferred for 35/36)
+
+`./scripts/tests/postgres-playback-parity.test.sh` runs both scenarios against
+an owned PostgreSQL service/container and synthetic Jellyfin seed. It builds the
+real patched server and the checkout's candidate plugin; no host-global clone,
+user-systemd unit, production image, or `/var/tmp/jf-test` state is required.
+`python3 tools/rig-scenarios/isolated-playback-rig.py --backend sqlite` retains
+SQLite parity. The standalone 35/36 scripts now use this isolated runner, while
+`RIG_NO_RESET=1` preserves caller-owned migration-rig operation.
+See [the rig contract](../tasks/postgres-playback-parity-rig.md) for candidate
+artifact injection, prerequisites, retained evidence and Gitea execution.
+The legacy clone/systemd instructions below apply to other scenarios, **not**
+the isolated 35/36 check.
+
 Operator does not want to be in the loop for every test cycle.
 Run live integration tests yourself against a clone of the
 operator's production Jellyfin and gostream state. This doc

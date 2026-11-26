@@ -1,0 +1,56 @@
+name: postgres-playback-parity
+on:
+  push:
+    branches: [main, bee-p0-postgres-playback-parity-rig]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  playback:
+    runs-on: [k8s]
+    timeout-minutes: 45
+    container:
+      image: mcr.microsoft.com/dotnet/sdk:9.0.305-noble
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: isolated-parity-only
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      PHANTOM_PARITY_PGHOST: postgres
+      PHANTOM_PARITY_PGUSER: postgres
+      PHANTOM_PARITY_PGPASSWORD: isolated-parity-only
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Install test/build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends nodejs git python3 curl patch postgresql-client ca-certificates xz-utils
+      - uses: actions/checkout@v4
+      - name: PostgreSQL movie AND episode native-open playback (mandatory)
+        run: ./scripts/tests/postgres-playback-parity.test.sh
+      - name: Retain exact artifacts, DSN identity without password, and all scenario evidence
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: postgres-playback-parity
+          path: |
+            artifacts/playback-parity-*/build-identity.json
+            artifacts/playback-parity-*/*-build.log
+            artifacts/playback-parity-*/build.log
+            artifacts/playback-parity-*/ffmpeg-identity.json
+            artifacts/playback-parity-*/results.json
+            artifacts/playback-parity-*/movie/*.json
+            artifacts/playback-parity-*/movie/*.txt
+            artifacts/playback-parity-*/movie/*.log
+            artifacts/playback-parity-*/movie/logs/**
+            artifacts/playback-parity-*/movie/responses/**
+            artifacts/playback-parity-*/episode/*.json
+            artifacts/playback-parity-*/episode/*.txt
+            artifacts/playback-parity-*/episode/*.log
+            artifacts/playback-parity-*/episode/logs/**
+            artifacts/playback-parity-*/episode/responses/**
+          if-no-files-found: error
